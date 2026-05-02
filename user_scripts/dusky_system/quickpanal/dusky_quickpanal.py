@@ -1852,7 +1852,7 @@ class QuickPanalWindow(Adw.ApplicationWindow):
         self.lbl_date = Gtk.Label(css_classes=["header-date"])
         self.clock_box.append(self.lbl_time); self.clock_box.append(self.lbl_date)
         clock_click = Gtk.GestureClick.new()
-        clock_click.connect("pressed", lambda *args: execute_cmd("uwsm app -- kitty --class gnome-clocks gnome-clocks"))
+        clock_click.connect("pressed", lambda *args: execute_cmd("uwsm-app -- gnome-clocks"))
         self.clock_box.add_controller(clock_click)
         self.header_center.set_center_widget(self.clock_box)
 
