@@ -1926,7 +1926,7 @@ class QuickPanalWindow(Adw.ApplicationWindow):
         for tg in (self.tg_wifi, self.tg_bt, self.tg_perf, self.tg_idle, self.tg_dnd, self.tg_blur, self.tg_shader, self.tg_settings, self.tg_theme, self.tg_updates): self.flow.append(tg)
         main_box.append(self.flow)
 
-        # --- Power Management Segmented Control ---
+# --- Power Management Segmented Control ---
         self.power_group = Adw.PreferencesGroup()
         self.power_row = Adw.ActionRow(title="Power Profile")
         power_icon = Gtk.Image.new_from_icon_name("power-profile-balanced-symbolic")
@@ -1946,18 +1946,15 @@ class QuickPanalWindow(Adw.ApplicationWindow):
 
         self.btn_save = Gtk.ToggleButton(icon_name="power-profile-power-saver-symbolic")
         self.btn_save.set_tooltip_text("Power Saver")
-        self.btn_save.add_css_class("circular")
-        self.btn_save.add_css_class("flat")
+        self.btn_save.set_css_classes(["circular", "flat", "power-ring-btn"])
         
         self.btn_bal = Gtk.ToggleButton(icon_name="power-profile-balanced-symbolic")
         self.btn_bal.set_tooltip_text("Balanced")
-        self.btn_bal.add_css_class("circular")
-        self.btn_bal.add_css_class("flat")
+        self.btn_bal.set_css_classes(["circular", "flat", "power-ring-btn"])
         
         self.btn_perf = Gtk.ToggleButton(icon_name="power-profile-performance-symbolic")
         self.btn_perf.set_tooltip_text("Performance")
-        self.btn_perf.add_css_class("circular")
-        self.btn_perf.add_css_class("flat")
+        self.btn_perf.set_css_classes(["circular", "flat", "power-ring-btn"])
         
         self.btn_bal.set_group(self.btn_save)
         self.btn_perf.set_group(self.btn_save)
@@ -2254,6 +2251,15 @@ scale.media-scale highlight { background-color: #cba6f7; }
 .icon-sunset { color: #fab387; }
 .icon-label { font-size: 18px; font-family: "Symbols Nerd Font", "JetBrainsMono Nerd Font", monospace; }
 .value-label { font-size: 14px; font-weight: 700; opacity: 0.8; font-family: "JetBrainsMono Nerd Font", monospace; font-variant-numeric: tabular-nums; }
+
+button.power-ring-btn {
+    border: 2px solid transparent; /* Invisible border to prevent jumping */
+    transition: all 0.2s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+}
+button.power-ring-btn:checked {
+    border-color: @accent_color;
+    background-color: alpha(@accent_bg_color, 0.15); /* Subtle tinted background */
+}
 """
 
 class QuickPanalApp(Adw.Application):
