@@ -169,7 +169,7 @@
     "return-type": "json",
     "format": "{}",
     "tooltip": true,
-    "on-click": "uwsm-app -- kitty --class system_update.sh -e ~/user_scripts/update_dusky/system_update.sh"
+    "on-click": "uwsm-app -- kitty --class system_update.sh --hold -e ~/user_scripts/update_dusky/system_update.sh --all"
   },
 
   "custom/notification": {
