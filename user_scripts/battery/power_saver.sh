@@ -28,13 +28,15 @@ readonly WP_AUDIO_SINK="@DEFAULT_AUDIO_SINK@"
 
 # Target resources to manage during power transitions
 # Note: Process names must not exceed 15 characters due to kernel TASK_COMM_LEN limits.
-readonly -a TARGET_PROCESSES=("btop" "nvtop")
-# Target scripts (Safely matched via args parsing to prevent killing text editors)
-readonly -a TARGET_SCRIPTS=("dusky_main.py") 
+readonly -a TARGET_PROCESSES=("btop" "nvtop" "hyprsunset" "awww-daemon")
 
-readonly -a TARGET_SYSTEM_SERVICES=("firewalld" "vsftpd" "waydroid-container" "logrotate.timer" "sshd")
+# Target scripts (Safely matched via args parsing to prevent killing text editors)
+readonly -a TARGET_SCRIPTS=("dusky_main.py" "dusky_stt_main.py") 
+
+readonly -a TARGET_SYSTEM_SERVICES=("firewalld" "vsftpd" "waydroid-container" "logrotate.timer" "sshd" "ufw")
+
 # Note: 'hypridle' explicitly removed to preserve Wayland DPMS idle power-saving management.
-readonly -a TARGET_USER_SERVICES=("battery_notify" "blueman-applet" "gvfs-daemon" "gvfs-metadata" "network_meter")
+readonly -a TARGET_USER_SERVICES=("battery_notify" "blueman-applet" "gvfs-daemon" "gvfs-metadata" "network_meter" "waybar" "blueman-manager" "dusky_quickpanal" "dusky")
 
 # --- INITIALIZATION ---
 mkdir -p "${STATE_DIR}"
