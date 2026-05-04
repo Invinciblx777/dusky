@@ -16,6 +16,7 @@ fi
 
 # --- CONSTANTS & PATHS ---
 readonly STATE_DIR="${HOME}/.config/dusky/settings/power_saver"
+readonly GUI_STATE_FILE="${HOME}/.config/dusky/settings/power_saver_state"
 
 # Hardware Limits
 readonly BRIGHTNESS_PS_LEVEL="1%"
@@ -42,6 +43,7 @@ readonly -a TARGET_USER_SERVICES=("battery_notify" "blueman-applet" "gvfs-daemon
 
 # --- INITIALIZATION ---
 mkdir -p "${STATE_DIR}"
+mkdir -p "$(dirname "${GUI_STATE_FILE}")"
 
 # --- UTILITY: LOGGING ---
 log_info()  { printf '\033[1;34m::\033[0m %s\n' "$*"; }
@@ -502,6 +504,8 @@ enable_power_saver() {
         uwsm app -- "${THEME_SCRIPT}" set --mode light &>/dev/null || true
     fi
 
+    # Update global GUI state
+    printf "true" > "${GUI_STATE_FILE}"
     log_step "POWER SAVING ENABLED. System optimized."
 }
 
@@ -525,6 +529,9 @@ disable_power_saver() {
     fi
 
     clear_state "power_saver_active"
+    
+    # Update global GUI state
+    printf "false" > "${GUI_STATE_FILE}"
     log_step "PERFORMANCE MODE RESTORED. Constraints lifted."
 }
 
