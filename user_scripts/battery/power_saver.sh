@@ -24,6 +24,7 @@ readonly VOLUME_CAP=50
 # Integrations & Peripherals
 readonly THEME_SCRIPT="${HOME}/user_scripts/theme_matugen/theme_ctl.sh"
 readonly VISUALS_SCRIPT="${HOME}/user_scripts/hypr/hypr_blur_opacity_shadow_toggle.sh"
+readonly ANIM_SCRIPT="${HOME}/user_scripts/rofi/hypr_anim.sh"
 readonly DDC_VCP_BRIGHTNESS_CODE="10"
 readonly WP_AUDIO_SINK="@DEFAULT_AUDIO_SINK@"
 
@@ -456,18 +457,29 @@ manage_animations() {
         fi
     fi
 
-    # 3. Core Animations (In-Memory IPC)
-    if has_cmd uwsm && has_cmd hyprctl; then
-        if [[ "$mode" == "enable" ]]; then
+    # 3. Core Animations (IPC / Rofi Delegation)
+    if [[ "$mode" == "enable" ]]; then
+        # Use zero-fork IPC to freeze animations instantly during power save
+        if has_cmd uwsm && has_cmd hyprctl; then
             uwsm app -- hyprctl keyword animations:enabled 0 &>/dev/null || log_warn "IPC signal dropped: animations"
-        else
-            uwsm app -- hyprctl keyword animations:enabled 1 &>/dev/null || log_warn "IPC signal dropped: animations"
-        fi
-    elif has_cmd hyprctl && [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
-        if [[ "$mode" == "enable" ]]; then
+        elif has_cmd hyprctl && [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
             hyprctl keyword animations:enabled 0 &>/dev/null || log_warn "IPC signal dropped: animations"
+        fi
+    elif [[ "$mode" == "disable" ]]; then
+        # Delegate restoration to the user's Rofi script to ensure custom curves are loaded
+        if [[ -x "${ANIM_SCRIPT}" ]]; then
+            if has_cmd uwsm; then
+                uwsm app -- "${ANIM_SCRIPT}" --current &>/dev/null || true
+            else
+                "${ANIM_SCRIPT}" --current &>/dev/null || true
+            fi
         else
-            hyprctl keyword animations:enabled 1 &>/dev/null || log_warn "IPC signal dropped: animations"
+            # Fallback if Rofi script is missing
+            if has_cmd uwsm && has_cmd hyprctl; then
+                uwsm app -- hyprctl keyword animations:enabled 1 &>/dev/null || log_warn "IPC signal dropped: animations"
+            elif has_cmd hyprctl && [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
+                hyprctl keyword animations:enabled 1 &>/dev/null || log_warn "IPC signal dropped: animations"
+            fi
         fi
     fi
 }
