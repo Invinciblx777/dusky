@@ -457,25 +457,29 @@ manage_services() {
             fi
         done
         
-        # Simple processes
+        # Simple processes (Using nohup + disown to safely survive script SIGHUP dispatch)
         for proc in "${TARGET_PROCESSES[@]}"; do
             if [[ "$(get_state "proc_active_${proc}")" == "true" ]]; then
                 if has_cmd uwsm; then
-                    uwsm app -- "$proc" &>/dev/null &
+                    nohup uwsm app -- "$proc" </dev/null >/dev/null 2>&1 &
+                    disown "$!" 2>/dev/null || true
                 else
-                    "$proc" &>/dev/null &
+                    nohup "$proc" </dev/null >/dev/null 2>&1 &
+                    disown "$!" 2>/dev/null || true
                 fi
                 clear_state "proc_active_${proc}"
             fi
         done
         
-        # Background Scripts
+        # Background Scripts (Using nohup + disown to safely survive script SIGHUP dispatch)
         for script in "${TARGET_SCRIPTS[@]}"; do
             if [[ "$(get_state "script_active_${script}")" == "true" ]]; then
                 if has_cmd uwsm; then
-                    uwsm app -- "$script" &>/dev/null &
+                    nohup uwsm app -- "$script" </dev/null >/dev/null 2>&1 &
+                    disown "$!" 2>/dev/null || true
                 else
-                    "$script" &>/dev/null &
+                    nohup "$script" </dev/null >/dev/null 2>&1 &
+                    disown "$!" 2>/dev/null || true
                 fi
                 clear_state "script_active_${script}"
             fi
