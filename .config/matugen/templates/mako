@@ -1,7 +1,7 @@
 # Material You colors - Sleek Transparent Theme
 
 # 80% opacity (cc) on the background for a frosted glass look
-background-color={{colors.on_primary.default.hex}}03
+background-color={{colors.on_primary.default.hex}}ff
 text-color={{colors.tertiary.default.hex}}
 # 93% opacity (ee) on the border for a subtle edge
 border-color={{colors.tertiary_container.default.hex}}ee
@@ -38,7 +38,7 @@ margin=0
 text-alignment=center
 
 # -- Contrast Override --
-background-color={{colors.surface.default.hex}}03
+background-color={{colors.surface.default.hex}}ff
 progress-color={{colors.primary_container.default.hex}}
 text-color={{colors.on_surface.default.hex}}
 
