@@ -11,6 +11,7 @@ border-size=2
 border-radius=8
 icons=1
 max-icon-size=48
+icon-path=/usr/share/icons/Papirus-Dark:/usr/share/icons/Papirus
 default-timeout=5000
 ignore-timeout=0
 max-visible=6
