@@ -104,6 +104,12 @@ case "$MODE" in
         
     --timer|--pomodoro)
         DURATION_SEC="${2:-0}"
+        
+        # CLI Quality of Life: Auto-fill 25 minutes if called headlessly without a duration
+        if [[ "$MODE" == "--pomodoro" ]] && (( DURATION_SEC == 0 )); then
+            DURATION_SEC=1500
+        fi
+        
         if (( DURATION_SEC <= 0 )); then exit 1; fi
         TARGET_SEC=$((START_SEC + DURATION_SEC))
         
@@ -111,7 +117,6 @@ case "$MODE" in
             left=$((TARGET_SEC - SECONDS))
             if (( left <= 0 )); then
                 
-                # FIXED: Removed 'local' keyword to prevent Bash syntax crash in global scope
                 alert_msg="Your timer has finished."
                 [[ "$MODE" == "--pomodoro" ]] && alert_msg="Your Pomodoro session has finished."
                 notify-send -u critical -a "dusky-glance-alert" "Time's Up!" "$alert_msg"
