@@ -2,7 +2,8 @@
 
 # 40% opacity (66) on the background for a glassy Hyprland blur effect
 background-color={{colors.surface.default.hex}}ff
-text-color={{colors.on_surface.default.hex}}
+# Text color matching the primary accent color
+text-color={{colors.primary.default.hex}}
 # 93% opacity (ee) on the border using your primary accent color
 border-color={{colors.primary.default.hex}}ee
 # Dynamic timeout progress bar color
@@ -40,7 +41,7 @@ text-alignment=center
 # -- Contrast Override --
 background-color={{colors.surface.default.hex}}ff
 progress-color={{colors.primary_container.default.hex}}
-text-color={{colors.on_surface.default.hex}}
+text-color={{colors.primary.default.hex}}
 
 # Optional: Gives the OSD a slightly more defined border to stand out
 border-size=0
