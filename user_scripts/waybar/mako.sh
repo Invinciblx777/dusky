@@ -68,7 +68,11 @@ jq -c -n \
     # 2. Calculate true pending count in a single filtered pass
     | ($active + $history) 
     | unique_by(.id) 
-    | map(select(.summary != null and .summary != "" and .app_name != "OSD")) 
+    | map(select(.summary != null and .summary != ""))
+    
+    # Comprehensive filter matching Rofi behavior
+    | map(select(["OSD", "dusky-keys", "dusky-cava", "dusky-cava-alert", "dusky-glance-narrow", "dusky-glance-wide", "dusky-glance-timer", "dusky-glance-alert", "Spotify"] | index(.app_name) | not))
+    
     | map(select($blacklist_dict[.id | tostring] | not))
     | length as $count
     

@@ -51,7 +51,9 @@ MENU_PAYLOAD=$(jq -r -n \
   | reverse 
   | .[] 
   | select(.summary != null and .summary != "") 
-  | select(.app_name != "OSD")
+  
+  # Comprehensive filter: ignore OSD, all dusky modules, and silenced apps
+  | select(["OSD", "dusky-keys", "dusky-cava", "dusky-cava-alert", "dusky-glance-narrow", "dusky-glance-wide", "dusky-glance-timer", "dusky-glance-alert", "Spotify"] | index(.app_name) | not)
   
   # Filter out blacklisted IDs
   | select((.id | tostring) as $id_str | $blacklisted_ids | index($id_str) | not)
