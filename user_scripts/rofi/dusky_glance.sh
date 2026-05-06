@@ -32,18 +32,17 @@ parse_timer() {
 
 parse_pomodoro() {
     local input="$1"
-    local work_m="${input%:*}"
-    local break_m="${input#*:}"
+    local work_s="${input%:*}"
+    local break_s="${input#*:}"
     
-    [[ "$work_m" == "$break_m" ]] && break_m=0
+    work_s="${work_s//[!0-9]/}"
+    break_s="${break_s//[!0-9]/}"
     
-    work_m="${work_m//[!0-9]/}"
-    break_m="${break_m//[!0-9]/}"
+    # Defaults: 25 minutes (1500s) and 5 minutes (300s)
+    [[ -z "$work_s" ]] && work_s=1500
+    [[ -z "$break_s" ]] && break_s=300
     
-    [[ -z "$work_m" ]] && work_m=25
-    [[ -z "$break_m" ]] && break_m=5
-    
-    echo "$(( work_m * 60 )) $(( break_m * 60 ))"
+    echo "$work_s $break_s"
 }
 
 fmt_t() {
@@ -91,10 +90,11 @@ if (( $# > 0 )); then
                 [[ -z "$w_in" ]] && w_in=25
                 [[ -z "$b_in" ]] && b_in=5
                 
-                echo "$w_in:$b_in" > "$POMO_STATE"
+                # Input args typically denote minutes
+                echo "$((w_in * 60)):$((b_in * 60))" > "$POMO_STATE"
                 "$DAEMON_SCRIPT" --pomodoro "$((w_in * 60))" "$((b_in * 60))" & disown
             else
-                last_pomo="25:5"
+                last_pomo="1500:300"
                 [[ -f "$POMO_STATE" ]] && last_pomo=$(<"$POMO_STATE")
                 read -r work_s break_s <<< "$(parse_pomodoro "$last_pomo")"
                 "$DAEMON_SCRIPT" --pomodoro "$work_s" "$break_s" & disown
@@ -142,7 +142,7 @@ choice=$(printf '%s\n' "${MENU_OPTIONS[@]}" | "${ROFI_CMD[@]}" -p "Glance") || e
 
 case "$choice" in
     '🍅  Pomodoro')
-        last_pomo="25:5"
+        last_pomo="1500:300"
         [[ -f "$POMO_STATE" ]] && last_pomo=$(<"$POMO_STATE")
         
         read -r lw_sec lb_sec <<< "$(parse_pomodoro "$last_pomo")"
@@ -164,7 +164,7 @@ case "$choice" in
             b=$(rofi -dmenu -i -p "Break Duration (Mins) [0 for none]" -theme-str 'window {width: 40%;} listview {lines: 0;} entry {placeholder: "";}') || exit 0
             b=${b//[!0-9]/}; [[ -z "$b" ]] && b=0
             
-            echo "$w:$b" > "$POMO_STATE"
+            echo "$((w*60)):$((b*60))" > "$POMO_STATE"
             "$DAEMON_SCRIPT" --pomodoro "$((w*60))" "$((b*60))" & disown
             
         elif [[ "$pchoice" == *"Seconds"* ]]; then
@@ -174,7 +174,7 @@ case "$choice" in
             b=$(rofi -dmenu -i -p "Break Duration (Secs) [0 for none]" -theme-str 'window {width: 40%;} listview {lines: 0;} entry {placeholder: "";}') || exit 0
             b=${b//[!0-9]/}; [[ -z "$b" ]] && b=0
             
-            echo "$((w/60)):$((b/60))" > "$POMO_STATE"
+            echo "$w:$b" > "$POMO_STATE"
             "$DAEMON_SCRIPT" --pomodoro "$w" "$b" & disown
         fi
         ;;

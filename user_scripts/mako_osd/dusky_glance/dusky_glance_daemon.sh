@@ -14,7 +14,6 @@ PID_FILE="${XDG_RUNTIME_DIR:-/run/user/$UID}/dusky_glance.pid"
 MODE="${1:-}"
 
 # --- MODULE CATEGORIZATION ---
-# Accurately route timers to the widest Mako configuration to prevent clipping
 case "$MODE" in
     --network|--battery|--uptime) CURRENT_APP="$APP_NAME_WIDE" ;;
     --pomodoro|--timer)           CURRENT_APP="$APP_NAME_TIMER" ;;
@@ -130,6 +129,14 @@ case "$MODE" in
     --pomodoro)
         WORK_SEC="${2:-1500}"
         BREAK_SEC="${3:-300}"
+        
+        # Guard rail: prevent zero-duration infinite execution loop
+        if (( WORK_SEC <= 0 )); then 
+            send_osd "Invalid Time"
+            sleep 2
+            exit 1
+        fi
+        
         PHASE="WORK"
         TARGET_SEC=$((START_SEC + WORK_SEC))
         
@@ -200,12 +207,34 @@ case "$MODE" in
 
     --temp)
         zone_file=""
-        for z in /sys/class/hwmon/hwmon*/temp1_input /sys/class/thermal/thermal_zone*/temp; do
-            if [[ -r "$z" ]]; then
-                zone_file="$z"
-                break
+        
+        # 1. Probe for deterministic CPU hardware sensors
+        for hwmon in /sys/class/hwmon/hwmon*/name; do
+            [[ -r "$hwmon" ]] || continue
+            read -r name < "$hwmon"
+            if [[ "$name" == "coretemp" || "$name" == "k10temp" || "$name" == "zenpower" || "$name" == "cpu_thermal" ]]; then
+                dir="${hwmon%/*}"
+                if [[ -r "$dir/temp1_input" ]]; then
+                    zone_file="$dir/temp1_input"
+                    break
+                fi
             fi
         done
+        
+        # 2. Safe fallback to ACPI / Thermal Zones if no native hwmon matched
+        if [[ -z "$zone_file" ]]; then
+            for tz in /sys/class/thermal/thermal_zone*/type; do
+                [[ -r "$tz" ]] || continue
+                read -r type < "$tz"
+                if [[ "$type" == *"x86_pkg_temp"* || "$type" == *"cpu"* ]]; then
+                    dir="${tz%/*}"
+                    if [[ -r "$dir/temp" ]]; then
+                        zone_file="$dir/temp"
+                        break
+                    fi
+                fi
+            done
+        fi
         
         while true; do
             if [[ -n "$zone_file" ]] && read -r t < "$zone_file" 2>/dev/null; then
@@ -292,7 +321,6 @@ case "$MODE" in
     --uptime)
         while true; do
             if read -r up_time _ < /proc/uptime; then
-                # Strip fractional seconds natively in bash
                 up_sec=${up_time%%.*}
                 h=$(( up_sec / 3600 ))
                 m=$(( (up_sec % 3600) / 60 ))
@@ -307,15 +335,36 @@ case "$MODE" in
         ;;
         
     --workspace)
-        while true; do
-            # Securely extract just the numeric ID of the active workspace natively
-            if ws_id=$(hyprctl activeworkspace 2>/dev/null | awk '/workspace ID/ {print $3}'); then
-                send_osd "WS: $ws_id"
-            else
-                send_osd "WS: ?"
-            fi
-            # Poll at 0.5s to keep it extremely light on the hyprctl socket
-            sleep 0.5
-        done
+        if [[ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
+            send_osd "WS: ?"
+            exit 1
+        fi
+        
+        # Process the initial state before dropping into the IPC listener loop
+        if ws_info=$(hyprctl activeworkspace 2>/dev/null); then
+            ws_id=$(awk '/workspace ID/ {print $3}' <<< "$ws_info")
+            send_osd "WS: ${ws_id:-?}"
+        else
+            send_osd "WS: ?"
+        fi
+
+        # Transition to extremely low-overhead IPC socket streaming 
+        socket_path="$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock"
+        if command -v socat >/dev/null 2>&1 && [[ -S "$socket_path" ]]; then
+            socat -U - UNIX-CONNECT:"$socket_path" 2>/dev/null | while read -r line; do
+                if [[ "$line" == "workspace>>"* ]]; then
+                    send_osd "WS: ${line#workspace>>}"
+                fi
+            done
+        else
+            # Failsafe polling fallback (optimized to 1s intervals instead of 0.5s)
+            while true; do
+                if ws_info=$(hyprctl activeworkspace 2>/dev/null); then
+                    ws_id=$(awk '/workspace ID/ {print $3}' <<< "$ws_info")
+                    send_osd "WS: ${ws_id:-?}"
+                fi
+                sleep 1
+            done
+        fi
         ;;
 esac
