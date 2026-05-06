@@ -51,6 +51,12 @@ jq -c -n \
     --arg dnd "$DND_STATE" \
     --arg mode "$MODE" '
     
+    # SAFELY define all the apps and modules we want to ignore
+    def is_ignored:
+        . == "OSD" or . == "dusky-keys" or . == "dusky-cava" or . == "dusky-cava-alert" or 
+        . == "dusky-glance-narrow" or . == "dusky-glance-wide" or . == "dusky-glance-timer" or 
+        . == "dusky-glance-alert" or . == "Spotify";
+        
     # Helper for vertical alignment centering
     def pad3:
         tostring |
@@ -70,8 +76,8 @@ jq -c -n \
     | unique_by(.id) 
     | map(select(.summary != null and .summary != ""))
     
-    # Comprehensive filter matching Rofi behavior
-    | map(select(["OSD", "dusky-keys", "dusky-cava", "dusky-cava-alert", "dusky-glance-narrow", "dusky-glance-wide", "dusky-glance-timer", "dusky-glance-alert", "Spotify"] | index(.app_name) | not))
+    # Apply the ignore filter securely mapping Rofi behavior
+    | map(select(.app_name | is_ignored | not))
     
     | map(select($blacklist_dict[.id | tostring] | not))
     | length as $count

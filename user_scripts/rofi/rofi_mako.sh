@@ -16,6 +16,12 @@ MENU_PAYLOAD=$(jq -r -n \
   --argjson history "$HISTORY" \
   --arg bl "$BLACKLIST_RAW" '
   
+  # SAFELY define all the apps and modules we want to ignore
+  def is_ignored:
+    . == "OSD" or . == "dusky-keys" or . == "dusky-cava" or . == "dusky-cava-alert" or 
+    . == "dusky-glance-narrow" or . == "dusky-glance-wide" or . == "dusky-glance-timer" or 
+    . == "dusky-glance-alert" or . == "Spotify";
+
   def escape_pango: 
       if type == "string" then 
         gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;") | gsub("\""; "&quot;") | gsub("'\''"; "&apos;")
@@ -52,8 +58,8 @@ MENU_PAYLOAD=$(jq -r -n \
   | .[] 
   | select(.summary != null and .summary != "") 
   
-  # Comprehensive filter: ignore OSD, all dusky modules, and silenced apps
-  | select(["OSD", "dusky-keys", "dusky-cava", "dusky-cava-alert", "dusky-glance-narrow", "dusky-glance-wide", "dusky-glance-timer", "dusky-glance-alert", "Spotify"] | index(.app_name) | not)
+  # Apply the ignore filter securely
+  | select(.app_name | is_ignored | not)
   
   # Filter out blacklisted IDs
   | select((.id | tostring) as $id_str | $blacklisted_ids | index($id_str) | not)
