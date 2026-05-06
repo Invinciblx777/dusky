@@ -177,14 +177,33 @@ text-alignment=center
 font=monospace 12
 
 # ======================================
-# DUSKY GLANCE (BOTTOM RIGHT)
+# DUSKY GLANCE (NARROW MODULES)
 # ======================================
-[app-name=dusky-glance]
+# Handles: Clock, Timers, CPU, Temp, RAM
+[app-name=dusky-glance-narrow]
 anchor=bottom-right
 margin=0,20,20,0
 
-# Fixed width for 9-10 character strings
 width=170
+height=56
+padding=0
+
+border-radius=20
+border-size=1
+icons=0
+text-alignment=center
+
+format=%b
+
+# ======================================
+# DUSKY GLANCE (WIDE MODULES)
+# ======================================
+# Handles: Network Meter, Battery
+[app-name=dusky-glance-wide]
+anchor=bottom-right
+margin=0,20,20,0
+
+width=210
 height=56
 padding=0
 

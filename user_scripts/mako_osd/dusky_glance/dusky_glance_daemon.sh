@@ -1,19 +1,29 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# DUSKY GLANCE DAEMON - ULTRA-MINIMALIST HARDWARE MONITORING 
+# DUSKY GLANCE DAEMON - DYNAMIC WIDTH EDITION
 # ==============================================================================
 
 set -euo pipefail
 
-APP_NAME="dusky-glance"
-SYNC_ID="${APP_NAME}-sync"
+APP_NAME_NARROW="dusky-glance-narrow"
+APP_NAME_WIDE="dusky-glance-wide"
+SYNC_ID="dusky-glance-sync"
 PID_FILE="${XDG_RUNTIME_DIR:-/run/user/$UID}/dusky_glance.pid"
 
 MODE="${1:-}"
 
+# --- MODULE CATEGORIZATION ---
+# Route the mode to the correct Mako app-name for dynamic width sizing
+case "$MODE" in
+    --network|--battery) CURRENT_APP="$APP_NAME_WIDE" ;;
+    *) CURRENT_APP="$APP_NAME_NARROW" ;;
+esac
+
 # --- CORE LIFECYCLE ---
 clear_osd() {
-    notify-send -a "$APP_NAME" -h string:x-canonical-private-synchronous:"$SYNC_ID" -t 10 " " " " 2>/dev/null || true
+    # Send synchronous clear payloads to both classes to prevent visual ghosting
+    notify-send -a "$APP_NAME_NARROW" -h string:x-canonical-private-synchronous:"$SYNC_ID" -t 10 " " " " 2>/dev/null || true
+    notify-send -a "$APP_NAME_WIDE" -h string:x-canonical-private-synchronous:"$SYNC_ID" -t 10 " " " " 2>/dev/null || true
 }
 
 if [[ -f "$PID_FILE" ]]; then
@@ -47,7 +57,8 @@ trap 'exit 0' INT TERM
 send_osd() {
     local text="$1"
     local body="<span font='monospace 20' weight='bold'>${text}</span>"
-    notify-send -a "$APP_NAME" -h string:x-canonical-private-synchronous:"$SYNC_ID" -t 2000 " " "$body"
+    # Pushes to Mako using the dynamically assigned category width
+    notify-send -a "$CURRENT_APP" -h string:x-canonical-private-synchronous:"$SYNC_ID" -t 2000 " " "$body"
 }
 
 format_time() {
@@ -71,7 +82,7 @@ play_sound() {
     fi
 }
 
-# --- HARDWARE MODULES (STRICTLY < 10 CHARACTERS) ---
+# --- HARDWARE MODULES ---
 START_SEC=$SECONDS
 
 case "$MODE" in
