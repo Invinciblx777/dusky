@@ -13,15 +13,14 @@ PID_FILE="${XDG_RUNTIME_DIR:-/run/user/$UID}/dusky_glance.pid"
 MODE="${1:-}"
 
 # --- MODULE CATEGORIZATION ---
-# Route the mode to the correct Mako app-name for dynamic width sizing
+# Route pomodoro and timer to the wide Mako app-name so the text isn't cut off
 case "$MODE" in
-    --network|--battery) CURRENT_APP="$APP_NAME_WIDE" ;;
+    --network|--battery|--pomodoro|--timer) CURRENT_APP="$APP_NAME_WIDE" ;;
     *) CURRENT_APP="$APP_NAME_NARROW" ;;
 esac
 
 # --- CORE LIFECYCLE ---
 clear_osd() {
-    # Send synchronous clear payloads to both classes to prevent visual ghosting
     notify-send -a "$APP_NAME_NARROW" -h string:x-canonical-private-synchronous:"$SYNC_ID" -t 10 " " " " 2>/dev/null || true
     notify-send -a "$APP_NAME_WIDE" -h string:x-canonical-private-synchronous:"$SYNC_ID" -t 10 " " " " 2>/dev/null || true
 }
@@ -57,7 +56,6 @@ trap 'exit 0' INT TERM
 send_osd() {
     local text="$1"
     local body="<span font='monospace 20' weight='bold'>${text}</span>"
-    # Pushes to Mako using the dynamically assigned category width
     notify-send -a "$CURRENT_APP" -h string:x-canonical-private-synchronous:"$SYNC_ID" -t 2000 " " "$body"
 }
 
@@ -102,32 +100,17 @@ case "$MODE" in
         done
         ;;
         
-    --timer|--pomodoro)
-        DURATION_SEC="${2:-0}"
-        
-        # CLI Quality of Life: Auto-fill 25 minutes if called headlessly without a duration
-        if [[ "$MODE" == "--pomodoro" ]] && (( DURATION_SEC == 0 )); then
-            DURATION_SEC=1500
-        fi
-        
+    --timer)
+        DURATION_SEC="${2:-900}"
         if (( DURATION_SEC <= 0 )); then exit 1; fi
         TARGET_SEC=$((START_SEC + DURATION_SEC))
         
         while true; do
             left=$((TARGET_SEC - SECONDS))
             if (( left <= 0 )); then
+                notify-send -u critical -a "dusky-glance-alert" "Time's Up!" "Your timer has finished."
+                play_sound "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga"
                 
-                alert_msg="Your timer has finished."
-                [[ "$MODE" == "--pomodoro" ]] && alert_msg="Your Pomodoro session has finished."
-                notify-send -u critical -a "dusky-glance-alert" "Time's Up!" "$alert_msg"
-                
-                if [[ "$MODE" == "--pomodoro" ]]; then
-                    play_sound "/usr/share/sounds/gnome/default/alarms/glass-bell.oga"
-                else
-                    play_sound "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga"
-                fi
-                
-                # Bottom-right visual flash
                 for _ in {1..5}; do
                     send_osd "00:00"
                     sleep 0.5
@@ -137,6 +120,45 @@ case "$MODE" in
                 exit 0
             fi
             send_osd "$(format_time "$left")"
+            sleep 1
+        done
+        ;;
+
+    --pomodoro)
+        WORK_SEC="${2:-1500}"
+        BREAK_SEC="${3:-300}"
+        PHASE="WORK"
+        TARGET_SEC=$((START_SEC + WORK_SEC))
+        
+        while true; do
+            left=$((TARGET_SEC - SECONDS))
+            
+            if (( left <= 0 )); then
+                if [[ "$PHASE" == "WORK" ]] && (( BREAK_SEC > 0 )); then
+                    # Work finished, switch to break
+                    notify-send -u critical -a "dusky-glance-alert" "Break Time!" "Time to take a break!"
+                    play_sound "/usr/share/sounds/gnome/default/alarms/glass-bell.oga"
+                    
+                    PHASE="BREAK"
+                    TARGET_SEC=$((SECONDS + BREAK_SEC))
+                    continue
+                else
+                    # Break finished (or work finished with no break) -> Loop back to Work
+                    msg="Work session finished."
+                    (( BREAK_SEC > 0 )) && msg="Break is over. Back to work!"
+                    
+                    notify-send -u critical -a "dusky-glance-alert" "Pomodoro Cycle" "$msg"
+                    play_sound "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga"
+                    
+                    PHASE="WORK"
+                    TARGET_SEC=$((SECONDS + WORK_SEC))
+                    continue
+                fi
+            fi
+            
+            # Emojis stripped. Uses narrow text prefixes to fit perfectly.
+            [[ "$PHASE" == "WORK" ]] && prefix="W: " || prefix="B: "
+            send_osd "${prefix}$(format_time "$left")"
             sleep 1
         done
         ;;
