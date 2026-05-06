@@ -36,6 +36,7 @@ declare -ra FLEET_COMMANDS=(
     "U | systemctl --user enable --now dusky_quickpanal.service || true"
     'U | systemctl --user daemon-reload || true'
     'U | systemctl --user restart dusky_quickpanal.service || true'
+    'U | systemctl --user restart osd_lock.service || true'
 )
 
 # ==============================================================================

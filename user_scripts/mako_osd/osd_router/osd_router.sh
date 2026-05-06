@@ -17,6 +17,14 @@ notify() {
     fi
 }
 
+# Atomic write to entirely eliminate torn reads by the async worker
+atomic_write() {
+    local file="$1"
+    local data="$2"
+    echo "$data" > "${file}.tmp"
+    mv "${file}.tmp" "$file"
+}
+
 main() {
     local action="$1"
     local step="${2:-5}"
@@ -26,7 +34,7 @@ main() {
             exec {lock_fd}> "${XDG_RUNTIME_DIR:-/tmp}/osd_audio.lock"
             flock -x "$lock_fd"
 
-            local icon
+            local icon title vol
             if [[ "$action" == "--vol-up" ]]; then
                 wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ "${step}%+"
                 icon="audio-volume-high"
@@ -35,33 +43,28 @@ main() {
                 icon="audio-volume-low"
             fi
             
-            # Release hardware lock immediately
+            vol=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ | awk '{print int($2 * 100 + 0.5)}')
+            title="Volume: ${vol}%"
+            
+            # Write target state atomically while holding hardware lock
+            atomic_write "${XDG_RUNTIME_DIR:-/tmp}/osd_audio_state.txt" "$icon|$title|$vol"
             exec {lock_fd}>&-
             
-            # Hybrid Async UI Updater: Rate-limited + Final Consistency
+            # Asynchronous Single Worker Loop
             (
-                intent_file="${XDG_RUNTIME_DIR:-/tmp}/osd_audio_intent.pid"
-                ui_lock="${XDG_RUNTIME_DIR:-/tmp}/osd_audio_ui.lock"
-                
-                # Register this process as the latest intent
-                echo $BASHPID > "$intent_file"
-                
-                exec {ui_fd}> "$ui_lock"
-                
-                if flock -n "$ui_fd"; then
-                    # We got the lock instantly -> update UI immediately
-                    vol=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ | awk '{print int($2 * 100 + 0.5)}')
-                    notify "$icon" "Volume: ${vol}%" "$vol"
-                else
-                    # UI is busy -> wait in line
-                    flock -x "$ui_fd"
-                    # Once free, only update if we are still the newest intent
-                    if [[ "$(cat "$intent_file" 2>/dev/null)" == "$BASHPID" ]]; then
-                        vol=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ | awk '{print int($2 * 100 + 0.5)}')
-                        notify "$icon" "Volume: ${vol}%" "$vol"
+                flock -n 9 || exit 0
+                while true; do
+                    IFS='|' read -r c_icon c_title c_vol < "${XDG_RUNTIME_DIR:-/tmp}/osd_audio_state.txt"
+                    [[ -z "$c_title" ]] && break 
+                    
+                    notify "$c_icon" "$c_title" "$c_vol"
+                    
+                    IFS='|' read -r n_icon n_title n_vol < "${XDG_RUNTIME_DIR:-/tmp}/osd_audio_state.txt"
+                    if [[ "$c_vol" == "$n_vol" && "$c_icon" == "$n_icon" && "$c_title" == "$n_title" ]]; then
+                        break # State caught up, exit worker cleanly
                     fi
-                fi
-            ) &
+                done
+            ) 9>> "${XDG_RUNTIME_DIR:-/tmp}/osd_audio_ui.lock" &
             ;;
 
         --vol-mute)
@@ -70,33 +73,34 @@ main() {
 
             wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
             
+            local icon title vol
+            if wpctl get-volume @DEFAULT_AUDIO_SINK@ | grep -q "MUTED"; then
+                icon="audio-volume-muted"
+                title="Audio Muted"
+                vol=""
+            else
+                icon="audio-volume-high"
+                vol=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ | awk '{print int($2 * 100 + 0.5)}')
+                title="Audio Unmuted"
+            fi
+            
+            atomic_write "${XDG_RUNTIME_DIR:-/tmp}/osd_audio_state.txt" "$icon|$title|$vol"
             exec {lock_fd}>&-
 
             (
-                intent_file="${XDG_RUNTIME_DIR:-/tmp}/osd_audio_intent.pid"
-                ui_lock="${XDG_RUNTIME_DIR:-/tmp}/osd_audio_ui.lock"
-                echo $BASHPID > "$intent_file"
-                
-                exec {ui_fd}> "$ui_lock"
-                
-                send_mute_notify() {
-                    if wpctl get-volume @DEFAULT_AUDIO_SINK@ | grep -q "MUTED"; then
-                        notify "audio-volume-muted" "Audio Muted" ""
-                    else
-                        vol=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ | awk '{print int($2 * 100 + 0.5)}')
-                        notify "audio-volume-high" "Audio Unmuted" "$vol"
+                flock -n 9 || exit 0
+                while true; do
+                    IFS='|' read -r c_icon c_title c_vol < "${XDG_RUNTIME_DIR:-/tmp}/osd_audio_state.txt"
+                    [[ -z "$c_title" ]] && break
+                    
+                    notify "$c_icon" "$c_title" "$c_vol"
+                    
+                    IFS='|' read -r n_icon n_title n_vol < "${XDG_RUNTIME_DIR:-/tmp}/osd_audio_state.txt"
+                    if [[ "$c_vol" == "$n_vol" && "$c_icon" == "$n_icon" && "$c_title" == "$n_title" ]]; then
+                        break
                     fi
-                }
-
-                if flock -n "$ui_fd"; then
-                    send_mute_notify
-                else
-                    flock -x "$ui_fd"
-                    if [[ "$(cat "$intent_file" 2>/dev/null)" == "$BASHPID" ]]; then
-                        send_mute_notify
-                    fi
-                fi
-            ) &
+                done
+            ) 9>> "${XDG_RUNTIME_DIR:-/tmp}/osd_audio_ui.lock" &
             ;;
 
         --mic-mute)
@@ -118,37 +122,39 @@ main() {
                 brightnessctl set "${step}%-" -q
             fi
             
-            # Release hardware lock immediately
+            local icon="gpm-brightness-lcd" title bright
+            bright=$(brightnessctl -m | awk -F, '{print int($4 + 0.5)}')
+            title="Brightness: ${bright}%"
+            
+            atomic_write "${XDG_RUNTIME_DIR:-/tmp}/osd_display_state.txt" "$icon|$title|$bright"
             exec {lock_fd}>&-
             
-            # Hybrid Async UI Updater
             (
-                intent_file="${XDG_RUNTIME_DIR:-/tmp}/osd_display_intent.pid"
-                ui_lock="${XDG_RUNTIME_DIR:-/tmp}/osd_display_ui.lock"
-                
-                echo $BASHPID > "$intent_file"
-                
-                exec {ui_fd}> "$ui_lock"
-                
-                if flock -n "$ui_fd"; then
-                    bright=$(brightnessctl -m | awk -F, '{print int($4 + 0.5)}')
-                    notify "gpm-brightness-lcd" "Brightness: ${bright}%" "$bright"
-                else
-                    flock -x "$ui_fd"
-                    if [[ "$(cat "$intent_file" 2>/dev/null)" == "$BASHPID" ]]; then
-                        bright=$(brightnessctl -m | awk -F, '{print int($4 + 0.5)}')
-                        notify "gpm-brightness-lcd" "Brightness: ${bright}%" "$bright"
+                flock -n 9 || exit 0
+                while true; do
+                    IFS='|' read -r c_icon c_title c_bright < "${XDG_RUNTIME_DIR:-/tmp}/osd_display_state.txt"
+                    [[ -z "$c_title" ]] && break
+                    
+                    notify "$c_icon" "$c_title" "$c_bright"
+                    
+                    IFS='|' read -r n_icon n_title n_bright < "${XDG_RUNTIME_DIR:-/tmp}/osd_display_state.txt"
+                    if [[ "$c_bright" == "$n_bright" && "$c_icon" == "$n_icon" && "$c_title" == "$n_title" ]]; then
+                        break
                     fi
-                fi
-            ) &
+                done
+            ) 9>> "${XDG_RUNTIME_DIR:-/tmp}/osd_display_ui.lock" &
             ;;
 
         --kbd-bright-up|--kbd-bright-down)
+            exec {lock_fd}> "${XDG_RUNTIME_DIR:-/tmp}/osd_kbd.lock"
+            flock -x "$lock_fd"
+
             local kbd_dev
             kbd_dev=$(brightnessctl -l | awk -F"'" '/kbd_backlight/ {print $2; exit}')
 
             if [[ -z "$kbd_dev" ]]; then
                 notify "dialog-error" "No Kbd Backlight Found" ""
+                exec {lock_fd}>&-
                 exit 1
             fi
 
@@ -158,11 +164,28 @@ main() {
                 brightnessctl --device="$kbd_dev" set "${step}%-" -q
             fi
 
-            local kbd_bright
+            local icon="keyboard-brightness" title kbd_bright
             kbd_bright=$(brightnessctl --device="$kbd_dev" -m 2>/dev/null | awk -F, '{print int($4 + 0.5)}')
             [[ -z "$kbd_bright" ]] && kbd_bright=0
+            title="Kbd Brightness: ${kbd_bright}%"
 
-            notify "keyboard-brightness" "Kbd Brightness: ${kbd_bright}%" "$kbd_bright"
+            atomic_write "${XDG_RUNTIME_DIR:-/tmp}/osd_kbd_state.txt" "$icon|$title|$kbd_bright"
+            exec {lock_fd}>&-
+
+            (
+                flock -n 9 || exit 0
+                while true; do
+                    IFS='|' read -r c_icon c_title c_bright < "${XDG_RUNTIME_DIR:-/tmp}/osd_kbd_state.txt"
+                    [[ -z "$c_title" ]] && break
+                    
+                    notify "$c_icon" "$c_title" "$c_bright"
+                    
+                    IFS='|' read -r n_icon n_title n_bright < "${XDG_RUNTIME_DIR:-/tmp}/osd_kbd_state.txt"
+                    if [[ "$c_bright" == "$n_bright" && "$c_icon" == "$n_icon" && "$c_title" == "$n_title" ]]; then
+                        break
+                    fi
+                done
+            ) 9>> "${XDG_RUNTIME_DIR:-/tmp}/osd_kbd_ui.lock" &
             ;;
 
         --kbd-bright-show)
