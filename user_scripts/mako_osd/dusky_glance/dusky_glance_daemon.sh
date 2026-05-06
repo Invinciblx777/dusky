@@ -110,11 +110,19 @@ case "$MODE" in
         while true; do
             left=$((TARGET_SEC - SECONDS))
             if (( left <= 0 )); then
+                
+                # RE-ADDED: The Top-Center Alert Notification
+                local alert_msg="Your timer has finished."
+                [[ "$MODE" == "--pomodoro" ]] && alert_msg="Your Pomodoro session has finished."
+                notify-send -u critical -a "dusky-glance-alert" "Time's Up!" "$alert_msg"
+                
                 if [[ "$MODE" == "--pomodoro" ]]; then
                     play_sound "/usr/share/sounds/gnome/default/alarms/glass-bell.oga"
                 else
                     play_sound "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga"
                 fi
+                
+                # Bottom-right visual flash
                 for _ in {1..5}; do
                     send_osd "00:00"
                     sleep 0.5

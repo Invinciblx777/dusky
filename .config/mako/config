@@ -183,20 +183,15 @@ font=monospace 12
 [app-name=dusky-glance-narrow]
 anchor=bottom-right
 margin=0,20,20,0
-
 width=170
 height=56
 padding=0
-
 border-radius=20
 border-size=2
 icons=0
 text-alignment=center
-
 format=%b
-
-# This binds Left-Click to your Rofi script without dismissing the notification!
-on-button-left=exec sh -c 'pkill rofi; uwsm-app -- ~/user_scripts/rofi/dusky_glance.sh'
+on-button-left=exec bash -c "pkill rofi; uwsm-app -- $HOME/user_scripts/rofi/dusky_glance.sh"
 
 # ======================================
 # DUSKY GLANCE (WIDE MODULES)
@@ -205,20 +200,16 @@ on-button-left=exec sh -c 'pkill rofi; uwsm-app -- ~/user_scripts/rofi/dusky_gla
 [app-name=dusky-glance-wide]
 anchor=bottom-right
 margin=0,20,20,0
-
 width=210
 height=56
 padding=0
-
 border-radius=20
 border-size=2
 icons=0
 text-alignment=center
-
 format=%b
+on-button-left=exec bash -c "pkill rofi; uwsm-app -- $HOME/user_scripts/rofi/dusky_glance.sh"
 
-# Apply the same Left-Click bind to the wide modules
-on-button-left=exec sh -c 'pkill rofi; uwsm-app -- ~/user_scripts/rofi/dusky_glance.sh'
 
 # ======================================
 # DUSKY GLANCE ALERTS (TIMERS)
