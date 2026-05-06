@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# DUSKY GLANCE - ROFI FRONTEND & SMART WRAPPER
+# DUSKY GLANCE - ROFI FRONTEND, SMART WRAPPER & STATE MANAGER
 # ==============================================================================
 
 set -euo pipefail
@@ -13,7 +13,39 @@ mkdir -p "$SETTINGS_DIR"
 TIMER_STATE="$SETTINGS_DIR/timer.state"
 POMO_STATE="$SETTINGS_DIR/pomodoro.state"
 
-# --- HELPER: FORMAT SECONDS FOR MENU ---
+# --- HELPER: TIME PARSERS ---
+parse_timer() {
+    local input="$1"
+    local value="${input//[!0-9]/}"
+    local unit="${input//[0-9]/}"
+    
+    [[ -z "$value" ]] && value=15
+    [[ -z "$unit" ]] && unit="m"
+    
+    case "$unit" in
+        s) echo "$value" ;;
+        m) echo "$((value * 60))" ;;
+        h) echo "$((value * 3600))" ;;
+        *) echo "$((value * 60))" ;;
+    esac
+}
+
+parse_pomodoro() {
+    local input="$1"
+    local work_m="${input%:*}"
+    local break_m="${input#*:}"
+    
+    [[ "$work_m" == "$break_m" ]] && break_m=0
+    
+    work_m="${work_m//[!0-9]/}"
+    break_m="${break_m//[!0-9]/}"
+    
+    [[ -z "$work_m" ]] && work_m=25
+    [[ -z "$break_m" ]] && break_m=5
+    
+    echo "$(( work_m * 60 )) $(( break_m * 60 ))"
+}
+
 fmt_t() {
     local s="${1:-0}"
     local m=$((s / 60))
@@ -32,16 +64,16 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     printf "\e[1;34m::\e[0m \e[1mDusky Glance\e[0m - Smart HUD Wrapper\n\n"
     printf "\e[1mUSAGE:\e[0m\n  dusky_glance.sh [COMMAND]\n\n"
     printf "\e[1mCOMMANDS:\e[0m\n"
-    printf "  \e[32m--pomodoro\e[0m      Start Pomodoro (Runs last saved config natively)\n"
-    printf "  \e[32m--timer\e[0m         Start Timer (Runs last saved config natively)\n"
-    printf "  \e[32m--stopwatch\e[0m     Start the stopwatch\n"
-    printf "  \e[32m--clock\e[0m         Show the live clock\n"
-    printf "  \e[32m--cpu\e[0m           Show live CPU usage\n"
-    printf "  \e[32m--ram\e[0m           Show live RAM usage\n"
-    printf "  \e[32m--temp\e[0m          Show CPU temperature\n"
-    printf "  \e[32m--battery\e[0m       Show battery status and power draw\n"
-    printf "  \e[32m--network\e[0m       Show live network speed\n"
-    printf "  \e[31m--stop\e[0m          Stop any running monitor and clear the screen\n"
+    printf "  \e[32m--pomodoro [work] [break]\e[0m  Start Pomodoro (e.g., 45 10. Defaults to last saved)\n"
+    printf "  \e[32m--timer [time]\e[0m             Start Timer (e.g., 90s, 15m. Defaults to last saved)\n"
+    printf "  \e[32m--stopwatch\e[0m                Start the stopwatch\n"
+    printf "  \e[32m--clock\e[0m                    Show the live clock\n"
+    printf "  \e[32m--cpu\e[0m                      Show live CPU usage\n"
+    printf "  \e[32m--ram\e[0m                      Show live RAM usage\n"
+    printf "  \e[32m--temp\e[0m                     Show CPU temperature\n"
+    printf "  \e[32m--battery\e[0m                  Show battery status and power draw\n"
+    printf "  \e[32m--network\e[0m                  Show live network upload/download speed\n"
+    printf "  \e[31m--stop\e[0m                     Stop any running monitor and clear the screen\n"
     exit 0
 fi
 
@@ -50,14 +82,34 @@ if (( $# > 0 )); then
     cmd="$1"
     case "$cmd" in
         --pomodoro)
-            last_pw=1500; last_pb=300
-            [[ -f "$POMO_STATE" ]] && read -r last_pw last_pb < "$POMO_STATE" || true
-            "$DAEMON_SCRIPT" --pomodoro "$last_pw" "$last_pb" & disown
+            if [[ -n "${2:-}" ]]; then
+                w_in="${2//[!0-9]/}"
+                b_in="${3:-0}"
+                b_in="${b_in//[!0-9]/}"
+                [[ -z "$w_in" ]] && w_in=25
+                [[ -z "$b_in" ]] && b_in=5
+                
+                # Save new state
+                echo "$w_in:$b_in" > "$POMO_STATE"
+                "$DAEMON_SCRIPT" --pomodoro "$((w_in * 60))" "$((b_in * 60))" & disown
+            else
+                last_pomo="25:5"
+                [[ -f "$POMO_STATE" ]] && last_pomo=$(<"$POMO_STATE")
+                read -r work_s break_s <<< "$(parse_pomodoro "$last_pomo")"
+                "$DAEMON_SCRIPT" --pomodoro "$work_s" "$break_s" & disown
+            fi
             ;;
         --timer)
-            last_t=900
-            [[ -f "$TIMER_STATE" ]] && last_t=$(<"$TIMER_STATE")
-            "$DAEMON_SCRIPT" --timer "$last_t" & disown
+            if [[ -n "${2:-}" ]]; then
+                echo "$2" > "$TIMER_STATE"
+                secs=$(parse_timer "$2")
+                "$DAEMON_SCRIPT" --timer "$secs" & disown
+            else
+                last_timer="15m"
+                [[ -f "$TIMER_STATE" ]] && last_timer=$(<"$TIMER_STATE")
+                secs=$(parse_timer "$last_timer")
+                "$DAEMON_SCRIPT" --timer "$secs" & disown
+            fi
             ;;
         *)
             "$DAEMON_SCRIPT" "$@" & disown
@@ -68,7 +120,6 @@ fi
 
 # --- GUI EXECUTION ---
 declare -agr ROFI_CMD=(rofi -dmenu -i -no-custom -theme-str 'window {width: 20%;} listview {lines: 10;}')
-# WIDENED to 35% so the sub-menu text doesn't truncate
 declare -agr ROFI_SUB=(rofi -dmenu -i -no-custom -theme-str 'window {width: 35%;} listview {lines: 3;}')
 
 declare -agr MENU_OPTIONS=(
@@ -88,67 +139,79 @@ choice=$(printf '%s\n' "${MENU_OPTIONS[@]}" | "${ROFI_CMD[@]}" -p "Glance") || e
 
 case "$choice" in
     '🍅  Pomodoro')
-        last_pw=1500; last_pb=300
-        [[ -f "$POMO_STATE" ]] && read -r last_pw last_pb < "$POMO_STATE" || true
+        last_pomo="25:5"
+        [[ -f "$POMO_STATE" ]] && last_pomo=$(<"$POMO_STATE")
+        
+        # Parse the saved state into readable seconds for the menu string
+        read -r lw_sec lb_sec <<< "$(parse_pomodoro "$last_pomo")"
         
         p_opts=(
-            "▶️  Start Last ($(fmt_t "$last_pw") Work / $(fmt_t "$last_pb") Break)"
+            "▶️  Start Last ($(fmt_t "$lw_sec") Work / $(fmt_t "$lb_sec") Break)"
             "⚙️  Set in Minutes"
             "⚙️  Set in Seconds"
         )
         pchoice=$(printf '%s\n' "${p_opts[@]}" | "${ROFI_SUB[@]}" -p "Pomodoro") || exit 0
         
         if [[ "$pchoice" == *"Start Last"* ]]; then
-            "$DAEMON_SCRIPT" --pomodoro "$last_pw" "$last_pb" & disown
+            "$DAEMON_SCRIPT" --pomodoro "$lw_sec" "$lb_sec" & disown
             
         elif [[ "$pchoice" == *"Minutes"* ]]; then
-            w=$(rofi -dmenu -i -p "Work Duration (Mins)" -theme-str 'window {width: 20%;} listview {lines: 0;}') || exit 0
+            # WIDENED TO 40%
+            w=$(rofi -dmenu -i -p "Work Duration (Mins)" -theme-str 'window {width: 40%;} listview {lines: 0;}') || exit 0
             w=${w//[!0-9]/}; [[ -z "$w" ]] && exit 0
             
-            b=$(rofi -dmenu -i -p "Break Duration (Mins) [0 for none]" -theme-str 'window {width: 20%;} listview {lines: 0;}') || exit 0
+            # WIDENED TO 40%
+            b=$(rofi -dmenu -i -p "Break Duration (Mins) [0 for none]" -theme-str 'window {width: 40%;} listview {lines: 0;}') || exit 0
             b=${b//[!0-9]/}; [[ -z "$b" ]] && b=0
             
-            echo "$((w*60)) $((b*60))" > "$POMO_STATE"
+            echo "$w:$b" > "$POMO_STATE"
             "$DAEMON_SCRIPT" --pomodoro "$((w*60))" "$((b*60))" & disown
             
         elif [[ "$pchoice" == *"Seconds"* ]]; then
-            w=$(rofi -dmenu -i -p "Work Duration (Secs)" -theme-str 'window {width: 20%;} listview {lines: 0;}') || exit 0
+            # WIDENED TO 40%
+            w=$(rofi -dmenu -i -p "Work Duration (Secs)" -theme-str 'window {width: 40%;} listview {lines: 0;}') || exit 0
             w=${w//[!0-9]/}; [[ -z "$w" ]] && exit 0
             
-            b=$(rofi -dmenu -i -p "Break Duration (Secs) [0 for none]" -theme-str 'window {width: 20%;} listview {lines: 0;}') || exit 0
+            # WIDENED TO 40%
+            b=$(rofi -dmenu -i -p "Break Duration (Secs) [0 for none]" -theme-str 'window {width: 40%;} listview {lines: 0;}') || exit 0
             b=${b//[!0-9]/}; [[ -z "$b" ]] && b=0
             
-            echo "$w $b" > "$POMO_STATE"
+            echo "$((w/60)):$((b/60))" > "$POMO_STATE"
             "$DAEMON_SCRIPT" --pomodoro "$w" "$b" & disown
         fi
         ;;
         
     '⏳  Timer')
-        last_t=900
-        [[ -f "$TIMER_STATE" ]] && last_t=$(<"$TIMER_STATE")
+        last_timer="15m"
+        [[ -f "$TIMER_STATE" ]] && last_timer=$(<"$TIMER_STATE")
+        
+        # Parse the saved state into readable seconds for the menu string
+        lt_sec=$(parse_timer "$last_timer")
         
         t_opts=(
-            "▶️  Start Last ($(fmt_t "$last_t"))"
+            "▶️  Start Last ($(fmt_t "$lt_sec"))"
             "⚙️  Set in Minutes"
             "⚙️  Set in Seconds"
         )
         tchoice=$(printf '%s\n' "${t_opts[@]}" | "${ROFI_SUB[@]}" -p "Timer") || exit 0
         
         if [[ "$tchoice" == *"Start Last"* ]]; then
-            "$DAEMON_SCRIPT" --timer "$last_t" & disown
+            "$DAEMON_SCRIPT" --timer "$lt_sec" & disown
             
         elif [[ "$tchoice" == *"Minutes"* ]]; then
-            val=$(rofi -dmenu -i -p "Duration (Mins)" -theme-str 'window {width: 20%;} listview {lines: 0;}') || exit 0
+            # WIDENED TO 40%
+            val=$(rofi -dmenu -i -p "Duration (Mins)" -theme-str 'window {width: 40%;} listview {lines: 0;}') || exit 0
             val=${val//[!0-9]/}; [[ -z "$val" ]] && exit 0
             
-            echo "$((val*60))" > "$TIMER_STATE"
+            echo "${val}m" > "$TIMER_STATE"
             "$DAEMON_SCRIPT" --timer "$((val*60))" & disown
             
         elif [[ "$tchoice" == *"Seconds"* ]]; then
-            val=$(rofi -dmenu -i -p "Duration (Secs)" -theme-str 'window {width: 20%;} listview {lines: 0;}') || exit 0
+            # WIDENED TO 40%
+            val=$(rofi -dmenu -i -p "Duration (Secs)" -theme-str 'window {width: 40%;} listview {lines: 0;}') || exit 0
             val=${val//[!0-9]/}; [[ -z "$val" ]] && exit 0
             
-            echo "$val" > "$TIMER_STATE"
+            echo "${val}s" > "$TIMER_STATE"
             "$DAEMON_SCRIPT" --timer "$val" & disown
         fi
         ;;
