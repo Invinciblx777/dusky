@@ -138,6 +138,7 @@ INSTALL_SEQUENCE=(
     "U | 460_switch_clipboard.sh"
 #    "S | 465_sddm_setup.sh"
     "U | 470_vesktop_matugen.sh"
+    "S | 473_add_user_to_group.sh"
     "U | 475_reverting_sleep_timeout.sh"
     "U | 480_dusky_commands.sh"
     "S | 485_sudoers_nopassword.sh"
