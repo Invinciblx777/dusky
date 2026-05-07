@@ -120,7 +120,7 @@ if (( $# > 0 )); then
 fi
 
 # --- GUI EXECUTION ---
-declare -agr ROFI_CMD=(rofi -dmenu -i -no-custom -theme-str 'window {width: 20%;} listview {lines: 12;}')
+declare -agr ROFI_CMD=(rofi -dmenu -i -no-custom -theme-str 'window {width: 20%;} listview {lines: 13;}')
 declare -agr ROFI_SUB=(rofi -dmenu -i -no-custom -theme-str 'window {width: 35%;} listview {lines: 3;}')
 
 declare -agr MENU_OPTIONS=(
@@ -135,6 +135,7 @@ declare -agr MENU_OPTIONS=(
     '🌐  Network Speed'
     '🚀  System Uptime'
     '🖥️  Active Workspace'
+    '🎨  Edit appearances'
     '🛑  Stop / Clear'
 )
 
@@ -220,5 +221,6 @@ case "$choice" in
     '🌐  Network Speed')  "$DAEMON_SCRIPT" --network & disown ;;
     '🚀  System Uptime')  "$DAEMON_SCRIPT" --uptime & disown ;;
     '🖥️  Active Workspace')"$DAEMON_SCRIPT" --workspace & disown ;;
+    '🎨  Edit appearances') kitty --class glance_mako_tui.sh -e "$HOME/user_scripts/mako_osd/dusky_glance/dusky_glance_tui" & disown ;;
     '🛑  Stop / Clear')   "$DAEMON_SCRIPT" --stop & disown ;;
 esac
