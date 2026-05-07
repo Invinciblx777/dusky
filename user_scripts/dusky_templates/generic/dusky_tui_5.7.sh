@@ -2,7 +2,7 @@
 # -----------------------------------------------------------------------------
 # Dusky TUI Engine - Generic Configuration Template
 # Target: Generic Linux Configs (/etc, .conf, .ini, host files)
-# Based on TUI Template v5.6
+# Based on TUI Template v5.7
 # -----------------------------------------------------------------------------
 
 set -Eeuo pipefail
@@ -15,7 +15,7 @@ shopt -s extglob
 : "${XDG_CONFIG_HOME:=${HOME}/.config}"
 declare CONFIG_FILE="${DUSKY_CONFIG_FILE:-${XDG_CONFIG_HOME}/myapp/settings.conf}"
 declare -r APP_TITLE="Generic System Config Editor"
-declare -r APP_VERSION="v5.6"
+declare -r APP_VERSION="v5.7"
 
 # Dimensions & layout.
 declare -ri MAX_DISPLAY_ROWS=14
@@ -242,6 +242,12 @@ cleanup() {
     for path in "${_TEMP_PATHS[@]:-}"; do
         [[ -n $path && -e $path ]] && rm -f -- "$path" 2>/dev/null || :
     done
+    
+    # Safely clear out the lockfile from /tmp to prevent pollution
+    if [[ -n ${LOCK_TARGET:-} && -f $LOCK_TARGET ]]; then
+        rm -f -- "$LOCK_TARGET" 2>/dev/null || :
+    fi
+    
     _TEMP_PATHS=()
     _TMPFILE=""
     _TMPMODE=""
@@ -298,12 +304,17 @@ remove_many_temps() {
 }
 
 resolve_write_target() {
-    # Ensure directory exists before resolving
     path_dirname "$CONFIG_FILE"
     mkdir -p "$REPLY" 2>/dev/null || :
     touch "$CONFIG_FILE" 2>/dev/null || :
     WRITE_TARGET=$(realpath -e -- "$CONFIG_FILE" 2>/dev/null || echo "$CONFIG_FILE")
-    LOCK_TARGET="${WRITE_TARGET}.lock"
+    
+    # Route the lock file to /tmp to prevent polluting user directories
+    local lock_dir="/tmp/dusky_tui_locks"
+    mkdir -p "$lock_dir" 2>/dev/null || :
+    # Convert the full path to a safe filename string
+    local safe_name="${WRITE_TARGET//\//_}"
+    LOCK_TARGET="${lock_dir}/${safe_name}.lock"
 }
 
 create_temp_near() {
@@ -466,10 +477,14 @@ validate_item_config() {
         bool|int|float|cycle|menu|action|string) ;;
         *) log_err "Invalid type for '$label': $type"; exit 1 ;;
     esac
-    if [[ -n $block && ! $block =~ ^[a-zA-Z0-9_.:-]+(/[a-zA-Z0-9_.:-]+)*$ ]]; then
+    
+    # Safe robust regex for blocks: accounts for spaces, quotes, and tildes.
+    local re='^[a-zA-Z0-9_.: =/"~'\''-]+(/[a-zA-Z0-9_.: =/"~'\''-]+)*$'
+    if [[ -n $block && ! $block =~ $re ]]; then
         log_err "Register Error: Invalid block path for '$label': $block"
         exit 1
     fi
+    
     case $type in
         int)
             if [[ -n $min ]] && ! is_int_literal "$min"; then log_err "Register Error: Invalid int min for '$label'."; exit 1; fi
@@ -1130,8 +1145,8 @@ draw_main_view() {
     printf -v pad_buf '%*s' "$right_pad" ''
     buf+="${pad_buf}│${C_RESET}${CLR_EOL}"$'\n'
 
-    (( TAB_SCROLL_START > CURRENT_TAB )) && TAB_SCROLL_START=$CURRENT_TAB
-    (( TAB_SCROLL_START < 0 )) && TAB_SCROLL_START=0
+    if (( TAB_SCROLL_START > CURRENT_TAB )); then TAB_SCROLL_START=$CURRENT_TAB; fi
+    if (( TAB_SCROLL_START < 0 )); then TAB_SCROLL_START=0; fi
     local -i max_tab_width=$(( BOX_INNER_WIDTH - 6 ))
     LEFT_ARROW_ZONE=""; RIGHT_ARROW_ZONE=""
 
@@ -1140,6 +1155,7 @@ draw_main_view() {
         current_col=3
         TAB_ZONES=()
         local -i used_len=0
+        
         if (( TAB_SCROLL_START > 0 )); then
             tab_line+="${C_YELLOW}«${C_RESET} "
             LEFT_ARROW_ZONE="$current_col:$(( current_col + 1 ))"
@@ -1151,25 +1167,41 @@ draw_main_view() {
         for (( i = TAB_SCROLL_START; i < TAB_COUNT; i++ )); do
             name=${TABS[i]}; display_name=$name
             local -i tab_name_len=${#name}
-            local -i chunk_len=$(( tab_name_len + 4 ))
+            
+            # Determine if this is strictly the last tab
+            local -i is_last=0
+            if (( i == TAB_COUNT - 1 )); then is_last=1; fi
+            
+            local -i chunk_len=$(( tab_name_len + 2 ))
+            if (( ! is_last )); then chunk_len=$(( chunk_len + 2 )); fi
+            
             local -i reserve=0
-            if (( i < TAB_COUNT - 1 )); then reserve=2; fi
+            if (( ! is_last )); then reserve=2; fi
+            
             if (( used_len + chunk_len + reserve > max_tab_width )); then
                 if (( i < CURRENT_TAB || (i == CURRENT_TAB && TAB_SCROLL_START < CURRENT_TAB) )); then
                     TAB_SCROLL_START=$(( TAB_SCROLL_START + 1 )); continue 2
                 fi
                 if (( i == CURRENT_TAB )); then
-                    local -i avail_label=$(( max_tab_width - used_len - reserve - 4 ))
-                    (( avail_label < 1 )) && avail_label=1
+                    local -i avail_label=$(( max_tab_width - used_len - reserve - 2 ))
+                    if (( ! is_last )); then avail_label=$(( avail_label - 2 )); fi
+                    
+                    if (( avail_label < 1 )); then avail_label=1; fi
                     if (( tab_name_len > avail_label )); then
                         if (( avail_label == 1 )); then display_name="…"; else display_name="${name:0:avail_label-1}…"; fi
-                        tab_name_len=${#display_name}; chunk_len=$(( tab_name_len + 4 ))
+                        tab_name_len=${#display_name}
+                        chunk_len=$(( tab_name_len + 2 ))
+                        if (( ! is_last )); then chunk_len=$(( chunk_len + 2 )); fi
                     fi
                     zone_start=$current_col
-                    tab_line+="${C_CYAN}${C_INVERSE} ${display_name} ${C_RESET}${C_MAGENTA}│ "
+                    if (( is_last )); then
+                        tab_line+="${C_CYAN}${C_INVERSE} ${display_name} ${C_RESET}"
+                    else
+                        tab_line+="${C_CYAN}${C_INVERSE} ${display_name} ${C_RESET}${C_MAGENTA}│ "
+                    fi
                     TAB_ZONES+=("${zone_start}:$(( zone_start + tab_name_len + 1 ))")
                     used_len=$(( used_len + chunk_len )); current_col=$(( current_col + chunk_len ))
-                    if (( i < TAB_COUNT - 1 )); then
+                    if (( ! is_last )); then
                         tab_line+="${C_YELLOW}» ${C_RESET}"
                         RIGHT_ARROW_ZONE="$current_col:$(( current_col + 1 ))"
                         used_len=$(( used_len + 2 ))
@@ -1181,8 +1213,21 @@ draw_main_view() {
                 used_len=$(( used_len + 2 ))
                 break
             fi
+            
             zone_start=$current_col
-            if (( i == CURRENT_TAB )); then tab_line+="${C_CYAN}${C_INVERSE} ${display_name} ${C_RESET}${C_MAGENTA}│ "; else tab_line+="${C_GREY} ${display_name} ${C_MAGENTA}│ "; fi
+            if (( i == CURRENT_TAB )); then
+                if (( is_last )); then
+                    tab_line+="${C_CYAN}${C_INVERSE} ${display_name} ${C_RESET}"
+                else
+                    tab_line+="${C_CYAN}${C_INVERSE} ${display_name} ${C_RESET}${C_MAGENTA}│ "
+                fi
+            else
+                if (( is_last )); then
+                    tab_line+="${C_GREY} ${display_name} ${C_RESET}"
+                else
+                    tab_line+="${C_GREY} ${display_name} ${C_MAGENTA}│ "
+                fi
+            fi
             TAB_ZONES+=("${zone_start}:$(( zone_start + tab_name_len + 1 ))")
             used_len=$(( used_len + chunk_len )); current_col=$(( current_col + chunk_len ))
         done
@@ -1262,25 +1307,41 @@ draw_picker_view() {
     if (( count == 0 )); then
         PICKER_SELECTED=0; PICKER_SCROLL=0
     else
-        (( PICKER_SELECTED < 0 )) && PICKER_SELECTED=0
-        (( PICKER_SELECTED >= count )) && PICKER_SELECTED=$(( count - 1 ))
-        (( PICKER_SELECTED < PICKER_SCROLL )) && PICKER_SCROLL=$PICKER_SELECTED
-        (( PICKER_SELECTED >= PICKER_SCROLL + MAX_DISPLAY_ROWS )) && PICKER_SCROLL=$(( PICKER_SELECTED - MAX_DISPLAY_ROWS + 1 ))
-        local -i max_scroll=$(( count - MAX_DISPLAY_ROWS )); (( max_scroll < 0 )) && max_scroll=0; (( PICKER_SCROLL > max_scroll )) && PICKER_SCROLL=$max_scroll
+        if (( PICKER_SELECTED < 0 )); then PICKER_SELECTED=0; fi
+        if (( PICKER_SELECTED >= count )); then PICKER_SELECTED=$(( count - 1 )); fi
+        if (( PICKER_SELECTED < PICKER_SCROLL )); then PICKER_SCROLL=$PICKER_SELECTED; fi
+        if (( PICKER_SELECTED >= PICKER_SCROLL + MAX_DISPLAY_ROWS )); then PICKER_SCROLL=$(( PICKER_SELECTED - MAX_DISPLAY_ROWS + 1 )); fi
+        local -i max_scroll=$(( count - MAX_DISPLAY_ROWS ))
+        if (( max_scroll < 0 )); then max_scroll=0; fi
+        if (( PICKER_SCROLL > max_scroll )); then PICKER_SCROLL=$max_scroll; fi
     fi
-    vstart=$PICKER_SCROLL; vend=$(( PICKER_SCROLL + MAX_DISPLAY_ROWS )); (( vend > count )) && vend=$count
-    (( PICKER_SCROLL > 0 )) && buf+="${C_GREY}    ▲ (more above)${CLR_EOL}${C_RESET}"$'\n' || buf+="${CLR_EOL}"$'\n'
+    vstart=$PICKER_SCROLL
+    vend=$(( PICKER_SCROLL + MAX_DISPLAY_ROWS ))
+    if (( vend > count )); then vend=$count; fi
+    
+    if (( PICKER_SCROLL > 0 )); then buf+="${C_GREY}    ▲ (more above)${CLR_EOL}${C_RESET}"$'\n'; else buf+="${CLR_EOL}"$'\n'; fi
+    
     max_len=$(( ITEM_PADDING - 1 ))
     for (( i = vstart; i < vend; i++ )); do
         item=${PICKER_ITEMS[i]}; hint=${PICKER_HINTS[i]:-}
         if (( ${#item} > ITEM_PADDING )); then printf -v padded "%-${max_len}s…" "${item:0:max_len}"; else printf -v padded "%-${ITEM_PADDING}s" "$item"; fi
-        hint_trim=$hint; (( ${#hint_trim} > 32 )) && hint_trim="${hint_trim:0:31}…"
-        if (( i == PICKER_SELECTED )); then buf+="${C_CYAN} ➤ ${C_INVERSE}${padded}${C_RESET} ${C_GREY}${hint_trim}${C_RESET}${CLR_EOL}"$'\n'; else buf+="    ${padded} ${C_GREY}${hint_trim}${C_RESET}${CLR_EOL}"$'\n'; fi
+        hint_trim=$hint
+        if (( ${#hint_trim} > 32 )); then hint_trim="${hint_trim:0:31}…"; fi
+        if (( i == PICKER_SELECTED )); then 
+            buf+="${C_CYAN} ➤ ${C_INVERSE}${padded}${C_RESET} ${C_GREY}${hint_trim}${C_RESET}${CLR_EOL}"$'\n'
+        else 
+            buf+="    ${padded} ${C_GREY}${hint_trim}${C_RESET}${CLR_EOL}"$'\n'
+        fi
     done
-    rows_rendered=$(( vend - vstart )); for (( i = rows_rendered; i < MAX_DISPLAY_ROWS; i++ )); do buf+="${CLR_EOL}"$'\n'; done
+    rows_rendered=$(( vend - vstart ))
+    for (( i = rows_rendered; i < MAX_DISPLAY_ROWS; i++ )); do buf+="${CLR_EOL}"$'\n'; done
     if (( count > MAX_DISPLAY_ROWS )); then
         local pos_info="[$(( PICKER_SELECTED + 1 ))/${count}]"
-        (( vend < count )) && buf+="${C_GREY}    ▼ (more below) ${pos_info}${CLR_EOL}${C_RESET}"$'\n' || buf+="${C_GREY}                   ${pos_info}${CLR_EOL}${C_RESET}"$'\n'
+        if (( vend < count )); then 
+            buf+="${C_GREY}    ▼ (more below) ${pos_info}${CLR_EOL}${C_RESET}"$'\n'
+        else 
+            buf+="${C_GREY}                   ${pos_info}${CLR_EOL}${C_RESET}"$'\n'
+        fi
     else
         buf+="${CLR_EOL}"$'\n'
     fi
@@ -1315,16 +1376,16 @@ exit_picker() {
 
 picker_navigate() {
     local -i dir=$1 count=${#PICKER_ITEMS[@]}
-    (( count == 0 )) && return 0
+    if (( count == 0 )); then return 0; fi
     PICKER_SELECTED=$(( (PICKER_SELECTED + dir + count) % count ))
 }
 
 picker_confirm() {
     local -i count=${#PICKER_ITEMS[@]}
-    (( count == 0 )) && { exit_picker; return; }
+    if (( count == 0 )); then exit_picker; return; fi
     local chosen=${PICKER_ITEMS[PICKER_SELECTED]} cb=$PICKER_CALLBACK
     exit_picker
-    [[ -n $cb && $(type -t "$cb") == function ]] && "$cb" "$chosen"
+    if [[ -n $cb && $(type -t "$cb") == function ]]; then "$cb" "$chosen"; fi
 }
 
 navigate() {
@@ -1333,7 +1394,7 @@ navigate() {
     get_active_context
     local -n _nav_items_ref="$REPLY_REF"
     count=${#_nav_items_ref[@]}
-    (( count == 0 )) && return 0
+    if (( count == 0 )); then return 0; fi
     SELECTED_ROW=$(( (SELECTED_ROW + dir + count) % count ))
     clear_status
 }
@@ -1344,10 +1405,10 @@ navigate_page() {
     get_active_context
     local -n _items_ref="$REPLY_REF"
     count=${#_items_ref[@]}
-    (( count == 0 )) && return 0
+    if (( count == 0 )); then return 0; fi
     SELECTED_ROW=$(( SELECTED_ROW + dir * MAX_DISPLAY_ROWS ))
-    (( SELECTED_ROW < 0 )) && SELECTED_ROW=0
-    (( SELECTED_ROW >= count )) && SELECTED_ROW=$(( count - 1 ))
+    if (( SELECTED_ROW < 0 )); then SELECTED_ROW=0; fi
+    if (( SELECTED_ROW >= count )); then SELECTED_ROW=$(( count - 1 )); fi
     clear_status
 }
 
@@ -1357,8 +1418,8 @@ navigate_end() {
     get_active_context
     local -n _items_ref="$REPLY_REF"
     count=${#_items_ref[@]}
-    (( count == 0 )) && return 0
-    (( target == 0 )) && SELECTED_ROW=0 || SELECTED_ROW=$(( count - 1 ))
+    if (( count == 0 )); then return 0; fi
+    if (( target == 0 )); then SELECTED_ROW=0; else SELECTED_ROW=$(( count - 1 )); fi
     clear_status
 }
 
@@ -1367,10 +1428,10 @@ adjust() {
     local REPLY_REF REPLY_CTX label type
     get_active_context
     local -n _items_ref="$REPLY_REF"
-    (( ${#_items_ref[@]} == 0 )) && return 0
+    if (( ${#_items_ref[@]} == 0 )); then return 0; fi
     label=${_items_ref[SELECTED_ROW]}
     IFS='|' read -r dummy_key type dummy_block dummy_min dummy_max dummy_step <<< "${ITEM_MAP["${REPLY_CTX}::${label}"]}"
-    [[ $type == action || $type == string ]] && return 0
+    if [[ $type == action || $type == string ]]; then return 0; fi
     modify_value "$label" "$dir"
 }
 
@@ -1402,7 +1463,7 @@ activate_item() {
     local REPLY_REF REPLY_CTX item config key type block
     get_active_context
     local -n _act_ref="$REPLY_REF"
-    (( ${#_act_ref[@]} == 0 )) && return 1
+    if (( ${#_act_ref[@]} == 0 )); then return 1; fi
     item=${_act_ref[SELECTED_ROW]}
     config=${ITEM_MAP["${REPLY_CTX}::${item}"]}
     IFS='|' read -r key type block dummy_min dummy_max dummy_step <<< "$config"
@@ -1697,7 +1758,7 @@ handle_input_router() {
     if [[ $key == $'\x1b' ]]; then
         if read_escape_seq escape_seq; then
             key=$escape_seq
-            [[ $key == "" || $key == $'\n' ]] && key=$'\e\n'
+            if [[ $key == "" || $key == $'\n' ]]; then key=$'\e\n'; fi
         else
             key=ESC
         fi
@@ -1722,8 +1783,7 @@ parse_args() {
         case $1 in
             --config)
                 shift
-                [[ $# -gt 0 ]] || { log_err "--config requires a path"; exit 2; }
-                CONFIG_FILE=$1
+                if [[ $# -gt 0 ]]; then CONFIG_FILE=$1; else log_err "--config requires a path"; exit 2; fi
                 ;;
             --help|-h)
                 printf 'Usage: %s [--config /path/to/settings.conf]\n' "${0##*/}"
@@ -1746,7 +1806,7 @@ main() {
 
     local dep
     for dep in realpath mktemp timeout flock sync stat head cat chmod chown mv rm stty sudo awk sed; do
-        command -v "$dep" >/dev/null 2>&1 || { log_err "Missing dependency: $dep"; exit 1; }
+        if ! command -v "$dep" >/dev/null 2>&1; then log_err "Missing dependency: $dep"; exit 1; fi
     done
 
     resolve_write_target
@@ -1755,7 +1815,7 @@ main() {
 
     ORIGINAL_STTY=$(stty -g < /dev/tty 2>/dev/null) || ORIGINAL_STTY=""
     if [[ -z $ORIGINAL_STTY ]]; then log_err "Failed to read terminal settings. A controlling TTY is required."; exit 1; fi
-    stty -icanon -echo -ixon min 0 time 0 < /dev/tty 2>/dev/null || { log_err "Failed to configure terminal raw input."; exit 1; }
+    if ! stty -icanon -echo -ixon min 0 time 0 < /dev/tty 2>/dev/null; then log_err "Failed to configure terminal raw input."; exit 1; fi
 
     TUI_STARTED=1
     printf '%s%s%s%s%s' "$ALT_SCREEN_ON" "$MOUSE_ON" "$CURSOR_HIDE" "$CLR_SCREEN" "$CURSOR_HOME"
