@@ -478,7 +478,27 @@ def main() -> None:
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(production_css)
             console.print(f"\n[bold green]✔ Success! Template beautifully updated at:[/] {file_path}")
-            console.print("[bold cyan]You can now open your Dusky TUI Manager to enable and deploy it.[/]")
+            
+            # --- TUI Auto-Deploy Integration ---
+            tui_script = Path.home() / "user_scripts" / "theme_matugen" / "firefox" / "dusky_firefox_tui.sh"
+            
+            if tui_script.exists():
+                auto_deploy = Confirm.ask("\n[bold cyan]Do you want to auto-deploy these changes to Firefox now?[/]")
+                if auto_deploy:
+                    console.print("[dim]Deploying autonomously using Dusky Firefox Themer...[/]")
+                    try:
+                        subprocess.run([str(tui_script), "--auto"], check=True)
+                        console.print("\n[bold green]✔ Deployment complete! Restart Firefox to see your changes.[/]")
+                    except subprocess.CalledProcessError as e:
+                        console.print(f"\n[bold red]✖ Auto-deploy failed (exit code {e.returncode}).[/]")
+                    except Exception as e:
+                        console.print(f"\n[bold red]✖ Error executing script: {e}[/]")
+                else:
+                    console.print("\n[bold cyan]You can open your Dusky TUI Manager later to enable and deploy it.[/]")
+            else:
+                console.print("\n[bold cyan]You can now open your Dusky TUI Manager to enable and deploy it.[/]")
+            # -----------------------------------
+
         except OSError as e:
             console.print(f"\n[bold red]✖ Error saving file: {e}[/]")
             console.print("[bold cyan]Here is your Merged Production Code instead:[/]\n")
