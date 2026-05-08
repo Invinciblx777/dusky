@@ -51,18 +51,19 @@ ROLES = {
     "1": {"name": "Main Background", "prop": "background-color", "var": "var(--surface)"},
     "2": {"name": "Sidebar / Navigation Background", "prop": "background-color", "var": "var(--surface_container_low)"},
     "3": {"name": "Panel/Card Background", "prop": "background-color", "var": "var(--surface_container)"},
-    "4": {"name": "Primary Text (Headings/Body)", "prop": "color", "var": "var(--on_surface)"},
-    "5": {"name": "Muted Text (Subtitles/Dates)", "prop": "color", "var": "var(--on_surface_variant)"},
-    "6": {"name": "Borders & Dividers", "prop": "border-color", "var": "var(--outline)"},
-    "7": {"name": "Accent Element (Buttons/Links)", "prop": "background-color", "var": "var(--primary)"},
-    "8": {"name": "Text on Accent Button", "prop": "color", "var": "var(--on_primary)"},
-    "9": {"name": "Error/Warning Alert", "prop": "background-color", "var": "var(--error)"}
+    "4": {"name": "Input Field / Search Bar", "prop": "background-color", "var": "var(--surface_container_highest)"},
+    "5": {"name": "Primary Text (Headings/Body)", "prop": "color", "var": "var(--on_surface)"},
+    "6": {"name": "Muted Text (Subtitles/Dates)", "prop": "color", "var": "var(--on_surface_variant)"},
+    "7": {"name": "Borders & Dividers", "prop": "border-color", "var": "var(--outline)"},
+    "8": {"name": "Accent Element (Buttons/Links)", "prop": "background-color", "var": "var(--primary)"},
+    "9": {"name": "Text on Accent Button", "prop": "color", "var": "var(--on_primary)"},
+    "10": {"name": "Error/Warning Alert", "prop": "background-color", "var": "var(--error)"}
 }
 
 # High-contrast palette for visual debugging in the Stylus preview
 DEBUG_COLORS = [
-    "red", "teal", "dodgerblue", "lime", "magenta", 
-    "yellow", "cyan", "darkorange", "hotpink"
+    "red", "teal", "dodgerblue", "blueviolet", "lime", 
+    "magenta", "yellow", "cyan", "darkorange", "hotpink"
 ]
 
 def print_menu() -> None:
