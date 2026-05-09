@@ -22,6 +22,13 @@ from textual.timer import Timer
 
 from rich.text import Text
 
+
+# =============================================================================
+# FOR DIOGNOSING ANY ISSUES, VERY IMPORTANT Commands!!
+# =============================================================================
+# python -m textual console
+# python -m textual run --dev python_tui.py
+
 # =============================================================================
 # HOT-RELOADING NATIVE JSON THEME ENGINE
 # =============================================================================
