@@ -167,22 +167,23 @@ def format_rgb(color_name: str, fmt: str, original_val: str) -> str:
 
 THEME_FILE_PATH = Path("~/.config/matugen/generated/dusky_tui.json").expanduser()
 
-def load_matugen_json(file_path: Path) -> dict[str, str]:
-    colors = {
-        "bg": "#111318", "fg": "#e1e2e9", "accent": "#a8c8ff", 
-        "error": "#ffb4ab", "warning": "#bdc7dc", "success": "#dbbce1", "muted": "#43474e"
-    }
+def load_matugen_json(file_path: Path) -> dict[str, str] | None:
     if not file_path.exists():
-        return colors
+        return None
     try:
         with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            colors.update(data)
+            return json.load(f)
     except (OSError, json.JSONDecodeError):
-        pass
-    return colors
+        return None
 
-THEME = load_matugen_json(THEME_FILE_PATH)
+THEME = {
+    "bg": "#111318", "fg": "#e1e2e9", "accent": "#a8c8ff", 
+    "error": "#ffb4ab", "warning": "#bdc7dc", "success": "#dbbce1", "muted": "#43474e"
+}
+
+_initial_theme = load_matugen_json(THEME_FILE_PATH)
+if _initial_theme:
+    THEME.update(_initial_theme)
 
 # =============================================================================
 # SCHEMA & DATA DEFINITIONS
@@ -473,7 +474,7 @@ class FileLink(Label):
         txt = Text()
         txt.append(" 󰈔 File: ", style=THEME["accent"])
         txt.append(self.path, style=THEME["fg"] + " underline")
-        txt.append("  (Edit: LMB/RMB- GUI/Neovim)", style=f"italic {THEME['muted']}")
+        txt.append("  (Edit: LMB/RMB- GUI/Terminal)", style=f"italic {THEME['muted']}")
         return txt
         
     def on_click(self, event: events.Click) -> None:
@@ -484,14 +485,15 @@ class FileLink(Label):
             expanded_path.touch(exist_ok=True)
             if event.button == 1:
                 subprocess.Popen(
-                    ["gnome-text-editor", str(expanded_path)], 
+                    ["xdg-open", str(expanded_path)], 
                     start_new_session=True,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL
                 )
             elif event.button == 3:
+                editor = os.environ.get("VISUAL", os.environ.get("EDITOR", "nano"))
                 with self.app.suspend():
-                    subprocess.run(["nvim", str(expanded_path)])
+                    subprocess.run([editor, str(expanded_path)])
         except (FileNotFoundError, OSError):
             if hasattr(self.app, "notify_status"):
                 getattr(self.app, "notify_status")("Error resolving path or launching editor.")
@@ -710,36 +712,39 @@ class DuskyApp(App):
             if current_mtime > self.last_theme_mtime:
                 self.last_theme_mtime = current_mtime
                 new_theme = load_matugen_json(THEME_FILE_PATH)
-                THEME.update(new_theme) 
                 
-                self.apply_theme_to_engine()
-                
-                for i in range(len(TABS)):
-                    try:
-                        ol = self.query_one(f"#list-{i}", ConfigOptionList)
-                        items = SCHEMA.get(i, [])
-                        last_idx = ol.last_highlighted_idx
-                        
-                        for idx, item in enumerate(items):
-                            is_hl = (idx == last_idx) and (self.current_option_list == ol)
-                            ol.replace_option_prompt_at_index(idx, self._build_option(item, is_hl))
-                    except Exception:
-                        continue
-                        
-                for shortcut in self.query(Shortcut):
-                    shortcut.refresh()
+                if new_theme is not None:
+                    THEME.update(new_theme) 
+                    self.apply_theme_to_engine()
                     
-                for footer in self.query(AppFooter):
-                    for legend in footer.query("#footer-legend"):
-                        legend.update(f"   [{THEME['error']}]●[/] Modified")
-                for link in self.query(FileLink):
-                    link.refresh()
+                    for i in range(len(TABS)):
+                        try:
+                            ol = self.query_one(f"#list-{i}", ConfigOptionList)
+                            items = SCHEMA.get(i, [])
+                            last_idx = ol.last_highlighted_idx
+                            
+                            for idx, item in enumerate(items):
+                                is_hl = (idx == last_idx) and (self.current_option_list == ol)
+                                ol.replace_option_prompt_at_index(idx, self._build_option(item, is_hl))
+                        except Exception:
+                            continue
+                            
+                    for shortcut in self.query(Shortcut):
+                        shortcut.refresh()
+                        
+                    for footer in self.query(AppFooter):
+                        for legend in footer.query("#footer-legend"):
+                            legend.update(f"   [{THEME['error']}]●[/] Modified")
+                    for link in self.query(FileLink):
+                        link.refresh()
         except OSError:
             pass
 
     def apply_theme_to_engine(self) -> None:
-        self._theme_revision = getattr(self, "_theme_revision", 0) + 1
-        theme_name = f"dusky_matugen_rev{self._theme_revision}"
+        # Ping-pong between two names to force Textual's reactive watcher to trigger 
+        # a full CSS re-render without leaking memory.
+        self._theme_toggle = not getattr(self, "_theme_toggle", False)
+        theme_name = "dusky_matugen_A" if self._theme_toggle else "dusky_matugen_B"
 
         custom_theme = Theme(
             name=theme_name,
@@ -907,6 +912,9 @@ class DuskyApp(App):
     def action_submit_current(self) -> None:
         ol = self.current_option_list
         if ol and ol.highlighted is not None:
+            # Ensure keyboard submits don't use stale mouse coordinates
+            ol._last_click_x = 0
+            ol._mouse_down_highlight = None
             self._handle_item_action(ol, ol.highlighted)
 
     @on(OptionList.OptionSelected)
@@ -914,8 +922,11 @@ class DuskyApp(App):
         ol = event.option_list
         if isinstance(ol, ConfigOptionList):
             # Only trigger action if item was already highlighted prior to the click
-            if ol._mouse_down_highlight == event.option_index:
+            if getattr(ol, "_mouse_down_highlight", None) == event.option_index:
                 self._handle_item_action(ol, event.option_index)
+            # Reset mouse tracking to prevent keyboard hijacks
+            ol._mouse_down_highlight = None
+            ol._last_click_x = 0
 
     def _handle_item_action(self, ol: ConfigOptionList, index: int) -> None:
         try:
@@ -940,7 +951,8 @@ class DuskyApp(App):
             else: 
                 threshold = 40 + len(val_str)
             
-            if getattr(ol, "_last_click_x", 0) >= threshold:
+            click_x = getattr(ol, "_last_click_x", 0)
+            if threshold <= click_x <= threshold + 12: # Safe bound
                 item.value = item.default
                 ol.replace_option_prompt_at_index(index, self._build_option(item, True))
                 self.notify_status(f"Reset {item.label}")
