@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import os
+import re
 import json
 import subprocess
+import colorsys
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -27,6 +29,137 @@ from rich.text import Text
 # =============================================================================
 # python -m textual console
 # python -m textual run --dev python_tui.py
+
+# =============================================================================
+# COLOR UTILITIES
+# =============================================================================
+
+KNOWN_COLORS = {
+    "Red": (255, 0, 0), "Green": (0, 128, 0), "Lime": (0, 255, 0),
+    "Blue": (0, 0, 255), "Yellow": (255, 255, 0), "Cyan": (0, 255, 255),
+    "Magenta": (255, 0, 255), "White": (255, 255, 255), "Black": (0, 0, 0),
+    "Gray": (128, 128, 128), "Silver": (192, 192, 192), "Maroon": (128, 0, 0),
+    "Olive": (128, 128, 0), "Purple": (128, 0, 128), "Teal": (0, 128, 128),
+    "Navy": (0, 0, 128), "Orange": (255, 165, 0), "Pink": (255, 192, 203),
+    "Brown": (165, 42, 42), "Indigo": (75, 0, 130), "Violet": (238, 130, 238),
+    "Gold": (255, 215, 0), "Coral": (255, 127, 80), "Salmon": (250, 128, 114),
+    "Khaki": (240, 230, 140), "Plum": (221, 160, 221), "Turquoise": (64, 224, 208),
+    "Crimson": (220, 20, 60), "Azure": (240, 255, 255), "Beige": (245, 245, 220),
+    "Chocolate": (210, 105, 30), "Tomato": (255, 99, 71), "Lavender": (230, 230, 250)
+}
+
+CYCLE_COLORS = ["Red", "Lime", "Blue", "Yellow", "Cyan", "Magenta", "White", "Black"]
+
+def parse_color_format(val: str) -> str:
+    val = str(val).strip().lower()
+    if val.startswith("0x"): return "0xhex"
+    if val.startswith("#"): return "hex"
+    if val.startswith("rgba"): return "rgba"
+    if val.startswith("rgb"): return "rgb"
+    if val.startswith("hsla"): return "hsla"
+    if val.startswith("hsl"): return "hsl"
+    if val.startswith("oklch"): return "oklch"
+    return "hex"
+
+def color_to_rgb(val: str) -> tuple[int, int, int]:
+    """Gracefully extracts an RGB tuple to determine the color's display name and visual swatch."""
+    val = str(val).strip().lower()
+    if val.startswith("0x"):
+        v = val[2:]
+        if len(v) == 8: v = v[2:] 
+        if len(v) >= 6:
+            try: return (int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16))
+            except ValueError: pass
+    if val.startswith("#"):
+        v = val[1:]
+        if len(v) in (3, 4): 
+            try: return (int(v[0]*2, 16), int(v[1]*2, 16), int(v[2]*2, 16))
+            except ValueError: pass
+        if len(v) >= 6: 
+            try: return (int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16))
+            except ValueError: pass
+    
+    m_rgb = re.match(r"rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)", val)
+    if m_rgb:
+        return (int(m_rgb.group(1)), int(m_rgb.group(2)), int(m_rgb.group(3)))
+        
+    m_hsl = re.match(r"hsla?\(\s*([\d.]+)\s*,\s*([\d.]+)%?\s*,\s*([\d.]+)%?", val)
+    if m_hsl:
+        h, s, l_ = float(m_hsl.group(1))/360.0, float(m_hsl.group(2))/100.0, float(m_hsl.group(3))/100.0
+        r, g, b = colorsys.hls_to_rgb(h, l_, s)
+        return (int(r*255), int(g*255), int(b*255))
+        
+    m_oklch = re.match(r"oklch\(\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)", val)
+    if m_oklch:
+        # Approximate OKLCH mapping strictly for UI visualization purposes
+        l_val, c_val, h_val = float(m_oklch.group(1)), float(m_oklch.group(2)), float(m_oklch.group(3))
+        r, g, b = colorsys.hls_to_rgb(h_val/360.0, l_val, min(c_val*2.5, 1.0))
+        return (max(0, min(255, int(r*255))), max(0, min(255, int(g*255))), max(0, min(255, int(b*255))))
+        
+    return (128, 128, 128)
+
+def get_color_name(r: int, g: int, b: int) -> str:
+    """Finds the nearest human readable color."""
+    best_name = "Unknown"
+    best_dist = float('inf')
+    for name, color in KNOWN_COLORS.items():
+        d = (r-color[0])**2 + (g-color[1])**2 + (b-color[2])**2
+        if d < best_dist:
+            best_dist = d
+            best_name = name
+    return best_name
+
+def format_rgb(color_name: str, fmt: str, original_val: str) -> str:
+    """Generates the appropriate string format based on the originally configured syntax."""
+    r, g, b = KNOWN_COLORS.get(color_name, (128,128,128))
+    
+    if fmt == "hex":
+        if len(original_val) == 9 and original_val.startswith("#"):
+            return f"#{r:02x}{g:02x}{b:02x}{original_val[7:9]}"
+        return f"#{r:02x}{g:02x}{b:02x}"
+        
+    if fmt == "0xhex":
+        alpha = "ff"
+        if original_val.startswith("0x") and len(original_val) == 10:
+            alpha = original_val[2:4]
+        return f"0x{alpha}{r:02x}{g:02x}{b:02x}"
+        
+    if fmt == "rgb":
+        return f"rgb({r}, {g}, {b})"
+        
+    if fmt == "rgba":
+        alpha = "1.0"
+        m = re.search(r"rgba\([^,]+,[^,]+,[^,]+,\s*([0-9.]+)\)", original_val)
+        if m: alpha = m.group(1)
+        return f"rgba({r}, {g}, {b}, {alpha})"
+        
+    if fmt == "hsl" or fmt == "hsla":
+        h, l, s = colorsys.rgb_to_hls(r/255.0, g/255.0, b/255.0)
+        h_deg = int(h * 360)
+        s_pct = int(s * 100)
+        l_pct = int(l * 100)
+        if fmt == "hsl":
+            return f"hsl({h_deg}, {s_pct}%, {l_pct}%)"
+        else:
+            alpha = "1.0"
+            m = re.search(r"hsla\([^,]+,[^,]+,[^,]+,\s*([0-9.]+)\)", original_val)
+            if m: alpha = m.group(1)
+            return f"hsla({h_deg}, {s_pct}%, {l_pct}%, {alpha})"
+            
+    if fmt == "oklch":
+        oklch_map = {
+            "Red": "oklch(0.628 0.258 29.23)",
+            "Lime": "oklch(0.866 0.295 142.5)",
+            "Blue": "oklch(0.452 0.313 264.05)",
+            "Yellow": "oklch(0.968 0.211 109.77)",
+            "Cyan": "oklch(0.905 0.183 195.58)",
+            "Magenta": "oklch(0.702 0.322 328.36)",
+            "White": "oklch(1.0 0 0)",
+            "Black": "oklch(0.0 0 0)",
+        }
+        return oklch_map.get(color_name, "oklch(0.5 0.2 180)")
+        
+    return f"#{r:02x}{g:02x}{b:02x}"
 
 # =============================================================================
 # HOT-RELOADING NATIVE JSON THEME ENGINE
@@ -55,7 +188,7 @@ THEME = load_matugen_json(THEME_FILE_PATH)
 # SCHEMA & DATA DEFINITIONS
 # =============================================================================
 
-type ConfigType = Literal["bool", "int", "float", "string", "cycle", "action", "menu", "picker"]
+type ConfigType = Literal["bool", "int", "float", "string", "cycle", "action", "menu", "picker", "color"]
 
 @dataclass(kw_only=True)
 class ConfigItem:
@@ -93,7 +226,9 @@ SCHEMA: dict[int, list[ConfigItem]] = {
                    options=["Catppuccin Mocha", "Nord", "Dracula", "Gruvbox", "Tokyo Night"],
                    hints=["Warm & Pastel", "Arctic Cold", "Vampire Dark", "Retro Groove", "Neon Lights"]),
         ConfigItem(label="Restart Daemon", key="demo_sudo", type_="action", default=""),
-        ConfigItem(label="Shadow Color", key="color", type_="cycle", default="0xee1a1a1a", options=["0xee1a1a1a", "0xff000000"]),
+        ConfigItem(label="Shadow Color (Hex)", key="color_hex", type_="color", default="0xee1a1a1a"),
+        ConfigItem(label="Accent Color (RGB)", key="color_rgb", type_="color", default="rgb(0, 255, 0)"),
+        ConfigItem(label="Highlight (OKLCH)", key="color_oklch", type_="color", default="oklch(0.628 0.258 29.23)"),
     ]
 }
 
@@ -525,6 +660,12 @@ class DuskyApp(App):
                         txt.append(f"[✎] {val_str}", style=THEME["accent"])
                 case "picker":
                     txt.append(f"[+] {val_str}", style=THEME["accent"])
+                case "color":
+                    r, g, b = color_to_rgb(val_str)
+                    hex_color = f"#{r:02x}{g:02x}{b:02x}"
+                    color_name = get_color_name(r, g, b)
+                    txt.append(" ⬤ ", style=hex_color)
+                    txt.append(f"{color_name}", style=THEME["accent"])
                 case _:
                     txt.append(val_str, style=THEME["fg"])
                     
@@ -722,6 +863,14 @@ class DuskyApp(App):
                 try: idx = item.options.index(item.value)
                 except ValueError: idx = 0
                 item.value = item.options[(idx + direction) % len(item.options)]
+            case "color":
+                r, g, b = color_to_rgb(str(item.value))
+                current_name = get_color_name(r, g, b)
+                try: idx = CYCLE_COLORS.index(current_name)
+                except ValueError: idx = 0
+                next_name = CYCLE_COLORS[(idx + direction) % len(CYCLE_COLORS)]
+                fmt = parse_color_format(str(item.value))
+                item.value = format_rgb(next_name, fmt, str(item.value))
             case _: return
             
         ol.replace_option_prompt_at_index(item_idx, self._build_option(item, True))
@@ -780,9 +929,16 @@ class DuskyApp(App):
         # Smart detection for clicking the "Reset" string on the right margin
         if is_modified and item.type_ != "action":
             val_str = str(item.value)
-            if item.type_ == "bool": threshold = 47
-            elif item.type_ in ("string", "picker"): threshold = 44 + len(val_str)
-            else: threshold = 40 + len(val_str)
+            if item.type_ == "bool": 
+                threshold = 47
+            elif item.type_ in ("string", "picker"): 
+                threshold = 44 + len(val_str)
+            elif item.type_ == "color":
+                r, g, b = color_to_rgb(val_str)
+                c_name = get_color_name(r, g, b)
+                threshold = 40 + len(c_name) + 3
+            else: 
+                threshold = 40 + len(val_str)
             
             if getattr(ol, "_last_click_x", 0) >= threshold:
                 item.value = item.default
@@ -793,7 +949,7 @@ class DuskyApp(App):
         match item.type_:
             case "bool" | "cycle": 
                 self.action_adjust(1)
-            case "int" | "float" | "string": 
+            case "int" | "float" | "string" | "color": 
                 self.prompt_string(ol, tab_idx, index, item)
             case "action":
                 if item.key == "demo_sudo":
