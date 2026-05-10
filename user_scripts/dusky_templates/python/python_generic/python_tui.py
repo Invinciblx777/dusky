@@ -585,9 +585,10 @@ class AppFooter(Vertical):
         with Horizontal(id="footer-controls"):
             yield Shortcut("r", "Reset Item", "reset_item")
             yield Shortcut("R", "Reset Page", "reset_all")
+            yield Shortcut("ctrl+f", "Search", "search")
             yield Shortcut("q", "Quit", "quit")
-            yield Label(f"   [{THEME['error']}]●[/] Modified", id="footer-legend")
-        
+#            yield Label(f"   [{THEME['error']}]●[/] Modified", id="footer-legend")
+
         with Horizontal(id="footer-bottom-row"):
             yield Label("", id="status-bar")
             yield FileLink(id="file-link")
