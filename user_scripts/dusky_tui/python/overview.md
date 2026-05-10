@@ -1,4 +1,4 @@
-~/user_scripts/dusky_templates/
+~/user_scripts/dusky_tui/
 │
 ├── python/
 │   ├── frontend/

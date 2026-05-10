@@ -24,7 +24,7 @@ _setup_cache()
 # 1. Path Injection (IoC Setup)
 # Ensures the runner can find the ecosystem without hardcoded system installs.
 # =============================================================================
-TEMPLATE_DIR = Path("~/user_scripts/dusky_templates").expanduser().resolve()
+TEMPLATE_DIR = Path("~/user_scripts/dusky_tui").expanduser().resolve()
 if str(TEMPLATE_DIR) not in sys.path:
     sys.path.insert(0, str(TEMPLATE_DIR))
 
