@@ -492,18 +492,18 @@ class ScrollIndicator(Label):
         thumb_size = max(1, int(self._track_height * (viewport_height / virtual_height)))
         max_pos = self._track_height - thumb_size
         pos = int((scroll_y / max_scroll_y) * max_pos) if max_scroll_y > 0 else 0
-            
-        lines = ["▲"]
-        lines.extend(["│"] * pos)
-        lines.extend(["┃"] * thumb_size)
-        lines.extend(["│"] * (self._track_height - pos - thumb_size))
-        lines.append("▼")
         
+        # High-Speed String Multiplier block-rendering (Restored Optimization)
         txt = Text()
-        for i, char in enumerate(lines):
-            style = "bold" if char in ("▲", "▼") else ("dim" if char == "│" else "")
-            txt.append(char + ("\n" if i < len(lines)-1 else ""), style=style)
-            
+        txt.append("▲\n", style="bold")
+        if pos > 0:
+            txt.append("│\n" * pos, style="dim")
+        txt.append("┃\n" * thumb_size)
+        remainder = self._track_height - pos - thumb_size
+        if remainder > 0:
+            txt.append("│\n" * remainder, style="dim")
+        txt.append("▼", style="bold")
+        
         self.update(txt)
 
     def on_mouse_down(self, event: events.MouseDown) -> None:
@@ -546,8 +546,14 @@ class Shortcut(Label):
 
     def render(self) -> Text:
         txt = Text()
-        txt.append(f"[{self.key_text}] ", style=self.app.theme_colors["accent"])
-        txt.append(self.label_text, style=self.app.theme_colors["fg"])
+        # If the widget has the -active class, force text to background color for contrast
+        if self.has_class("-active"):
+            contrast_color = self.app.theme_colors["bg"]
+            txt.append(f"[{self.key_text}] ", style=f"bold {contrast_color}")
+            txt.append(self.label_text, style=f"bold {contrast_color}")
+        else:
+            txt.append(f"[{self.key_text}] ", style=self.app.theme_colors["accent"])
+            txt.append(self.label_text, style=self.app.theme_colors["fg"])
         return txt
 
     async def on_click(self) -> None:
@@ -555,7 +561,13 @@ class Shortcut(Label):
 
     def blink(self) -> None:
         self.add_class("-active")
-        self.set_timer(0.2, lambda: self.remove_class("-active"))
+        self.refresh()
+        
+        def _unblink():
+            self.remove_class("-active")
+            self.refresh()
+            
+        self.set_timer(0.2, _unblink)
 
 class FileLink(Label):
     path = reactive("")
@@ -633,9 +645,9 @@ class FlowContainer(Widget):
         for child in self.children:
             if not child.display: continue
             child.styles.position = "absolute"
-            cw = child.outer_size.width
+            cw = child.size.width
             if cw <= 0: cw = len(child.render().plain) + 2 
-            ch = child.outer_size.height
+            ch = child.size.height
             if ch <= 0: ch = 1
             visible_children.append((child, cw, ch))
 
@@ -681,7 +693,6 @@ class AppFooter(Vertical):
 
     def compose(self) -> ComposeResult:
         with FlowContainer(id="footer-shortcuts-container"):
-            # Cleaned up visual footer footprint - keybind logic remains globally intact
             yield Shortcut("ctrl+s", "Batch Save", "save_batch", id="shortcut-ctrl-s")
             yield Shortcut("/", "Jump", "focus_local_search", id="shortcut-slash")
             yield Shortcut("ctrl+f", "Search", "search", id="shortcut-ctrl-f")
@@ -1023,7 +1034,7 @@ class DuskyTUI(App):
                     else:
                         item.exists_in_target = False
                         
-                    if not item._initial_loaded:
+                    if not getattr(item, "_initial_loaded", False):
                         item.initial_value = item.value
                         item._initial_loaded = True
                     
@@ -1115,6 +1126,7 @@ class DuskyTUI(App):
             stat_info = await asyncio.to_thread(self.theme_path.stat)
             current_mtime = stat_info.st_mtime
             if current_mtime > self.last_theme_mtime:
+                # Use asyncio.to_thread to prevent blocking IO from dropping framerates
                 new_theme = await asyncio.to_thread(load_matugen_json, self.theme_path)
                 if new_theme is not None:
                     self.last_theme_mtime = current_mtime
@@ -1165,6 +1177,7 @@ class DuskyTUI(App):
             sc = self.query_one(f"#shortcut-{key_id}", Shortcut)
             if active: sc.add_class("-active")
             else: sc.remove_class("-active")
+            sc.refresh()
         except Exception: pass
 
     def _get_item_from_id(self, opt_id: str) -> tuple[int, int, ConfigItem] | None:
@@ -1244,17 +1257,7 @@ class DuskyTUI(App):
             if player:
                 cmd = [player, sound_path]
                 if player.endswith("mpv"): cmd.extend(["--no-video", "--really-quiet"])
-                
-                async def _play() -> None:
-                    try:
-                        proc = await asyncio.create_subprocess_exec(
-                            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
-                        )
-                        await proc.wait()
-                    except OSError:
-                        pass
-                        
-                asyncio.create_task(_play())
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def _apply_value(self, tab_idx: int, item_idx: int, item: ConfigItem, new_val: Any, is_undo: bool = False, batch_mode: bool = False) -> bool:
         if not is_undo:
@@ -1286,7 +1289,6 @@ class DuskyTUI(App):
     def _do_auto_save(self, item: ConfigItem, val_str: str) -> None:
         success, msg, _ = self.engine.write_value(item.key, item.scope, val_str)
         if success:
-            item.initial_value = item.value
             self.notify_status(f"Updated {item.label}")
         else:
             self.notify_status(f"Error: {msg}")
@@ -1324,7 +1326,6 @@ class DuskyTUI(App):
             
             success, _, _ = self.engine.write_value(item.key, item.scope, val_str)
             if success:
-                item.initial_value = val
                 self.pending_commits.discard((tab_idx, item_idx))
                 success_count += 1
                 
@@ -1521,10 +1522,11 @@ class DuskyTUI(App):
             if success_count > 0:
                 if self.auto_save:
                     self.action_save_batch()
+                    self.notify_status(f"Reset and saved {success_count} items in {self.tabs[tab_idx]}")
                 else:
                     self._update_footer_legend()
-                self.notify_status(f"Reset {success_count} items in {self.tabs[tab_idx]}")
-                self.play_reset_sound()
+                    self.notify_status(f"Reset {success_count} items in {self.tabs[tab_idx]}")
+                    self.play_reset_sound()
         except Exception: pass
 
     def action_submit_current(self) -> None:
