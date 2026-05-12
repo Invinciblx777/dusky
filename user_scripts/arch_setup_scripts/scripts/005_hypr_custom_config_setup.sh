@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Initializes or validates the 'edit_here' user configuration overlay for Hyprland.
 #              Ensures all template files exist.
-#              Designed for Arch Linux/Hyprland/UWSM environments.
+#              Designed for Arch Linux / Hyprland 0.55+ / UWSM environments.
+#              All configuration files use Lua syntax (.lua) as of Hyprland 0.55.
+#              hyprlang (.conf) is deprecated and will be dropped in a future release.
 #
-# Usage:       ./setup_hypr_overlay.sh [--force]
-#              --force: Backs up existing 'edit_here' dir and regenerates.
+# Usage:       ./005_hypr_custom_config_setup.sh [--force]
+#              --force: Backs up existing 'edit_here' dir and regenerates all templates.
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -23,572 +25,470 @@ readonly RESET=$'\033[0m'
 readonly HYPR_DIR="${HOME}/.config/hypr"
 readonly EDIT_DIR="${HYPR_DIR}/edit_here"
 readonly EDIT_SOURCE_DIR="${EDIT_DIR}/source"
-readonly MAIN_CONF="${HYPR_DIR}/hyprland.conf"
-readonly NEW_CONF="${EDIT_DIR}/hyprland.conf"
+readonly MAIN_CONF="${HYPR_DIR}/hyprland.lua"
+readonly NEW_CONF="${EDIT_DIR}/hyprland.lua"
 
-# Path strings written into configs (single quotes prevent expansion)
-readonly INCLUDE_PATH='~/.config/hypr/edit_here/hyprland.conf'
-readonly APPS_DEFAULTS_PATH='~/.config/hypr/edit_here/source/default_apps.conf'
+# Lua require() strings that are inserted into / searched for in hyprland.lua.
+# These are the EXACT literal strings written to and grepped from the main config.
+#
+# Dot-separated Lua module paths map to filesystem paths relative to ~/.config/hypr/:
+#   "edit_here.source.default_apps"  ->  ~/.config/hypr/edit_here/source/default_apps.lua
+#   "edit_here.hyprland"             ->  ~/.config/hypr/edit_here/hyprland.lua
+readonly APPS_DEFAULTS_REQUIRE='require("edit_here.source.default_apps")'
+readonly OVERLAY_REQUIRE='require("edit_here.hyprland")'
 
-# Required configuration file templates
-# Defined here for easy visibility and maintenance
+# ==============================================================================
+# CONFIG FILE LIST  <<<  EDIT THIS TO ADD / REMOVE FILES  >>>
+# ==============================================================================
+# Each entry is a .lua filename created inside:
+#   ~/.config/hypr/edit_here/source/
+#
+# The script will automatically:
+#   - Create a template file if it does not already exist
+#   - Append a require() line for it to ~/.config/hypr/edit_here/hyprland.lua
+#     (the loader that is sourced at the bottom of hyprland.lua)
+#
+# "default_apps.lua" is SPECIAL:
+#   It is require()d at the very TOP of hyprland.lua so that its global
+#   variables are available to every other file.  If you rename it you must
+#   also update the APPS_DEFAULTS_REQUIRE variable above.
+#
+# FUTURE EXPANSION EXAMPLE — splitting input.lua into sub-files:
+#   Remove "input.lua" and add:
+#     "keyboard.lua"
+#     "touchpad.lua"
+#     "cursor.lua"
+#   Each new file is automatically picked up on next run.
+# ==============================================================================
 readonly -a CONFIG_FILES=(
-    "default_apps.conf"
-    "monitors.conf"
-    "keybinds.conf"
-    "appearance.conf"
-    "autostart.conf"
-    "plugins.conf"
-    "window_rules.conf"
-    "workspace_rules.conf"
-    "environment_variables.conf"
-    "input.conf"
+    # --- Core (required at top of hyprland.lua via APPS_DEFAULTS_REQUIRE) ---
+    "default_apps.lua"
+
+    # --- Display & Layout ---
+    "monitors.lua"
+    "appearance.lua"
+    "workspace_rules.lua"
+
+    # --- Behavior ---
+    "keybinds.lua"
+    "input.lua"
+    "window_rules.lua"
+
+    # --- Session ---
+    "autostart.lua"
+    "environment_variables.lua"
+    "plugins.lua"
+
+    # --- Future files: add new entries here ---
+    # "keyboard.lua"
+    # "touchpad.lua"
+    # "cursor.lua"
 )
 
 # ------------------------------------------------------------------------------
 # 2. Helper Functions
 # ------------------------------------------------------------------------------
-# Logging functions (Added ${1:-} to handle empty args safely)
-log_info()    { printf '%s[INFO]%s %s\n' "${BLUE}" "${RESET}" "${1:-}"; }
-log_success() { printf '%s[OK]%s   %s\n' "${GREEN}" "${RESET}" "${1:-}"; }
-log_warn()    { printf '%s[WARN]%s %s\n' "${YELLOW}" "${RESET}" "${1:-}"; }
-log_error()   { printf '%s[ERR]%s  %s\n' "${RED}" "${RESET}" "${1:-}" >&2; }
+log_info()    { printf '%s[INFO]%s %s\n'    "${BLUE}"   "${RESET}" "${1:-}"; }
+log_success() { printf '%s[OK]%s   %s\n'    "${GREEN}"  "${RESET}" "${1:-}"; }
+log_warn()    { printf '%s[WARN]%s %s\n'    "${YELLOW}" "${RESET}" "${1:-}"; }
+log_error()   { printf '%s[ERR]%s  %s\n'    "${RED}"    "${RESET}" "${1:-}" >&2; }
 
-# Generates content for configuration files
-# EDIT THIS FUNCTION TO HARDCODE YOUR DEFAULTS
+# ------------------------------------------------------------------------------
+# Generates template content for each configuration file.
+# All files use Lua syntax — comments are --, not #.
+#
+# NOTE: We use <<'EOF' (single-quoted) heredocs to prevent shell variable
+# expansion, so Lua strings like "edit_here.source.foo" are written literally.
+#
+# EDIT THIS FUNCTION to update the default template for any file.
+# ------------------------------------------------------------------------------
 get_file_content() {
     local -r filename="${1:-}"
 
-    # NOTE: We use <<'EOF' (quoted EOF) to prevent variable expansion.
-    # This ensures signs like $mainMod are written literally to the file.
     case "${filename}" in
-        "default_apps.conf")
-            cat <<'EOF'
-# ==============================================================================
-# USER CONFIGURATION: default_apps.conf
-# ==============================================================================
-# Override default applications here.
-# These variables are sourced at the very top of hyprland.conf so they
-# are available for use in all other configuration files.
-# ==============================================================================
 
-$terminal    = kitty
-$fileManager = nemo
-$menu        = rofi -show drun
-$browser     = firefox
-$textEditor  = nvim
+        # ======================================================================
+        "default_apps.lua")
+            cat <<'EOF'
+-- ==============================================================================
+-- USER CONFIGURATION: default_apps.lua
+-- ==============================================================================
+-- Override default applications here.
+-- These are Lua GLOBALS (defined WITHOUT the 'local' keyword) so that they
+-- are accessible in every file require()d after this one in hyprland.lua.
+--
+-- This file is require()d at the very TOP of hyprland.lua — before all
+-- other config files — so these variables are always in scope.
+--
+-- See: https://wiki.hypr.land/Configuring/Start/
+-- ==============================================================================
+
+-- terminal    = "kitty"
+-- fileManager = "nemo"
+-- menu        = "rofi -show drun"
+-- browser     = "firefox"
+-- textEditor  = "nvim"
 EOF
             ;;
-        "monitors.conf")
+
+        # ======================================================================
+        "monitors.lua")
             cat <<'EOF'
-# ==============================================================================
-# USER CONFIGURATION: monitors.conf
-# ==============================================================================
-# Add your custom settings for monitors here.
-# These will override or add to the defaults found in ~/.config/hypr/source/monitors
-# This file can also be edited with dusky monitor from the rofi menu or from dusky control center
-# ==============================================================================
-
-EOF
-            ;;
-        "keybinds.conf")
-            cat <<'EOF'
-# ==============================================================================
-# USER CONFIGURATION: keybinds.conf
-# ==============================================================================
-# Add your custom settings for keybinds here.
-# These will override or add to the defaults found in ~/.config/hypr/source/keybinds.conf
-# This file can also be edited with dusky keybinds manager from the rofi menu or from dusky control center
-# ==============================================================================
-
-# Auto-generated by FM Switcher
-bindd = $mainMod, E, File Manager, exec, uwsm-app $fileManager
-
-# Auto-generated by Browser Switcher
-bindd = $mainMod, W, Launch Browser, exec, uwsm-app -- $browser
-
-# Auto-generated by Text Editor Switcher
-bindd = $mainMod, R, Open Text Editor, exec, uwsm-app -- $terminal --class nvim -e $textEditor
-
-# Auto-generated by Terminal Switcher
-bindd = $mainMod, Q, Launch Terminal, exec, uwsm-app -- $terminal
-EOF
-            ;;
-        "appearance.conf")
-            cat <<'EOF'
-# ==============================================================================
-# USER CONFIGURATION: appearance.conf
-# ==============================================================================
-# Add your custom settings for appearance here.
-# These will override or add to the defaults found in ~/.config/hypr/source/appearance.conf
-# This file can also be edited with dusky appearance from the rofi menu or from dusky control center
-# ==============================================================================
-
-# -------------------------------------------------------------------------------------------------
-# THEME SOURCE
-# -------------------------------------------------------------------------------------------------
-# Sourcing colors generated by Matugen
-source = ~/.config/matugen/generated/hyprland-colors.conf
-
-# -------------------------------------------------------------------------------------------------
-# 1. GENERAL APPEARANCE
-# Control gaps, borders, and layout behavior.
-# See: https://wiki.hyprland.org/Configuring/Variables/#general
-# -------------------------------------------------------------------------------------------------
-general {
-    # --- Gaps & Borders ---
-    gaps_in = 6                 # Gap between windows
-    gaps_out = 12               # Gap between windows and monitor edges
-    gaps_workspaces = 0         # Gap between workspaces (when sliding)
-    border_size = 2             # Size of window borders
-
-    # --- Colors ---
-    # Uses variables from the sourced matugen file
-    col.active_border = $primary
-    col.inactive_border = $inverse_on_surface 
-
-    # --- Behavior ---
-    # RESIZING: Set to true. This allows you to resize windows by clicking and dragging 
-    # on the gaps/border area, rather than hitting the exact 2px pixel border.
-    resize_on_border = false
-
-    # TEARING: Allows lower latency in games. 
-    # NOTE: To use this, you must also apply 'windowrulev2 = immediate, class:^(game_class)$'
-    allow_tearing = true
-
-    # Default layout engine
-    layout = dwindle
-
-    # --- Snapping ---
-    # Controls how floating windows snap to each other and edges
-    snap {
-        enabled = false
-        window_gap = 10         # Min gap (px) before snapping to another window
-        monitor_gap = 10        # Min gap (px) before snapping to monitor edge
-        border_overlap = false  # If true, windows snap with overlapping borders
-    }
-}
-
-# -------------------------------------------------------------------------------------------------
-# 2. DECORATION
-# Shadows, Blur, Opacity, and Rounding.
-# See: https://wiki.hyprland.org/Configuring/Variables/#decoration
-# -------------------------------------------------------------------------------------------------
-decoration {
-    # --- Rounding ---
-    rounding = 6
-    rounding_power = 6.0
-
-    # --- Opacity ---
-    active_opacity = 1.0
-    inactive_opacity = 1.0
-    fullscreen_opacity = 1.0
-
-    # --- Dimming ---
-    dim_inactive = true
-    dim_strength = 0.2
-    dim_special = 0.8           # Stronger dimming for special workspace
-
-    # --- Shadows ---
-    # Enabled because your hardware (12700H) can easily handle it.
-    shadow {
-        enabled = false
-        range = 35
-        render_power = 2        # 1-4. Higher is faster falloff (sharper looking)
-        sharp = false           # If true, renders a sharp shadow (retro style)
-        ignore_window = true    # If true, shadow isn't rendered behind the window itself
-        scale = 1.0             # Scale of the shadow (1.0 = window size)
-        color = rgba(1a1a1aee)
-        # color = $primary
-        # offset = 0 0          # Displaces shadow (x, y)
-    }
-
-    # --- Blur ---
-    # Enabled for aesthetic depth.
-    blur {
-        enabled = false
-        size = 4                # Radius
-        passes = 2              # Quality (2 is a good balance of perf/looks)
-        new_optimizations = true
-        ignore_opacity = true   # Blurs behind transparent windows even if opacity is high
-        xray = false            # If true, floating windows "see through" tiled ones
-        
-        # Texture & Quality
-        noise = 0.0117          # Adds grain to prevent color banding
-        contrast = 0.8916       # Contrast modulation for blur
-        brightness = 0.8172     # Brightness modulation for blur
-        vibrancy = 0.1696       # Saturation of blurred colors
-        
-        # Specifics
-        popups = false          # Whether to blur right-click menus/popups
-    }
-
-    # --- Shaders ---
-    # screen_shader = ~/.config/hypr/shaders/grayscale_advanced.glsl
-}
-
-# -------------------------------------------------------------------------------------------------
-# 3. ANIMATIONS
-# See: https://wiki.hyprland.org/Configuring/Animations/
-# -------------------------------------------------------------------------------------------------
-
-source = ~/.config/hypr/source/animations/active/active.conf
-
-# -------------------------------------------------------------------------------------------------
-# 4. LAYOUTS
-# -------------------------------------------------------------------------------------------------
-dwindle {
-    pseudotile = true
-    preserve_split = true
-    # smart_split = false     # If true, splits based on mouse position.
-    # smart_resizing = false  # If true, resizing direction is determined by mouse pos.
-}
-
-master {
-    new_status = master
-}
-
-# -------------------------------------------------------------------------------------------------
-# 5. MISCELLANEOUS & PERFORMANCE
-# See: https://wiki.hyprland.org/Configuring/Variables/#misc
-# -------------------------------------------------------------------------------------------------
-misc {
-    force_default_wallpaper = 1     # Set to 0 to enable the anime mascot
-    disable_hyprland_logo = true
-    disable_splash_rendering = true
-}
-
-# -------------------------------------------------------------------------------------------------
-# 6. BINDS (Visual specific)
-# -------------------------------------------------------------------------------------------------
-binds {
-    allow_pin_fullscreen = true
-}
-
-# debug {
-#    overlay = true
-# }
-# -------------------------------------------------------------------------------------------------
-# 7. SMART GAPS (Single Window Override)
-# Applied automatically when only 1 window is tiled or fullscreened on a workspace.
-# -------------------------------------------------------------------------------------------------
-$single_window_gap = 10
-workspace = w[tv1], gapsout:$single_window_gap, gapsin:0
-workspace = f[1], gapsout:$single_window_gap, gapsin:0
-EOF
-            ;;
-        "autostart.conf")
-            cat <<'EOF'
-# ==============================================================================
-# USER CONFIGURATION: autostart.conf
-# ==============================================================================
-# Add your custom settings for autostart here.
-# These will override or add to the defaults found in ~/.config/hypr/source/autostart.conf
-# ==============================================================================
-
-# EG: dusky glance (uncomment any one)
-# exec-once = ~/user_scripts/rofi/dusky_glance.sh --cpu
-# exec-once = ~/user_scripts/rofi/dusky_glance.sh --ram
-# exec-once = ~/user_scripts/rofi/dusky_glance.sh --temp
-# exec-once = ~/user_scripts/rofi/dusky_glance.sh --battery
-# exec-once = ~/user_scripts/rofi/dusky_glance.sh --network
-# exec-once = ~/user_scripts/rofi/dusky_glance.sh --uptime
-# exec-once = ~/user_scripts/rofi/dusky_glance.sh --workspace
-# exec-once = ~/user_scripts/rofi/dusky_glance.sh --clock
-EOF
-            ;;
-        "plugins.conf")
-            cat <<'EOF'
-# ==============================================================================
-# USER CONFIGURATION: plugins.conf
-# ==============================================================================
-# Add your custom settings for plugins here.
-# These will override or add to the defaults found in ~/.config/hypr/source/plugins.conf
-# ==============================================================================
+-- ==============================================================================
+-- USER CONFIGURATION: monitors.lua
+-- ==============================================================================
+-- Add your monitor configuration here.
+-- These will override or add to the defaults found in ~/.config/hypr/source/
+-- This file can also be managed with dusky monitor from the rofi menu or
+-- from dusky control center.
+--
+-- Syntax:
+--   hl.monitor({ output = "DP-1", mode = "2560x1440@144", position = "0x0", scale = 1 })
+--   hl.monitor({ output = "",     mode = "preferred",     position = "auto", scale = "auto" })
+--
+-- See: https://wiki.hypr.land/Configuring/Basics/Monitors/
+-- ==============================================================================
 
 EOF
             ;;
-        "window_rules.conf")
+
+        # ======================================================================
+        "keybinds.lua")
             cat <<'EOF'
-# ==============================================================================
-# USER CONFIGURATION: window_rules.conf
-# ==============================================================================
-# Add your custom settings for window_rules here.
-# These will override or add to the defaults found in ~/.config/hypr/source/window_rules.conf
-# ==============================================================================
+-- ==============================================================================
+-- USER CONFIGURATION: keybinds.lua
+-- ==============================================================================
+-- Add your custom keybinds here.
+-- These will override or add to the defaults found in ~/.config/hypr/source/
+-- This file can also be managed with dusky keybinds manager from the rofi
+-- menu or from dusky control center.
+--
+-- Syntax:
+--   local mainMod = "SUPER"
+--   hl.bind(mainMod .. " + Q", hl.dsp.exec_cmd(terminal))
+--   hl.bind(mainMod .. " + Q", hl.dsp.exec_cmd("kitty"), { description = "Launch terminal" })
+--
+-- NOTE: 'terminal', 'browser', etc. are globals defined in default_apps.lua.
+--
+-- See: https://wiki.hypr.land/Configuring/Basics/Binds/
+-- ==============================================================================
+
+-- local mainMod = "SUPER"
+
+-- -- File Manager
+-- hl.bind(mainMod .. " + E", hl.dsp.exec_cmd("uwsm-app -- " .. fileManager),
+--     { description = "File Manager" })
+
+-- -- Browser
+-- hl.bind(mainMod .. " + W", hl.dsp.exec_cmd("uwsm-app -- " .. browser),
+--     { description = "Launch Browser" })
+
+-- -- Text Editor
+-- hl.bind(mainMod .. " + R",
+--     hl.dsp.exec_cmd("uwsm-app -- " .. terminal .. " --class nvim -e " .. textEditor),
+--     { description = "Open Text Editor" })
+
+-- -- Terminal
+-- hl.bind(mainMod .. " + Q", hl.dsp.exec_cmd("uwsm-app -- " .. terminal),
+--     { description = "Launch Terminal" })
+EOF
+            ;;
+
+        # ======================================================================
+        "appearance.lua")
+            cat <<'EOF'
+-- ==============================================================================
+-- USER CONFIGURATION: appearance.lua
+-- ==============================================================================
+-- Add your custom appearance settings here.
+-- These will override or add to the defaults found in ~/.config/hypr/source/
+-- This file can also be managed with dusky appearance from the rofi menu or
+-- from dusky control center.
+--
+-- Syntax:
+--   hl.config({
+--       general = {
+--           gaps_in  = 6,
+--           gaps_out = 12,
+--           border_size = 2,
+--           col = {
+--               active_border   = { colors = {"rgba(33ccffee)", "rgba(00ff99ee)"}, angle = 45 },
+--               inactive_border = "rgba(595959aa)",
+--           },
+--           layout = "dwindle",
+--       },
+--       decoration = {
+--           rounding = 6,
+--           shadow = { enabled = false },
+--           blur   = { enabled = false },
+--       },
+--   })
+--
+-- See: https://wiki.hypr.land/Configuring/Basics/Variables/
+-- See: https://wiki.hypr.land/Configuring/Advanced-and-Cool/Animations/
+-- ==============================================================================
+
+-- -------------------------------------------------------------------------------------------------
+-- THEME SOURCE
+-- -------------------------------------------------------------------------------------------------
+-- Sourcing colors generated by Matugen.
+-- In Lua configs, external Lua files can be require()d; plain shell-style
+-- 'source =' is no longer valid.  If matugen generates a .lua file, use:
+--   require("matugen.generated.hyprland-colors")
+-- -------------------------------------------------------------------------------------------------
+
+-- -------------------------------------------------------------------------------------------------
+-- 1. GENERAL APPEARANCE
+-- -------------------------------------------------------------------------------------------------
+
+-- -------------------------------------------------------------------------------------------------
+-- 2. DECORATION (rounding, opacity, shadows, blur)
+-- -------------------------------------------------------------------------------------------------
+
+-- -------------------------------------------------------------------------------------------------
+-- 3. ANIMATIONS
+-- -------------------------------------------------------------------------------------------------
+-- require("source.animations.active.active")
+
+-- -------------------------------------------------------------------------------------------------
+-- 4. LAYOUTS (dwindle / master)
+-- -------------------------------------------------------------------------------------------------
+
+-- -------------------------------------------------------------------------------------------------
+-- 5. MISCELLANEOUS & PERFORMANCE
+-- -------------------------------------------------------------------------------------------------
+
+-- -------------------------------------------------------------------------------------------------
+-- 6. BINDS (visual / appearance-specific bind options)
+-- -------------------------------------------------------------------------------------------------
+
+-- -------------------------------------------------------------------------------------------------
+-- 7. SMART GAPS (single-window override)
+-- -------------------------------------------------------------------------------------------------
+-- hl.workspace_rule({ workspace = "w[tv1]", gaps_out = 10, gaps_in = 0 })
+-- hl.workspace_rule({ workspace = "f[1]",   gaps_out = 10, gaps_in = 0 })
+EOF
+            ;;
+
+        # ======================================================================
+        "autostart.lua")
+            cat <<'EOF'
+-- ==============================================================================
+-- USER CONFIGURATION: autostart.lua
+-- ==============================================================================
+-- Add your custom autostart entries here.
+-- These will override or add to the defaults found in ~/.config/hypr/source/
+--
+-- Syntax:
+--   hl.on("hyprland.start", function()
+--       hl.exec_cmd("waybar")
+--       hl.exec_cmd("nm-applet")
+--   end)
+--
+-- See: https://wiki.hypr.land/Configuring/Basics/Autostart/
+-- ==============================================================================
+
+-- hl.on("hyprland.start", function()
+--     -- EG: dusky glance (uncomment any one)
+--     -- hl.exec_cmd("~/user_scripts/rofi/dusky_glance.sh --cpu")
+--     -- hl.exec_cmd("~/user_scripts/rofi/dusky_glance.sh --ram")
+--     -- hl.exec_cmd("~/user_scripts/rofi/dusky_glance.sh --temp")
+--     -- hl.exec_cmd("~/user_scripts/rofi/dusky_glance.sh --battery")
+--     -- hl.exec_cmd("~/user_scripts/rofi/dusky_glance.sh --network")
+--     -- hl.exec_cmd("~/user_scripts/rofi/dusky_glance.sh --uptime")
+--     -- hl.exec_cmd("~/user_scripts/rofi/dusky_glance.sh --workspace")
+--     -- hl.exec_cmd("~/user_scripts/rofi/dusky_glance.sh --clock")
+-- end)
+EOF
+            ;;
+
+        # ======================================================================
+        "plugins.lua")
+            cat <<'EOF'
+-- ==============================================================================
+-- USER CONFIGURATION: plugins.lua
+-- ==============================================================================
+-- Add your plugin configuration here.
+-- These will override or add to the defaults found in ~/.config/hypr/source/
+--
+-- See: https://wiki.hypr.land/Plugins/Using-Plugins/
+-- ==============================================================================
 
 EOF
             ;;
-        "workspace_rules.conf")
+
+        # ======================================================================
+        "window_rules.lua")
             cat <<'EOF'
-# ==============================================================================
-# USER CONFIGURATION: workspace_rules.conf
-# ==============================================================================
-# Add your custom rules for workspace here.
-# These will override or add to the defaults found in :
-# ~/.config/hypr/source/workspace_rules.conf
-#
-# This file can also be edited with dusky workspace manager tui,
-# which can be found in dusky control center
-# ==============================================================================
-# USER CONFIGURATION: workspace_rules.conf
-# Managed by Dusky TUI - Granular Matrix v4.4.1
-# ==============================================================================
-
-# --- Global Rules ---
-$global_layout = dwindle
-workspace = r[11-99], layout:$global_layout
-
-# --- Ephemeral Global Override (Resets on reboot) ---
-$ephemeral_layout = monocle
-$ephemeral_enabled = false
-
-# --- Individual Workspaces (1-10) ---
-$ws1_layout = dwindle
-$ws1_persistent = false
-$ws1_master_orient = left
-$ws1_scroll_dir = right
-workspace = 1, layout:$ws1_layout, persistent:$ws1_persistent, layoutopt:orientation:$ws1_master_orient, layoutopt:direction:$ws1_scroll_dir
-
-$ws2_layout = dwindle
-$ws2_persistent = false
-$ws2_master_orient = left
-$ws2_scroll_dir = right
-workspace = 2, layout:$ws2_layout, persistent:$ws2_persistent, layoutopt:orientation:$ws2_master_orient, layoutopt:direction:$ws2_scroll_dir
-
-$ws3_layout = dwindle
-$ws3_persistent = false
-$ws3_master_orient = left
-$ws3_scroll_dir = right
-workspace = 3, layout:$ws3_layout, persistent:$ws3_persistent, layoutopt:orientation:$ws3_master_orient, layoutopt:direction:$ws3_scroll_dir
-
-$ws4_layout = dwindle
-$ws4_persistent = false
-$ws4_master_orient = left
-$ws4_scroll_dir = right
-workspace = 4, layout:$ws4_layout, persistent:$ws4_persistent, layoutopt:orientation:$ws4_master_orient, layoutopt:direction:$ws4_scroll_dir
-
-$ws5_layout = dwindle
-$ws5_persistent = false
-$ws5_master_orient = left
-$ws5_scroll_dir = right
-workspace = 5, layout:$ws5_layout, persistent:$ws5_persistent, layoutopt:orientation:$ws5_master_orient, layoutopt:direction:$ws5_scroll_dir
-
-$ws6_layout = dwindle
-$ws6_persistent = false
-$ws6_master_orient = left
-$ws6_scroll_dir = right
-workspace = 6, layout:$ws6_layout, persistent:$ws6_persistent, layoutopt:orientation:$ws6_master_orient, layoutopt:direction:$ws6_scroll_dir
-
-$ws7_layout = dwindle
-$ws7_persistent = false
-$ws7_master_orient = left
-$ws7_scroll_dir = right
-workspace = 7, layout:$ws7_layout, persistent:$ws7_persistent, layoutopt:orientation:$ws7_master_orient, layoutopt:direction:$ws7_scroll_dir
-
-$ws8_layout = dwindle
-$ws8_persistent = false
-$ws8_master_orient = left
-$ws8_scroll_dir = right
-workspace = 8, layout:$ws8_layout, persistent:$ws8_persistent, layoutopt:orientation:$ws8_master_orient, layoutopt:direction:$ws8_scroll_dir
-
-$ws9_layout = dwindle
-$ws9_persistent = false
-$ws9_master_orient = left
-$ws9_scroll_dir = right
-workspace = 9, layout:$ws9_layout, persistent:$ws9_persistent, layoutopt:orientation:$ws9_master_orient, layoutopt:direction:$ws9_scroll_dir
-
-$ws10_layout = dwindle
-$ws10_persistent = false
-$ws10_master_orient = left
-$ws10_scroll_dir = right
-workspace = 10, layout:$ws10_layout, persistent:$ws10_persistent, layoutopt:orientation:$ws10_master_orient, layoutopt:direction:$ws10_scroll_dir
-EOF
-            ;;
-        "environment_variables.conf")
-            cat <<'EOF'
-# ==============================================================================
-# USER CONFIGURATION: environment_variables.conf
-# ==============================================================================
-# Add your custom settings for environment_variables here.
-# These will override or add to the defaults found in ~/.config/hypr/source/environment_variables.conf
-# NOTE: it's strongly advised to place your environment variables in the uwsm files in ~/.config/uwsm/{env,env-hyprland}
-# ==============================================================================
+-- ==============================================================================
+-- USER CONFIGURATION: window_rules.lua
+-- ==============================================================================
+-- Add your custom window rules here.
+-- These will override or add to the defaults found in ~/.config/hypr/source/
+--
+-- Syntax:
+--   hl.window_rule({
+--       name  = "my-rule-name",            -- unique identifier (required)
+--       match = { class = "^kitty$" },     -- match table
+--       float = true,
+--   })
+--
+--   hl.layer_rule({
+--       name  = "my-layer-rule",
+--       match = { namespace = "^waybar$" },
+--       blur  = true,
+--   })
+--
+-- See: https://wiki.hypr.land/Configuring/Basics/Window-Rules/
+-- ==============================================================================
 
 EOF
             ;;
-        "input.conf")
+
+        # ======================================================================
+        "workspace_rules.lua")
             cat <<'EOF'
-# ==============================================================================
-# USER CONFIGURATION: input.conf
-# ==============================================================================
-# Add your custom settings for input here.
-# These will override or add to the defaults found in ~/.config/hypr/source/input.conf
-# This file can also be edited with dusky input from the rofi menu or from dusky control center
-# ==============================================================================
-# -------------------------------------------------------------------------------------------------
-# 1. KEYBOARD & LANGUAGE
-# -------------------------------------------------------------------------------------------------
-input {
-    kb_layout = us
-    
-    # TUI: Dropdown - Common options like "caps:escape", "grp:alt_shift_toggle"
-    # This is a high-value configuration for developers.
-    kb_options =
-    
-    resolve_binds_by_sym = false
-    numlock_by_default = true
-    
-    # TUI: Slider [10 - 100]
-    repeat_rate = 35
-    
-    # TUI: Slider [100 - 1000]
-    repeat_delay = 250
-}
+-- ==============================================================================
+-- USER CONFIGURATION: workspace_rules.lua
+-- ==============================================================================
+-- Add your custom workspace rules here.
+-- These will override or add to the defaults found in:
+--   ~/.config/hypr/source/workspace_rules.lua
+--
+-- This file can also be managed with dusky workspace manager TUI,
+-- which can be found in dusky control center.
+--
+-- Syntax:
+--   hl.workspace_rule({ workspace = "1",       layout = "dwindle" })
+--   hl.workspace_rule({ workspace = "r[11-99]", layout = "dwindle" })
+--
+-- NOTE: layoutopt keys (orientation, direction) are passed inside layout_opts:
+--   hl.workspace_rule({
+--       workspace   = "2",
+--       layout      = "master",
+--       layout_opts = { orientation = "top" },
+--   })
+--
+-- See: https://wiki.hypr.land/Configuring/Basics/Workspace-Rules/
+-- ==============================================================================
 
-# -------------------------------------------------------------------------------------------------
-# 2. MOUSE & POINTER ACCELERATION
-# -------------------------------------------------------------------------------------------------
-input {
-    # 0: Cursor movement doesn't change focus
-    # 1: Cursor movement changes focus to window under cursor (Default)
-    # 2: Detached focus (Click to focus keyboard, mouse follows independently)
-    # 3: Completely separate focus
-    follow_mouse = 1
+-- --- Global Rules ---
+-- hl.workspace_rule({ workspace = "r[11-99]", layout = "dwindle" })
 
-    # TUI: Slider [-1.0 to 1.0]
-    sensitivity = 0
-    
-    # TUI: Dropdown [flat, adaptive, custom]
-    # "Adaptive" is generally better for touchpads/desktop use. "Flat" for gaming.
-    accel_profile = adaptive
+-- --- Individual Workspaces (1-10) ---
+-- for i = 1, 10 do
+--     hl.workspace_rule({ workspace = tostring(i), layout = "dwindle" })
+-- end
+EOF
+            ;;
 
-    # TUI: Toggle [true/false] - "Raw Input" for gamers.
-    # Bypasses most pointer settings. Critical for high-end mice.
-    force_no_accel = false
-
-    # TUI: Toggle [true/false]
-    left_handed = false
-
-    # TUI: Toggle [true/false] - Useful for preventing focus stealing
-    mouse_refocus = true
-}
-
-# -------------------------------------------------------------------------------------------------
-# 3. SCROLLING & TRACKBALLS
-# -------------------------------------------------------------------------------------------------
-input {
-    # TUI: Toggle [true/false] - "Natural Scrolling" (MacOS style) for mice
-    natural_scroll = false
-
-    # TUI: Dropdown [2fg, edge, on_button_down, no_scroll]
-    # Vital for trackball users.
-    scroll_method = 2fg
-    
-    # Only relevant if scroll_method is on_button_down
-    scroll_button = 0
-    scroll_button_lock = false
-}
-
-# -------------------------------------------------------------------------------------------------
-# 4. TOUCHPAD
-# -------------------------------------------------------------------------------------------------
-input {
-    touchpad {
-        # TUI: Toggle [true/false]
-        natural_scroll = true
-        
-        # TUI: Toggle [true/false] - "Disable while typing"
-        disable_while_typing = true
-
-        # TUI: Toggle [true/false] - "Tap to click"
-        tap-to-click = true
-
-        # TUI: Toggle [true/false] - "Mac-style Right Click"
-        # true = 2-finger click is right click usually.
-        # false = Physical click on bottom-right is right click.
-        clickfinger_behavior = false
-
-        # TUI: Toggle [true/false]
-        drag_lock = false
-    }
-}
-
-# -------------------------------------------------------------------------------------------------
-# 5. CURSOR BEHAVIOR & RENDERING
-# -------------------------------------------------------------------------------------------------
-cursor {
-    # TUI: Toggle [true/false] - Sync XCursor theme with GSettings
-    sync_gsettings_theme = true
-
-    # TUI: Dropdown [0, 1, 2] - CRITICAL for Nvidia/VMs
-    # 0 = Use HW cursors (Performance)
-    # 1 = Force SW cursors (Compatibility / Fixes disappearing cursor)
-    # 2 = Auto (Disable when tearing)
-    no_hardware_cursors = 2
-
-    # TUI: Dropdown [0, 1, 2] - Nvidia Specific optimization
-    # 0 = Off, 1 = On, 2 = Auto
-    use_cpu_buffer = 2
-
-    # TUI: Toggle [true/false] - Hides cursor when typing
-    # Great for "distraction free" coding.
-    hide_on_key_press = false
-
-    # TUI: Slider [0 - 60] - Hide cursor after X seconds of inactivity (0=never)
-    inactive_timeout = 0
-
-    # TUI: Dropdown [0, 1, 2] - Workflow Preference
-    # 0 = Disabled (Cursor stays put)
-    # 1 = Enabled (Cursor moves to center of focused window)
-    # 2 = Force
-    warp_on_change_workspace = 0
-    
-    # TUI: Dropdown [0, 1, 2] - Gaming / VRR Specific
-    # Prevents framerate spikes in VRR games by pausing cursor updates
-    # 0 = Off, 1 = On, 2 = Auto
-    no_break_fs_vrr = 2
-    
-    # TUI: Slider [1.0 - 5.0] - Accessibility / Presentation
-    # Sets the zoom level for the magnifier.
-    zoom_factor = 1.0
-}
-
-# -------------------------------------------------------------------------------------------------
-# 6. GESTURE PHYSICS (Tuning)
-# -------------------------------------------------------------------------------------------------
-# Note: The actual actions are in the dispatchers below.
-# This block controls the "feel" of the swipes.
-gestures {
-    # TUI: Slider [100 - 1000] - "Swipe Distance"
-    workspace_swipe_distance = 300
-    
-    # TUI: Slider [0.0 - 1.0] - "Swipe Cancellation Threshold"
-    workspace_swipe_cancel_ratio = 0.5
-    
-    # TUI: Toggle [true/false] - "Invert Swipe Direction"
-    workspace_swipe_invert = true
-    
-    # TUI: Toggle [true/false] - "Swipe to Create New Workspace"
-    workspace_swipe_create_new = true
-    
-    # TUI: Toggle [true/false] - "Swipe Forever" (Don't clamp at neighbors)
-    workspace_swipe_forever = false
-}
-
-# -------------------------------------------------------------------------------------------------
-# 7. TABLET CONFIGURATION
-# -------------------------------------------------------------------------------------------------
-# device {
-#    name = wacom-intuos-s-2-pen
-#    output = DP-1  # <-- Change this to your monitor name (e.g., eDP-1, DP-1)
-# }
+        # ======================================================================
+        "environment_variables.lua")
+            cat <<'EOF'
+-- ==============================================================================
+-- USER CONFIGURATION: environment_variables.lua
+-- ==============================================================================
+-- Add your custom environment variables here.
+-- These will override or add to the defaults found in:
+--   ~/.config/hypr/source/environment_variables.lua
+--
+-- NOTE: It is strongly recommended to place environment variables in the
+-- UWSM files at ~/.config/uwsm/{env,env-hyprland} instead, as those are
+-- sourced before Hyprland starts and apply to the full session.
+--
+-- Syntax:
+--   hl.env("XCURSOR_SIZE",    "24")
+--   hl.env("HYPRCURSOR_SIZE", "24")
+--
+-- See: https://wiki.hypr.land/Configuring/Advanced-and-Cool/Environment-variables/
+-- ==============================================================================
 
 EOF
             ;;
+
+        # ======================================================================
+        "input.lua")
+            cat <<'EOF'
+-- ==============================================================================
+-- USER CONFIGURATION: input.lua
+-- ==============================================================================
+-- Add your custom input settings here.
+-- These will override or add to the defaults found in ~/.config/hypr/source/
+-- This file can also be managed with dusky input from the rofi menu or
+-- from dusky control center.
+--
+-- Syntax:
+--   hl.config({
+--       input = {
+--           kb_layout  = "us",
+--           kb_options = "",
+--           follow_mouse = 1,
+--           sensitivity  = 0,
+--           touchpad = {
+--               natural_scroll   = true,
+--               tap_to_click     = true,
+--               disable_while_typing = true,
+--           },
+--       },
+--       cursor = {
+--           no_hardware_cursors = 2,
+--           sync_gsettings_theme = true,
+--       },
+--   })
+--
+-- For per-device configuration (overrides globals for a specific device):
+--   hl.device({
+--       name        = "my-epic-mouse-v1",   -- from: hyprctl devices
+--       sensitivity = -0.5,
+--   })
+--
+-- See: https://wiki.hypr.land/Configuring/Basics/Variables/
+-- See: https://wiki.hypr.land/Configuring/Advanced-and-Cool/Devices/
+-- ==============================================================================
+
+-- -------------------------------------------------------------------------------------------------
+-- 1. KEYBOARD & LANGUAGE
+-- -------------------------------------------------------------------------------------------------
+
+-- -------------------------------------------------------------------------------------------------
+-- 2. MOUSE & POINTER ACCELERATION
+-- -------------------------------------------------------------------------------------------------
+
+-- -------------------------------------------------------------------------------------------------
+-- 3. SCROLLING & TRACKBALLS
+-- -------------------------------------------------------------------------------------------------
+
+-- -------------------------------------------------------------------------------------------------
+-- 4. TOUCHPAD
+-- -------------------------------------------------------------------------------------------------
+
+-- -------------------------------------------------------------------------------------------------
+-- 5. CURSOR BEHAVIOR & RENDERING
+-- -------------------------------------------------------------------------------------------------
+
+-- -------------------------------------------------------------------------------------------------
+-- 6. GESTURE PHYSICS (Tuning)
+-- -------------------------------------------------------------------------------------------------
+-- hl.gesture({ fingers = 3, direction = "horizontal", action = "workspace" })
+
+-- -------------------------------------------------------------------------------------------------
+-- 7. TABLET CONFIGURATION
+-- -------------------------------------------------------------------------------------------------
+-- hl.device({
+--     name   = "wacom-intuos-s-2-pen",
+--     output = "DP-1",
+-- })
+EOF
+            ;;
+
+        # ======================================================================
         *)
-            # Fallback using printf (safer than echo)
-            printf '# Default content for %s\n' "${filename}"
+            # Fallback for any future files added to CONFIG_FILES
+            printf '-- ==============================================================================\n'
+            printf '-- USER CONFIGURATION: %s\n' "${filename}"
+            printf '-- ==============================================================================\n'
+            printf '-- Add your custom settings here.\n'
+            printf '-- ==============================================================================\n\n'
             ;;
     esac
 }
@@ -609,7 +509,8 @@ if [[ ! -d "${HYPR_DIR}" ]]; then
 fi
 
 if [[ ! -f "${MAIN_CONF}" ]]; then
-    log_warn "Main Hyprland config not found at ${MAIN_CONF}. Creating empty file."
+    log_warn "Main Hyprland config not found at ${MAIN_CONF}."
+    log_warn "Creating empty file. You will need to populate it with your base config."
     touch -- "${MAIN_CONF}"
 fi
 
@@ -618,7 +519,6 @@ fi
 # ------------------------------------------------------------------------------
 force_mode=false
 
-# Strict argument parsing
 while [[ $# -gt 0 ]]; do
     case "${1}" in
         --force)
@@ -634,11 +534,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ "${force_mode}" == true && -d "${EDIT_DIR}" ]]; then
-    # Use Bash 5.0+ builtin for timestamp (No external 'date' command needed)
+    # Bash 5.0+ builtin timestamp (no external 'date' command needed)
     printf -v backup_timestamp '%(%Y%m%d_%H%M%S)T' -1
     backup_name="edit_here.bak_${backup_timestamp}"
-    
-    log_warn "Force mode: Backing up '${EDIT_DIR}' to '${backup_name}'..."
+
+    log_warn "Force mode: Backing up '${EDIT_DIR}' to '${HYPR_DIR}/${backup_name}'..."
     mv -- "${EDIT_DIR}" "${HYPR_DIR}/${backup_name}"
     log_success "Backup complete. Proceeding with clean regeneration."
 fi
@@ -669,61 +569,67 @@ for file in "${CONFIG_FILES[@]}"; do
     fi
 done
 
-# Generate the user's overlay loader config
-# DYNAMICALLY generated from CONFIG_FILES to prevent list drift
+# Generate the user overlay loader: edit_here/hyprland.lua
+# Dynamically built from CONFIG_FILES to prevent list drift.
 if [[ -f "${NEW_CONF}" ]]; then
     log_info "Loader file exists: ${NEW_CONF}"
 else
     log_warn "Loader file missing: ${NEW_CONF} -> Creating..."
-    
-    # Write Header
+
+    # Write header
     cat > "${NEW_CONF}" <<'EOF'
-# ==============================================================================
-# USER CONFIGURATION OVERLAY
-# ==============================================================================
-# This file sources all your custom configuration files.
-# Edit the specific files in 'source/' to apply your changes.
-# ==============================================================================
+-- ==============================================================================
+-- USER CONFIGURATION OVERLAY LOADER
+-- ==============================================================================
+-- This file is require()d at the bottom of hyprland.lua.
+-- It loads all your custom configuration files from 'source/'.
+-- Edit the specific files in 'source/' to apply your changes.
+--
+-- NOTE: 'default_apps.lua' is intentionally excluded here — it is require()d
+-- directly at the top of hyprland.lua so its globals are available first.
+-- ==============================================================================
 
 EOF
 
-    # Dynamically append source lines (skipping default_apps.conf which goes to main)
+    # Dynamically append require() lines (skip default_apps — handled separately)
     for file in "${CONFIG_FILES[@]}"; do
-        if [[ "${file}" == "default_apps.conf" ]]; then
+        if [[ "${file}" == "default_apps.lua" ]]; then
             continue
         fi
-        printf 'source = ~/.config/hypr/edit_here/source/%s\n' "${file}" >> "${NEW_CONF}"
+        # Strip .lua extension to form the Lua module path
+        module_name="${file%.lua}"
+        printf 'require("edit_here.source.%s")\n' "${module_name}" >> "${NEW_CONF}"
     done
 
     log_success "Created loader: ${NEW_CONF}"
 fi
 
 # ------------------------------------------------------------------------------
-# 6. Modify Main Configuration
+# 6. Modify Main Configuration (hyprland.lua)
 # ------------------------------------------------------------------------------
 log_info "Verifying main configuration at '${MAIN_CONF}'..."
 
-# A. Insert default_apps source at the TOP of the file (Priority)
-# Regex ensures we match start of line, ignoring comments (#)
-if grep -Eq "^[[:space:]]*source[[:space:]]*=[[:space:]]*${APPS_DEFAULTS_PATH}" "${MAIN_CONF}"; then
-    log_success "Main config already contains default_apps.conf source."
+# A. Insert default_apps require() at the TOP of the file (priority — globals first)
+#    Uses grep -Fq (fixed-string, quiet) to match the exact require() string.
+if grep -Fq "${APPS_DEFAULTS_REQUIRE}" "${MAIN_CONF}"; then
+    log_success "Main config already contains default_apps require()."
 else
-    # Robust Prepend: Uses a temp file instead of sed to handle empty files safely
+    # Robust prepend via temp file — handles empty files safely
     temp_file=$(mktemp)
     {
-        printf 'source = %s\n' "${APPS_DEFAULTS_PATH}"
+        printf '%s\n' "${APPS_DEFAULTS_REQUIRE}"
         cat "${MAIN_CONF}"
-    } > "${temp_file}" && mv "${temp_file}" "${MAIN_CONF}"
-    
-    log_success "Prepended default_apps.conf source to the top of '${MAIN_CONF}'."
+    } > "${temp_file}" && mv -- "${temp_file}" "${MAIN_CONF}"
+
+    log_success "Prepended '${APPS_DEFAULTS_REQUIRE}' to the top of '${MAIN_CONF}'."
 fi
 
-# B. Insert user overlay loader at the BOTTOM of the file (Last override)
-if grep -Eq "^[[:space:]]*source[[:space:]]*=[[:space:]]*${INCLUDE_PATH}" "${MAIN_CONF}"; then
-    log_success "Main config already contains the overlay loader source."
+# B. Insert overlay loader require() at the BOTTOM of the file (last override wins)
+if grep -Fq "${OVERLAY_REQUIRE}" "${MAIN_CONF}"; then
+    log_success "Main config already contains the overlay loader require()."
 else
-    printf '\n# Source User Custom Config Overlay\nsource = %s\n' "${INCLUDE_PATH}" >> "${MAIN_CONF}"
-    log_success "Appended overlay source directive to '${MAIN_CONF}'."
+    printf '\n-- Source User Custom Config Overlay\n%s\n' "${OVERLAY_REQUIRE}" >> "${MAIN_CONF}"
+    log_success "Appended '${OVERLAY_REQUIRE}' to '${MAIN_CONF}'."
 fi
 
 # ------------------------------------------------------------------------------
@@ -731,5 +637,5 @@ fi
 # ------------------------------------------------------------------------------
 printf '\n'
 log_success "Setup/Verification complete!"
-log_info "Your custom configs are located in: ${EDIT_DIR}"
-log_info "To apply changes, restart Hyprland or run 'hyprctl reload'."
+log_info  "Your custom configs are located in: ${EDIT_DIR}"
+log_info  "To apply changes, save any .lua file (auto-reload) or run 'hyprctl reload'."
