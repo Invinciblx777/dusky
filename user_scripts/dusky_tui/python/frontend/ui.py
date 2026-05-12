@@ -168,8 +168,6 @@ def load_matugen_json(file_path: Path) -> dict[str, str] | None:
 # =============================================================================
 
 class TextInputOverlay(ModalScreen[str | None]):
-    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
-
     def __init__(self, prompt: str, default: str) -> None:
         super().__init__()
         self.prompt_text = prompt
@@ -185,18 +183,10 @@ class TextInputOverlay(ModalScreen[str | None]):
     def on_mount(self) -> None:
         self.query_one(Input).focus()
 
-    def on_key(self, event: events.Key) -> None:
-        if event.key == "escape":
-            event.stop()
-            self.dismiss(None)
-
     @on(Input.Submitted)
     def handle_submit(self, event: Input.Submitted) -> None:
         event.stop()
         self.dismiss(event.value)
-        
-    def action_cancel(self) -> None:
-        self.dismiss(None)
         
     @on(events.Click, ".modal-close-btn")
     def on_close_click(self) -> None:
@@ -211,7 +201,6 @@ class PickerScreen(ModalScreen[str | None]):
     BINDINGS = [
         Binding("up,k", "cursor_up", "Up"),
         Binding("down,j", "cursor_down", "Down"),
-        Binding("escape", "cancel", "Cancel", priority=True),
     ]
 
     def __init__(self, title: str, options: list[str], hints: list[str]) -> None:
@@ -241,20 +230,12 @@ class PickerScreen(ModalScreen[str | None]):
         ol.add_options(options_to_add)
         ol.focus()
 
-    def on_key(self, event: events.Key) -> None:
-        if event.key == "escape":
-            event.stop()
-            self.dismiss(None)
-
     @on(OptionList.OptionSelected)
     def on_selected(self, event: OptionList.OptionSelected) -> None:
         self.dismiss(self.options[event.option_index])
 
     def action_cursor_up(self) -> None: self.query_one(OptionList).action_cursor_up()
     def action_cursor_down(self) -> None: self.query_one(OptionList).action_cursor_down()
-    
-    def action_cancel(self) -> None: 
-        self.dismiss(None)
         
     @on(events.Click, ".modal-close-btn")
     def on_close_click(self) -> None:
@@ -267,7 +248,6 @@ class PickerScreen(ModalScreen[str | None]):
 
 class SearchScreen(ModalScreen[tuple[int, int] | None]):
     BINDINGS = [
-        Binding("escape", "cancel", "Cancel", priority=True),
         Binding("down,j", "cursor_down", "Down"),
         Binding("up,k", "cursor_up", "Up"),
     ]
@@ -281,20 +261,13 @@ class SearchScreen(ModalScreen[tuple[int, int] | None]):
 
     def on_mount(self) -> None:
         self.query_one(Input).focus()
-        
         self._search_cache = []
         for tab_idx, tab_items in self.app.schema.items():
             tab_name = self.app.tabs[tab_idx] if tab_idx < len(self.app.tabs) else f"Tab {tab_idx}"
             for item_idx, item in enumerate(tab_items):
                 haystack = f"{tab_name} {item.label} {item.key} {item.type_}".lower().replace(" ", "")
                 self._search_cache.append((tab_idx, item_idx, item, tab_name, haystack))
-                
         self._populate_list("")
-
-    def on_key(self, event: events.Key) -> None:
-        if event.key == "escape":
-            event.stop()
-            self.dismiss(None)
 
     @on(Input.Changed)
     def handle_input(self, event: Input.Changed) -> None:
@@ -342,9 +315,6 @@ class SearchScreen(ModalScreen[tuple[int, int] | None]):
 
     def action_cursor_down(self) -> None: self.query_one(OptionList).action_cursor_down()
     def action_cursor_up(self) -> None: self.query_one(OptionList).action_cursor_up()
-    
-    def action_cancel(self) -> None: 
-        self.dismiss(None)
         
     @on(events.Click, ".modal-close-btn")
     def on_close_click(self) -> None:
@@ -356,8 +326,6 @@ class SearchScreen(ModalScreen[tuple[int, int] | None]):
             self.dismiss(None)
 
 class DiffScreen(ModalScreen[None]):
-    BINDINGS = [Binding("escape", "cancel", "Close", priority=True)]
-
     def compose(self) -> ComposeResult:
         with Vertical(id="diff-dialog"):
             yield Label("MODIFICATIONS (From Launch)", id="modal-title")
@@ -384,14 +352,6 @@ class DiffScreen(ModalScreen[None]):
                     
         if not added_any:
             ol.add_option(Option("No changes detected from initial load state.", disabled=True))
-
-    def on_key(self, event: events.Key) -> None:
-        if event.key == "escape":
-            event.stop()
-            self.dismiss(None)
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
         
     @on(events.Click, ".modal-close-btn")
     def on_close_click(self) -> None:
@@ -403,8 +363,6 @@ class DiffScreen(ModalScreen[None]):
             self.dismiss(None)
 
 class ShortcutsInfoScreen(ModalScreen[None]):
-    BINDINGS = [Binding("escape,q,f1", "cancel", "Close", priority=True)]
-    
     def compose(self) -> ComposeResult:
         with Vertical(id="shortcuts-dialog"):
             yield Label("KEYBOARD SHORTCUTS", id="modal-title")
@@ -445,14 +403,6 @@ class ShortcutsInfoScreen(ModalScreen[None]):
             txt.append(" ➜ ", style=self.app.theme_colors["muted"])
             txt.append(desc, style=self.app.theme_colors["fg"])
             ol.add_option(Option(txt, disabled=True))
-
-    def on_key(self, event: events.Key) -> None:
-        if event.key == "escape":
-            event.stop()
-            self.dismiss(None)
-            
-    def action_cancel(self) -> None:
-        self.dismiss(None)
         
     @on(events.Click, ".modal-close-btn")
     def on_close_click(self) -> None:
@@ -597,6 +547,10 @@ class Shortcut(Label):
     async def on_click(self) -> None:
         if self.action_name: await self.app.run_action(self.action_name)
 
+    def blink(self) -> None:
+        self.add_class("-active")
+        self.set_timer(0.2, lambda: self.remove_class("-active"))
+
 class FileLink(Label):
     path = reactive("")
     
@@ -633,8 +587,6 @@ class FileLink(Label):
                 getattr(self.app, "notify_status")("Error resolving path or launching editor.")
 
 class ModeButton(Label):
-    """Dynamic, Clickable mode button."""
-    
     def on_mount(self) -> None:
         self.update_mode()
 
@@ -655,7 +607,6 @@ class ModeButton(Label):
         await self.app.run_action("toggle_save_mode")
 
 class FlowContainer(Widget):
-    """Absolute positioned flow layout that enforces perfect vertical columns and fluid justification."""
     def on_mount(self) -> None:
         self.styles.height = "auto"
         self.styles.width = "100%"
@@ -674,8 +625,7 @@ class FlowContainer(Widget):
             
         visible_children = []
         for child in self.children:
-            if not child.display:
-                continue
+            if not child.display: continue
             child.styles.position = "absolute"
             cw = child.outer_size.width
             if cw <= 0: cw = len(child.render().plain) + 2 
@@ -688,19 +638,15 @@ class FlowContainer(Widget):
             return
 
         N = len(visible_children)
-
-        # 1. Find the absolute widest element to establish a safe minimum column width
         max_item_w = 0
         max_item_h = 1
         for _, cw, ch in visible_children:
             max_item_w = max(max_item_w, cw)
             max_item_h = max(max_item_h, ch)
 
-        # 2. Determine the physical limit of columns based on width
         col_w_needed = max_item_w + 2
         max_cols_possible = max(1, width // col_w_needed)
 
-        # 3. Calculate rows and balanced columns
         if max_cols_possible >= N:
             rows = 1
             cols = N
@@ -711,14 +657,11 @@ class FlowContainer(Widget):
         if cols > max_cols_possible:
             cols = max_cols_possible
 
-        # 4. Give each column an exactly equal fraction of the screen to form perfect vertical columns
         actual_col_width = width / cols if cols > 0 else width
 
-        # 5. Place the elements
         for i, (child, _, _) in enumerate(visible_children):
             r = i // cols
             c = i % cols
-            
             x = int(c * actual_col_width)
             y = r * max_item_h
             child.styles.offset = (x, y)
@@ -732,16 +675,16 @@ class AppFooter(Vertical):
 
     def compose(self) -> ComposeResult:
         with FlowContainer(id="footer-shortcuts-container"):
-            yield Shortcut("ctrl+s", "Batch Save", "save_batch", id="shortcut-batch-save")
-            yield Shortcut("d", "Diff", "show_diff")
-            yield Shortcut("u", "Undo", "undo")
+            yield Shortcut("ctrl+s", "Batch Save", "save_batch", id="shortcut-ctrl-s")
+            yield Shortcut("d", "Diff", "show_diff", id="shortcut-d")
+            yield Shortcut("u", "Undo", "undo", id="shortcut-u")
             yield Shortcut("?", "Help", "toggle_help", id="shortcut-help")
-            yield Shortcut("f1", "Shortcuts", "show_shortcuts")
-            yield Shortcut("/", "Jump", "focus_local_search")
-            yield Shortcut("ctrl+f", "Search", "search")
-            yield Shortcut("r", "Reset Item", "reset_item")
-            yield Shortcut("R", "Reset Page", "reset_all")
-            yield Shortcut("q", "Quit", "quit")
+            yield Shortcut("f1", "Shortcuts", "show_shortcuts", id="shortcut-f1")
+            yield Shortcut("/", "Jump", "focus_local_search", id="shortcut-slash")
+            yield Shortcut("ctrl+f", "Search", "search", id="shortcut-ctrl-f")
+            yield Shortcut("r", "Reset Item", "reset_item", id="shortcut-r")
+            yield Shortcut("R", "Reset Page", "reset_all", id="shortcut-R")
+            yield Shortcut("q", "Quit", "quit", id="shortcut-q")
 
         with Horizontal(id="footer-bottom-row"):
             yield FileLink(id="file-link")
@@ -785,16 +728,12 @@ class DuskyTUI(App):
         border-subtitle-style: bold;
         border-subtitle-align: right;
         background: transparent;
-        padding: 0 1 1 1; /* Padded from the bottom edges */
+        padding: 0 1 1 1;
     }
     
-    #tab-bar {
-        width: 100%; height: 1; margin-bottom: 1; background: transparent;
-    }
+    #tab-bar { width: 100%; height: 1; margin-bottom: 1; background: transparent; }
     
-    #tabs-container {
-        width: 1fr; height: 1; overflow-x: auto; scrollbar-size: 0 0;
-    }
+    #tabs-container { width: 1fr; height: 1; overflow-x: auto; scrollbar-size: 0 0; }
     
     .tab-arrow {
         width: 3; height: 1; content-align: center middle;
@@ -807,12 +746,8 @@ class DuskyTUI(App):
     ContentSwitcher { width: 1fr; height: 1fr; background: transparent; }
     
     #help-panel {
-        width: 35%; height: 100%;
-        min-width: 25; /* Prevents text wrap crashes */
-        border-left: solid $primary;
-        display: none; background: $background;
-        padding: 1 2;
-        overflow-y: auto;
+        width: 35%; height: 100%; min-width: 25; border-left: solid $primary;
+        display: none; background: $background; padding: 1 2; overflow-y: auto;
     }
     
     #content-area.-show-help ContentSwitcher { width: 65%; }
@@ -842,15 +777,7 @@ class DuskyTUI(App):
     }
     #local-search.-active { display: block; }
     
-    #footer { 
-        height: auto; 
-        min-height: 2;
-        dock: bottom; 
-        border-top: solid $secondary; 
-        padding: 0; 
-        background: transparent; 
-    }
-    
+    #footer { height: auto; min-height: 2; dock: bottom; border-top: solid $secondary; padding: 0; background: transparent; }
     #footer-bottom-row { width: 100%; height: 1; margin-top: 0; }
     
     .footer-sep { color: $secondary; }
@@ -868,11 +795,13 @@ class DuskyTUI(App):
     
     TextInputOverlay, PickerScreen, SearchScreen, DiffScreen, ShortcutsInfoScreen { align: center middle; background: rgba(0, 0, 0, 0.75); }
     
-    #modal-dialog { width: 50; height: auto; background: $background; border: round $primary; padding: 1 2; }
+    /* Dialog constrained sizes to force layout calculations and keep close button visible */
     #picker-dialog { width: 60; height: 15; background: $background; border: round $primary; padding: 1 2; }
     #search-dialog { width: 60; height: 20; background: $background; border: round $primary; padding: 1 2; }
-    #diff-dialog { width: 70; height: 25; background: $background; border: round $primary; padding: 1 2; }
+    #diff-dialog   { width: 70; height: 25; background: $background; border: round $primary; padding: 1 2; }
     #shortcuts-dialog { width: 70; height: 28; background: $background; border: round $primary; padding: 1 2; }
+    
+    #modal-dialog { width: 50; height: 12; background: $background; border: round $primary; padding: 1 2; }
     
     #picker-list, #search-list, #diff-list, #shortcuts-list { height: 1fr; scrollbar-size: 0 0; background: transparent; border: none; }
     #search-list > .option-list--option { padding: 0 1; background: transparent; transition: background 100ms linear; }
@@ -883,11 +812,10 @@ class DuskyTUI(App):
     #shortcuts-list > .option-list--option { padding: 0 1; background: transparent; }
     
     .modal-close-btn {
-        background: $primary 20%; color: $foreground; text-style: bold;
-        content-align: center middle; width: 100%; height: 1;
-        margin-top: 1;
+        background: $primary; color: $background; text-style: bold;
+        content-align: center middle; width: 100%; height: 1; margin-top: 1;
     }
-    .modal-close-btn:hover { background: $primary 40%; color: $background; }
+    .modal-close-btn:hover { background: $foreground; color: $background; }
     
     #modal-title, #picker-title { color: $primary; margin-bottom: 1; text-style: bold; border-bottom: solid $secondary; }
     #modal-hint { color: $secondary; text-style: italic; content-align: center middle; width: 100%; margin-top: 1; }
@@ -1192,11 +1120,18 @@ class DuskyTUI(App):
     def apply_theme_to_engine(self) -> None:
         self._theme_toggle = not getattr(self, "_theme_toggle", False)
         theme_name = "dusky_matugen_A" if self._theme_toggle else "dusky_matugen_B"
+        
+        # CORRECT THEME VARIABLE INJECTION: Uses "variables={}" strictly
         custom_theme = Theme(
-            name=theme_name, primary=self.theme_colors["accent"], secondary=self.theme_colors["muted"],
-            background=self.theme_colors["bg"], surface=self.theme_colors["bg"],
-            warning=self.theme_colors["warning"], error=self.theme_colors["error"],
-            success=self.theme_colors["success"], foreground=self.theme_colors["fg"],
+            name=theme_name, 
+            primary=self.theme_colors["accent"], 
+            secondary=self.theme_colors["muted"],
+            background=self.theme_colors["bg"], 
+            surface=self.theme_colors["bg"],
+            warning=self.theme_colors["warning"], 
+            error=self.theme_colors["error"],
+            success=self.theme_colors["success"], 
+            variables={"foreground": self.theme_colors["fg"]},
         )
         self.register_theme(custom_theme)
         self.theme = theme_name
@@ -1212,6 +1147,17 @@ class DuskyTUI(App):
                 self._update_pagination(ol)
                 self._update_scroll_indicators()
                 self.check_tab_overflow()
+        except Exception: pass
+
+    def trigger_shortcut_blink(self, key_id: str) -> None:
+        try: self.query_one(f"#shortcut-{key_id}", Shortcut).blink()
+        except Exception: pass
+
+    def toggle_shortcut_active(self, key_id: str, active: bool) -> None:
+        try:
+            sc = self.query_one(f"#shortcut-{key_id}", Shortcut)
+            if active: sc.add_class("-active")
+            else: sc.remove_class("-active")
         except Exception: pass
 
     def _get_item_from_id(self, opt_id: str) -> tuple[int, int, ConfigItem] | None:
@@ -1354,6 +1300,7 @@ class DuskyTUI(App):
         self.auto_save = not self.auto_save
 
     def action_save_batch(self) -> None:
+        self.trigger_shortcut_blink("ctrl-s")
         if not self.pending_commits:
             self.notify_status("No pending changes.")
             return
@@ -1379,12 +1326,25 @@ class DuskyTUI(App):
             self.play_reset_sound()
 
     def action_show_diff(self) -> None:
-        self.push_screen(DiffScreen())
+        if isinstance(self.screen, DiffScreen):
+            self.screen.dismiss(None)
+            return
+        if isinstance(self.screen, ModalScreen): return
+        
+        self.toggle_shortcut_active("d", True)
+        self.push_screen(DiffScreen(), lambda _: self.toggle_shortcut_active("d", False))
 
     def action_show_shortcuts(self) -> None:
-        self.push_screen(ShortcutsInfoScreen())
+        if isinstance(self.screen, ShortcutsInfoScreen):
+            self.screen.dismiss(None)
+            return
+        if isinstance(self.screen, ModalScreen): return
+        
+        self.toggle_shortcut_active("f1", True)
+        self.push_screen(ShortcutsInfoScreen(), lambda _: self.toggle_shortcut_active("f1", False))
 
     def action_undo(self) -> None:
+        self.trigger_shortcut_blink("u")
         if not self.undo_stack:
             self.notify_status("Nothing to undo.")
             return
@@ -1397,14 +1357,7 @@ class DuskyTUI(App):
     def action_toggle_help(self) -> None:
         content_area = self.query_one("#content-area")
         content_area.toggle_class("-show-help")
-        
-        try:
-            help_btn = self.query_one("#shortcut-help", Shortcut)
-            if content_area.has_class("-show-help"):
-                help_btn.add_class("-active")
-            else:
-                help_btn.remove_class("-active")
-        except Exception: pass
+        self.toggle_shortcut_active("help", content_area.has_class("-show-help"))
         
         if content_area.has_class("-show-help"):
             ol = self.current_option_list
@@ -1418,15 +1371,19 @@ class DuskyTUI(App):
         inp = self.query_one("#local-search", Input)
         inp.add_class("-active")
         inp.value = ""
-        # Guarantee input gets focus after the class mutation updates the layout
+        self.toggle_shortcut_active("slash", True)
         self.call_after_refresh(inp.focus)
 
     def action_clear_local_search(self) -> None:
+        # Handles ESC key globally - drops local search OR pops the active modal screen safely
         inp = self.query_one("#local-search", Input)
-        if inp.has_focus or inp.has_class("-active"):
+        if inp.has_class("-active"):
             inp.remove_class("-active")
+            self.toggle_shortcut_active("slash", False)
             if ol := self.current_option_list: 
                 self.call_after_refresh(ol.focus)
+        elif isinstance(self.screen, ModalScreen):
+            self.screen.dismiss(None)
 
     @on(Input.Changed, "#local-search")
     def handle_local_search(self, event: Input.Changed) -> None:
@@ -1444,7 +1401,6 @@ class DuskyTUI(App):
                     try:
                         idx = ol.get_option_index(opt_id)
                         ol.highlighted = idx
-                        # Safely call scroll_to_highlight only if it exists in API
                         if hasattr(ol, "scroll_to_highlight"):
                             ol.scroll_to_highlight()
                         break
@@ -1456,7 +1412,15 @@ class DuskyTUI(App):
         self.action_clear_local_search()
 
     def action_search(self) -> None:
+        if isinstance(self.screen, SearchScreen):
+            self.screen.dismiss(None)
+            return
+        if isinstance(self.screen, ModalScreen): return
+        
+        self.toggle_shortcut_active("ctrl-f", True)
+        
         def check_reply(result: tuple[int, int] | None) -> None:
+            self.toggle_shortcut_active("ctrl-f", False)
             if result is not None:
                 tab_idx, item_idx = result
                 self.action_switch_tab(tab_idx)
@@ -1469,7 +1433,6 @@ class DuskyTUI(App):
                         ol.highlighted = idx
                     except Exception: pass
                     
-                # Guarantee layout has finished switching tabs before highlighting
                 self.call_after_refresh(_focus_and_highlight)
                 
         self.push_screen(SearchScreen(), check_reply)
@@ -1515,6 +1478,7 @@ class DuskyTUI(App):
             self._apply_value(tab_idx, item_idx, item, new_val)
 
     def action_reset_item(self) -> None:
+        self.trigger_shortcut_blink("r")
         ol = self.current_option_list
         if not ol or not ol.last_highlighted_id: return
         parsed = self._get_item_from_id(ol.last_highlighted_id)
@@ -1522,6 +1486,7 @@ class DuskyTUI(App):
             self._apply_value(parsed[0], parsed[1], parsed[2], parsed[2].default)
 
     def action_reset_all(self) -> None:
+        self.trigger_shortcut_blink("R")
         try:
             switcher = self.query_one(ContentSwitcher)
             if not switcher.current: return
