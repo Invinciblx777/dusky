@@ -239,7 +239,6 @@ class HyprlandLuaEngine(BaseEngine):
             print(f"Load Exception: {e}")
             
         return {}
-
     def _is_raw_lua_val(self, val: str) -> bool:
         if val in {"true", "false", "nil", "__DELETE__"}: 
             return True
@@ -658,9 +657,10 @@ class HyprlandLuaEngine(BaseEngine):
                 
                 if res.returncode == 0:
                     pending_replacements.append((out_path, target_path, src_file))
+                elif res.returncode == 1:
+                    continue
                 else:
-                    if res.returncode != 1:
-                        status_msg = f"Lua Error {res.returncode} in {src_file}"
+                    status_msg = f"Lua Error {res.returncode} in {src_file}"
                     break
             else:
                 if pending_replacements:
