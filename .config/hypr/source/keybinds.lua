@@ -13,6 +13,7 @@ local fileManager = "yazi"
 local menu        = "rofi -show drun"
 local browser     = "firefox"
 local textEditor  = "nvim"
+local HOME = os.getenv("HOME")
 
 -- Path shortcut for cleaner config
 
@@ -164,15 +165,21 @@ hl.bind(
 -- --- Passthrough (Disable keybinds) ---
 hl.bind(
     "ALT + 6",
-    hl.dsp.exec_cmd([[notify-send -u critical -t 3000 "Passthrough Enabled" "Press ALT+6 to exit"; hyprctl dispatch submap passthrough]]),
-    { description = "Disable Game Mode (Disable Keybinds)", locked = true }
+    function()
+        hl.notification.create({ text = "Passthrough Enabled - Press ALT+6 to exit", timeout = 3000 })
+        hl.dispatch(hl.dsp.submap("passthrough"))
+    end,
+    { description = "Enable Game Mode (Disable Keybinds)", locked = true }
 )
 
 hl.define_submap("passthrough", function()
     hl.bind(
-        "ALT + 6",
-        hl.dsp.exec_cmd([[notify-send -u low -t 2000 "Passthrough Disabled" "Keybinds restored"; hyprctl dispatch submap reset]]),
-        { description = "Game Mode (Enable Keybinds)", locked = true }
+        "ALT + SHIFT + 6",
+        function()
+            hl.notification.create({ text = "Passthrough Disabled - Keybinds restored", timeout = 2000 })
+            hl.dispatch(hl.dsp.submap("reset"))
+        end,
+        { description = "Disable Game Mode (Restore Keybinds)", locked = true }
     )
 end)
 
@@ -204,13 +211,21 @@ hl.bind(
 
 hl.bind(
     "ALT + F7",
-    hl.dsp.exec_cmd("sleep 1 && hyprctl dispatch dpms off"),
+    function()
+        hl.timer(function()
+            hl.dispatch(hl.dsp.dpms({ action = "disable" }))
+        end, { timeout = 500, type = "oneshot" })
+    end,
     { description = "Screen Off DPMS", locked = true }
 )
 
 hl.bind(
     "ALT + F8",
-    hl.dsp.exec_cmd("hyprctl dispatch dpms on"),
+    function()
+        hl.timer(function()
+            hl.dispatch(hl.dsp.dpms({ action = "enable" }))
+        end, { timeout = 500, type = "oneshot" })
+    end,
     { description = "Screen On DPMS", locked = true }
 )
 
@@ -958,13 +973,13 @@ hl.bind(
 hl.bind(
     "XF86AudioMute",
     hl.dsp.exec_cmd(os.getenv("HOME") .. "/user_scripts/mako_osd/osd_router/osd_router.sh --vol-mute"),
-    { description = "Mute", locked = true, repeating = true }
+    { description = "Mute", locked = true }
 )
 
 hl.bind(
     "XF86AudioMicMute",
     hl.dsp.exec_cmd(os.getenv("HOME") .. "/user_scripts/mako_osd/osd_router/osd_router.sh --mic-mute"),
-    { description = "Mute microphone", locked = true, repeating = true }
+    { description = "Mute microphone", locked = true }
 )
 
 hl.bind(
