@@ -76,8 +76,8 @@ THEME_FILE = "~/.config/matugen/generated/dusky_tui.json"
 
 APP_TITLE = "configure monitors"
 
-# Controls the initial color mode of the TUI.
-# Options: "auto" | "dark" | "light"
+# Controls the initial save mode of the TUI.
+# Options: "auto" (saves on every change) | "batch" (requires Ctrl+S to commit)
 DEFAULT_MODE = "auto"
 
 # =============================================================================
