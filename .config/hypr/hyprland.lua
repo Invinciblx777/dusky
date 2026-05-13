@@ -23,6 +23,14 @@ HOME = os.getenv("HOME")
 
 dusky_scripts = HOME .. "/user_scripts/"
 
+
+
+-- -----------------------------------------------------
+-- Path to matugen colors
+-- -----------------------------------------------------
+
+dofile(HOME .. "/.config/matugen/generated/hyprland-colors.lua")
+
 -- =============================================================================
 -- HYPRLAND MAIN CONFIGURATION
 -- User: [dusky]
