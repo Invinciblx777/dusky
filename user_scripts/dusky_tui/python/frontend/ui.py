@@ -58,12 +58,29 @@ KNOWN_COLORS = {
     "Chocolate": (210, 105, 30), "Tomato": (255, 99, 71), "Lavender": (230, 230, 250)
 }
 
+_LOWER_KNOWN_COLORS = {k.lower() for k in KNOWN_COLORS}
+
 CYCLE_COLORS = ["Red", "Lime", "Blue", "Yellow", "Cyan", "Magenta", "White", "Black"]
+
+def is_theme_variable(val: str) -> bool:
+    val = str(val).strip()
+    # Must be a valid identifier (starts with letter/underscore, contains letters/numbers/underscores)
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", val):
+        return False
+    # Exclude known basic color names
+    if val.lower() in _LOWER_KNOWN_COLORS:
+        return False
+    # Exclude strings that look exactly like raw hex codes missing a '#' 
+    # (Lengths 3, 4, 6, 8 of only hex characters)
+    if re.match(r"^([a-fA-F0-9]{3}|[a-fA-F0-9]{4}|[a-fA-F0-9]{6}|[a-fA-F0-9]{8})$", val):
+        return False
+    return True
 
 def parse_color_format(val: str) -> str:
     val = str(val).strip().lower()
     if val.startswith("0x"): return "0xhex"
     if val.startswith("#"): return "hex"
+    if re.match(r"rgba?\([0-9a-f]+\)", val): return "hypr_hex"
     if val.startswith("rgba"): return "rgba"
     if val.startswith("rgb"): return "rgb"
     if val.startswith("hsla"): return "hsla"
@@ -84,6 +101,13 @@ def color_to_rgb(val: str) -> tuple[int, int, int]:
         if len(v) in (3, 4):
             try: return (int(v[0]*2, 16), int(v[1]*2, 16), int(v[2]*2, 16))
             except ValueError: pass
+        if len(v) >= 6:
+            try: return (int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16))
+            except ValueError: pass
+
+    hypr_m = re.match(r"rgba?\(([0-9a-f]+)\)", val)
+    if hypr_m:
+        v = hypr_m.group(1)
         if len(v) >= 6:
             try: return (int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16))
             except ValueError: pass
@@ -117,6 +141,15 @@ def get_color_name(r: int, g: int, b: int) -> str:
 
 def format_rgb(color_name: str, fmt: str, original_val: str) -> str:
     r, g, b = KNOWN_COLORS.get(color_name, (128,128,128))
+
+    if fmt == "hypr_hex":
+        alpha = "ff"
+        hypr_m = re.match(r"rgba?\([0-9a-fA-F]{6}([0-9a-fA-F]{2})?\)", original_val.strip())
+        if hypr_m and hypr_m.group(1): alpha = hypr_m.group(1)
+        is_rgba = original_val.strip().lower().startswith("rgba")
+        prefix = "rgba" if is_rgba else "rgb"
+        suffix = alpha if is_rgba else ""
+        return f"{prefix}({r:02x}{g:02x}{b:02x}{suffix})"
 
     if fmt == "hex":
         if len(original_val) == 9 and original_val.startswith("#"): return f"#{r:02x}{g:02x}{b:02x}{original_val[7:9]}"
@@ -984,11 +1017,19 @@ class DuskyTUI(App):
                 case "picker":
                     txt.append(f"[+] {val_str}", style=accent)
                 case "color":
-                    r, g, b = color_to_rgb(val_str)
+                    resolved_color = self.theme_colors.get(val_str, val_str)
+                    r, g, b = color_to_rgb(resolved_color)
                     hex_color = f"#{r:02x}{g:02x}{b:02x}"
-                    color_name = get_color_name(r, g, b)
+                    
                     txt.append(" ⬤ ", style=hex_color if exists else self.theme_colors["muted"])
-                    txt.append(f"{color_name}", style=accent)
+                    
+                    if is_theme_variable(val_str):
+                        txt.append(f"{val_str} (Theme Variable)", style=accent)
+                    else:
+                        color_name = get_color_name(r, g, b)
+                        if resolved_color != val_str:
+                            txt.append(f"[{val_str}] ", style=self.theme_colors["muted"])
+                        txt.append(f"{color_name}", style=accent)
                 case _:
                     txt.append(val_str, style=fg)
 
@@ -1027,7 +1068,6 @@ class DuskyTUI(App):
                         item.exists_in_target = True
                         raw_val = state[cache_key]
 
-                        # [SURGICAL FIX]: Robust Type Safety checks for native JSON engines vs Stringified engines.
                         if item.type_ == "bool":
                             if isinstance(raw_val, bool):
                                 item.value = raw_val
@@ -1039,7 +1079,10 @@ class DuskyTUI(App):
                             except (ValueError, TypeError): pass
                         elif item.type_ in ("string", "picker", "cycle", "color"):
                             if isinstance(raw_val, str):
-                                item.value = raw_val[1:-1] if raw_val.startswith('"') and raw_val.endswith('"') else raw_val
+                                if raw_val.startswith("__VAR__"):
+                                    item.value = raw_val[7:]
+                                else:
+                                    item.value = raw_val[1:-1] if raw_val.startswith('"') and raw_val.endswith('"') else raw_val
                             else:
                                 item.value = raw_val
                         else:
@@ -1054,13 +1097,11 @@ class DuskyTUI(App):
                     if item.group and item.group != current_group:
                         current_group = item.group
                         header_txt = Text(f"── {current_group.upper()} ──", style=f"bold {self.theme_colors['accent']}")
-                        options.append(Option(header_txt, id=f"header_{i}_{current_group}", disabled=True))
+                        options.append(Option(header_txt, id=f"header_{i}_{idx}", disabled=True))
 
                     opt_id = f"item_{i}_{idx}"
                     if first_item_id is None: first_item_id = opt_id
 
-                    # Only render tab 0's first item as highlighted at mount time;
-                    # all other tabs start unhighlighted to avoid stale last_highlighted_id state.
                     is_hl = (i == 0 and first_item_id == opt_id)
                     options.append(Option(self._build_option(item, is_highlighted=is_hl), id=opt_id))
 
@@ -1141,7 +1182,6 @@ class DuskyTUI(App):
             stat_info = await asyncio.to_thread(self.theme_path.stat)
             current_mtime = stat_info.st_mtime
             if current_mtime > self.last_theme_mtime:
-                # Use asyncio.to_thread to prevent blocking IO from dropping framerates
                 new_theme = await asyncio.to_thread(load_matugen_json, self.theme_path)
                 if new_theme is not None:
                     self.last_theme_mtime = current_mtime
@@ -1156,16 +1196,32 @@ class DuskyTUI(App):
         self._theme_toggle = not getattr(self, "_theme_toggle", False)
         theme_name = "dusky_matugen_A" if self._theme_toggle else "dusky_matugen_B"
 
+        bg = self.theme_colors.get("background", self.theme_colors.get("bg", "#111318"))
+        fg = self.theme_colors.get("on_background", self.theme_colors.get("fg", "#e1e2e9"))
+        accent = self.theme_colors.get("primary", self.theme_colors.get("accent", "#a8c8ff"))
+        muted = self.theme_colors.get("surface_variant", self.theme_colors.get("muted", "#43474e"))
+        err = self.theme_colors.get("error", self.theme_colors.get("error", "#ffb4ab"))
+        warn = self.theme_colors.get("tertiary", self.theme_colors.get("warning", "#bdc7dc"))
+        succ = self.theme_colors.get("secondary", self.theme_colors.get("success", "#dbbce1"))
+
+        self.theme_colors["bg"] = bg
+        self.theme_colors["fg"] = fg
+        self.theme_colors["accent"] = accent
+        self.theme_colors["muted"] = muted
+        self.theme_colors["error"] = err
+        self.theme_colors["warning"] = warn
+        self.theme_colors["success"] = succ
+
         custom_theme = Theme(
             name=theme_name,
-            primary=self.theme_colors["accent"],
-            secondary=self.theme_colors["muted"],
-            background=self.theme_colors["bg"],
-            surface=self.theme_colors["bg"],
-            warning=self.theme_colors["warning"],
-            error=self.theme_colors["error"],
-            success=self.theme_colors["success"],
-            variables={"foreground": self.theme_colors["fg"]},
+            primary=accent,
+            secondary=muted,
+            background=bg,
+            surface=bg,
+            warning=warn,
+            error=err,
+            success=succ,
+            variables={"foreground": fg},
         )
         self.register_theme(custom_theme)
         self.theme = theme_name
@@ -1284,14 +1340,15 @@ class DuskyTUI(App):
 
         if isinstance(new_val, bool): val_str = "true" if new_val else "false"
         elif new_val is None: val_str = "nil"
-        else: val_str = str(new_val)
+        else: 
+            val_str = str(new_val)
+            if item.type_ == "color" and is_theme_variable(val_str):
+                val_str = f"__VAR__{val_str}"
 
         if self.auto_save and not batch_mode:
             k = (tab_idx, item_idx)
             if k in self._save_timers:
                 self._save_timers[k].stop()
-            # Default-arg capture prevents stale closure if this method is ever called in a loop,
-            # and passes the key so _do_auto_save can evict its own entry from _save_timers.
             self._save_timers[k] = self.set_timer(
                 0.25, lambda ti=tab_idx, ii=item_idx, it=item, vs=val_str: self._do_auto_save(ti, ii, it, vs)
             )
@@ -1340,7 +1397,10 @@ class DuskyTUI(App):
             val = item.value
             if isinstance(val, bool): val_str = "true" if val else "false"
             elif val is None: val_str = "nil"
-            else: val_str = str(val)
+            else: 
+                val_str = str(val)
+                if item.type_ == "color" and is_theme_variable(val_str):
+                    val_str = f"__VAR__{val_str}"
 
             success, _, _ = self.engine.write_value(item.key, item.scope, val_str)
             if success:

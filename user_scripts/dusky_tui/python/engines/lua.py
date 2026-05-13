@@ -132,7 +132,8 @@ class HyprlandLuaEngine(BaseEngine):
                     -- Sandbox strict whitelist: path must reside in config_dir and have no upward traversal
                     if path:match("%.%.") then return nil end
                     local safe_dir = config_dir:gsub("([%-%.%+%[%]%(%)%$%^%%%?%*])", "%%%1")
-                    if not path:match("^" .. safe_dir) then return nil end
+                    if safe_dir:sub(-1) ~= "/" then safe_dir = safe_dir .. "/" end
+                    if path ~= config_dir and not path:match("^" .. safe_dir) then return nil end
                     return io.open(path, "r")
                 end
             }, 
@@ -142,6 +143,16 @@ class HyprlandLuaEngine(BaseEngine):
                 io.stderr:write("\n")
             end 
         }
+        
+        -- SURGICAL FIX: Intercept undefined globals to preserve them as variable references rather than throwing nils
+        setmetatable(safe_env, {
+            __index = function(_, key)
+                if type(key) == "string" and key:match("^[A-Za-z_][A-Za-z0-9_]*$") then
+                    return "__VAR__" .. key
+                end
+                return nil
+            end
+        })
         safe_env._G = safe_env
         
         safe_env.dofile = function(path) 
@@ -245,6 +256,7 @@ class HyprlandLuaEngine(BaseEngine):
             print(f"Load Exception: {e}")
             
         return {}
+    
     def _is_raw_lua_val(self, val: str) -> bool:
         if val in {"true", "false", "nil", "__DELETE__"}: 
             return True
@@ -267,7 +279,11 @@ class HyprlandLuaEngine(BaseEngine):
         if not self.loaded_files: 
             self.loaded_files = [str(self.config_path)]
         
-        val_str = new_value if self._is_raw_lua_val(new_value) else json.dumps(new_value, ensure_ascii=False)
+        # SURGICAL FIX: Strip variables flagged by Python to write identically to Lua
+        if isinstance(new_value, str) and new_value.startswith("__VAR__"):
+            val_str = new_value[7:]
+        else:
+            val_str = new_value if self._is_raw_lua_val(new_value) else json.dumps(new_value, ensure_ascii=False)
             
         # Concurrency safety check
         for src_file in self.loaded_files:
@@ -385,13 +401,16 @@ class HyprlandLuaEngine(BaseEngine):
                 if t == "true" or t == "false" or t == "nil" then return "bool" end
                 if t:find("^%[=*%[") or t:find("^['\"]") then return "string" end
                 if tonumber(t) ~= nil then return "number" end
+                if t:match("^[A-Za-z_][A-Za-z0-9_]*$") then return "ident" end
                 return "expr"
             end
 
             local function format_replacement(old_raw)
                 if new_value == "__DELETE__" then return "nil" end
                 local kind = classify_raw(old_raw)
-                if kind == "bool" then
+                if kind == "ident" then
+                    return new_value
+                elseif kind == "bool" then
                     if new_value == "true" or new_value == "false" or new_value == "nil" then return new_value end
                     return new_value == "0" and "false" or "true"
                 elseif kind == "number" then
@@ -583,7 +602,7 @@ class HyprlandLuaEngine(BaseEngine):
                     if method == "config" then
                         parse_table(target_tokens, target_text, arg_idx, {}, matches)
                     elseif method == "bind" or method == "unbind" then
-                        local comma_count, k, depth = 0, arg_idx, 0
+                        local comma_count, k, arg_idx, depth = 0, arg_idx, 0
                         while k <= #target_tokens do
                             local t = target_tokens[k].type
                             if t == "LPAREN" or t == "LBRACE" or t == "LBRACK" then depth = depth + 1
