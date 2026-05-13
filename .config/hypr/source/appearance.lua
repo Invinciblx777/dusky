@@ -7,9 +7,9 @@ hl.config({
     -- GENERAL (Borders, Gaps, Colors)
     -- ==========================================
     general = {
-        border_size = 2, -- Size of the border around windows
-        gaps_in = 6, -- Gaps between windows
-        gaps_out = 12, -- Gaps between windows and monitor edges
+        border_size = 1, -- Size of the border around windows
+        gaps_in = 4, -- Gaps between windows
+        gaps_out = 8, -- Gaps between windows and monitor edges
         float_gaps = 0, -- Gaps for floating windows (-1 means default)
         gaps_workspaces = 0, -- Gaps between workspaces (stacks with gaps_out)
 
@@ -18,8 +18,7 @@ hl.config({
         ["col.nogroup_border"] = inverse_on_surface, -- Inactive border color for window that cannot be added to a group
         ["col.nogroup_border_active"] = secondary, -- Active border color for window that cannot be added to a group
 
-        layout = "dwindle", -- Which layout to use [dwindle/master/scrolling/monocle]
-        resize_on_border = false, -- Enables resizing windows by clicking and dragging on borders and gaps
+        resize_on_border = true, -- Enables resizing windows by clicking and dragging on borders and gaps
         extend_border_grab_area = 15, -- Extends click/drag area around the border (needs resize_on_border)
         hover_icon_on_border = true, -- Shows cursor icon when hovering over borders (needs resize_on_border)
         allow_tearing = true, -- Master switch for allowing tearing to occur
@@ -30,22 +29,22 @@ hl.config({
     -- DECORATION (Rounding, Blur, Shadows)
     -- ==========================================
     decoration = {
-        rounding = 6, -- Rounded corners' radius (in layout px)
-        rounding_power = 6.0, -- Curve used for rounding (2.0 is circle, 4.0 squircle, 1.0 triangular)
-        active_opacity = 1.0, -- Opacity of active windows [0.0 - 1.0]
-        inactive_opacity = 1.0, -- Opacity of inactive windows [0.0 - 1.0]
+        rounding = 10, -- Rounded corners' radius (in layout px)
+        rounding_power = 2.5, -- Curve used for rounding (2.0 is circle, 4.0 squircle, 1.0 triangular)
+        active_opacity = 0.85, -- Opacity of active windows [0.0 - 1.0]
+        inactive_opacity = 0.85, -- Opacity of inactive windows [0.0 - 1.0]
         fullscreen_opacity = 1.0, -- Opacity of fullscreen windows [0.0 - 1.0]
         dim_modal = true, -- Enables dimming of parents of modal windows
         dim_inactive = true, -- Enables dimming of inactive windows
-        dim_strength = 0.2, -- How much inactive windows should be dimmed [0.0 - 1.0]
+        dim_strength = 0.3, -- How much inactive windows should be dimmed [0.0 - 1.0]
         dim_special = 0.8, -- How much to dim screen when special workspace is open [0.0 - 1.0]
         dim_around = 0.4, -- How much the dim_around window rule should dim by [0.0 - 1.0]
         screen_shader = "", -- Path to custom shader applied at the end of rendering
         border_part_of_window = true, -- Whether the window border should be a part of the window
 
         blur = {
-            enabled = false, -- Enable kawase window background blur
-            size = 4, -- Blur size (distance)
+            enabled = true, -- Enable kawase window background blur
+            size = 10, -- Blur size (distance)
             passes = 2, -- Amount of passes to perform
             ignore_opacity = true, -- Make the blur layer ignore the opacity of the window
             new_optimizations = true, -- Enable further optimizations (massively improves performance)
@@ -63,11 +62,11 @@ hl.config({
         },
 
         shadow = {
-            enabled = false, -- Enable drop shadows on windows
-            range = 35, -- Shadow range ("size") in layout px
-            render_power = 2, -- Falloff power (more power = faster falloff) [1 - 4]
+            enabled = true, -- Enable drop shadows on windows
+            range = 10, -- Shadow range ("size") in layout px
+            render_power = 1, -- Falloff power (more power = faster falloff) [1 - 4]
             sharp = false, -- Make shadows sharp, akin to infinite render power
-            color = shadow, -- Shadow's color. Alpha dictates opacity
+            color = "rgba(1a1a1aee)", -- Shadow's color. Alpha dictates opacity
             offset = {0, 0}, -- Shadow's rendering offset
             scale = 1.0 -- Shadow's scale [0.0 - 1.0]
         },
@@ -141,24 +140,8 @@ hl.config({
         animate_manual_resizes = false, -- Animate manual window resizes/moves
         animate_mouse_windowdragging = false, -- Animate windows being dragged by mouse
         background_color = background, -- Custom background color
-        render_unfocused_fps = 15, -- Max FPS limit for unfocused background windows
+        render_unfocused_fps = 5, -- Max FPS limit for unfocused background windows
         enable_anr_dialog = true -- Enable "App Not Responding" dialog
-    },
-
-    -- ==========================================
-    -- LAYOUT TWEAKS (For Appearance)
-    -- ==========================================
-    layout = {
-        single_window_aspect_ratio = {0, 0}, -- Add padding to force single window to aspect ratio
-        single_window_aspect_ratio_tolerance = 0.1 -- Tolerance for padding application [0.0 - 1.0]
-    },
-
-    dwindle = {
-        preserve_split = true
-    },
-
-    master = {
-        new_status = "master"
     },
 
     -- ==========================================
@@ -178,8 +161,6 @@ hl.config({
         expand_undersized_textures = true, -- Expand undersized textures vs stretching entire texture
         xp_mode = false, -- Disables back buffer and bottom layer rendering
         ctm_animation = 2, -- Fade animation for CTM changes (2=auto disables on Nvidia)
-        cm_enabled = true, -- Color management pipeline enabled
-        cm_auto_hdr = 1, -- Auto-switch to HDR in fullscreen [0=off, 1=cm/hdr, 2=cm/hdr/edid]
         use_shader_blur_blend = false -- Blurred bg blending
     },
 
