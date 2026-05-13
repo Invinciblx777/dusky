@@ -124,7 +124,8 @@ class HyprlandLuaEngine(BaseEngine):
         local safe_env = { 
             hl = hl, math = math, string = string, table = table, type = type, 
             pairs = pairs, ipairs = ipairs, tostring = tostring, tonumber = tonumber, 
-            os = {getenv = function() return nil end}, 
+            HOME = os.getenv("HOME") or "",
+            os = {getenv = function() return nil end},
             io = {
                 open = function(path, mode)
                     if mode and mode:match("w") then return nil end
@@ -147,7 +148,12 @@ class HyprlandLuaEngine(BaseEngine):
             if not path:match("%.lua$") then return nil end
             table.insert(loaded_files, path)
             local chunk = loadfile(path, "t", safe_env)
-            if chunk then return chunk() end 
+            if chunk then
+                local ok, err = pcall(chunk)
+                if not ok then
+                    io.stderr:write("[sandbox] dofile skipped: " .. tostring(err) .. "\n")
+                end
+            end
         end
         
         safe_env.require = function(path) return safe_env.dofile(path .. ".lua") end

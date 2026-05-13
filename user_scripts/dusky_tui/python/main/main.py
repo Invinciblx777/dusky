@@ -140,11 +140,9 @@ EXAMPLES:
     headless_group.add_argument("--set", metavar="KEY=VALUE", type=str, help="Headlessly set a value (format: target_key=new_value).")
     headless_group.add_argument("--export-state", action="store_true", help="Print the parsed AST state as JSON to stdout and exit.")
     headless_group.add_argument("--export-docs", action="store_true", help="Generate a Markdown documentation file based on the schema and exit.")
-    headless_group.add_argument("--export-docs", action="store_true", help="Generate a Markdown documentation file based on the schema and exit.")
 
-    parser.add_argument("--log", action="store_true", help="Enable file logging to ~/Documents/logs/tui/")   # <-- ADD THIS LINE
+    parser.add_argument("--log", action="store_true", help="Enable file logging to ~/Documents/logs/tui/")
 
-    args = parser.parse_args()
     args = parser.parse_args()
 
     # --- 1. SMART SCHEMA PATH RESOLUTION ---
