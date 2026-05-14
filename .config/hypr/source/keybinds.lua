@@ -351,19 +351,29 @@ hl.config({ cursor = { zoom_disable_aa = true } })
 
 hl.bind(
     "SUPER + equal",
-    hl.dsp.exec_cmd([[hyprctl keyword cursor:zoom_factor "$(hyprctl getoption cursor:zoom_factor | awk 'NR==1 {print $2 * 1.25}')"]]),
+    function()
+        local z = hl.get_config("cursor.zoom_factor")
+        hl.config({ cursor = { zoom_factor = z * 1.25 } })
+    end,
     { description = "Zoom In", repeating = true }
 )
 
 hl.bind(
     "SUPER + minus",
-    hl.dsp.exec_cmd([[hyprctl keyword cursor:zoom_factor "$(hyprctl getoption cursor:zoom_factor | awk 'NR==1 {val = $2 / 1.25; if (val < 1.0) val = 1.0; print val}')"]]),
+    function()
+        local z = hl.get_config("cursor.zoom_factor")
+        local nz = z / 1.25
+        if nz < 1.0 then nz = 1.0 end
+        hl.config({ cursor = { zoom_factor = nz } })
+    end,
     { description = "Zoom Out", repeating = true }
 )
 
 hl.bind(
     "SUPER + BACKSPACE",
-    hl.dsp.exec_cmd("hyprctl keyword cursor:zoom_factor 1.0"),
+    function()
+        hl.config({ cursor = { zoom_factor = 1.0 } })
+    end,
     { description = "Reset Zoom", locked = true }
 )
 
