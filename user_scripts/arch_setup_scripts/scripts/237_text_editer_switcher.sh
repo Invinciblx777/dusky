@@ -33,7 +33,7 @@ declare -ra EDITOR_CATALOG=(
 declare -r CONF_VARS="${HOME}/.config/hypr/edit_here/source/default_apps.lua"
 declare -r CONF_BINDS="${HOME}/.config/hypr/edit_here/source/keybinds.lua"
 declare -r STATE_FILE="${HOME}/.config/dusky/settings/texteditor_switch"
-declare -r LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/dusky_editor_switch.lock"
+declare -r LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/dusky_editor_switch_${UID}.lock"
 
 # UI Configuration
 declare -r APP_TITLE="Dusky Text Editor Switcher"
