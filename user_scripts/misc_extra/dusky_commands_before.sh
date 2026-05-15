@@ -24,8 +24,6 @@ declare -ra FLEET_COMMANDS=(
     # --- UI & Theming ---
 #    "U | gsettings set org.gnome.desktop.interface icon-theme 'Papirus'"
     "U | gsettings set org.cinnamon.desktop.default-applications.terminal exec 'kitty'"
-    "U | rm -f ~/.config/hypr/edit_here/source/workspace_rules.conf || true"
-    "U | sed -i 's/^zen$/zen-browser/' ~/.config/dusky/settings/browser_switch.smart || true"
     "U | mkdir -p ~/.config/opencode/themes || true"
     "U | mkdir -p ~/.config/Kvantum/matugen || true"
     "U | systemctl --user disable --now dusky_sliders.service || true"
