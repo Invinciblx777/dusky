@@ -1307,6 +1307,7 @@ class DuskyTUI(App):
                     self.apply_theme_to_engine()
                     self._refresh_all_ui()
                     for shortcut in self.query(Shortcut): shortcut.refresh()
+                    for file_link in self.query(FileLink): file_link.refresh()
                     self._update_footer_legend()
         except OSError: pass
 
@@ -1613,9 +1614,8 @@ class DuskyTUI(App):
             pass
 
     def _refresh_all_ui(self) -> None:
-        for tab_idx, items in self.schema.items():
-            for item_idx, item in enumerate(items):
-                self._refresh_single_ui(tab_idx, item_idx, item)
+        for tab_idx in self.schema.keys():
+            self._populate_option_list(tab_idx)
 
     def action_toggle_save_mode(self) -> None:
         self.auto_save = not self.auto_save
