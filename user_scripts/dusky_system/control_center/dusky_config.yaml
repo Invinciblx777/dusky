@@ -1693,7 +1693,7 @@ pages:
                     style: suggested
                     on_press:
                       type: exec
-                      command: kitty --class dusky_keybinds.sh --hold sh -c "$HOME/user_scripts/hypr/dusky_keybinds.sh"
+                      command: kitty --class dusky_keybinds.sh --hold sh -c "$HOME/user_scripts/hypr/input/dusky_keybinds.py"
             - type: button
               properties:
                 title: Input
