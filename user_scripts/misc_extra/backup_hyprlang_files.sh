@@ -51,7 +51,7 @@ shopt -s nullglob
 
 # Explicitly define the targeted files / globs as requested
 readonly -a TARGET_FILES=(
-    "${HYPR_DIR}/hyprland.conf"
+#    "${HYPR_DIR}/hyprland.conf"
     "${EDIT_DIR}/hyprland.conf"
     "${SOURCE_DIR}/"*.conf
 )
