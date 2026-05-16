@@ -309,6 +309,7 @@ input_path  = '/dev/null'
 output_path = '/dev/null'
 post_hook   = '''
   notify-send -i applications-graphics-symbolic "Theme Updated" || :
+  hyprctl reload || :
 '''
 
 # [templates.papirus_icon_theme]
@@ -323,5 +324,4 @@ input_path = '~/.config/matugen/templates/firefox_websites.css'
 output_path = '~/.config/matugen/generated/firefox_websites.css'
 post_hook = '''
     ln -nfs "/home/dusk/.config/matugen/generated/firefox_websites.css" "/home/dusk/.config/mozilla/firefox/tox6bnxb.default-release/chrome/colors.css" || :
-    hyprctl reload || :
 '''
