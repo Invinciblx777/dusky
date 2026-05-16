@@ -294,6 +294,7 @@ declare -ra UPDATE_SEQUENCE=(
 #    "U | 390_clipboard_persistance.sh"
 #    "S | 395_intel_media_sdk_check.sh"
 #    "U | 400_firefox_matugen_pywalfox.sh"
+     "U | 402_gecko_engine_colors_extention.sh"
 #    "U | 405_spicetify_matugen_setup.sh"
 #    "U | 410_waybar_swap_config.sh --toggle"
 #    "U | 415_mpv_setup.sh"
