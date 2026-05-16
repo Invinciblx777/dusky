@@ -18,6 +18,7 @@ declare -ar pkgs_misc=(
     "mako"
     "python-evdev"
     "python-pyudev"
+    "python-textual"
 
     "papirus-icon-theme"
 
