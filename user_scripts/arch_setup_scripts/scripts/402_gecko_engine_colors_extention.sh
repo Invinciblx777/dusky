@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # MatugenFox – Autonomous Setup & Provisioning Script
-# Version: 3.3.1 (Patched)
+# Version: 3.3.2 (Audited & Patched)
 # Target:  Linux (Arch, Fedora, Debian, NixOS, etc.) + macOS
 # Purpose: Zero-touch detection of every installed Firefox-family browser,
 #          profile resolution, native messaging host installation, config
@@ -26,7 +26,7 @@ readonly MANIFEST_NAME="matugenfox.json"
 readonly CONFIG_FILE="$HOST_DIR/config.json"
 readonly EXTENSION_ID="matugenfox@ubaid.com"
 readonly XPI_URL="https://addons.mozilla.org/firefox/downloads/latest/matugenfox/latest.xpi"
-readonly VERSION="3.3.1"
+readonly VERSION="3.3.2"
 
 # =============================================================================
 # ▼ VISUAL STYLING ▼
@@ -342,13 +342,13 @@ EOF
                 fi
 
                 if [[ -f "$target" ]]; then
-                    # Merge using jq to avoid breaking existing policies like Pywalfox
+                    # Merge using jq safely, instantiating missing root objects if needed
                     log_info "Merging policy into existing $target..."
                     local merged_tmp
                     merged_tmp=$(mktemp)
                     
                     if jq --arg ext "$EXTENSION_ID" --arg url "$XPI_URL" \
-                       '.policies.ExtensionSettings[$ext] = {"installation_mode": "normal_installed", "install_url": $url} | if .policies.ExtensionSettings["*"] == null then .policies.ExtensionSettings["*"] = {"installation_mode": "allowed"} else . end' \
+                       '.policies //= {} | .policies.ExtensionSettings //= {} | .policies.ExtensionSettings[$ext] = {"installation_mode": "normal_installed", "install_url": $url} | if .policies.ExtensionSettings["*"] == null then .policies.ExtensionSettings["*"] = {"installation_mode": "allowed"} else . end' \
                        "$target" > "$merged_tmp"; then
                         if ! $write_cmd "$merged_tmp" "$target" 2>/dev/null; then
                             log_warn "Failed to write merged policy to $target."
@@ -433,6 +433,8 @@ init_config() {
         fi
     fi
     log_info "Initializing default config.json..."
+    
+    # Injected colorsPath & websitesDir directly so the python host is active immediately
     cat > "$CONFIG_FILE" <<'CONFIG'
 {
   "smoothTransitions": false,
@@ -442,6 +444,8 @@ init_config() {
   "autoDisableDarkSites": false,
   "nakedMode": false,
   "paletteShortcut": "ctrl+alt+c",
+  "colorsPath": "~/.config/matugen/generated/firefox_websites.css",
+  "websitesDir": "~/.config/dusky_sites",
   "presets": [],
   "blocklist": []
 }
@@ -480,11 +484,11 @@ update_matugen_toml() {
     local tmp_toml
     tmp_toml=$(mktemp)
     
-    # 1. Safely remove existing [templates.firefox_websites] block via robust awk pattern
-    # 2. Pipe through a second awk block to strip out any trailing empty lines at the EOF
+    # 1. Safely remove existing [templates.firefox_websites] block
+    # 2. Strict regex prevents accidental match of bash brackets inside hook blocks
     awk '
     /^[ \t]*\[[ \t]*templates\.firefox_websites[ \t]*\]/ { skip = 1; next }
-    /^[ \t]*\[/ && skip { skip = 0 }
+    /^[ \t]*\[{1,2}[a-zA-Z0-9_.-]+(\.[a-zA-Z0-9_.-]+)*\]{1,2}[ \t]*$/ && skip { skip = 0 }
     !skip { print }
     ' "$toml_file" | awk 'NF > 0 {last = NR} {lines[NR] = $0} END {for (i = 1; i <= last; i++) print lines[i]}' > "$tmp_toml"
 
