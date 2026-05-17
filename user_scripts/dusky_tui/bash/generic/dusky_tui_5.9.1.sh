@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # -----------------------------------------------------------------------------
-# Dusky TUI Engine - Generic Configuration Template
+# Dusky TUI Engine - Generic Configuration Template v5.9.1
 # Target: Generic Linux Configs (/etc, .conf, .ini, host files)
-# Based on TUI Template v5.9
+# 
+# CHANGELOG:
+#   - FIX: Eradicated shorthand arithmetic bounds `(( x < 0 )) && x=0` which 
+#     trigger fatal aborts under Bash strict mode (`set -e`).
+#   - FIX: Fortified `handle_mouse` with null checks for `start`/`end` values
+#     preventing fatal syntax errors if zone boundaries evaluate as empty strings.
+#   - FIX: Strictly isolated `local zone` as a string to prevent math evaluation.
 # -----------------------------------------------------------------------------
 
 set -Eeuo pipefail
@@ -15,7 +21,7 @@ shopt -s extglob
 : "${XDG_CONFIG_HOME:=${HOME}/.config}"
 declare CONFIG_FILE="${DUSKY_CONFIG_FILE:-${XDG_CONFIG_HOME}/myapp/settings.conf}"
 declare -r APP_TITLE="Generic System Config Editor"
-declare -r APP_VERSION="v5.9"
+declare -r APP_VERSION="v5.9.1"
 
 # Dimensions & layout.
 declare -ri MAX_DISPLAY_ROWS=14
@@ -785,13 +791,19 @@ cycle_display_value() {
     REPLY=$value
     IFS=',' read -r -a opts <<< "$options"
     for opt in "${opts[@]:-}"; do
-        [[ $opt == "$value" ]] && { REPLY=$opt; return 0; }
+        if [[ $opt == "$value" ]]; then
+            REPLY=$opt
+            return 0
+        fi
     done
     if [[ $value =~ ^[0-9]+$ ]]; then
         for opt in "${opts[@]:-}"; do
             if [[ $opt =~ ^0[xX]([0-9a-fA-F]+)$ ]]; then
                 opt_dec=$(( 16#${BASH_REMATCH[1]} ))
-                [[ $value == "$opt_dec" ]] && { REPLY=$opt; return 0; }
+                if [[ $value == "$opt_dec" ]]; then
+                    REPLY=$opt
+                    return 0
+                fi
             fi
         done
     fi
@@ -865,14 +877,14 @@ modify_value() {
                 unsigned=${min#-}
                 if (( ${#unsigned} <= 18 )); then
                     min_i=$(( 10#${unsigned:-0} )); [[ $min == -* ]] && min_i=$(( -min_i ))
-                    (( int_val < min_i )) && int_val=$min_i
+                    if (( int_val < min_i )); then int_val=$min_i; fi
                 fi
             fi
             if [[ -n $max ]]; then
                 unsigned=${max#-}
                 if (( ${#unsigned} <= 18 )); then
                     max_i=$(( 10#${unsigned:-0} )); [[ $max == -* ]] && max_i=$(( -max_i ))
-                    (( int_val > max_i )) && int_val=$max_i
+                    if (( int_val > max_i )); then int_val=$max_i; fi
                 fi
             fi
             new_val=$int_val
@@ -889,7 +901,7 @@ modify_value() {
             local -i count idx=0 i
             IFS=',' read -r -a opts <<< "$min"
             count=${#opts[@]}
-            (( count == 0 )) && return 0
+            if (( count == 0 )); then return 0; fi
             for (( i = 0; i < count; i++ )); do
                 if [[ ${opts[i]} == "$current" ]]; then idx=$i; break; fi
             done
@@ -965,15 +977,15 @@ reset_defaults() {
         def_val=${DEFAULTS["${REPLY_CTX}::${item}"]:-}
         if [[ -n $def_val ]]; then
             if set_absolute_value "$item" "$def_val"; then
-                (( LAST_WRITE_CHANGED )) && any_written=1
+                if (( LAST_WRITE_CHANGED )); then any_written=1; fi
             else
                 any_failed=1
             fi
         fi
     done
 
-    (( any_written )) && post_write_action
-    (( any_failed )) && set_status "Some defaults were not written." || clear_status
+    if (( any_written )); then post_write_action; fi
+    if (( any_failed )); then set_status "Some defaults were not written."; else clear_status; fi
     return 0
 }
 
@@ -1017,7 +1029,7 @@ prompt_line_input() {
     stty "$ORIGINAL_STTY" < /dev/tty 2>/dev/null || :
 
     prompt_row=$(( HEADER_ROWS + MAX_DISPLAY_ROWS + 7 ))
-    (( prompt_row > TERM_ROWS - 1 )) && prompt_row=$(( TERM_ROWS - 1 ))
+    if (( prompt_row > TERM_ROWS - 1 )); then prompt_row=$(( TERM_ROWS - 1 )); fi
     printf '\033[%d;1H%s' "$prompt_row" "$CLR_EOS" || true
     printf '%s%s%s ' "$C_YELLOW" "$prompt_text" "$C_RESET" || true
 
@@ -1039,16 +1051,16 @@ compute_scroll_window() {
     if (( count == 0 )); then
         SELECTED_ROW=0; SCROLL_OFFSET=0; _vis_start=0; _vis_end=0; return 0
     fi
-    (( SELECTED_ROW < 0 )) && SELECTED_ROW=0
-    (( SELECTED_ROW >= count )) && SELECTED_ROW=$(( count - 1 ))
-    (( SELECTED_ROW < SCROLL_OFFSET )) && SCROLL_OFFSET=$SELECTED_ROW
-    (( SELECTED_ROW >= SCROLL_OFFSET + MAX_DISPLAY_ROWS )) && SCROLL_OFFSET=$(( SELECTED_ROW - MAX_DISPLAY_ROWS + 1 ))
+    if (( SELECTED_ROW < 0 )); then SELECTED_ROW=0; fi
+    if (( SELECTED_ROW >= count )); then SELECTED_ROW=$(( count - 1 )); fi
+    if (( SELECTED_ROW < SCROLL_OFFSET )); then SCROLL_OFFSET=$SELECTED_ROW; fi
+    if (( SELECTED_ROW >= SCROLL_OFFSET + MAX_DISPLAY_ROWS )); then SCROLL_OFFSET=$(( SELECTED_ROW - MAX_DISPLAY_ROWS + 1 )); fi
     local -i max_scroll=$(( count - MAX_DISPLAY_ROWS ))
-    (( max_scroll < 0 )) && max_scroll=0
-    (( SCROLL_OFFSET > max_scroll )) && SCROLL_OFFSET=$max_scroll
+    if (( max_scroll < 0 )); then max_scroll=0; fi
+    if (( SCROLL_OFFSET > max_scroll )); then SCROLL_OFFSET=$max_scroll; fi
     _vis_start=$SCROLL_OFFSET
     _vis_end=$(( SCROLL_OFFSET + MAX_DISPLAY_ROWS ))
-    (( _vis_end > count )) && _vis_end=$count
+    if (( _vis_end > count )); then _vis_end=$count; fi
     return 0
 }
 
@@ -1140,8 +1152,12 @@ draw_main_view() {
     strip_ansi "$APP_TITLE"; local -i t_len=${#REPLY}
     strip_ansi "$APP_VERSION"; local -i v_len=${#REPLY}
     vis_len=$(( t_len + v_len + 1 ))
-    left_pad=$(( (BOX_INNER_WIDTH - vis_len) / 2 )); (( left_pad < 0 )) && left_pad=0
-    right_pad=$(( BOX_INNER_WIDTH - vis_len - left_pad )); (( right_pad < 0 )) && right_pad=0
+    
+    left_pad=$(( (BOX_INNER_WIDTH - vis_len) / 2 ))
+    if (( left_pad < 0 )); then left_pad=0; fi
+    right_pad=$(( BOX_INNER_WIDTH - vis_len - left_pad ))
+    if (( right_pad < 0 )); then right_pad=0; fi
+    
     printf -v pad_buf '%*s' "$left_pad" ''
     buf+="${C_MAGENTA}│${pad_buf}${C_WHITE}${APP_TITLE} ${C_CYAN}${APP_VERSION}${C_MAGENTA}"
     printf -v pad_buf '%*s' "$right_pad" ''
@@ -1259,17 +1275,28 @@ draw_main_view() {
 draw_detail_view() {
     local buf="" pad_buf="" items_var breadcrumb title sub
     local -i count pad_needed left_pad right_pad vis_len _vis_start _vis_end
+    
     buf+="${CURSOR_HOME}${C_MAGENTA}┌${H_LINE}┐${C_RESET}${CLR_EOL}"$'\n'
     title=" DETAIL VIEW "; sub=" ${CURRENT_MENU_ID} "
     strip_ansi "$title"; local -i t_len=${#REPLY}; strip_ansi "$sub"; local -i s_len=${#REPLY}
-    vis_len=$(( t_len + s_len )); left_pad=$(( (BOX_INNER_WIDTH - vis_len) / 2 )); (( left_pad < 0 )) && left_pad=0
-    right_pad=$(( BOX_INNER_WIDTH - vis_len - left_pad )); (( right_pad < 0 )) && right_pad=0
+    vis_len=$(( t_len + s_len ))
+    
+    left_pad=$(( (BOX_INNER_WIDTH - vis_len) / 2 ))
+    if (( left_pad < 0 )); then left_pad=0; fi
+    right_pad=$(( BOX_INNER_WIDTH - vis_len - left_pad ))
+    if (( right_pad < 0 )); then right_pad=0; fi
+    
     printf -v pad_buf '%*s' "$left_pad" ''
     buf+="${C_MAGENTA}│${pad_buf}${C_YELLOW}${title}${C_GREY}${sub}${C_MAGENTA}"
     printf -v pad_buf '%*s' "$right_pad" ''
     buf+="${pad_buf}│${C_RESET}${CLR_EOL}"$'\n'
+    
     breadcrumb=" « Back to ${TABS[CURRENT_TAB]}"
-    strip_ansi "$breadcrumb"; local -i b_len=${#REPLY}; pad_needed=$(( BOX_INNER_WIDTH - b_len )); (( pad_needed < 0 )) && pad_needed=0
+    strip_ansi "$breadcrumb"; local -i b_len=${#REPLY}
+    
+    pad_needed=$(( BOX_INNER_WIDTH - b_len ))
+    if (( pad_needed < 0 )); then pad_needed=0; fi
+    
     printf -v pad_buf '%*s' "$pad_needed" ''
     buf+="${C_MAGENTA}│${C_CYAN}${breadcrumb}${C_RESET}${pad_buf}${C_MAGENTA}│${C_RESET}${CLR_EOL}"$'\n'
     buf+="${C_MAGENTA}└${H_LINE}┘${C_RESET}${CLR_EOL}"$'\n'
@@ -1291,16 +1318,28 @@ draw_detail_view() {
 draw_picker_view() {
     local buf="" pad_buf="" title sub breadcrumb item hint padded hint_trim
     local -i left_pad right_pad vis_len pad_needed count i vstart vend rows_rendered max_len
+    
     buf+="${CURSOR_HOME}${C_MAGENTA}┌${H_LINE}┐${C_RESET}${CLR_EOL}"$'\n'
     title=" PICKER "; sub=" ${PICKER_TITLE} "
     strip_ansi "$title"; local -i t_len=${#REPLY}; strip_ansi "$sub"; local -i s_len=${#REPLY}
-    vis_len=$(( t_len + s_len )); left_pad=$(( (BOX_INNER_WIDTH - vis_len) / 2 )); (( left_pad < 0 )) && left_pad=0
-    right_pad=$(( BOX_INNER_WIDTH - vis_len - left_pad )); (( right_pad < 0 )) && right_pad=0
+    vis_len=$(( t_len + s_len ))
+    
+    left_pad=$(( (BOX_INNER_WIDTH - vis_len) / 2 ))
+    if (( left_pad < 0 )); then left_pad=0; fi
+    right_pad=$(( BOX_INNER_WIDTH - vis_len - left_pad ))
+    if (( right_pad < 0 )); then right_pad=0; fi
+    
     printf -v pad_buf '%*s' "$left_pad" ''
     buf+="${C_MAGENTA}│${pad_buf}${C_YELLOW}${title}${C_GREY}${sub}${C_MAGENTA}"
     printf -v pad_buf '%*s' "$right_pad" ''
     buf+="${pad_buf}│${C_RESET}${CLR_EOL}"$'\n'
-    breadcrumb=" « Esc to cancel"; strip_ansi "$breadcrumb"; local -i b_len=${#REPLY}; pad_needed=$(( BOX_INNER_WIDTH - b_len )); (( pad_needed < 0 )) && pad_needed=0
+    
+    breadcrumb=" « Esc to cancel"
+    strip_ansi "$breadcrumb"; local -i b_len=${#REPLY}
+    
+    pad_needed=$(( BOX_INNER_WIDTH - b_len ))
+    if (( pad_needed < 0 )); then pad_needed=0; fi
+    
     printf -v pad_buf '%*s' "$pad_needed" ''
     buf+="${C_MAGENTA}│${C_CYAN}${breadcrumb}${C_RESET}${pad_buf}${C_MAGENTA}│${C_RESET}${CLR_EOL}"$'\n'
     buf+="${C_MAGENTA}└${H_LINE}┘${C_RESET}${CLR_EOL}"$'\n'
@@ -1551,7 +1590,7 @@ handle_mouse() {
             if [[ -n "$LEFT_ARROW_ZONE" ]]; then
                 start="${LEFT_ARROW_ZONE%%:*}"
                 end="${LEFT_ARROW_ZONE##*:}"
-                if (( x >= start && x <= end )); then
+                if [[ -n $start && -n $end ]] && (( x >= start && x <= end )); then
                     switch_tab -1
                     return 0
                 fi
@@ -1560,17 +1599,18 @@ handle_mouse() {
             if [[ -n "$RIGHT_ARROW_ZONE" ]]; then
                 start="${RIGHT_ARROW_ZONE%%:*}"
                 end="${RIGHT_ARROW_ZONE##*:}"
-                if (( x >= start && x <= end )); then
+                if [[ -n $start && -n $end ]] && (( x >= start && x <= end )); then
                     switch_tab 1
                     return 0
                 fi
             fi
 
             for (( i = 0; i < ${#TAB_ZONES[@]}; i++ )); do
+                if [[ -z "${TAB_ZONES[i]:-}" ]]; then continue; fi
                 zone="${TAB_ZONES[i]}"
                 start="${zone%%:*}"
                 end="${zone##*:}"
-                if (( x >= start && x <= end )); then
+                if [[ -n $start && -n $end ]] && (( x >= start && x <= end )); then
                     set_tab "$(( i + TAB_SCROLL_START ))"
                     return 0
                 fi
