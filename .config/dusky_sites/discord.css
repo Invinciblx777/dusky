@@ -20,12 +20,13 @@
         --blue-new-37: var(--primary) !important;
         
         /* Text Colors */
-        --neutral-23: var(--on_surface) !important;
-        --neutral-5: var(--on_surface) !important;
+        --neutral-23: var(--on_surface_variant) !important;
+        --neutral-5: var(--on_surface_variant) !important;
         --neutral-2: var(--on_surface) !important;
         
         --reaction-background-reacted-default: var(--inverse_on_surface) !important;
         --brand-10a: var(--inverse_on_surface) !important;
+        --brand-560: var(--on_primary_container) !important;
         --message-highlight-background-hover: var(--inverse_on_surface) !important;
         --message-highlight-background-default: var(--inverse_on_surface) !important;
     }
