@@ -1806,7 +1806,7 @@ pages:
                     style: suggested
                     on_press:
                       type: exec
-                      command: kitty --class dusky_window_rules.sh --hold sh -c "$HOME/user_scripts/hypr/dusky_window_rules.sh"
+                      command: foot --app-id=dusky_window_rules.sh --hold "$HOME/user_scripts/hypr/rules/window_rules_generator.py"
 
     - type: navigation
       properties:
