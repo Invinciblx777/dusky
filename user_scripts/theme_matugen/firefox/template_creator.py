@@ -76,7 +76,10 @@ ROLES = {
     "8": {"name": "Accent Element (Buttons/Links)", "prop": "background-color", "var": "var(--primary)"},
     "9": {"name": "Text on Accent Button", "prop": "color", "var": "var(--on_primary)"},
     "10": {"name": "Error/Warning Alert", "prop": "background-color", "var": "var(--error)"},
-    "11": {"name": "Hide / Remove Element", "prop": "display", "var": "none"}
+    "11": {"name": "Hide / Remove Element", "prop": "display", "var": "none"},
+    "12": {"name": "Make Background Transparent", "prop": "background-color", "var": "transparent"},
+    "13": {"name": "Make Border Transparent", "prop": "border-color", "var": "transparent"},
+    "14": {"name": "Make Text Transparent", "prop": "color", "var": "transparent"}
 }
 
 DEBUG_COLORS = [

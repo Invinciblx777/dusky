@@ -5,6 +5,7 @@
         --main-surface-primary: var(--surface) !important;
         --main-surface-secondary: var(--surface_container) !important;
         --main-surface-tertiary: var(--surface_container_highest) !important;
+        --bg-secondary-surface : var(--surface_container) !important;
         
         /* Sidebar Surfaces */
         --sidebar-surface-primary: var(--surface_container_low) !important;
