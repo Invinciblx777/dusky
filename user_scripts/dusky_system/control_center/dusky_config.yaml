@@ -1345,7 +1345,7 @@ pages:
                 button_text: "Open"
               on_press:
                 type: exec
-                command: kitty --class dusky_appearances.sh --hold sh -c "$HOME/user_scripts/hypr/dusky_appearances.sh"
+                command: kitty --class dusky_tui --hold "$HOME/user_scripts/dusky_tui/python/main/main.py" "$HOME/user_scripts/hypr/visual/tui_appearance.py"
                 terminal: false
             - type: button
               properties:
@@ -1835,7 +1835,7 @@ pages:
                     style: suggested
                     on_press:
                       type: exec
-                      command: kitty --class dusky_appearances.sh --hold sh -c "$HOME/user_scripts/hypr/dusky_appearances.sh"
+                command: kitty --class dusky_tui --hold "$HOME/user_scripts/dusky_tui/python/main/main.py" "$HOME/user_scripts/hypr/visual/tui_appearance.py"
             - type: button
               properties:
                 title: Workspace Rules
