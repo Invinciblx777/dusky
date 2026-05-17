@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # MatugenFox – Autonomous Setup & Provisioning Script
-# Version: 3.3.0
+# Version: 3.3.1 (Patched)
 # Target:  Linux (Arch, Fedora, Debian, NixOS, etc.) + macOS
 # Purpose: Zero-touch detection of every installed Firefox-family browser,
 #          profile resolution, native messaging host installation, config
@@ -19,13 +19,14 @@ trap 'exit_code=$?; log_err "Unexpected failure at line $LINENO (code $exit_code
 # =============================================================================
 
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly HOST_SCRIPT="$HOME/user_scripts/theme_matugen/firefox/matugenfox_host.py"
+readonly HOST_DIR="$HOME/user_scripts/theme_matugen/firefox"
+readonly HOST_SCRIPT="$HOST_DIR/matugenfox_host.py"
 readonly REFRESH_SCRIPT="$HOME/user_scripts/theme_matugen/theme_ctl.sh"
 readonly MANIFEST_NAME="matugenfox.json"
-readonly CONFIG_FILE="$SCRIPT_DIR/config.json"
+readonly CONFIG_FILE="$HOST_DIR/config.json"
 readonly EXTENSION_ID="matugenfox@ubaid.com"
 readonly XPI_URL="https://addons.mozilla.org/firefox/downloads/latest/matugenfox/latest.xpi"
-readonly VERSION="3.3.0"
+readonly VERSION="3.3.1"
 
 # =============================================================================
 # ▼ VISUAL STYLING ▼
@@ -419,6 +420,10 @@ bootstrap_profiles() {
 
 init_config() {
     local force_run=$1
+    
+    # Ensure the parent directory exists so the file can be written safely
+    mkdir -p "${CONFIG_FILE%/*}" || true
+
     if [[ -f "$CONFIG_FILE" ]] && [[ -s "$CONFIG_FILE" ]] && python3 -c "import json; json.load(open('$CONFIG_FILE'))" 2>/dev/null; then
         if (( ! force_run )); then
             log_info "config.json already exists. Skipping."
