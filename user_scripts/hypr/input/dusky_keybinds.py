@@ -460,8 +460,8 @@ def print_binding_info_box(bind: Bind, raw_text: str, width: int = 80) -> None:
 
 def draw_help_box(width: int = 80) -> None:
     print(f'{YELLOW}╭─ [ QUICK INSTRUCTIONS ] {"─" * (width - 27)}╮{RESET}')
-    for row in draw_box_row("Syntax", 'hl.bind("MODS + KEY", DISPATCHER[, OPTIONS])', GREY, GREEN, width, YELLOW): print(row)
-    for row in draw_box_row("Example", 'hl.bind("SUPER + Q", hl.dsp.exec_cmd("kitty"))', GREY, DIM, width, YELLOW): print(row)
+    for row in draw_box_row("Syntax", 'hl.bind("MODS + KEY", DISPATCHER[, OPTIONS])', BOLD, GREEN, width, YELLOW): print(row)
+    for row in draw_box_row("Example", 'hl.bind("SUPER + Q", hl.dsp.exec_cmd("kitty"))', BOLD, DIM, width, YELLOW): print(row)
     print(f'{YELLOW}╰{"─" * (width - 2)}╯{RESET}')
 
 def format_display(b: Bind) -> str:
