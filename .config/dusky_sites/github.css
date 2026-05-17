@@ -40,6 +40,7 @@
         --fgColor-danger: var(--error) !important;
         --button-danger-fgColor-rest: var(--error) !important;
         --button-danger-bgColor-hover: var(--error_container) !important;
+        --overlay-bgColor: var(--surface_container_low) !important;
 
         --bgColor-attention-emphasis: var(--secondary) !important;
         --borderColor-attention-muted: var(--secondary_container) !important;
