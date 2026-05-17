@@ -415,7 +415,7 @@ generate_config() {
             "${CARD_NAME[$SELECTED_PRIMARY_CARD]}" \
             "${CARD_PCI_ADDRESS[$SELECTED_PRIMARY_CARD]}"
         printf '# -----------------------------------------------------------------\n'
-        printf 'export ELECTRON_OZONE_PLATFORM_HINT=auto\n'
+        printf 'export ELECTRON_OZONE_PLATFORM_HINT=wayland\n'
         printf 'export MOZ_ENABLE_WAYLAND=1\n'
         printf '\n'
         
