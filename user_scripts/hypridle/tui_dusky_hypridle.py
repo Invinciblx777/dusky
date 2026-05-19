@@ -20,6 +20,7 @@ from python.frontend.core_types import ConfigItem
 ENGINE_TYPE = "hyprlang"
 TARGET_FILE = "~/.config/hypr/hypridle.conf"
 APP_TITLE = "Dusky Hypridle"
+THEME_FILE = "~/.config/matugen/generated/dusky_tui.json"
 
 # =============================================================================
 # 2. UI & ENVIRONMENT BEHAVIOR

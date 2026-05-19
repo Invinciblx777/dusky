@@ -1788,7 +1788,7 @@ pages:
                     style: suggested
                     on_press:
                       type: exec
-                      command: kitty --app-id=monitor_wizard.py --hold sh -c "$HOME/user_scripts/hypr/monitor/monitor_wizard.py"
+                      command: foot --app-id=dusky_tui --hold ~/user_scripts/dusky_tui/python/main/main.py ~/user_scripts/hypr/monitor/monitor_wizard.py
             - type: button
               properties:
                 title: Window Rules
@@ -1833,7 +1833,7 @@ pages:
                     style: suggested
                     on_press:
                       type: exec
-                command: kitty --class dusky_tui --hold "$HOME/user_scripts/dusky_tui/python/main/main.py" "$HOME/user_scripts/hypr/visual/tui_appearance.py"
+                      command: foot --app-id=dusky_tui --hold $HOME/user_scripts/dusky_tui/python/main/main.py $HOME/user_scripts/hypr/visual/tui_appearance.py
             - type: button
               properties:
                 title: Workspace Rules
@@ -1867,7 +1867,7 @@ pages:
                     style: suggested
                     on_press:
                       type: exec
-                      command: kitty --class dusky_hypridle.sh --hold sh -c "$HOME/user_scripts/hypridle/dusky_hypridle.sh"
+                      command: foot --app-id=dusky_tui --hold $HOME/user_scripts/dusky_tui/python/main/main.py $HOME/user_scripts/hypridle/tui_dusky_hypridle.py
 
   - type: section
     properties:
