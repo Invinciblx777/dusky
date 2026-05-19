@@ -86,7 +86,7 @@ THEME = compile_theme()
 def get_rgb_color(hex_str: str, default: tuple[int, int, int] = (255, 181, 155)) -> tuple[int, int, int]:
     try:
         clean_hex = hex_str.lstrip('#')
-        if len(clean_hex) == 6:
+        if len(clean_hex) >= 6:
             return int(clean_hex[0:2], 16), int(clean_hex[2:4], 16), int(clean_hex[4:6], 16)
         elif len(clean_hex) == 3:
             return int(clean_hex[0]*2, 16), int(clean_hex[1]*2, 16), int(clean_hex[2]*2, 16)
@@ -95,6 +95,7 @@ def get_rgb_color(hex_str: str, default: tuple[int, int, int] = (255, 181, 155))
     return default
 
 # --- ULTRA-MODERN MINIMAL CSS ARCHITECTURE ---
+# Eradicated fallacious ':active' pseudo-class invocation to strictly conform with Textual lexer axioms.
 DUSKY_CSS = f"""
 Screen {{ background: {THEME['bg']}; color: {THEME['fg']}; }}
 #sidebar {{
@@ -126,9 +127,6 @@ ScrollBar > .scrollbar--bar {{
 }}
 ScrollBar > .scrollbar--bar:hover {{
     color: {THEME['accent']}cc;
-}}
-ScrollBar > .scrollbar--bar:active {{
-    color: {THEME['accent']};
 }}
 ListView {{ background: transparent; overflow-x: hidden; height: 100%; scrollbar-size-vertical: 1; }}
 ListItem {{ 
