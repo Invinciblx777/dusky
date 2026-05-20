@@ -2093,6 +2093,13 @@ else
     log_success "Appended '${OVERLAY_REQUIRE}' to '${MAIN_CONF}'."
 fi
 
+# --- Hot-Reload Configuration ---
+if command -v hyprctl &>/dev/null; then
+    if hyprctl reload config-only &>/dev/null; then
+        log_success "Forced hot-reload of Hyprland configuration (config-only)."
+    fi
+fi
+
 # ------------------------------------------------------------------------------
 # 7. Completion
 # ------------------------------------------------------------------------------
