@@ -690,7 +690,6 @@ Libadwaita GTK 4 Prompt
 > # )
 > ```
 
-
 > [!NOTE]- Template Schema INI
 > ```python
 > #!/usr/bin/env python3
@@ -700,260 +699,270 @@ Libadwaita GTK 4 Prompt
 > ===============================================================================
 > 
 > TARGET MAPPING VISUALIZATION:
-> This pedagogical apparatus delineates the ontological mapping required to 
-> subjugate standard INI-style and Arch Linux configuration architectures 
-> (e.g., pacman.conf, makepkg.conf, mako/config).
+> How `scope` and `key` instruct the engine to mutate the target INI file.
+> (e.g., pacman.conf, makepkg.conf, mako/config, etc.)
 > 
 > ===============================================================================
-> [ INI SYNTACTIC HEGEMONY ]
+> [ SCENARIO A: Standard Section Variables ]
 > ===============================================================================
->   1. SECTIONAL DELINEATION
->      [telemetry.subsystem]           <-- scope="telemetry.subsystem"
->      transmission_rate = 5           <-- key="transmission_rate"
+>   [options]                      <-- scope="options"
+>   HoldPkg = pacman glibc         <-- key="HoldPkg"
 > 
->   2. ROOT/GLOBAL DEFINITIONS
->      log_level = debug               <-- scope="DEFAULT", key="log_level"
+> ===============================================================================
+> [ SCENARIO B: Root/Global Variables ]
+> ===============================================================================
+>   log_level = debug              <-- scope="DEFAULT", key="log_level"
 > 
->   3. VALUELESS FLAGS (Arch Linux pacman.conf style)
->      Color                           <-- scope="DEFAULT", key="Color", type_="bool", default=True
->      ILoveCandy                      <-- scope="options", key="ILoveCandy", type_="bool", default=False
+> ===============================================================================
+> [ SCENARIO C: Valueless Flags (Arch Linux style) ]
+> ===============================================================================
+>   Color                          <-- scope="DEFAULT", key="Color", type_="bool"
+>   ILoveCandy                     <-- scope="options", key="ILoveCandy", type_="bool"
 > 
-> STRICT ORTHODOXY FOR SCHEMA GENERATION (CRITICAL - DO NOT VIOLATE):
+> STRICT RULES FOR SCHEMA GENERATION (CRITICAL - DO NOT VIOLATE):
 > 
-> 4. UID (Unique Identifier) Nomenclature:
->    - Variables domiciled in the primordial root (devoid of sectional brackets) 
->      necessitate `scope="DEFAULT"`. The UID resolves merely to the `key`.
->    - Variables subjugated within a section construct a UID of `scope.key` 
->      (e.g., "telemetry.subsystem.transmission_rate").
->    - You MUST deploy this precise UID when architecting `parent_ref` hierarchies 
->      or orchestrating `preset_payload` matrix injections.
+> 1. UID (Unique Identifier) Rule:
+>    - If a variable sits at the root of the target file (no section), set scope="DEFAULT".
+>    - If scope is defined, the UID is `scope.key` (e.g., "options.HoldPkg").
+>    - If scope is "DEFAULT", the UID is just the `key` (e.g., "log_level").
+>    - You MUST use the exact UID when using `parent_ref` or `preset_payload`.
 > 
-> 5. Contiguous Grouping Imperative (Eschew Interleaving):
->    - ConfigItems sharing an identical `group` string MUST be instantiated in immediate, 
->      unbroken succession. The UI interpolates headers sequentially; fragmentation 
->      provokes catastrophic visual dissonance.
->    - Subordinate elements leveraging a `parent_ref` MUST reside instantaneously 
->      beneath their sovereign parent. Do not rupture the visual taxonomy.
+> 2. The Naming Imperative (STRICTLY ONE WORD):
+>    - TABS & GROUPS: Every `group` string and `Tab` string MUST be EXACTLY ONE WORD.
+>    - LABELS (SETTINGS): The `label` for each ConfigItem MUST be as succinct as humanly 
+>      possible, ideally ONE WORD (e.g., use "Logging" instead of "Enable System Logging").
 > 
-> 6. Structural Restrictions & Hybrid Folders (CRITICAL):
->    - "preset" and "action" paradigms exist as PURE UI ephemera. They exert zero 
->      direct mutation upon the target file. Their `key` is an internal lexical anchor.
->    - "menu": A phantom categorical folder (default=None, type_="menu"). It writes nothing.
->    - HYBRID FOLDERS: You may transmute ANY functional integer, boolean, or string into 
->      an expandable drop-down menu by asserting `is_parent=True`. This orchestrates a 
->      scenario wherein the parent header retains substantive backend agency whilst 
->      concealing subordinate parameters.
->    - Folders tolerate singular depth exclusively. Labyrinthine nesting is strictly forbidden.
+> 3. The Theme File Axiom (CRITICAL):
+>    - The `THEME_FILE` path must be exactly preserved (`~/.config/matugen/generated/dusky_tui.json`).
+>    - This file MUST ALWAYS exist at this exact path. Do not alter the string.
 > 
-> 7. Lexical Parsimony (ONE-WORD HEADERS ONLY):
->    - NO MULTI-WORD HEADERS: Every `group` moniker and `Tab` designation MUST comprise 
->      a solitary, highly descriptive lexeme (e.g., prioritize `Cryptography` over 
->      `Encryption Security Subsystem`). This mitigates terminal interface asphyxiation.
->    - USE DESCRIPTIVE KEYS: Employ rigorous, semantically unassailable identifiers 
->      for backend keys.
+> 4. Contiguous Grouping Rule (Do NOT interleave):
+>    - Items with the same `group` string MUST be placed immediately next to each other. 
+>    - Items with a `parent_ref` MUST be placed immediately beneath their parent in a 
+>      single, unbroken block. Do not break the visual tree.
 > 
-> 8. The Ontological Categories (`type_`):
->    - "bool"   : Binary toggle (True/False). Translates to `key=true/false` or uncommented valueless flags.
->    - "int"    : Integer mathematics (min_val, max_val, step).
->    - "float"  : Decimal mathematics (min_val, max_val, step).
->    - "string" : Alphanumeric character strings.
->    - "cycle"  : Instantaneous horizontal iteration via predefined `options` array.
->    - "picker" : Fullscreen modal search query derived from `options`.
->    - "color"  : Hexadecimal, RGB, or Matugen integration variable.
->    - "menu"   : Pure structural abstraction (requires `is_parent=True`, `default=None`).
->    - "action" : Triggers asynchronous POSIX shell execution (command string resides in `default`).
->    - "preset" : Orchestrates multi-variable state synchronization (requires `preset_payload`).
+> 5. Structural Restrictions & Hybrid Folders (CRITICAL):
+>    - "preset" and "action" items are PURE UI constructs. They DO NOT write to the 
+>      target file. Their `key` is just an internal ID.
+>    - HYBRID FOLDERS: You can turn ANY standard item (e.g., "bool", "cycle", "int") into
+>      an expandable drop-down menu by setting `is_parent=True`. This allows the parent 
+>      header itself to hold a changeable backend value (e.g., a Master Toggle Switch).
+>    - Folders can only be ONE level deep. DO NOT nest a folder inside another folder.
 > 
-> 9. Strict Type & Native Value Congruence:
->    - The Python literal assigned to `default` MUST mirror the epistemological reality 
->      of the `type_` declaration:
->      * "bool"   -> default=True (Native Python boolean)
->      * "int"    -> default=10   (Native Python integer)
->      * "string" -> default="Text" (Native Python string)
+> 6. Available Types (`type_`):
+>    - "bool"   : Toggles instantly (True/False). Maps to true/false OR valueless flags.
+>    - "int"    : Numeric integer (supports min_val, max_val, step).
+>    - "float"  : Numeric decimal (supports min_val, max_val, step).
+>    - "string" : Text input (Use options=[] to provide a multiple-choice dropdown).
+>    - "cycle"  : Instant left/right cycling through an `options` list of strings.
+>    - "picker" : Opens a searchable fullscreen modal from an `options` list.
+>    - "color"  : Hex, RGB, HSL, or Matugen theme variables.
+>    - "menu"   : A pure visual folder with no value (requires `is_parent=True`, `default=None`).
+>    - "action" : Triggers a shell command (put the exact shell command string in `default=`).
+>    - "preset" : Applies multiple values at once (requires `preset_payload`, `default=None`).
 > 
-> 10. Preset Payload Rigidity (The Nuclear Override):
->    - Presets constitute an uncompromising totalitarian state replacement. If a schema 
->      variable is omitted from the `preset_payload`, the engine will coercively 
->      revert that abandoned variable to its programmed `default`. Enumerate all 
->      mandatory states within the payload dictation.
-> 
-> 11. Pedagogy & Hermeneutics (`extended_help`):
->    - Every entity MUST incorporate exhaustively detailed `extended_help`.
->    - Elucidate the precise systemic ramifications of mutating the variable. 
->    - Construct the prose such that an uninitiated interlocutor may effortlessly 
->      decipher the operational consequences.
-> 
+> 7. Preset Payload Strict Application (Nuclear Reset):
+>    - Presets apply a STRICT state snapshot. If you omit a key from a `preset_payload`, 
+>      the application will forcibly revert that omitted key back to its `default` value 
+>      when the preset is applied. Define ALL necessary keys in the payload.
 > ===============================================================================
 > """
 > 
 > from python.frontend.core_types import ConfigItem
 > 
 > # =============================================================================
-> # 1. MACROSCOPIC SYSTEM ROUTING (REQUIRED)
+> # 1. CORE APPLICATION ROUTING (REQUIRED)
 > # =============================================================================
-> ENGINE_TYPE = "ini"                        # STRICTLY ENFORCED: "ini"
-> TARGET_FILE = "~/.config/hegemony/daemon.conf" # The physical locus of state modification
-> APP_TITLE = "Dusky Subsystem Control"      # The authoritative nomenclature atop the UI
+> ENGINE_TYPE = "ini"                        # STRICTLY: "ini"
+> TARGET_FILE = "~/.config/mako/config"      # Standard INI target path
+> APP_TITLE = "Dusky Config"                 # Displayed in the TUI border
 > 
 > # =============================================================================
-> # 2. ENVIRONMENTAL PARAMETRIZATION
+> # 2. UI & ENVIRONMENT BEHAVIOR
 > # =============================================================================
-> DEFAULT_MODE = "auto"                      # "auto" (instantaneous IO) | "batch" (deferred transactional commit via Ctrl+S)
-> THEME_FILE = "~/.config/matugen/generated/dusky_tui.json" # Chromatic variable mapping
-> ENABLE_USER_PRESETS = True                 # Authorize localized profile synthesization
-> USER_PRESETS_TAB = "Configurations"        # Must identically reflect a ONE-WORD tab designation below
+> DEFAULT_MODE = "auto"                      # "auto" (instant save) | "batch" (Ctrl+S required)
+> 
+> # STRICT REQUIREMENT: This exact path must always exist. Do not change.
+> THEME_FILE = "~/.config/matugen/generated/dusky_tui.json" 
+> 
+> ENABLE_USER_PRESETS = True                 # Allows users to save/delete profiles dynamically
+> USER_PRESETS_TAB = "Profiles"              # Must exactly match a ONE-WORD tab name below
 > 
 > # =============================================================================
-> # 3. MACRO-TAXONOMY (TABS DEFINITION)
+> # 3. TABS DEFINITION
+> # STRICT RULE: Keep tabs ONE WORD ONLY to prevent UI clutter and wrapping.
 > # =============================================================================
 > 
 > TABS = [
->     "Infrastructure",
->     "Cryptography",
->     "Configurations"
+>     "Core",
+>     "Visuals",
+>     "Profiles"
 > ]
 > 
 > # =============================================================================
-> # 4. THE SCHEMATIC ARCHITECTURE
+> # 4. SCHEMA DEFINITION
+> # STRICT RULE: Keep `label` as close to ONE WORD as possible.
 > # =============================================================================
 > 
 > SCHEMA = {
 >     # -------------------------------------------------------------------------
->     # TAB 0: SYSTEMIC INFRASTRUCTURE
+>     # TAB 0: CORE (Infrastructure & Standard Types)
 >     # -------------------------------------------------------------------------
 >     0: [
 >         ConfigItem(
->             label="Enforce Sovereign Telemetry",
->             key="telemetry_active",
->             scope="DEFAULT",       # UID = "telemetry_active" (Resides in the root of the INI)
->             type_="bool",
->             default=False,
->             group="Surveillance",  # STRICT: ONE WORD ONLY
->             extended_help="**Sovereign Telemetry Override**\n\nWhen instantiated, this parameter authorizes the daemon to perpetually exfiltrate operational diagnostics to the centralized hegemony. While ostensibly utilized for systemic optimization, the interlocutor should recognize the inherent privacy degradation precipitated by enabling this conduit."
->         ),
->         ConfigItem(
->             label="Maximum Concurrent Vectors",
->             key="max_connections",
->             scope="network",       # UID = "network.max_connections" (Resides under [network])
->             type_="int",
->             default=1024,
->             min_val=1,
->             max_val=65535,
->             step=64,
->             group="Network",
->             extended_help="**Socket Allocation Maximum**\n\nDelineates the absolute upper boundary of concurrent asynchronous socket connections permitted by the internal hypervisor. Elevating this threshold augments systemic throughput at the proportional expense of volatile memory allocation."
->         ),
->         ConfigItem(
->             label="Primary Routing Protocol",
->             key="routing_heuristic",
->             scope="network",       # UID = "network.routing_heuristic"
+>             label="Logging",
+>             key="log_level",
+>             scope="DEFAULT",       # UID = "log_level"
 >             type_="cycle",
->             default="bbr",
->             options=["bbr", "cubic", "reno", "illinois"], 
->             group="Network",
->             extended_help="**Congestion Control Algorithm**\n\nDictates the algorithmic paradigm employed to govern packet transmission rates across the digital ether. `bbr` maximizes bandwidth utilization, whilst legacy protocols like `reno` provide predictable, albeit antiquated, bottleneck arbitration."
+>             default="info",
+>             options=["debug", "info", "warning", "error"],
+>             group="System",        # STRICT: ONE WORD ONLY
+>             extended_help="**Diagnostic Logging**\n\nSets the verbosity of the daemon's internal logs. `debug` provides the highest detail, while `error` only reports critical failures."
+>         ),
+>         ConfigItem(
+>             label="Concurrency",
+>             key="max_threads",
+>             scope="DEFAULT",       # UID = "max_threads"
+>             type_="int",
+>             default=4,
+>             min_val=1,
+>             max_val=32,
+>             step=1,
+>             group="System",
+>             extended_help="**Thread Allocation**\n\nDefines the maximum number of simultaneous threads allocated for background processing."
+>         ),
+>         ConfigItem(
+>             label="Color",         # Example of an Arch Linux pacman.conf valueless flag
+>             key="Color",
+>             scope="options",       # UID = "options.Color"
+>             type_="bool",
+>             default=True,
+>             group="Pacman",
+>             extended_help="**Color Output**\n\nA valueless boolean flag. When enabled, inserts `Color` into the INI file without an equals sign to force colorized terminal output."
 >         ),
 >     ],
 > 
 >     # -------------------------------------------------------------------------
->     # TAB 1: CRYPTOGRAPHIC SUBSYSTEMS & HYBRID ABSTRACTIONS
+>     # TAB 1: VISUALS (UI Components & Hybrid Menu Folders)
 >     # -------------------------------------------------------------------------
 >     1: [
+>         ConfigItem(
+>             label="Background",
+>             key="background-color",
+>             scope="DEFAULT",       # UID = "background-color"
+>             type_="color",
+>             default="#1e1e2e",
+>             group="Theme",
+>             extended_help="**Base Background Color**\n\nDetermines the core background fill for UI elements. Accepts standard Hex codes."
+>         ),
+>         
 >         # --- HYBRID FOLDER IMPLEMENTATION ---
->         # 1. The Sovereign Parent (Possesses authentic backend agency whilst masquerading as a structural folder)
+>         # 1. The Parent (Holds a real backend "bool" value, acts as a folder)
 >         ConfigItem(
->             label="Enable Quantum Resistance",
->             key="quantum_hardening_enabled", 
->             scope="security",         # UID = "security.quantum_hardening_enabled"
->             type_="bool",             # Valid data type, subjected to backend I/O
+>             label="Typography",
+>             key="custom_fonts", 
+>             scope="appearance",       # UID = "appearance.custom_fonts"
+>             type_="bool",             # Real boolean value
 >             default=False,
->             is_parent=True,           # Manifests the expandable menu morphology
->             expanded=False,           # Defaults to obfuscation
->             group="Encryption",
->             extended_help="**Quantum Hardening Master Switch**\n\nThis Boolean orchestrates a macroscopic pivot toward post-quantum cryptographic primitives. \n\n- **ON**: Enforces draconian lattice-based cryptography, neutralizing Shor's algorithm threat vectors.\n- **OFF**: Retains reliance on standard elliptic curve vulnerabilities."
+>             is_parent=True,           # Flags this as an expandable folder
+>             expanded=False,
+>             group="Fonts",
+>             extended_help="**Typography Override**\n\nMaster switch for font enforcement. When ON, applies the nested typography values."
 >         ),
->         # 2. Subordinate Entity A (Must sequentially succeed its Sovereign)
+>         # 2. Child Item A (Contiguous with parent)
 >         ConfigItem(
->             label="Lattice Generation Algorithm",
->             key="lattice_primitive",
->             scope="security",         # UID = "security.lattice_primitive"
+>             label="Family",
+>             key="font",
+>             scope="appearance",       # UID = "appearance.font"
 >             type_="picker",        
->             default="Kyber768",
->             options=["Kyber512", "Kyber768", "Kyber1024", "Dilithium"],
->             hints=["Low Security", "Standard Hegemony", "Paranoid", "Signature Scheme"], 
->             parent_ref="security.quantum_hardening_enabled",  # Syntactic linkage to the Sovereign's UID
->             extended_help="**Post-Quantum Primitive Selection**\n\nSelects the specific mathematical architecture utilized to obfuscate symmetrical key exchanges. Elevating the matrix dimensions (e.g., Kyber1024) increases decryption resistance exponentially but severely degrades handshake velocity."
+>             default="JetBrains Mono",
+>             options=["JetBrains Mono", "Fira Code", "Roboto", "Inter"],
+>             hints=["Monospace", "Ligatures", "Sans", "Sans"], 
+>             parent_ref="appearance.custom_fonts",  # Links to Hybrid Parent UID
+>             extended_help="**Interface Font Family**\n\nSelects the core typeface used across the system UI panels."
 >         ),
->         # 3. Subordinate Entity B
+>         # 3. Child Item B (Contiguous with parent)
 >         ConfigItem(
->             label="Entropy Pool Rotation Interval",
->             key="entropy_rotation_seconds",
->             scope="security",         # UID = "security.entropy_rotation_seconds"
->             type_="int",        
->             default=3600,
->             min_val=60,
->             max_val=86400,
->             step=60,
->             parent_ref="security.quantum_hardening_enabled",
->             extended_help="**Entropy Regeneration Matrix**\n\nQuantifies the chronological span (in seconds) preceding the forceful invalidation and reconstitution of the cryptographic entropy pool. Hyper-frequent rotations safeguard against prolonged state compromises."
+>             label="Size",
+>             key="font_size",
+>             scope="appearance",       # UID = "appearance.font_size"
+>             type_="float",        
+>             default=10.0,
+>             min_val=6.0,
+>             max_val=24.0,
+>             step=0.5,
+>             parent_ref="appearance.custom_fonts",
+>             extended_help="**Base Font Size**\n\nThe root cryptographic scale parameter measured in points (pt)."
 >         ),
 >     ],
 > 
 >     # -------------------------------------------------------------------------
->     # TAB 2: ORCHESTRATION & STATE SYNCHRONIZATION
+>     # TAB 2: PROFILES (Advanced Controls & State Synchronization)
 >     # -------------------------------------------------------------------------
 >     2: [
 >         ConfigItem(
->             label="Purge Cryptographic Ephemera",
->             key="action_purge_keys", 
->             scope="DEFAULT",          # UID = "action_purge_keys"
+>             label="Purge",
+>             key="action_clear_cache", 
+>             scope="DEFAULT",          # UID = "action_clear_cache"
 >             type_="action",
->             default="rm -rf ~/.config/hegemony/keys/* && echo 'Keyring Obliterated'",
+>             default="rm -rf ~/.cache/mako/* && echo 'Cache Cleared'",
 >             group="Maintenance",
->             extended_help="**Destructive State Purge**\n\nExecuting this command line stratagem immediately decimates all volatile session keys via the POSIX subsystem. Utilize this mechanism exclusively during confirmed digital incursions to sever adversarial persistence."
+>             extended_help="**Cache Purge**\n\nImmediately deletes volatile application cache files via shell command."
 >         ),
 >         ConfigItem(
->             label="Instantiate Lockdown Paradigm",
->             key="preset_lockdown_mode",     
->             scope="DEFAULT",          # UID = "preset_lockdown_mode"
+>             label="Performance",
+>             key="preset_performance",     
+>             scope="DEFAULT",          # UID = "preset_performance"
 >             type_="preset",
 >             default=None,
->             group="Orchestration",
+>             group="Orchestrator",
 >             preset_payload={
->                 "telemetry_active": False,      
->                 "network.max_connections": 1,            
->                 "security.quantum_hardening_enabled": True,
->                 "security.lattice_primitive": "Kyber1024"
+>                 "log_level": "error",      
+>                 "appearance.custom_fonts": False,            
+>                 "max_threads": 32  
 >             },
->             extended_help="**Totalitarian Security Preset**\n\nInstantly overwrites the operational matrix to enforce maximal defensive posturing. \n\nImplementation guarantees:\n1. Severance of all non-essential telemetry.\n2. Strangulation of concurrent connections to absolute singularity.\n3. Mandatory implementation of paramount post-quantum cryptography.\n\n*Note: Any configuration unaddressed within this payload shall be ruthlessly regressed to its primordial default.*"
+>             extended_help="**Performance Preset**\n\nInstantly overrides multiple settings to maximize system responsiveness. Any omitted settings are forcibly reverted to default."
+>         ),
+>         ConfigItem(
+>             label="Reset",
+>             key="preset_factory_reset",
+>             scope="DEFAULT",          # UID = "preset_factory_reset"
+>             type_="preset",
+>             default=None,
+>             group="Orchestrator",
+>             preset_payload={
+>                 "__ALL_DEFAULTS__": True
+>             },
+>             extended_help="**Factory Reset**\n\nReverts every single configuration item across all tabs back to its originally programmed default state."
 >         ),
 >     ]
 > }
 > 
 > # =============================================================================
-> # QUICK-REFERENCE CODEX (THE INI HEGEMONY)
+> # QUICK-REFERENCE CHEAT SHEET (BULLETPROOF EDITION)
 > # =============================================================================
+> # Copy/Paste this block when building new items to ensure correct kwargs.
 > #
 > # ConfigItem(
-> #     label          = "Display Nomenclature",
-> #     key            = "backend_identifier",
-> #     scope          = "section_name",     # "section_name" (e.g., [core]) or "DEFAULT" for root keys
+> #     label          = "ShortName",        # STRICT: Keep as succinct/close to one word as possible.
+> #     key            = "backend_key",
+> #     scope          = "DEFAULT",          # "backend_section" or "DEFAULT" for root/valueless keys.
 > #     type_          = "bool",             # STANDARD: bool | int | float | string | color
 > #                                          # MODALS: cycle | picker 
-> #                                          # ABSTRACTIONS: action | preset | menu
-> #     default        = None,               # Native Python type MUST reflect type_ (e.g., True, 10, "text"). 
-> #                                          # -> For 'action', default is the POSIX execution string. 
-> #                                          # -> For 'menu' & 'preset', default MUST resolve to None.
-> #     options        = [],                 # Imperative for 'cycle'/'picker'. Triggers Hybrid Dropdowns for standard scalars.
-> #     hints          = [],                 # Explanatory subtitles for 'picker' modals.
-> #     preset_payload = {},                 # Dict mapping "scope.key" to target_value. Omissions trigger factory reset.
-> #     min_val        = None,               # Mathematical nadir (int/float)
-> #     max_val        = None,               # Mathematical zenith (int/float)
-> #     step           = None,               # Iterative adjustment coefficient
-> #     group          = "OneWord",          # STRICT: Visual header MUST be a solitary lexeme.
-> #     extended_help  = "Markdown Prose",   # Rigorous documentation for the interlocutor's perusal.
-> #     is_parent      = False,              # Dictates whether this entity encapsulates subordinate logic.
-> #     parent_ref     = None,               # Syntactic linkage to a Sovereign parent. Must mirror parent's UID ("scope.key").
-> #     expanded       = False,              # Default UI expansion state.
+> #                                          # PURE UI: action | preset | menu
+> #     default        = None,               # Native Python type MUST match type_ (e.g., True, 10, "text"). 
+> #                                          # -> For 'action', default is the shell command string. 
+> #                                          # -> For 'menu' & 'preset', default MUST be None.
+> #     options        = [],                 # Required for 'cycle'/'picker'. Triggers Hybrid Menu for int/float/string/color.
+> #     hints          = [],                 # Subtitles for 'picker' modals (length must match options list).
+> #     preset_payload = {},                 # Dict of {"scope.key": target_value}. Unlisted keys revert to default.
+> #     min_val        = None,               # Numeric lower bound (int/float).
+> #     max_val        = None,               # Numeric upper bound (int/float).
+> #     step           = None,               # Numeric step size for arrow key adjustments.
+> #     group          = "OneWord",          # STRICT: UI header string MUST BE ONE WORD.
+> #     extended_help  = "Markdown String",  # Explain what the setting does for the user's '?' panel.
+> #     is_parent      = False,              # Set True to make this item an expandable folder (Works on ANY type!).
+> #     parent_ref     = None,               # Nested UI link. MUST exactly match parent's UID format: "scope.key" (or "key" if DEFAULT).
+> #     expanded       = False,              # Default UI state for parent folders (Starts open or closed).
 > # )
 > ```
