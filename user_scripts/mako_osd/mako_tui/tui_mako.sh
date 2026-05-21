@@ -41,7 +41,7 @@ register_items() {
     register 1 "Border Size"     'border-size|int||0|20|1'      "2"
     register 1 "Inner Padding"   'padding|int||0|50|5'          "15"
     register 1 "Show Icons"      'icons|bool||||'               "1"
-    register 1 "Max Icon Size"   'max-icon-size|int||16|128|4'  "48"
+    register 1 "Max Icon Size"   'max-icon-size|int||16|128|4'  "30"
 
     # Tab 2: Behavior
     register 2 "Default Timeout" 'default-timeout|int||0|15000|500' "5000"
