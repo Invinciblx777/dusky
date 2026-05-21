@@ -81,7 +81,10 @@ output_path = '~/.config/matugen/generated/wlogout-colors.css'
 [templates.mako]
 input_path  = '~/.config/matugen/templates/mako'
 output_path = '~/.config/matugen/generated/mako-colors'
-post_hook = 'makoctl reload'
+post_hook   = '''
+  cp -f "$HOME/.config/matugen/generated/mako-colors" "$HOME/.config/mako/config"
+  makoctl reload || :
+'''
 
 [templates.rofi]
 input_path  = '~/.config/matugen/templates/rofi-colors.rasi'

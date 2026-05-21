@@ -1,246 +1,213 @@
-# ======================================
-# GLOBAL DAEMON PARAMETERS
-# ======================================
-on-notify=exec pkill -RTMIN+8 waybar
-font=monospace 10
-width=350
+# ==============================================================================
+# MAKO CONFIGURATION: MATUGEN TEMPLATE ARCHITECTURE
+# DESTINATION FOR FINAL: ~/.config/mako/config
+# PRE-PROCESSOR: Matugen 4.0+
+# ==============================================================================
+
+# ==============================================================================
+# 1. GLOBAL GEOMETRY & PLACEMENT
+# ==============================================================================
+# output=eDP-1
+layer=overlay
+anchor=bottom-left
+width=340
 height=150
-margin=20
-padding=15
-border-size=2
+outer-margin=0,0,30,0
+margin=5
+padding=10
+border-size=1
 border-radius=18
+
+# ==============================================================================
+# 2. TYPOGRAPHY & ICONS
+# ==============================================================================
+font=monospace 10
+markup=1
+format=<b>%s</b>\n%b
 icons=1
 max-icon-size=48
+icon-border-radius=8
 icon-path=/usr/share/icons/Papirus-Dark:/usr/share/icons/Papirus-Light:/usr/share/icons/Papirus:/usr/share/icons/breeze-dark:/usr/share/icons/breeze:/usr/share/icons/Adwaita:/usr/share/icons/AdwaitaLegacy:/usr/share/icons/hicolor
+
+# ==============================================================================
+# 3. TIMEOUTS, HISTORY, BEHAVIOR & ACTIONS
+# ==============================================================================
 default-timeout=5000
 ignore-timeout=0
 max-visible=6
-layer=overlay
-anchor=bottom-left
-sort=-time
-history=1
 max-history=50
-on-button-left=invoke-default-action
+history=1
+sort=-time
 actions=1
-on-button-right=exec makoctl menu -n "$MAKO_NOTIFICATION_ID" -- rofi -dmenu -p Action:
+on-button-left=invoke-default-action
+on-button-middle=exec makoctl menu -n "$MAKO_NOTIFICATION_ID" -- rofi -dmenu -p Action:
+on-button-right=dismiss
+on-notify=exec pkill -RTMIN+8 waybar
 
-# ======================================
-# MATUGEN THEME INJECTION
-# ======================================
-# MUST remain in the global scope (before any criteria blocks).
-include=~/.config/matugen/generated/mako-colors
+# ==============================================================================
+# 4. GLOBAL MATUGEN COLOR INJECTION (BASE THEME)
+# ==============================================================================
+# TUI NOTE: To hardcode a color, replace the matugen variable with a hex code.
+# NOTE ON MATUGEN SYNTAX: Material Design 3 roles MUST use snake_case!
+background-color=#1b101766
+text-color=#f2dde7
+border-color=#ffade1ee
+progress-color=#87006e
 
-# ======================================
-# DO NOT DISTURB MODE
-# ======================================
-# Drops all incoming notifications silently into the history buffer
+# ==============================================================================
+# 5. STATE MODES (Cascading Overrides)
+# ==============================================================================
 [mode=do-not-disturb]
 invisible=1
+on-notify=none
 
-# Allow critical system notifications to punch through DND
-[mode=do-not-disturb urgency=critical]
-invisible=0
+[mode=silent]
+on-notify=none
 
-# ======================================
-# CRITERIA: TIMEOUTS & URGENCY
-# ======================================
+# ==============================================================================
+# 6. URGENCY LEVELS
+# ==============================================================================
 [urgency=low]
 default-timeout=2000
+# OVERRIDES
+# background-color=#1b1017e6
+# text-color=#f2dde7
+# border-color=#51434b
 
 [urgency=normal]
 default-timeout=3000
 
 [urgency=critical]
-default-timeout=5000
+invisible=0
+default-timeout=0
+ignore-timeout=1
+on-notify=exec pkill -RTMIN+8 waybar
+# OVERRIDES
+background-color=#93000a66
+text-color=#ffdad6
+border-color=#ffb4ab
 
-# ======================================
-# CRITERIA: AUTOMATION & BEHAVIOR
-# ======================================
-
-# 1. Mute noisy apps entirely
+# ==============================================================================
+# 7. APPLICATION OVERRIDES
+# ==============================================================================
 [app-name=Spotify]
 invisible=1
 
-# 2. Auto-Execute on Receipt (Example)
-# If a backup script sends a failure notice, run a recovery bash script instantly
-# Uses ~ to ensure portability across different users' machines
-# [app-name=SystemBackup summary~="Failed"]
-# on-notify=exec sh -c '~/.local/bin/trigger-recovery.sh & pkill -RTMIN+8 waybar'
+[app-name="VLC media player"]
+default-timeout=1500
 
-# 3. Dusky Updates Click Action
+[app-name=grimblast]
+max-icon-size=84
+default-timeout=4000
+format=<b>%s</b>\n%b
+on-button-left=exec imv "$MAKO_NOTIFICATION_BODY"
+
 [summary="Dusky Dotfiles"]
 on-button-left=exec kitty --class update_dusky.sh --hold ~/user_scripts/update_dusky/update_dusky.sh
 
-# 4. Visual Overrides for Specific Apps
-# Make screenshot thumbnails massive so you can verify what you clipped
-[app-name=grimblast]
-max-icon-size=84
-format=<b>%s</b>\n%b
+# ==============================================================================
+# 8. CUSTOM MODULES (DUSKY SUITE)
+# ==============================================================================
 
-# ======================================
-# MATUGEN TEMPLATE REFERENCE
-# ======================================
-# If you are cloning these dotfiles, place the following template
-# into your Matugen template directory and route it to generate
-# ~/.config/matugen/generated/mako-colors
-#
-# # 80% opacity (cc) on the background for a frosted glass look
-# background-color={{colors.on_primary.default.hex}}cc
-# text-color={{colors.tertiary.default.hex}}
-# # 93% opacity (ee) on the border for a subtle edge
-# border-color={{colors.tertiary_container.default.hex}}ee
-# progress-color={{colors.primary.default.hex}}
-#
-# [mode=silent]
-# on-notify=none
-#
-# [urgency=high]
-# border-color={{colors.error_container.default.hex}}
-# text-color={{colors.error.default.hex}}
-#
-# ======================================
-# OSD HARDWARE OVERLAY
-# ======================================
 [app-name=OSD]
-# anchor=bottom-center
-# Optional: You can also strip the border or adjust margins specifically for the OSD here
-# border-size=0
-# margin=0,0,50,0
+anchor=bottom-center
 width=240
 height=48
+outer-margin=0,0,30,0
+margin=0
+padding=0
+border-size=0
 border-radius=24
+icons=0
+text-alignment=center
 default-timeout=1000
+on-button-left=invoke-default-action
+# OVERRIDES
+background-color=#111110e6
+text-color=#ffffff
+border-color=#555555
 
-# ======================================
-# DUSKY KEYS VISUALIZER
-# ======================================
 [app-name=dusky-keys]
-# 1. Position
 anchor=bottom-center
-margin=0,0,20,0
-
-# 2. Dimensions
 width=200
 height=40
+margin=0,0,20,0
 padding=0
-
-# 3. Create the "Oval / Pill" shape
-border-radius=20
 border-size=2
-
-# 4. Center align and format the text properly
+border-radius=20
 icons=0
 text-alignment=center
 font=monospace 14
 format=%s
+default-timeout=1500
+# OVERRIDES
+background-color=#51434b66
+text-color=#d5c1cb
+border-color=#9e8c95
 
-# 5. Visuals
-# Comment these out so it inherits your Matugen theme automatically
-# background-color=#111111E6
-# text-color=#FFFFFF
-# border-color=#555555
-
-# ======================================
-# DUSKY CAVA VISUALIZER
-# ======================================
 [app-name=dusky-cava]
-# 1. Position (Moved to the bottom)
 anchor=bottom-center
-# Margin pushes it 20px up from the bottom edge
-margin=0,0,20,0
-
-# 2. Dimensions (Thinner height, wider width to eliminate '...')
 width=380
 height=40
+margin=0,0,20,0
 padding=0
-
-# 3. Pill Shape (Radius must be exactly half of the height: 40 / 2 = 20)
-border-radius=20
 border-size=2
-
-# 4. Typography (Scaled down font to fit the thinner height)
+border-radius=20
 icons=0
 text-alignment=center
 font=monospace 22
 format=%s
+default-timeout=0
+# OVERRIDES
+# background-color=#281c23ff
+# text-color=#ffade1
+# border-color=#87006e
 
-# ======================================
-# DUSKY CAVA ALERTS
-# ======================================
 [app-name=dusky-cava-alert]
 anchor=bottom-center
-margin=0,0,20,0
 width=300
 height=40
+margin=0,0,20,0
+padding=0
 border-radius=20
 text-alignment=center
 font=monospace 12
+default-timeout=3000
+# OVERRIDES
+# background-color=#6e3540ff
+# text-color=#ffd9de
 
-# ======================================
-# DUSKY GLANCE (NARROW MODULES)
-# ======================================
-# Handles: Clock, CPU, Temp, RAM
-[app-name=dusky-glance-narrow]
+[app-name=dusky-glance]
 anchor=bottom-right
-margin=0,20,20,0
 width=174
 height=56
-padding=0
-border-radius=20
-border-size=0
-icons=0
-text-alignment=center
-format=%b
-on-button-left=exec bash -c "pkill rofi; uwsm-app -- $HOME/user_scripts/rofi/dusky_glance.sh"
-
-# ======================================
-# DUSKY GLANCE (WIDE MODULES)
-# ======================================
-# Handles: Network Meter, Battery
-layer=overlay
-background-color=#00000000
-[app-name=dusky-glance-wide]
-anchor=bottom-right
 margin=0,20,20,0
-width=210
-height=56
 padding=0
-border-radius=20
 border-size=0
+border-radius=20
 icons=0
 text-alignment=center
 format=%b
 on-button-left=exec bash -c "pkill rofi; uwsm-app -- $HOME/user_scripts/rofi/dusky_glance.sh"
-
-# ======================================
-# DUSKY GLANCE (TIMERS & POMODORO)
-# ======================================
-layer=overlay
+default-timeout=0
+# OVERRIDES
 background-color=#00000000
-[app-name=dusky-glance-timer]
-anchor=bottom-right
-margin=0,20,20,0
-width=240
-height=56
-padding=0
-border-radius=20
-border-size=0
-icons=0
-text-alignment=center
-format=%b
-on-button-left=exec bash -c "pkill rofi; uwsm-app -- $HOME/user_scripts/rofi/dusky_glance.sh"
+# text-color=#ffade1
+# border-color=#9e8c95
 
-# ======================================
-# DUSKY GLANCE ALERTS (TIMERS)
-# ======================================
-layer=overlay
-background-color=#00000000
 [app-name=dusky-glance-alert]
 anchor=top-center
 width=300
 height=80
+margin=20,0,0,0
+padding=10
+border-size=1
 border-radius=12
+icons=1
 text-alignment=center
-
-# Standard dismiss action for timer alerts
+ignore-timeout=1
 on-button-left=dismiss
+# OVERRIDES
+background-color=#623b4b66
+text-color=#ffd9e5
+border-color=#eeb8cb

@@ -5,26 +5,15 @@
 
 set -euo pipefail
 
-APP_NAME_NARROW="dusky-glance-narrow"
-APP_NAME_WIDE="dusky-glance-wide"
-APP_NAME_TIMER="dusky-glance-timer"
+CURRENT_APP="dusky-glance"
 SYNC_ID="dusky-glance-sync"
 PID_FILE="${XDG_RUNTIME_DIR:-/run/user/$UID}/dusky_glance.pid"
 
 MODE="${1:-}"
 
-# --- MODULE CATEGORIZATION ---
-case "$MODE" in
-    --network|--battery|--uptime) CURRENT_APP="$APP_NAME_WIDE" ;;
-    --pomodoro|--timer)           CURRENT_APP="$APP_NAME_TIMER" ;;
-    *)                            CURRENT_APP="$APP_NAME_NARROW" ;;
-esac
-
 # --- CORE LIFECYCLE ---
 clear_osd() {
-    notify-send -a "$APP_NAME_NARROW" -h string:x-canonical-private-synchronous:"$SYNC_ID" -t 10 " " " " 2>/dev/null || true
-    notify-send -a "$APP_NAME_WIDE" -h string:x-canonical-private-synchronous:"$SYNC_ID" -t 10 " " " " 2>/dev/null || true
-    notify-send -a "$APP_NAME_TIMER" -h string:x-canonical-private-synchronous:"$SYNC_ID" -t 10 " " " " 2>/dev/null || true
+    notify-send -a "$CURRENT_APP" -h string:x-canonical-private-synchronous:"$SYNC_ID" -t 10 " " " " 2>/dev/null || true
 }
 
 if [[ -f "$PID_FILE" ]]; then
@@ -121,6 +110,7 @@ case "$MODE" in
         while true; do
             left=$((TARGET_SEC - SECONDS))
             if (( left <= 0 )); then
+                # Leaving 'dusky-glance-alert' intact as requested via config overrides
                 notify-send -u critical -a "dusky-glance-alert" "Time's Up!" "Your timer has finished."
                 play_sound "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga"
                 
@@ -290,6 +280,14 @@ case "$MODE" in
                 send_osd "Bat: N/A"
             fi
             sleep 1
+        done
+        ;;
+
+    --disk)
+        while true; do
+            usage=$(df -h / | awk 'NR==2 {print $5}')
+            send_osd "Disk: ${usage}"
+            sleep 10
         done
         ;;
 

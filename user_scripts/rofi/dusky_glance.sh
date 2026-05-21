@@ -71,6 +71,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     printf "  \e[32m--ram\e[0m                      Show live RAM usage\n"
     printf "  \e[32m--temp\e[0m                     Show CPU temperature\n"
     printf "  \e[32m--battery\e[0m                  Show battery status/power\n"
+    printf "  \e[32m--disk\e[0m                     Show root disk usage\n"
     printf "  \e[32m--network\e[0m                  Show live network speed\n"
     printf "  \e[32m--uptime\e[0m                   Show system uptime\n"
     printf "  \e[32m--workspace\e[0m                Show active Hyprland workspace\n"
@@ -119,24 +120,95 @@ if (( $# > 0 )); then
     exit 0
 fi
 
-# --- GUI EXECUTION ---
-declare -agr ROFI_CMD=(rofi -dmenu -i -no-custom -theme-str 'window {width: 20%;} listview {lines: 13;}')
-declare -agr ROFI_SUB=(rofi -dmenu -i -no-custom -theme-str 'window {width: 35%;} listview {lines: 3;}')
+# --- GUI EXECUTION / ROFI LAYOUT STYLING ---
 
-declare -agr MENU_OPTIONS=(
-    '🍅  Pomodoro'
-    '⏳  Timer'
-    '⏱️  Stopwatch'
-    '🕒  Live Clock'
-    '💻  CPU Usage'
-    '🧠  Memory (RAM)'
-    '🌡️  CPU Temp'
-    '🔋  Battery / Power'
-    '🌐  Network Speed'
-    '🚀  System Uptime'
-    '🖥️  Active Workspace'
-    '🎨  Edit appearances'
-    '🛑  Stop / Clear'
+# Sleek 2-column dashboard layout. Left-aligned text makes the emojis form a neat column.
+# Added `flow: horizontal;` to balance search results evenly across columns.
+declare -a ROFI_CMD=(
+    rofi -dmenu -i -no-custom
+    -theme-str '
+        window {
+            width: 740px;
+            padding: 24px;
+            border-radius: 16px;
+        }
+        inputbar {
+            margin: 0px 0px 20px 0px;
+            padding: 14px 18px;
+            border-radius: 12px;
+            spacing: 12px;
+        }
+        prompt {
+            vertical-align: 0.5;
+            font: "JetBrainsMono Nerd Font Bold 12";
+        }
+        entry {
+            vertical-align: 0.5;
+            placeholder: "Filter options...";
+            font: "JetBrainsMono Nerd Font 12";
+        }
+        listview {
+            columns: 2;
+            lines: 7;
+            spacing: 14px;
+            fixed-height: false;
+            fixed-columns: true;
+            flow: horizontal;
+            border: 0px;
+            scrollbar: false;
+        }
+        element {
+            padding: 14px 18px;
+            border-radius: 10px;
+            border: 0px;
+            cursor: pointer;
+        }
+        element-text {
+            horizontal-align: 0.0;
+            vertical-align: 0.5;
+            cursor: inherit;
+        }
+    '
+)
+
+# Styling for the sub-menus so they look equally clean and consistent.
+declare -a ROFI_SUB=(
+    rofi -dmenu -i -no-custom
+    -theme-str '
+        window { width: 420px; padding: 24px; border-radius: 16px; }
+        inputbar { margin: 0px 0px 16px 0px; padding: 12px; border-radius: 10px; }
+        listview { lines: 3; columns: 1; spacing: 10px; scrollbar: false; }
+        element { padding: 14px 16px; border-radius: 10px; }
+        element-text { horizontal-align: 0.0; }
+    '
+)
+
+# Shared prompt style for text input (Minutes/Seconds)
+PROMPT_STYLE='window {width: 380px; padding: 20px; border-radius: 16px;} listview {lines: 0;} entry {placeholder: "Enter value...";}'
+
+# Grouped perfectly for a 2-column layout with horizontal flow (fills rows left-to-right)
+# This puts Stop/Clear and Edit at the top, and evenly distributes filtered items.
+declare -a MENU_OPTIONS=(
+    # --- ROW 1 ---
+    "🛑  Stop / Clear"          "🎨  Edit appearances"
+    
+    # --- ROW 2 ---
+    "🍅  Pomodoro"              "💻  CPU Usage"
+    
+    # --- ROW 3 ---
+    "⏳  Timer"                 "🧠  Memory (RAM)"
+    
+    # --- ROW 4 ---
+    "⏱️  Stopwatch"             "🌡️  CPU Temp"
+    
+    # --- ROW 5 ---
+    "🕒  Live Clock"            "🔋  Battery / Power"
+    
+    # --- ROW 6 ---
+    "🖥️  Active Workspace"      "💽  Disk Usage"
+    
+    # --- ROW 7 ---
+    "🌐  Network Speed"         "🚀  System Uptime"
 )
 
 choice=$(printf '%s\n' "${MENU_OPTIONS[@]}" | "${ROFI_CMD[@]}" -p "Glance") || exit 0
@@ -159,20 +231,20 @@ case "$choice" in
             "$DAEMON_SCRIPT" --pomodoro "$lw_sec" "$lb_sec" & disown
             
         elif [[ "$pchoice" == *"Minutes"* ]]; then
-            w=$(rofi -dmenu -i -p "Work Duration (Mins)" -theme-str 'window {width: 40%;} listview {lines: 0;} entry {placeholder: "";}') || exit 0
+            w=$(rofi -dmenu -i -p "Work (Mins)" -theme-str "$PROMPT_STYLE") || exit 0
             w=${w//[!0-9]/}; [[ -z "$w" ]] && exit 0
             
-            b=$(rofi -dmenu -i -p "Break Duration (Mins) [0 for none]" -theme-str 'window {width: 40%;} listview {lines: 0;} entry {placeholder: "";}') || exit 0
+            b=$(rofi -dmenu -i -p "Break (Mins)" -theme-str "$PROMPT_STYLE") || exit 0
             b=${b//[!0-9]/}; [[ -z "$b" ]] && b=0
             
             echo "$((w*60)):$((b*60))" > "$POMO_STATE"
             "$DAEMON_SCRIPT" --pomodoro "$((w*60))" "$((b*60))" & disown
             
         elif [[ "$pchoice" == *"Seconds"* ]]; then
-            w=$(rofi -dmenu -i -p "Work Duration (Secs)" -theme-str 'window {width: 40%;} listview {lines: 0;} entry {placeholder: "";}') || exit 0
+            w=$(rofi -dmenu -i -p "Work (Secs)" -theme-str "$PROMPT_STYLE") || exit 0
             w=${w//[!0-9]/}; [[ -z "$w" ]] && exit 0
             
-            b=$(rofi -dmenu -i -p "Break Duration (Secs) [0 for none]" -theme-str 'window {width: 40%;} listview {lines: 0;} entry {placeholder: "";}') || exit 0
+            b=$(rofi -dmenu -i -p "Break (Secs)" -theme-str "$PROMPT_STYLE") || exit 0
             b=${b//[!0-9]/}; [[ -z "$b" ]] && b=0
             
             echo "$w:$b" > "$POMO_STATE"
@@ -197,14 +269,14 @@ case "$choice" in
             "$DAEMON_SCRIPT" --timer "$lt_sec" & disown
             
         elif [[ "$tchoice" == *"Minutes"* ]]; then
-            val=$(rofi -dmenu -i -p "Duration (Mins)" -theme-str 'window {width: 40%;} listview {lines: 0;} entry {placeholder: "";}') || exit 0
+            val=$(rofi -dmenu -i -p "Duration (Mins)" -theme-str "$PROMPT_STYLE") || exit 0
             val=${val//[!0-9]/}; [[ -z "$val" ]] && exit 0
             
             echo "${val}m" > "$TIMER_STATE"
             "$DAEMON_SCRIPT" --timer "$((val*60))" & disown
             
         elif [[ "$tchoice" == *"Seconds"* ]]; then
-            val=$(rofi -dmenu -i -p "Duration (Secs)" -theme-str 'window {width: 40%;} listview {lines: 0;} entry {placeholder: "";}') || exit 0
+            val=$(rofi -dmenu -i -p "Duration (Secs)" -theme-str "$PROMPT_STYLE") || exit 0
             val=${val//[!0-9]/}; [[ -z "$val" ]] && exit 0
             
             echo "${val}s" > "$TIMER_STATE"
@@ -218,9 +290,10 @@ case "$choice" in
     '🧠  Memory (RAM)')   "$DAEMON_SCRIPT" --ram & disown ;;
     '🌡️  CPU Temp')       "$DAEMON_SCRIPT" --temp & disown ;;
     '🔋  Battery / Power')"$DAEMON_SCRIPT" --battery & disown ;;
+    '💽  Disk Usage')     "$DAEMON_SCRIPT" --disk & disown ;;
     '🌐  Network Speed')  "$DAEMON_SCRIPT" --network & disown ;;
     '🚀  System Uptime')  "$DAEMON_SCRIPT" --uptime & disown ;;
     '🖥️  Active Workspace')"$DAEMON_SCRIPT" --workspace & disown ;;
-    '🎨  Edit appearances') kitty --class glance_mako_tui.sh -e "$HOME/user_scripts/mako_osd/dusky_glance/dusky_glance_tui" & disown ;;
+    '🎨  Edit appearances') foot --app-id=dusky_tui python ~/user_scripts/dusky_tui/python/main/main.py ~/user_scripts/mako_osd/dusky_glance/tui_mako.py & disown ;;
     '🛑  Stop / Clear')   "$DAEMON_SCRIPT" --stop & disown ;;
 esac
