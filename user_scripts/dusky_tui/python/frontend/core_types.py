@@ -63,6 +63,12 @@ class ConfigItem:
     parent_ref: str | None = None  # Use the uid of the parent item to nest under
     expanded: bool = False
 
+    # Validation, Prompts, & Multi-Engine Targeting Overrides
+    warning_msg: str | None = None
+    popup_message: str | None = None
+    target_file_override: str | None = None
+    engine_type_override: str | None = None
+
     @property
     def uid(self) -> str:
         """Returns a globally unique identifier based on scope and key."""

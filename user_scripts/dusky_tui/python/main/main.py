@@ -6,6 +6,7 @@ import importlib.util
 import json
 import shutil
 import logging
+import hashlib
 from datetime import datetime
 from pathlib import Path
 
@@ -66,13 +67,26 @@ def setup_logging(module_name: str, enable_logging: bool) -> logging.Logger:
     return logger
 
 def manage_backup(target_file: Path, action: str, logger: logging.Logger) -> bool:
-    """Handles creating and restoring backups without hard exiting, allowing CLI composition."""
+    """Handles creating and restoring backups across multi-file ecosystems."""
     backup_dir = Path("~/Documents/dusky_backups/tui_reset/").expanduser()
     backup_dir.mkdir(parents=True, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = backup_dir / f"{target_file.name}.{timestamp}.bak"
-    latest_link = backup_dir / f"{target_file.name}.latest.bak"
+    
+    # REPAIRED: Prevent cross-engine collisions in the backup folder utilizing a cryptographically secure path hash.
+    # A config at `~/.config/app_A/config.ini` and `~/.config/app_B/config.ini` will safely backup with unique hashes.
+    path_hash = hashlib.md5(str(target_file.resolve()).encode()).hexdigest()[:6]
+    safe_prefix = f"{target_file.parent.name}_{path_hash}_" if target_file.parent.name else f"{path_hash}_"
+    
+    backup_path = backup_dir / f"{safe_prefix}{target_file.name}.{timestamp}.bak"
+    latest_link = backup_dir / f"{safe_prefix}{target_file.name}.latest.bak"
+
+    if action == "check_restore":
+        # Supports the atomic pre-flight check
+        if not latest_link.exists():
+            print(f"[-] Missing backup for: {target_file.name} (Cannot perform atomic restore)")
+            return False
+        return True
 
     if action == "create":
         if not target_file.exists():
@@ -90,12 +104,12 @@ def manage_backup(target_file: Path, action: str, logger: logging.Logger) -> boo
 
     elif action == "restore":
         if not latest_link.exists():
-            print("[-] No backup found to restore.")
+            print(f"[-] No backup found to restore for: {target_file.name}")
             return False
         
         shutil.copy2(latest_link, target_file)
         logger.info(f"Restored from backup: {latest_link}")
-        print(f"[+] Successfully restored configuration from backup.")
+        print(f"[+] Successfully restored configuration: {target_file.name}")
         return True
     
     return False
@@ -198,6 +212,7 @@ EXAMPLES:
         DEFAULT_MODE = getattr(schema_module, "DEFAULT_MODE", "auto")
         ENABLE_USER_PRESETS = getattr(schema_module, "ENABLE_USER_PRESETS", True)
         USER_PRESETS_TAB = getattr(schema_module, "USER_PRESETS_TAB", None)
+        GLOBAL_POPUP = getattr(schema_module, "GLOBAL_POPUP", None)
         
         # STRICT REQUIREMENT: The schema MUST explicitly define ENGINE_TYPE.
         # We access it directly so it throws an AttributeError if it's missing.
@@ -215,65 +230,114 @@ EXAMPLES:
 
     logger.info(f"Loaded schema: {schema_path} | Target: {TARGET_FILE} | Engine: {ENGINE_TYPE}")
 
-    # --- 2. PRE-FLIGHT CHECKS (Backups / Restores) ---
+
+    # =========================================================================
+    # --- 2. MULTI-ENGINE ARCHITECTURE & ROUTER BLOCK ---
+    # =========================================================================
+    engine_pool = {}
+
+    def get_engine_instance(e_type: str, config_path: str):
+        key = (e_type, config_path)
+        if key in engine_pool: return engine_pool[key]
+        
+        if e_type == "lua":
+            from python.engines.lua import HyprlandLuaEngine
+            engine = HyprlandLuaEngine(config_path=config_path)
+        elif e_type == "trackpad":
+            from python.engines.trackpad import TrackpadLuaEngine
+            engine = TrackpadLuaEngine(config_path=config_path)
+        elif e_type == "monitor":
+            from python.engines.monitor_engine import MonitorLuaEngine
+            engine = MonitorLuaEngine(config_path=config_path)
+        elif e_type == "ini":
+            from python.engines.ini import IniConfigEngine
+            engine = IniConfigEngine(config_path=config_path)
+        elif e_type == "systemd":
+            from python.engines.systemd import SystemdEngine
+            engine = SystemdEngine()
+        elif e_type == "hyprlang":
+            from python.engines.hyprlang import HyprlangEngine
+            engine = HyprlangEngine(config_path=config_path)
+        else:
+            print(f"[-] Fatal: Unknown ENGINE_TYPE '{e_type}' specified in schema '{schema_path.name}'.")
+            print("[i] Supported engines are: 'lua', 'ini'")
+            sys.exit(1)
+            
+        engine_pool[key] = engine
+        return engine
+
+    # Prime the primary engine target
+    default_engine_key = (ENGINE_TYPE, str(TARGET_FILE))
+    get_engine_instance(*default_engine_key)
+
+    # Pre-instantiate overridden engines targeted across the schema
+    for tab_idx, items in SCHEMA.items():
+        for item in items:
+            if getattr(item, "engine_type_override", None) or getattr(item, "target_file_override", None):
+                override_etype = (item.engine_type_override or ENGINE_TYPE).lower()
+                override_tfile = str(Path(item.target_file_override).expanduser().resolve()) if item.target_file_override else str(TARGET_FILE)
+                get_engine_instance(override_etype, override_tfile)
+
+
+    # --- 3. PRE-FLIGHT CHECKS (Backups / Restores) ---
     is_headless = any([args.default, args.reset_key, args.set, args.export_state, args.export_docs])
 
+    # Extract ALL unique target files from the schema to ensure total backup coverage
+    unique_targets = {TARGET_FILE}
+    for items in SCHEMA.values():
+        for item in items:
+            if getattr(item, "target_file_override", None):
+                unique_targets.add(Path(item.target_file_override).expanduser().resolve())
+
     if args.restore:
-        if not manage_backup(TARGET_FILE, "restore", logger):
+        # ATOMICITY FIX: Pre-flight check all required backups BEFORE touching any active files
+        can_restore_all = True
+        for t_file in unique_targets:
+            if not manage_backup(t_file, "check_restore", logger):
+                can_restore_all = False
+                
+        if not can_restore_all:
+            print("[-] Atomic restore aborted: One or more required backup files are missing.")
             sys.exit(1)
+            
+        # Execute actual restores now that atomicity is guaranteed
+        for t_file in unique_targets:
+            manage_backup(t_file, "restore", logger)
+            
         if not is_headless and not args.backup:
             sys.exit(0)
             
     if args.backup:
-        manage_backup(TARGET_FILE, "create", logger)
+        for t_file in unique_targets:
+            manage_backup(t_file, "create", logger)
         if not is_headless:
             sys.exit(0)
 
-    # =========================================================================
-    # --- 3. INSTANTIATE ENGINE (ROUTER BLOCK) ---
-    # =========================================================================
-    # ADD NEW ENGINES HERE
-    # To add a new engine in the future:
-    # 1. Create your engine file in python/engines/ (e.g., yaml.py)
-    # 2. Add an `elif ENGINE_TYPE == "yaml":` block below.
-    # 3. Import your engine class locally inside that block.
-    # 4. Instantiate it: engine = MyNewEngine(config_path=str(TARGET_FILE))
-    # =========================================================================
-    if ENGINE_TYPE == "lua":
-        from python.engines.lua import HyprlandLuaEngine
-        engine = HyprlandLuaEngine(config_path=str(TARGET_FILE))
-
-    elif ENGINE_TYPE == "trackpad":
-        from python.engines.trackpad import TrackpadLuaEngine
-        engine = TrackpadLuaEngine(config_path=str(TARGET_FILE))
-
-    elif ENGINE_TYPE == "monitor":
-        from python.engines.monitor_engine import MonitorLuaEngine
-        engine = MonitorLuaEngine(config_path=str(TARGET_FILE))
-
-    elif ENGINE_TYPE == "ini":
-        from python.engines.ini import IniConfigEngine
-        engine = IniConfigEngine(config_path=str(TARGET_FILE))
-
-    elif ENGINE_TYPE == "systemd":
-        from python.engines.systemd import SystemdEngine
-        engine = SystemdEngine()
-
-    elif ENGINE_TYPE == "hyprlang":
-        from python.engines.hyprlang import HyprlangEngine
-        engine = HyprlangEngine(config_path=str(TARGET_FILE))
-
-    else:
-        print(f"[-] Fatal: Unknown ENGINE_TYPE '{ENGINE_TYPE}' specified in schema '{schema_path.name}'.")
-        print("[i] Supported engines are: 'lua', 'ini'")
-        sys.exit(1)
 
     # --- 4. HEADLESS OPERATIONS ---
     if is_headless:
-        engine.load_state()
+        # Pre-load state caches across all active backend targets
+        for eng in engine_pool.values():
+            eng.load_state()
 
         if args.export_state:
-            print(json.dumps(engine.cache, indent=2))
+            # REPAIRED: Flattened dictionary with highly secure namespacing to avoid overlapping keys
+            merged_state = {}
+            for ekey, eng in engine_pool.items():
+                st = eng.cache if hasattr(eng, "cache") else eng.load_state()
+                if ekey == default_engine_key:
+                    # Primary target remains perfectly flat to preserve API integrity
+                    merged_state.update(st)
+                else:
+                    # Secondary targets get dynamically prefixed (preventing exact folder structure collisions)
+                    file_path = Path(ekey[1])
+                    path_hash = hashlib.md5(str(file_path.resolve()).encode()).hexdigest()[:4]
+                    safe_namespace = f"{file_path.parent.name}_{file_path.name}_{path_hash}"
+                    
+                    for k, v in st.items():
+                        merged_state[f"{safe_namespace}::{k}"] = v
+                        
+            print(json.dumps(merged_state, indent=2))
             sys.exit(0)
 
         if args.export_docs:
@@ -325,11 +389,15 @@ EXAMPLES:
                 print(f"[-] Key '{target_key}' is ambiguous across multiple scopes. Please specify using 'scope.{target_key}'.")
                 sys.exit(1)
 
+            e_type = (item.engine_type_override or ENGINE_TYPE).lower()
+            t_file = str(Path(item.target_file_override).expanduser().resolve()) if item.target_file_override else str(TARGET_FILE)
+            target_engine = engine_pool[(e_type, t_file)]
+
             # NATIVE SERIALIZATION (Handles __VAR__ wrappers and type coercion natively)
             val_str = item.serialize(val_str)
 
             logger.info(f"Headless Injection: {target_key} -> {val_str}")
-            success, msg, _ = engine.write_value(item.key, item.scope, val_str, item_type=item.type_)
+            success, msg, _ = target_engine.write_value(item.key, item.scope, val_str, item_type=item.type_)
             print(f"[{'OK' if success else 'FAIL'}] {msg}")
             sys.exit(0 if success else 1)
 
@@ -343,11 +411,15 @@ EXAMPLES:
                 print(f"[-] Key '{args.reset_key}' is ambiguous across multiple scopes. Please specify using 'scope.{args.reset_key}'.")
                 sys.exit(1)
 
+            e_type = (item.engine_type_override or ENGINE_TYPE).lower()
+            t_file = str(Path(item.target_file_override).expanduser().resolve()) if item.target_file_override else str(TARGET_FILE)
+            target_engine = engine_pool[(e_type, t_file)]
+
             # NATIVE SERIALIZATION 
             val = item.serialize(item.default)
 
             logger.info(f"Headless Reset Key: {args.reset_key} -> {val}")
-            success, msg, _ = engine.write_value(item.key, item.scope, val, item_type=item.type_)
+            success, msg, _ = target_engine.write_value(item.key, item.scope, val, item_type=item.type_)
             print(f"[{'OK' if success else 'FAIL'}] {msg}")
             sys.exit(0 if success else 1)
 
@@ -357,29 +429,39 @@ EXAMPLES:
             # Use id() mapping to ensure we don't duplicate executions for keys vs scoped_keys
             unique_items = {id(item): item for item in flat_schema.values() if item is not None}.values()
             
-            changes_to_write = []
-            
+            changes_by_engine = {}
             for item in unique_items:
                 # NATIVE SERIALIZATION 
                 val = item.serialize(item.default)
-                changes_to_write.append((item.key, item.scope, val, item.type_))
-            
-            # FULLY DEPLOY NATIVE BATCH ARCHITECTURE IN HEADLESS CLI
-            success, msg, _ = engine.write_batch(changes_to_write)
-            
-            if success:
-                print(f"[*] Restoration Complete. Reset {len(changes_to_write)} items successfully.")
-                sys.exit(0)
-            else:
-                # Graceful fallback logic
-                success_count, skip_count = 0, 0
-                for key, scope, val, itype in changes_to_write:
-                    ok, _, _ = engine.write_value(key, scope, val, item_type=itype)
-                    if ok: success_count += 1
-                    else: skip_count += 1
+                e_type = (item.engine_type_override or ENGINE_TYPE).lower()
+                t_file = str(Path(item.target_file_override).expanduser().resolve()) if item.target_file_override else str(TARGET_FILE)
+                ekey = (e_type, t_file)
                 
-                print(f"[*] Partial Restoration Complete. Reset: {success_count} | Skipped: {skip_count}")
-                sys.exit(0 if success_count > 0 else 1)
+                if ekey not in changes_by_engine: changes_by_engine[ekey] = []
+                changes_by_engine[ekey].append((item.key, item.scope, val, item.type_))
+            
+            all_success = True
+            for ekey, changes in changes_by_engine.items():
+                # FULLY DEPLOY NATIVE BATCH ARCHITECTURE IN HEADLESS CLI
+                success, msg, _ = engine_pool[ekey].write_batch(changes)
+                
+                if success:
+                    print(f"[*] Restoration Complete for {ekey[0]} backend. Reset {len(changes)} items successfully.")
+                else:
+                    # Graceful fallback logic
+                    success_count, skip_count = 0, 0
+                    for key, scope, val, itype in changes:
+                        ok, _, _ = engine_pool[ekey].write_value(key, scope, val, item_type=itype)
+                        if ok: success_count += 1
+                        else: skip_count += 1
+                    
+                    if skip_count == 0:
+                        print(f"[*] Restoration Complete for {ekey[0]} backend via fallback. Reset {success_count} items successfully.")
+                    else:
+                        print(f"[*] Partial Restoration Complete for {ekey[0]} backend. Reset: {success_count} | Skipped: {skip_count}")
+                        all_success = False
+
+            sys.exit(0 if all_success else 1)
 
 
     # --- 5. INTERACTIVE TUI EXECUTION ---
@@ -389,7 +471,8 @@ EXAMPLES:
     from python.frontend.ui import DuskyTUI
     
     app = DuskyTUI(
-        engine=engine, 
+        engine_pool=engine_pool, 
+        default_engine_key=default_engine_key,
         schema=SCHEMA, 
         tabs=TABS, 
         title=APP_TITLE,
@@ -397,7 +480,8 @@ EXAMPLES:
         default_mode=DEFAULT_MODE,
         schema_name=module_name,
         enable_user_presets=ENABLE_USER_PRESETS,
-        user_presets_tab=USER_PRESETS_TAB
+        user_presets_tab=USER_PRESETS_TAB,
+        global_popup=GLOBAL_POPUP
     )
     
     app.run()

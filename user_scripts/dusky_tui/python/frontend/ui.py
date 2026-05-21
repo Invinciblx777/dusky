@@ -170,6 +170,36 @@ def load_matugen_json(file_path: Path) -> dict[str, str] | None:
 # MODALS & OVERLAYS
 # =============================================================================
 
+class AlertDialog(ModalScreen[None]):
+    BINDINGS = [
+        Binding("escape", "dismiss_modal", "Dismiss"),
+        Binding("enter", "dismiss_modal", "Dismiss"),
+    ]
+
+    def __init__(self, message: str, title: str = "NOTICE") -> None:
+        super().__init__()
+        self.message = message
+        self.title_text = title
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="alert-dialog"):
+            yield Label(self.title_text, id="modal-title")
+            yield Markdown(self.message, id="alert-message")
+            with Horizontal(classes="modal-btn-container"):
+                yield Label(" OK ", classes="modal-close-btn")
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
+
+    @on(events.Click, ".modal-close-btn")
+    def on_close_click(self) -> None:
+        self.dismiss(None)
+
+    @on(events.Click)
+    def on_background_click(self, event: events.Click) -> None:
+        if event.control is self:
+            self.dismiss(None)
+
 class HybridInputScreen(ModalScreen[str | None]):
     BINDINGS = [
         Binding("down,j", "focus_list", "Focus List"),
@@ -907,13 +937,16 @@ class DuskyTUI(App):
     #file-link { padding: 0 1; background: transparent; }
     #file-link:hover { text-style: bold; color: $foreground; background: $primary 25%; }
 
-    HybridInputScreen, PickerScreen, SearchScreen, DiffScreen, ShortcutsInfoScreen { align: center middle; background: rgba(0, 0, 0, 0.75); }
+    HybridInputScreen, PickerScreen, SearchScreen, DiffScreen, ShortcutsInfoScreen, AlertDialog { align: center middle; background: rgba(0, 0, 0, 0.75); }
 
     #picker-dialog { width: 60; height: 70%; background: $background; border: solid $primary; padding: 1 2; }
     #search-dialog { width: 60; height: 80%; background: $background; border: solid $primary; padding: 1 2; }
     #diff-dialog   { width: 70; height: 80%; background: $background; border: solid $primary; padding: 1 2; }
     #shortcuts-dialog { width: 70; height: 80%; background: $background; border: solid $primary; padding: 1 2; }
     #modal-dialog { width: 50; height: auto; background: $background; border: solid $primary; padding: 1 2; }
+
+    #alert-dialog { width: 50; height: auto; max-height: 80%; background: $background; border: solid $warning; padding: 1 2; }
+    #alert-message { color: $foreground; margin-bottom: 1; }
 
     #picker-list, #search-list, #diff-list, #shortcuts-list { height: 1fr; scrollbar-size: 0 0; background: transparent; border: none; }
     #search-list > .option-list--option { padding: 0 1; background: transparent; transition: background 100ms linear; }
@@ -988,9 +1021,11 @@ class DuskyTUI(App):
 
     auto_save = reactive(True)
 
-    def __init__(self, engine: BaseEngine, schema: dict[int, list[ConfigItem]], tabs: list[str], title="Dusky Editor", theme_path: str | None = None, default_mode: str = "auto", schema_name: str = "default", enable_user_presets: bool = True, user_presets_tab: str | None = None, **kwargs):
+    def __init__(self, engine_pool: dict[tuple[str, str], BaseEngine], default_engine_key: tuple[str, str], schema: dict[int, list[ConfigItem]], tabs: list[str], title="Dusky Editor", theme_path: str | None = None, default_mode: str = "auto", schema_name: str = "default", enable_user_presets: bool = True, user_presets_tab: str | None = None, global_popup: str | None = None, **kwargs):
         super().__init__(**kwargs)
-        self.engine = engine
+        self.engine_pool = engine_pool
+        self.default_engine_key = default_engine_key
+        self.global_popup = global_popup
         self.schema = schema
         self.tabs = tabs
         self.editor_title = title
@@ -1001,9 +1036,9 @@ class DuskyTUI(App):
         self.user_presets_tab_name = user_presets_tab
         self.user_presets_tab_idx = 0
         
-        # Track external configuration file modifications dynamically 
-        self.last_target_mtime: float = 0.0
-        self._initial_target_mtime_set: bool = False
+        # Track external configuration file modifications dynamically across multiple engines
+        self.last_target_mtimes: dict[tuple[str, str], float] = {}
+        self._initial_target_mtimes_set: bool = False
         
         # Route User Presets to their proper schema tab assignment automatically
         if self.user_presets_tab_name and self.user_presets_tab_name in self.tabs:
@@ -1022,6 +1057,7 @@ class DuskyTUI(App):
         
         self._key_map: dict[str, tuple[int, int]] = {}
         self._save_timers: dict[tuple[int, int], Timer] = {}
+        self._indent_cache: dict[str, str] = {}
         
         # Debounce timer for preset UI refreshes to prevent extreme lag spikes
         self._preset_refresh_timer: Timer | None = None
@@ -1081,6 +1117,15 @@ class DuskyTUI(App):
 
         yield AppFooter(id="footer")
 
+    def _get_item_engine_info(self, item: ConfigItem) -> tuple[str, str]:
+        """Resolves target engine and file config dynamically via overrides."""
+        e_type = (item.engine_type_override.lower() if item.engine_type_override else self.default_engine_key[0])
+        t_file = str(Path(item.target_file_override).expanduser().resolve()) if item.target_file_override else self.default_engine_key[1]
+        return (e_type, t_file)
+
+    def _get_engine_for_item(self, item: ConfigItem) -> BaseEngine:
+        return self.engine_pool.get(self._get_item_engine_info(item), self.engine_pool[self.default_engine_key])
+
     def _get_item_uid(self, item: ConfigItem) -> str:
         """Robust internal resolver for mapping children to parents safely."""
         return f"{item.scope}.{item.key}" if item.scope and item.scope != "DEFAULT" else item.key
@@ -1128,7 +1173,7 @@ class DuskyTUI(App):
                 if itm.type_ == "preset":
                     self._refresh_single_ui(t_idx, i_idx, itm)
 
-    def _build_option(self, item: ConfigItem, is_highlighted: bool = False, is_last_child: bool = False) -> Text:
+    def _build_option(self, item: ConfigItem, is_highlighted: bool = False, indent_prefix: str = "") -> Text:
         txt = Text()
         exists = item.exists_in_target
         is_pending = (str(item.value) != str(item.initial_value))
@@ -1148,13 +1193,15 @@ class DuskyTUI(App):
             # User defined up to 10% deviation tolerance (allows down to 90% matching)
             is_deviated_preset = (0.9 <= ratio < 1.0)
 
-        # EXACT ALIGNMENT FOR DOT PREFIX SYSTEM & HIERARCHIES
-        if item.parent_ref:
-            prefix = " └─ " if is_last_child else " ├─ "
-            txt.append(prefix, style=self.theme_colors["muted"])
-        elif item.is_parent:
+        # EXACT ALIGNMENT FOR RECURSIVE DOT PREFIX SYSTEM & HIERARCHIES
+        if indent_prefix:
+            txt.append(indent_prefix, style=self.theme_colors["muted"])
+
+        if item.is_parent:
             exp_char = "[-] " if item.expanded else "[+] "
             txt.append(exp_char, style=f"{self.theme_colors['accent']} bold")
+        elif indent_prefix and len(indent_prefix) > 0 and indent_prefix != "    ":
+            txt.append("    ")
         else:
             txt.append("    ")
 
@@ -1175,7 +1222,9 @@ class DuskyTUI(App):
                 dot_color = self.theme_colors["error"] if (is_modified and exists) else self.theme_colors["muted"]
                 txt.append("●  ", style=dot_color)
 
-        # LABEL RENDERING
+        # LABEL RENDERING WITH WARNINGS
+        warning_marker = "⚠️ " if item.warning_msg else ""
+        
         if exists:
             if item.type_ == "preset" and is_active_preset:
                 label_style = f"{self.theme_colors['success']} bold"
@@ -1184,10 +1233,14 @@ class DuskyTUI(App):
             else:
                 label_style = f"{self.theme_colors['fg']} bold" if is_highlighted else self.theme_colors["fg"]
                 
-            txt.append(f"{item.label:<35}", style=label_style)
+            if warning_marker:
+                txt.append(warning_marker, style=f"bold {self.theme_colors['warning']}")
+                txt.append(f"{item.label:<32}", style=label_style)
+            else:
+                txt.append(f"{item.label:<35}", style=label_style)
         else:
             label_style = f"{self.theme_colors['muted']} strike" if not is_highlighted else f"{self.theme_colors['muted']} strike bold"
-            raw_label = f"{item.label} [Missing]"
+            raw_label = f"{warning_marker}{item.label} [Missing]"
             padding_len = max(0, 35 - len(raw_label))
             txt.append(raw_label, style=label_style)
             txt.append(" " * padding_len)
@@ -1337,7 +1390,10 @@ class DuskyTUI(App):
     async def on_mount(self) -> None:
         self.query_one("#main-box").border_title = f" {self.editor_title} "
         self.apply_theme_to_engine()
-        self.query_one("#file-link", FileLink).path = self.engine.target_path
+        
+        # Point the initial file link to the default configured engine backend
+        first_engine = self.engine_pool[self.default_engine_key]
+        self.query_one("#file-link", FileLink).path = first_engine.target_path
 
         self._cached_tabs_container = self.query_one("#tabs-container", Horizontal)
         self._cached_tab_left = self.query_one("#tab-left", Label)
@@ -1348,7 +1404,8 @@ class DuskyTUI(App):
             batch_shortcut.display = not self.auto_save
         except Exception: pass
 
-        state = self.engine.load_state()
+        # Load states securely across all registered backend target configurations
+        states = {ekey: eng.load_state() for ekey, eng in self.engine_pool.items()}
 
         self._load_user_presets()
         self._rebuild_key_map()
@@ -1356,6 +1413,8 @@ class DuskyTUI(App):
         # PASS 1: Set initial values and existence based on state BEFORE rendering UI
         for i in range(len(self.tabs)):
             for idx, item in enumerate(self.schema.get(i, [])):
+                engine_key = self._get_item_engine_info(item)
+                state = states.get(engine_key, {})
                 cache_key = f"{item.scope}/{item.key}" if item.scope else item.key
                 
                 if item.type_ in ("action", "preset", "menu"):
@@ -1388,10 +1447,13 @@ class DuskyTUI(App):
         self.call_after_refresh(self._update_scroll_indicators)
         self._update_footer_legend()
 
+        # Trigger Global Notice Hook if defined in the schema
+        if self.global_popup:
+            self.call_after_refresh(lambda: self.push_screen(AlertDialog(self.global_popup, title="System Notice")))
+
     def _populate_option_list(self, tab_idx: int, maintain_highlight_id: str | None = None) -> None:
         """
-        Dynamically rebuilds the DOM for a given tab, filtering out hidden children 
-        while preserving strict focus and resolving seamless structural tree connections.
+        Dynamically rebuilds the DOM for a given tab, resolving N-Level recursive tree hierarchies
         """
         try:
             ol = self.query_one(f"#list-{tab_idx}", ConfigOptionList)
@@ -1411,39 +1473,50 @@ class DuskyTUI(App):
         current_group = None
         first_item_id = None
 
-        # Build list of expanded parent UIDs to resolve child visibility
-        expanded_parents = {
-            self._get_item_uid(itm) for itm in items 
-            if itm.is_parent and itm.expanded
-        }
+        children_map = {self._get_item_uid(itm): [] for itm in items}
+        root_items = []
 
-        visible_items = []
-        for idx, item in enumerate(items):
-            pref = item.parent_ref
-            if pref and pref not in expanded_parents:
-                continue
-            visible_items.append((idx, item))
+        for orig_idx, itm in enumerate(items):
+            pref = itm.parent_ref
+            if pref and pref in children_map:
+                children_map[pref].append((orig_idx, itm))
+            else:
+                root_items.append((orig_idx, itm))
 
-        for list_idx, (orig_idx, item) in enumerate(visible_items):
-            if item.group and item.group != current_group:
-                current_group = item.group
+        def traverse(node_idx: int, node_item: ConfigItem, is_last_sibling_list: list[bool]):
+            nonlocal current_group, first_item_id
+            
+            if node_item.group and node_item.group != current_group:
+                current_group = node_item.group
                 header_txt = Text(f" {current_group.upper()}", style=f"bold {self.theme_colors['accent']}")
-                options.append(Option(header_txt, id=f"header_{tab_idx}_{orig_idx}", disabled=True))
+                options.append(Option(header_txt, id=f"header_{tab_idx}_{node_idx}", disabled=True))
 
-            opt_id = f"item_{tab_idx}_{orig_idx}"
+            opt_id = f"item_{tab_idx}_{node_idx}"
             if first_item_id is None: 
                 first_item_id = opt_id
 
-            is_last_child = True
-            if item.parent_ref:
-                # Look ahead to see if the next visible item has the same parent
-                if list_idx + 1 < len(visible_items):
-                    next_item = visible_items[list_idx + 1][1]
-                    if next_item.parent_ref == item.parent_ref:
-                        is_last_child = False
-
             is_hl = (maintain_highlight_id == opt_id) if maintain_highlight_id else (tab_idx == 0 and first_item_id == opt_id)
-            options.append(Option(self._build_option(item, is_highlighted=is_hl, is_last_child=is_last_child), id=opt_id))
+
+            prefix = ""
+            depth = len(is_last_sibling_list) - 1
+            if depth > 0:
+                for is_last in is_last_sibling_list[:-1]:
+                    prefix += "   " if is_last else " │ "
+                prefix += " └─ " if is_last_sibling_list[-1] else " ├─ "
+            
+            self._indent_cache[opt_id] = prefix
+            options.append(Option(self._build_option(node_item, is_highlighted=is_hl, indent_prefix=prefix), id=opt_id))
+
+            if node_item.is_parent and node_item.expanded:
+                uid = self._get_item_uid(node_item)
+                children = children_map.get(uid, [])
+                for i, (child_idx, child_item) in enumerate(children):
+                    is_last = (i == len(children) - 1)
+                    traverse(child_idx, child_item, is_last_sibling_list + [is_last])
+
+        for i, (orig_idx, itm) in enumerate(root_items):
+            is_last = (i == len(root_items) - 1)
+            traverse(orig_idx, itm, [is_last])
 
         ol.clear_options()
         ol.add_options(options)
@@ -1530,52 +1603,53 @@ class DuskyTUI(App):
             pass
 
     async def watch_target_file(self) -> None:
-        if not self.engine.target_path: return
-        path = Path(self.engine.target_path).expanduser().resolve()
-        try:
-            stat_info = await asyncio.to_thread(path.stat)
-            current_mtime = stat_info.st_mtime
+        changed_any = False
+        
+        for e_key, engine in self.engine_pool.items():
+            if not engine.target_path: continue
+            path = Path(engine.target_path).expanduser().resolve()
             
-            if not self._initial_target_mtime_set:
-                self.last_target_mtime = current_mtime
-                self._initial_target_mtime_set = True
-                return
+            try:
+                stat_info = await asyncio.to_thread(path.stat)
+                current_mtime = stat_info.st_mtime
                 
-            if current_mtime > self.last_target_mtime:
-                self.last_target_mtime = current_mtime
-                
-                # The target configuration engine was modified externally!
-                new_state = await asyncio.to_thread(self.engine.load_state)
-                changed_any = False
-                
-                for i in range(len(self.tabs)):
-                    for idx, item in enumerate(self.schema.get(i, [])):
-                        # Skip if there's a pending uncommitted UI change
-                        if not self.auto_save and (i, idx) in self.pending_commits:
-                            continue
-                            
-                        if item.type_ in ("action", "preset", "menu"):
-                            continue
-                            
-                        cache_key = f"{item.scope}/{item.key}" if item.scope else item.key
-                        
-                        if cache_key in new_state:
-                            new_val = item.deserialize(new_state[cache_key])
-                            if str(item.value) != str(new_val):
-                                item.value = new_val
-                                item.exists_in_target = True
-                                changed_any = True
-                        else:
-                            if item.exists_in_target:
-                                item.exists_in_target = False
-                                changed_any = True
-                                
-                if changed_any:
-                    self._refresh_all_ui()
-                    self.notify_status("Config modified externally. Refreshed UI.")
+                if not self._initial_target_mtimes_set:
+                    self.last_target_mtimes[e_key] = current_mtime
+                    continue
                     
-        except OSError: 
-            pass
+                if current_mtime > self.last_target_mtimes.get(e_key, 0.0):
+                    self.last_target_mtimes[e_key] = current_mtime
+                    
+                    new_state = await asyncio.to_thread(engine.load_state)
+                    
+                    for i in range(len(self.tabs)):
+                        for idx, item in enumerate(self.schema.get(i, [])):
+                            if self._get_item_engine_info(item) != e_key: continue
+                            if not self.auto_save and (i, idx) in self.pending_commits: continue
+                            if item.type_ in ("action", "preset", "menu"): continue
+                                
+                            cache_key = f"{item.scope}/{item.key}" if item.scope else item.key
+                            
+                            if cache_key in new_state:
+                                new_val = item.deserialize(new_state[cache_key])
+                                if str(item.value) != str(new_val):
+                                    item.value = new_val
+                                    item.exists_in_target = True
+                                    changed_any = True
+                            else:
+                                if item.exists_in_target:
+                                    item.exists_in_target = False
+                                    changed_any = True
+            except OSError: 
+                pass
+
+        if not self._initial_target_mtimes_set:
+            self._initial_target_mtimes_set = True
+            return
+            
+        if changed_any:
+            self._refresh_all_ui()
+            self.notify_status("Config modified externally. Refreshed UI.")
 
     async def watch_theme_file(self) -> None:
         if not self.theme_path: return
@@ -1682,6 +1756,18 @@ class DuskyTUI(App):
             return tab_idx, item_idx, self.schema[tab_idx][item_idx]
         except (ValueError, KeyError, IndexError): return None
 
+    def _update_help_panel(self, item: ConfigItem) -> None:
+        try:
+            content_area = self.query_one("#content-area")
+            if content_area.has_class("-show-help"):
+                md = self.query_one("#help-markdown", Markdown)
+                help_text = ""
+                if item.warning_msg:
+                    help_text += f"> **⚠️ WARNING:** {item.warning_msg}\n\n"
+                help_text += item.extended_help or f"**{item.label}**\n\nNo extended documentation available."
+                md.update(help_text)
+        except Exception: pass
+
     @on(OptionList.OptionHighlighted)
     def handle_option_highlight(self, event: OptionList.OptionHighlighted) -> None:
         ol = event.option_list
@@ -1689,50 +1775,25 @@ class DuskyTUI(App):
 
         parsed = self._get_item_from_id(event.option_id)
         if parsed:
-            _, _, item = parsed
-            try:
-                content_area = self.query_one("#content-area")
-                if content_area.has_class("-show-help"):
-                    md = self.query_one("#help-markdown", Markdown)
-                    help_text = item.extended_help or f"**{item.label}**\n\nNo extended documentation available."
-                    md.update(help_text)
-            except Exception: pass
+            self._update_help_panel(parsed[2])
+            engine = self._get_engine_for_item(parsed[2])
+            self.query_one("#file-link", FileLink).path = engine.target_path
 
         last_id = ol.last_highlighted_id
         if last_id and last_id != event.option_id:
             old_parsed = self._get_item_from_id(last_id)
             if old_parsed:
-                # Need to run full schema check for the old item to re-evaluate if it was the last child
                 try:
                     old_idx = ol.get_option_index(last_id)
-                    old_item = old_parsed[2]
-                    is_last_child = True
-                    if old_item.parent_ref:
-                        items = self.schema.get(old_parsed[0], [])
-                        for next_item in items[old_parsed[1] + 1:]:
-                            if next_item.parent_ref == old_item.parent_ref:
-                                is_last_child = False
-                                break
-                            elif next_item.parent_ref != old_item.parent_ref:
-                                break
-                    ol.replace_option_prompt_at_index(old_idx, self._build_option(old_item, False, is_last_child))
+                    old_prefix = self._indent_cache.get(last_id, "")
+                    ol.replace_option_prompt_at_index(old_idx, self._build_option(old_parsed[2], False, old_prefix))
                 except OptionDoesNotExist: pass
 
         if parsed:
             try:
                 curr_idx = ol.get_option_index(event.option_id)
-                curr_item = parsed[2]
-                is_last_child = True
-                if curr_item.parent_ref:
-                    items = self.schema.get(parsed[0], [])
-                    for next_item in items[parsed[1] + 1:]:
-                        if next_item.parent_ref == curr_item.parent_ref:
-                            is_last_child = False
-                            break
-                        elif next_item.parent_ref != curr_item.parent_ref:
-                            break
-                
-                ol.replace_option_prompt_at_index(curr_idx, self._build_option(curr_item, True, is_last_child))
+                curr_prefix = self._indent_cache.get(event.option_id, "")
+                ol.replace_option_prompt_at_index(curr_idx, self._build_option(parsed[2], True, curr_prefix))
                 ol.last_highlighted_id = event.option_id
             except OptionDoesNotExist: pass
 
@@ -1859,15 +1920,22 @@ class DuskyTUI(App):
                 self._preset_refresh_timer.stop()
             self._preset_refresh_timer = self.set_timer(0.15, self._refresh_presets_ui)
 
+        # Trigger schema-driven feedback popup
+        if item.popup_message and not is_undo and not batch_mode:
+            self.push_screen(AlertDialog(item.popup_message, title=f"Notice: {item.label}"))
+
         return True
 
     def _do_auto_save(self, tab_idx: int, item_idx: int, item: ConfigItem, val_str: str, old_val: Any) -> None:
         self._save_timers.pop((tab_idx, item_idx), None)
-        success, msg, _ = self.engine.write_value(item.key, item.scope, val_str, item_type=item.type_)
+        engine = self._get_engine_for_item(item)
+
+        success, msg, _ = engine.write_value(item.key, item.scope, val_str, item_type=item.type_)
         if success:
             # FIX: Sync internal mtime to prevent false external modification detections from our own saves
             try:
-                self.last_target_mtime = Path(self.engine.target_path).expanduser().resolve().stat().st_mtime
+                ekey = self._get_item_engine_info(item)
+                self.last_target_mtimes[ekey] = Path(engine.target_path).expanduser().resolve().stat().st_mtime
             except OSError: pass
             self.notify_status(f"Updated {item.label}")
         else:
@@ -1889,19 +1957,8 @@ class DuskyTUI(App):
             opt_id = f"item_{tab_idx}_{item_idx}"
             idx = ol.get_option_index(opt_id)
             is_hl = (ol.last_highlighted_id == opt_id)
-            
-            # Re-evaluate tree position dynamically
-            is_last_child = True
-            if item.parent_ref:
-                items = self.schema.get(tab_idx, [])
-                for next_item in items[item_idx + 1:]:
-                    if next_item.parent_ref == item.parent_ref:
-                        is_last_child = False
-                        break
-                    elif next_item.parent_ref != item.parent_ref:
-                        break
-                        
-            ol.replace_option_prompt_at_index(idx, self._build_option(item, is_hl, is_last_child))
+            prefix = self._indent_cache.get(opt_id, "")
+            ol.replace_option_prompt_at_index(idx, self._build_option(item, is_hl, prefix))
         except OptionDoesNotExist: 
             pass 
         except Exception: 
@@ -1932,52 +1989,57 @@ class DuskyTUI(App):
             self.notify_status("No pending changes.")
             return True
 
-        changes_to_write = []
-        processed_commits = []
-
+        batches = {}
         for tab_idx, item_idx in list(self.pending_commits):
             item = self.schema[tab_idx][item_idx]
             val_str = item.serialize(item.value)
+            ekey = self._get_item_engine_info(item)
+            if ekey not in batches: batches[ekey] = []
+            batches[ekey].append(((item.key, item.scope, val_str, item.type_), (tab_idx, item_idx)))
 
-            changes_to_write.append((item.key, item.scope, val_str, item.type_))
-            processed_commits.append((tab_idx, item_idx))
+        final_success = True
+        success_count = 0
+        error_msgs = []
 
-        success, msg, _ = self.engine.write_batch(changes_to_write)
-        final_success = False
-
-        if success:
-            for commit in processed_commits:
-                self.pending_commits.discard(commit)
-            self.notify_status(f"Batched {len(changes_to_write)} commits successfully.")
-            self.play_reset_sound()
-            final_success = True
-        else:
-            success_count = 0
-            first_error = ""
-            for (key, scope, val_str, itype), commit in zip(changes_to_write, processed_commits):
-                ok, item_msg, _ = self.engine.write_value(key, scope, val_str, item_type=itype)
-                if ok:
-                    self.pending_commits.discard(commit)
-                    success_count += 1
-                elif not first_error:
-                    first_error = item_msg
-
-            if success_count == len(changes_to_write):
-                self.notify_status(f"Batched {len(changes_to_write)} commits successfully (fallback).")
-                self.play_reset_sound()
-                final_success = True
-            elif success_count > 0:
-                self.notify_status(f"Partial success ({success_count}/{len(changes_to_write)}). Error: {first_error}")
-                self.play_reset_sound()
+        for ekey, batch in batches.items():
+            engine = self.engine_pool[ekey]
+            changes = [b[0] for b in batch]
+            commits = [b[1] for b in batch]
+            
+            success, msg, _ = engine.write_batch(changes)
+            if success:
+                success_count += len(changes)
+                for c in commits: self.pending_commits.discard(c)
+                try: self.last_target_mtimes[ekey] = Path(engine.target_path).expanduser().resolve().stat().st_mtime
+                except OSError: pass
             else:
-                err = first_error if first_error else msg
-                self.notify_status(f"Batch Error: {err}")
+                # REPAIRED: Accurately count fallback successes to prevent false failure reports
+                engine_success_count = 0
+                for (key, scope, val_str, itype), commit in batch:
+                    ok, item_msg, _ = engine.write_value(key, scope, val_str, item_type=itype)
+                    if ok:
+                        success_count += 1
+                        engine_success_count += 1
+                        self.pending_commits.discard(commit)
+                        try: self.last_target_mtimes[ekey] = Path(engine.target_path).expanduser().resolve().stat().st_mtime
+                        except OSError: pass
+                    else:
+                        error_msgs.append(item_msg)
+                
+                # If the fallback perfectly swept the failures, DO NOT mark final_success as False
+                if engine_success_count != len(changes):
+                    final_success = False
 
-        # FIX: Sync internal mtime to prevent false external modification detections from our own saves
-        if final_success or success_count > 0:
-            try:
-                self.last_target_mtime = Path(self.engine.target_path).expanduser().resolve().stat().st_mtime
-            except OSError: pass
+        if final_success:
+            self.notify_status(f"Batched {success_count} commits successfully.")
+            self.play_reset_sound()
+        elif success_count > 0:
+            first_err = error_msgs[0] if error_msgs else "Unknown Engine Error"
+            self.notify_status(f"Partial success ({success_count} applied). Error: {first_err}")
+            self.play_reset_sound()
+        else:
+            first_err = error_msgs[0] if error_msgs else "Unknown Engine Error"
+            self.notify_status(f"Batch Error: {first_err}")
 
         self._refresh_all_ui()
         self._update_footer_legend()
@@ -2037,8 +2099,7 @@ class DuskyTUI(App):
             if ol and ol.last_highlighted_id:
                 parsed = self._get_item_from_id(ol.last_highlighted_id)
                 if parsed:
-                    md = self.query_one("#help-markdown", Markdown)
-                    md.update(parsed[2].extended_help or f"**{parsed[2].label}**\n\nNo extended documentation.")
+                    self._update_help_panel(parsed[2])
 
     def action_focus_local_search(self) -> None:
         inp = self.query_one("#local-search", Input)
@@ -2071,15 +2132,29 @@ class DuskyTUI(App):
                 if query in item.label.lower().replace(" ", ""):
                     opt_id = f"item_{tab_idx}_{item_idx}"
                     
-                    # Intercept hidden parent & auto-expand to prevent search failures
+                    # REPAIRED: Intercept hidden parent & auto-expand carefully (Fixes Infinite loop crash)
                     pref = item.parent_ref
                     if pref:
-                        for p_item in items:
-                            if self._get_item_uid(p_item) == pref and p_item.is_parent:
-                                if not p_item.expanded:
-                                    p_item.expanded = True
-                                    self._populate_option_list(tab_idx, maintain_highlight_id=opt_id)
-                                break
+                        current_pref = pref
+                        expanded_any = False
+                        seen_prefs = set()
+                        
+                        # Set-tracking replaces arbitrary numerical limits and guarantees we never loop infinitely 
+                        while current_pref and current_pref not in seen_prefs:
+                            seen_prefs.add(current_pref)
+                            for p_item in items:
+                                if self._get_item_uid(p_item) == current_pref and p_item.is_parent:
+                                    if not p_item.expanded:
+                                        p_item.expanded = True
+                                        expanded_any = True
+                                    current_pref = p_item.parent_ref
+                                    break
+                            else:
+                                current_pref = None
+                        
+                        if expanded_any:
+                            self._populate_option_list(tab_idx, maintain_highlight_id=opt_id)
+
                     try:
                         idx = ol.get_option_index(opt_id)
                         ol.highlighted = idx
@@ -2107,12 +2182,19 @@ class DuskyTUI(App):
                 tab_idx, item_idx = result
                 target_item = self.schema[tab_idx][item_idx]
 
-                # Pre-flight intercept: Auto-expand the nested parent globally if needed
+                # Pre-flight intercept: Auto-expand the nested parent globally utilizing safe set-tracking
                 pref = target_item.parent_ref
                 if pref:
-                    for p_item in self.schema[tab_idx]:
-                        if self._get_item_uid(p_item) == pref and p_item.is_parent:
-                            p_item.expanded = True
+                    current_pref = pref
+                    seen_prefs = set()
+                    while current_pref and current_pref not in seen_prefs:
+                        seen_prefs.add(current_pref)
+                        for p_item in self.schema[tab_idx]:
+                            if self._get_item_uid(p_item) == current_pref and p_item.is_parent:
+                                p_item.expanded = True
+                                current_pref = p_item.parent_ref
+                                break
+                        else:
                             break
                             
                 self._populate_option_list(tab_idx, maintain_highlight_id=f"item_{tab_idx}_{item_idx}")
@@ -2285,7 +2367,12 @@ class DuskyTUI(App):
         is_keyboard = (click_x == 0)
         instant_action = False
 
-        if item.is_parent and (1 <= click_x <= 9):
+        # REPAIRED: Offset calculation for deep nesting interactivity
+        # Allows mouse expansion tracking perfectly alongside recursive UI depth lines
+        indent_prefix = self._indent_cache.get(opt_id, "")
+        prefix_len = len(indent_prefix)
+
+        if item.is_parent and (prefix_len <= click_x <= prefix_len + 9):
             instant_action = True
             
         if item.type_ in ("preset", "action") and click_x >= 44:
@@ -2312,7 +2399,8 @@ class DuskyTUI(App):
 
         is_modified = str(item.value) != str(item.default)
         if is_modified and item.type_ not in ("action", "preset"):
-            rendered_text = self._build_option(item, True)
+            prefix = self._indent_cache.get(opt_id, "")
+            rendered_text = self._build_option(item, True, indent_prefix=prefix)
             total_width = rendered_text.cell_len
             reset_width = 10
             threshold = total_width - reset_width
