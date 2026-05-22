@@ -401,6 +401,10 @@ res_mon() {
     # Isolate shell options for predictable execution
     emulate -L zsh
     
+    # CRITICAL: Force standard numeric locale so floats use '.' reliably across 
+    # all systems, while preserving UTF-8 for process names to prevent garbling.
+    local LC_NUMERIC=C
+    
     local target_sort="cpu"
     local ps_sort="-pcpu"
     local arg
@@ -408,31 +412,27 @@ res_mon() {
     local count="15"
     local -a plain_nums=()
 
-    _show_help() {
-        print -P "\n%F{blue}::%f %Bres_mon%b — Live System Resource Monitor"
-        print -P "%F{238}-----------------------------------------------------------------------------%f"
-        print -P "%F{green}Usage:%f res_mon [sort_metric] [interval] [count]"
-        print -P "       %F{242}(Arguments can be provided in ANY order)%f\n"
-        
-        print -P "%BMetrics:%b (Default: cpu)"
-        print -P "  %F{cyan}cpu%f                  - Sort by CPU usage percentage"
-        print -P "  %F{cyan}ram%f, %F{cyan}mem%f             - Sort by RAM usage\n"
-        
-        print -P "%BNumbers:%b (Defaults: 2s interval, 15 processes)"
-        print -P "  %F{cyan}<number>%f             - Sets the process count (e.g., 20)"
-        print -P "  %F{cyan}<number>s%f            - Sets the interval in seconds (e.g., 1s or 0.5s)\n"
-        
-        print -P "%BExamples:%b"
-        print -P "  %F{yellow}res_mon ram 5 1s%f     # Top 5 by RAM, updating every 1s"
-        print -P "  %F{yellow}res_mon 10 cpu 0.5s%f  # Top 10 by CPU, updating every 0.5s"
-        print -P "  %F{yellow}res_mon ram 1 5%f      # Smart fallback: Top 5 by RAM, 1s interval\n"
-    }
-
-    # 1. Advanced Order-Agnostic Argument Tokenizer (Regex supports sub-second floats)
+    # 1. Advanced Order-Agnostic Argument Tokenizer (Regex supports .5 and 0.5)
     for arg in "$@"; do
         case "${arg:l}" in
             help|-h|--help) 
-                _show_help
+                print -P "\n%F{blue}::%f %Bres_mon%b — Live System Resource Monitor"
+                print -P "%F{238}-----------------------------------------------------------------------------%f"
+                print -P "%F{green}Usage:%f res_mon [sort_metric] [interval] [count]"
+                print -P "       %F{242}(Arguments can be provided in ANY order)%f\n"
+                
+                print -P "%BMetrics:%b (Default: cpu)"
+                print -P "  %F{cyan}cpu%f                  - Sort by CPU usage percentage"
+                print -P "  %F{cyan}ram%f, %F{cyan}mem%f             - Sort by RAM usage\n"
+                
+                print -P "%BNumbers:%b (Defaults: 2s interval, 15 processes)"
+                print -P "  %F{cyan}<number>%f               - Sets the process count (e.g., 20)"
+                print -P "  %F{cyan}<number>s%f              - Sets the interval in seconds (e.g., 1s or .5s)\n"
+                
+                print -P "%BExamples:%b"
+                print -P "  %F{yellow}res_mon ram 5 1s%f       # Top 5 by RAM, updating every 1s"
+                print -P "  %F{yellow}res_mon 10 cpu .5s%f     # Top 10 by CPU, updating every 0.5s"
+                print -P "  %F{yellow}res_mon ram 1 5%f        # Smart fallback: Top 5 by RAM, 1s interval\n"
                 return 0 
                 ;;
             cpu) 
@@ -445,7 +445,7 @@ res_mon() {
                 ;;
             *[0-9]s) 
                 local possible_interval="${arg%s}"
-                if [[ "$possible_interval" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                if [[ "$possible_interval" =~ ^([0-9]*\.)?[0-9]+$ ]]; then
                     interval="$possible_interval"
                 else
                     print -u2 -P "\n%F{red}✖ Error:%f Invalid interval format: '%F{yellow}$arg%f'"
@@ -453,7 +453,7 @@ res_mon() {
                 fi
                 ;;
             *)
-                if [[ "$arg" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                if [[ "$arg" =~ ^([0-9]*\.)?[0-9]+$ ]]; then
                     plain_nums+=("$arg")
                 else
                     print -u2 -P "\n%F{red}✖ Error:%f Unknown argument: '%F{yellow}$arg%f'"
@@ -466,15 +466,16 @@ res_mon() {
 
     # 2. Intelligent Number Routing
     if (( ${#plain_nums[@]} == 1 )); then
-        # If it contains a decimal, it implies an interval. Otherwise, count.
         if [[ "${plain_nums[1]}" == *.* ]]; then
             interval="${plain_nums[1]}"
         else
             count="${plain_nums[1]}"
         fi
     elif (( ${#plain_nums[@]} >= 2 )); then
-        # The larger number inherently becomes the row count.
-        if (( plain_nums[1] > plain_nums[2] )); then
+        # Cast securely to floats to prevent implicit shell math crashes.
+        local -F num1="${plain_nums[1]}"
+        local -F num2="${plain_nums[2]}"
+        if (( num1 > num2 )); then
             count="${plain_nums[1]}"
             interval="${plain_nums[2]}"
         else
@@ -483,10 +484,13 @@ res_mon() {
         fi
     fi
 
-    # Strip decimal from count if a user made a typo, and set hard interval floor
+    # Strip decimal from count if a user made a typo
     count=${count%.*} 
-    if (( interval < 0.1 )); then
-        interval=0.1
+
+    # Set hard interval floor using explicit float variable conversion
+    local -F check_interval="$interval"
+    if (( check_interval < 0.1 )); then
+        interval="0.1"
     fi
 
     local title_metric=$([[ "$target_sort" == "cpu" ]] && echo "CPU Sort" || echo "RAM Sort")
@@ -494,7 +498,7 @@ res_mon() {
     # Enter UI Context: Hide cursor (\e[?25l), Disable Wrap (\e[?7l), Enter Alt-Screen (\e[?1049h)
     printf "\e[?25l\e[?7l\e[?1049h"
 
-    # Zsh 'always' block guarantees perfectly clean terminal restoration on Ctrl+C
+    # Zsh 'always' block guarantees perfectly clean terminal restoration on Ctrl+C or errors
     {
         while true; do
             # Dynamic Dimensions: Read current terminal size every tick
@@ -507,11 +511,11 @@ res_mon() {
             (( active_count > max_count )) && active_count=$max_count
             (( active_count < 1 )) && active_count=1
 
-            # Dynamic string width for COMMAND column (49 is total chars of all other columns)
-            local -i cmd_width=$(( term_cols - 49 ))
+            # Dynamic string width for COMMAND column (50 is exact char count of all prior columns + spaces)
+            local -i cmd_width=$(( term_cols - 50 ))
             (( cmd_width < 10 )) && cmd_width=10
 
-            # Generate dynamic width separator dynamically using Zsh parameter expansion
+            # Generate horizontal separator dynamically using Zsh parameter expansion
             local sep_line=${(pl:term_cols::-:)}
 
             # Hyper-optimized Procps pipeline extracting full args, truncated dynamically by Awk
@@ -520,12 +524,15 @@ res_mon() {
                 NR > max { exit }
                 {
                     cmd = $6
-                    for(i=7; i<=NF; i++) cmd = cmd " " $i
+                    for(i=7; i<=NF; i++) {
+                        cmd = cmd " " $i
+                        # Optimizaton: Break early if command length hits screen boundary
+                        if (length(cmd) > cmd_len) break
+                    }
                     ram_mb = $4 / 1024.0
-                    cpu_str = sprintf("%5.1f%%", $2)
-                    mem_str = sprintf("%5.1f%%", $3)
                     
-                    line = sprintf("\033[38;5;246m%8s\033[0m \033[38;5;220m%7s\033[0m \033[38;5;218m%7s\033[0m \033[38;5;213m%10.1f\033[0m \033[38;5;114m%10s\033[0m   \033[1;38;5;39m%-" cmd_len "s\033[0m", $1, cpu_str, mem_str, ram_mb, $5, substr(cmd, 1, cmd_len))
+                    # ANSI Injection mathematically mapped to support >9 day process uptime shifts
+                    line = sprintf("\033[38;5;246m%8s\033[0m \033[38;5;220m%6.1f%%\033[0m \033[38;5;218m%6.1f%%\033[0m \033[38;5;213m%10.1f\033[0m \033[38;5;114m%11s\033[0m   \033[1;38;5;39m%s\033[0m", $1, $2, $3, ram_mb, $5, substr(cmd, 1, cmd_len))
                     
                     if (NR == 1) printf "%s", line
                     else printf "\n%s", line
@@ -536,7 +543,7 @@ res_mon() {
             printf "\e[H" # Seek cursor directly to 0,0
             print -P "%F{blue}::%f %B${title_metric}%b (Update: ${interval}s | Top: ${active_count})"
             print -P "%F{238}${sep_line}%f"
-            print -P "%F{242}     PID   CPU%%   MEM%%    RAM(MB)       TIME   COMMAND%f"
+            print -P "%F{242}     PID    CPU%%    MEM%%    RAM(MB)        TIME   COMMAND%f"
             print -P "%F{238}${sep_line}%f"
             printf "%s\n" "$output_str"
             
