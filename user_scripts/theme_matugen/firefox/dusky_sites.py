@@ -131,7 +131,6 @@ class DuskyASTManager:
 
         if not docs:
             moz_code = f'@-moz-document domain("{self.domain}") {{\n}}\n'
-            # [FIXED] Safely extract the target node, avoiding leading whitespace issues
             moz_node = next(n for n in tinycss2.parse_stylesheet(moz_code) if getattr(n, 'type', '') == 'at-rule')
             self.stylesheet.append(moz_node)
             docs = [moz_node]
@@ -172,9 +171,11 @@ class DuskyASTManager:
             if sel in existing_rules_map:
                 # [NON-DESTRUCTIVE AST MERGE MODE]
                 old_rule = existing_rules_map[sel]
-                parsed_content = tinycss2.parse_declaration_list(old_rule.content)
                 
-                # [FIXED] Smart casing mapping: variables stay exact, standard properties lowercase
+                # [FIXED] Flush AST nodes back to a string to prevent ParseError token-mismatches across iterations
+                raw_old_content = tinycss2.serialize(old_rule.content)
+                parsed_content = tinycss2.parse_declaration_list(raw_old_content)
+                
                 keys_to_update = set()
                 for k, _ in props:
                     keys_to_update.add(k if k.startswith('--') else k.lower())
@@ -188,7 +189,6 @@ class DuskyASTManager:
                 for node in parsed_content:
                     is_whitespace = getattr(node, 'type', '') == 'whitespace'
                     
-                    # [FIXED] Whitespace Memory Leak: collapse orphaned spaces around purged declarations
                     if skip_next_whitespace and is_whitespace:
                         skip_next_whitespace = False
                         continue
@@ -204,6 +204,10 @@ class DuskyASTManager:
 
                     new_content.append(node)
                     skip_next_whitespace = False
+
+                # [FIXED] Strip trailing whitespace tokens to prevent \n bloat during successive identical-selector merges
+                while new_content and getattr(new_content[-1], 'type', '') == 'whitespace':
+                    new_content.pop()
 
                 if meta:
                     new_content.extend(tinycss2.parse_declaration_list(f"\n        --dusky-meta: \"{meta}\";"))
@@ -225,13 +229,11 @@ class DuskyASTManager:
                     css_lines.append(f"        {k}: {v}{suffix};")
                 css_lines.append("    }\n")
                 
-                # [FIXED] Bypass AST truncation caused by leading WhitespaceTokens
                 parsed_nodes = tinycss2.parse_stylesheet("\n".join(css_lines))
                 new_rule_ast = next((n for n in parsed_nodes if getattr(n, 'type', '') == 'qualified-rule'), None)
                 
                 if new_rule_ast:
                     inner_rules.append(new_rule_ast)
-                    # [FIXED] State Desync: Register the newly created rule immediately to allow multi-variable accumulation
                     existing_rules_map[sel] = new_rule_ast
 
         self._repack_moz_node(target_moz_node, inner_rules)
@@ -246,7 +248,9 @@ class DuskyASTManager:
             for r in inner_rules:
                 if getattr(r, 'type', '') == 'qualified-rule':
                     sel = tinycss2.serialize(r.prelude).strip()
-                    decls = [d for d in tinycss2.parse_declaration_list(r.content) if getattr(d, 'type', '') == 'declaration']
+                    # Safe string-flush serialization parsing pattern
+                    raw_content = tinycss2.serialize(r.content)
+                    decls = [d for d in tinycss2.parse_declaration_list(raw_content) if getattr(d, 'type', '') == 'declaration']
                     meta_decl = next((d for d in decls if d.lower_name == '--dusky-meta'), None)
                     if meta_decl:
                         meta_val = tinycss2.serialize(meta_decl.value).strip().strip('\'"')
@@ -263,7 +267,8 @@ class DuskyASTManager:
             for r in inner_rules:
                 if getattr(r, 'type', '') == 'qualified-rule':
                     sel = tinycss2.serialize(r.prelude).strip()
-                    decls = [d for d in tinycss2.parse_declaration_list(r.content) if getattr(d, 'type', '') == 'declaration']
+                    raw_content = tinycss2.serialize(r.content)
+                    decls = [d for d in tinycss2.parse_declaration_list(raw_content) if getattr(d, 'type', '') == 'declaration']
                     meta_decl = next((d for d in decls if d.lower_name == '--dusky-meta'), None)
                     meta_val = tinycss2.serialize(meta_decl.value).strip().strip('\'"') if meta_decl else None
                     
@@ -285,7 +290,8 @@ class DuskyASTManager:
             for r in inner_rules:
                 if getattr(r, 'type', '') == 'qualified-rule':
                     sel = tinycss2.serialize(r.prelude).strip()
-                    decls = [d for d in tinycss2.parse_declaration_list(r.content) if getattr(d, 'type', '') == 'declaration']
+                    raw_content = tinycss2.serialize(r.content)
+                    decls = [d for d in tinycss2.parse_declaration_list(raw_content) if getattr(d, 'type', '') == 'declaration']
                     meta_decl = next((d for d in decls if d.lower_name == '--dusky-meta'), None)
                     meta_val = tinycss2.serialize(meta_decl.value).strip().strip('\'"') if meta_decl else None
                     
@@ -299,7 +305,9 @@ class DuskyASTManager:
 
     def _repack_moz_node(self, moz_node: tinycss2.ast.AtRule, inner_rules: list):
         """Safely repacks inner rules, preventing multiline serialization corruption."""
-        repacked_css = "\n\n".join(r.serialize().strip() for r in inner_rules)
+        # [FIXED] Brutally filter out any ParseError objects to absolutely guarantee we never crash on serialization
+        valid_rules = [r for r in inner_rules if getattr(r, 'type', '') != 'error']
+        repacked_css = "\n\n".join(r.serialize().strip() for r in valid_rules)
         moz_node.content = tinycss2.parse_component_value_list(f"\n    {repacked_css}\n")
 
     def generate_css(self) -> str:
@@ -500,7 +508,6 @@ def flow_create_edit():
                         if getattr(d, 'important', False) and "!important" not in val.lower():
                             val += " !important"
                         if val:
-                            # [FIXED] Case-sensitive property parsing to save CSS Variables natively
                             prop_name = d.name if d.name.startswith('--') else d.lower_name
                             props.append((prop_name, val))
                             
