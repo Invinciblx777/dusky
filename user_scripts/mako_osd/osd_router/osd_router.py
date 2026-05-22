@@ -138,7 +138,8 @@ async def monitor_device(dev_path: str) -> None:
                         dispatch_notification(f"caps-lock-{state.lower()}", f"Caps Lock: {state}")
                 elif event.code == ecodes.LED_NUML:
                     if now - _last_physical_keypress[ecodes.KEY_NUMLOCK] < 1.0:
-                        state = "ON" if event.value == 1 else "OFF"
+                        # Logic inverted: hardware LED state maps oppositely to the logical typing state
+                        state = "OFF" if event.value == 1 else "ON"
                         dispatch_notification(f"num-lock-{state.lower()}", f"Num Lock: {state}")
                     
     except (OSError, PermissionError):
