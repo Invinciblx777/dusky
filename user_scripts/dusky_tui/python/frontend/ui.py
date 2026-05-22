@@ -1368,7 +1368,66 @@ class DuskyTUI(App):
                     txt.append(" ⬤ ", style=hex_color if exists else self.theme_colors["muted"])
                     
                     if is_theme_variable(val_str):
-                        txt.append(f" {val_str}", style=accent)
+                        # Global variable tracker across the TUI
+                        if not hasattr(self, "_color_var_registry"):
+                            self._color_var_registry = {}
+                            self._color_var_counter = 1
+                            
+                        display_name = None
+                        
+                        # Intelligently map to a schema Hint if provided (handles alpha suffixes like {{..}}1a perfectly)
+                        if item.options:
+                            # Sort options descending so it maps the most accurate/longest string prefix 
+                            sorted_opts = sorted(enumerate(item.options), key=lambda x: len(str(x[1])), reverse=True)
+                            for idx, opt in sorted_opts:
+                                if val_str.startswith(str(opt)):
+                                    if idx < len(item.hints) and item.hints[idx]:
+                                        base_hint = item.hints[idx]
+                                        suffix = val_str[len(str(opt)):].strip()
+                                        if suffix:
+                                            display_name = f"{base_hint} [{suffix}]"
+                                        else:
+                                            display_name = base_hint
+                                    break
+                                    
+                        # Complete the user request: automatically assign "Variable 1", "Variable 2", etc.
+                        if not display_name:
+                            norm_val = val_str.strip()
+                            
+                            # --- START NATIVE VARIABLE NAME EXTRACTION ---
+                            extracted_name = None
+                            
+                            # 1. CSS Variables: var(--surface-bg)
+                            css_match = re.search(r"var\(--([^)]+)\)", norm_val)
+                            if css_match: 
+                                extracted_name = css_match.group(1)
+                                
+                            # 2. Matugen / Jinja: {{colors.primary.default.hex}}
+                            elif "{{" in norm_val:
+                                mat_match = re.search(r"\{\{([^}]+)\}\}", norm_val)
+                                if mat_match:
+                                    parts = mat_match.group(1).split(".")
+                                    extracted_name = parts[1] if len(parts) > 1 and parts[0] == "colors" else parts[-1]
+                                    
+                            # 3. GTK/SCSS/Bash/Hyprland: @accent_bg_color or $background
+                            else:
+                                prefix_match = re.search(r"[@$]([a-zA-Z0-9_-]+)", norm_val)
+                                if prefix_match:
+                                    extracted_name = prefix_match.group(1)
+                                    
+                            if extracted_name:
+                                # Clean formatting (e.g., 'window_bg_color' -> 'Window Bg Color')
+                                display_name = extracted_name.replace("_", " ").replace("-", " ").title()
+                            # --- END NATIVE VARIABLE NAME EXTRACTION ---
+
+                            # --- FALLBACK: Unknowns become Variable 1, Variable 2 ---
+                            if not display_name:
+                                if norm_val not in self._color_var_registry:
+                                    self._color_var_registry[norm_val] = f"Variable {self._color_var_counter}"
+                                    self._color_var_counter += 1
+                                display_name = self._color_var_registry[norm_val]
+                            
+                        txt.append(f" {display_name}", style=accent)
                     else:
                         color_name = get_color_name(r, g, b)
                         if resolved_color != val_str:

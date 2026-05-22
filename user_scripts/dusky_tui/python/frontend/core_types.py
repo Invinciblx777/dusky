@@ -26,9 +26,30 @@ _LOWER_KNOWN_COLORS = {k.lower() for k in KNOWN_COLORS}
 def is_theme_variable(val: str) -> bool:
     """Validates if a string is a custom theme variable rather than a standard color/hex."""
     val = str(val).strip()
-    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", val): return False
-    if val.lower() in _LOWER_KNOWN_COLORS: return False
-    if re.match(r"^([a-fA-F0-9]{3}|[a-fA-F0-9]{4}|[a-fA-F0-9]{6}|[a-fA-F0-9]{8})$", val): return False
+    if not val: return False
+    
+    val_lower = val.lower()
+
+    # --- NATIVE VARIABLE DETECTION SAFEGUARD ---
+    # If the string contains explicit structural variable syntax, it is guaranteed
+    # to be a theme variable. This prevents values like `rgba($color, 0.5)` or 
+    # `rgb(var(--bg))` from incorrectly getting marked as standard functional colors.
+    if re.search(r"(\$|@|var\(|\{\{)", val_lower): 
+        return True
+    
+    # Fast fail for obvious explicit standard color name declarations
+    if val_lower in _LOWER_KNOWN_COLORS: return False
+    
+    # Filter out standard Hex structures (with or without #)
+    if re.match(r"^#?([a-fA-F0-9]{3}|[a-fA-F0-9]{4}|[a-fA-F0-9]{6}|[a-fA-F0-9]{8})$", val): return False
+    
+    # Filter out 0x prefixed hex
+    if re.match(r"^0x[a-fA-F0-9]{6,8}$", val_lower): return False
+    
+    # Filter out functional color blocks (now safe because variables inside them were caught above)
+    if val_lower.startswith(("rgb", "rgba", "hsl", "hsla", "oklch")): return False
+    
+    # Everything remaining (Template {{tags}}, Bash $vars, CSS var(--xyz)) is a theme variable
     return True
 
 # Preserving your exact Python 3.12+ type alias syntax from the original ui.py
