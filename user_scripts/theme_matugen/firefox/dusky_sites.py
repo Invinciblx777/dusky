@@ -115,7 +115,6 @@ class DuskyASTManager:
     def _get_target_moz_documents(self) -> list[tinycss2.ast.AtRule]:
         """Locates ALL @-moz-document blocks for the target domain."""
         docs = []
-        # [FIX] Supports standard double/single quotes OR unquoted domains securely.
         escaped_domain = re.escape(self.domain)
         pattern = rf'(?:[\'"]{escaped_domain}[\'"]|\b{escaped_domain}\b)'
         
@@ -132,7 +131,8 @@ class DuskyASTManager:
 
         if not docs:
             moz_code = f'@-moz-document domain("{self.domain}") {{\n}}\n'
-            moz_node = tinycss2.parse_stylesheet(moz_code)[0]
+            # [FIXED] Safely extract the target node, avoiding leading whitespace issues
+            moz_node = next(n for n in tinycss2.parse_stylesheet(moz_code) if getattr(n, 'type', '') == 'at-rule')
             self.stylesheet.append(moz_node)
             docs = [moz_node]
 
@@ -148,7 +148,7 @@ class DuskyASTManager:
 
         for r_data in new_rules:
             if r_data.get('type') == 'at-rule':
-                # [FIX] Smart-merge for nested @rules (like @media) to prevent exponential bloat.
+                # Smart-merge for nested @rules (like @media)
                 new_node = r_data['ast_node']
                 prelude_str = tinycss2.serialize(new_node.prelude).strip()
                 keyword = getattr(new_node, 'at_keyword', '')
@@ -174,16 +174,36 @@ class DuskyASTManager:
                 old_rule = existing_rules_map[sel]
                 parsed_content = tinycss2.parse_declaration_list(old_rule.content)
                 
-                keys_to_update = {k.lower() for k, _ in props}
+                # [FIXED] Smart casing mapping: variables stay exact, standard properties lowercase
+                keys_to_update = set()
+                for k, _ in props:
+                    keys_to_update.add(k if k.startswith('--') else k.lower())
+                
                 if meta:
                     keys_to_update.add('--dusky-meta')
 
                 new_content = []
+                skip_next_whitespace = False
+                
                 for node in parsed_content:
-                    # Strip out ONLY the declarations we are directly overriding
-                    if getattr(node, 'type', '') == 'declaration' and node.lower_name in keys_to_update:
+                    is_whitespace = getattr(node, 'type', '') == 'whitespace'
+                    
+                    # [FIXED] Whitespace Memory Leak: collapse orphaned spaces around purged declarations
+                    if skip_next_whitespace and is_whitespace:
+                        skip_next_whitespace = False
                         continue
-                    new_content.append(node) # Preserves comments, whitespace, and fallbacks!
+
+                    if getattr(node, 'type', '') == 'declaration':
+                        target_name = node.name if node.name.startswith('--') else node.lower_name
+                        if target_name in keys_to_update:
+                            # Pop preceding whitespace if it exists
+                            if new_content and getattr(new_content[-1], 'type', '') == 'whitespace':
+                                new_content.pop()
+                            skip_next_whitespace = True
+                            continue
+
+                    new_content.append(node)
+                    skip_next_whitespace = False
 
                 if meta:
                     new_content.extend(tinycss2.parse_declaration_list(f"\n        --dusky-meta: \"{meta}\";"))
@@ -205,8 +225,14 @@ class DuskyASTManager:
                     css_lines.append(f"        {k}: {v}{suffix};")
                 css_lines.append("    }\n")
                 
-                new_rule_ast = tinycss2.parse_stylesheet("\n".join(css_lines))[0]
-                inner_rules.append(new_rule_ast)
+                # [FIXED] Bypass AST truncation caused by leading WhitespaceTokens
+                parsed_nodes = tinycss2.parse_stylesheet("\n".join(css_lines))
+                new_rule_ast = next((n for n in parsed_nodes if getattr(n, 'type', '') == 'qualified-rule'), None)
+                
+                if new_rule_ast:
+                    inner_rules.append(new_rule_ast)
+                    # [FIXED] State Desync: Register the newly created rule immediately to allow multi-variable accumulation
+                    existing_rules_map[sel] = new_rule_ast
 
         self._repack_moz_node(target_moz_node, inner_rules)
 
@@ -273,7 +299,6 @@ class DuskyASTManager:
 
     def _repack_moz_node(self, moz_node: tinycss2.ast.AtRule, inner_rules: list):
         """Safely repacks inner rules, preventing multiline serialization corruption."""
-        # [FIX] Added explicit double newlines to prevent stylesheet compaction bloat
         repacked_css = "\n\n".join(r.serialize().strip() for r in inner_rules)
         moz_node.content = tinycss2.parse_component_value_list(f"\n    {repacked_css}\n")
 
@@ -315,7 +340,6 @@ def get_smart_input(prompt_msg: str) -> str:
             if line == "":
                 empty_count += 1
                 if empty_count >= 2:
-                    # Remove the first empty line added by the initial Return
                     if lines and lines[-1] == "":
                         lines.pop()
                     break
@@ -357,7 +381,6 @@ def flow_audit_mode():
     console.print(Panel.fit("=== Dusky Auditor: Fix or Prune Selectors ===", style="bold yellow"))
     
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    # Sorted for deterministic TUI presentation
     css_files = sorted(CONFIG_DIR.glob("*.css"), key=lambda f: f.name)
     
     if not css_files:
@@ -370,7 +393,6 @@ def flow_audit_mode():
         
     file_choice = Prompt.ask("\nChoice", default="1")
     try:
-        # [FIX] Prevent silent negative indexing wrapping to the end of the list
         f_idx = int(file_choice) - 1
         if f_idx < 0:
             raise ValueError
@@ -405,7 +427,6 @@ def flow_audit_mode():
             break
             
         try:
-            # [FIX] Prevent silent negative indexing mapping
             c_idx = int(choice) - 1
             if c_idx < 0:
                 raise ValueError
@@ -479,11 +500,12 @@ def flow_create_edit():
                         if getattr(d, 'important', False) and "!important" not in val.lower():
                             val += " !important"
                         if val:
-                            props.append((d.lower_name, val))
+                            # [FIXED] Case-sensitive property parsing to save CSS Variables natively
+                            prop_name = d.name if d.name.startswith('--') else d.lower_name
+                            props.append((prop_name, val))
                             
                     if props:
                         meta_name = Prompt.ask(f"[bold yellow]Name this block (Selector: {sel})[/] [dim](Enter to skip)[/]").strip()
-                        # [FIX] Sanitize metadata quotes to prevent CSS syntax injection breaking the file
                         if meta_name: meta_name = meta_name.replace('"', "'")
                         
                         pending_rules.append({
