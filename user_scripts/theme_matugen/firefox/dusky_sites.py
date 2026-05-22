@@ -24,6 +24,13 @@ try:
     import tinycss2
 except ImportError:
     print("\n[!] Essential libraries ('rich' or 'tinycss2') are missing.")
+    
+    # Prevent infinite loop if installation succeeds but resolution fails
+    if os.environ.get("_DUSKY_BOOTSTRAP_ATTEMPTED"):
+        print("[!] Bootstrap loop detected. Dependency resolution failed permanently.")
+        print("[!] Please install manually: sudo pacman -S python-rich python-tinycss2")
+        sys.exit(1)
+        
     try:
         if is_in_venv():
             print("[*] Virtual environment detected. Installing dependencies via pip...")
@@ -41,10 +48,14 @@ except ImportError:
             if which_path:
                 script_path = Path(which_path).resolve()
                 
+        if not script_path.exists():
+            print("\n[!] Could not automatically resolve execution path. Please restart manually.")
+            sys.exit(1)
+                
+        os.environ["_DUSKY_BOOTSTRAP_ATTEMPTED"] = "1"
         os.execv(sys.executable, [sys.executable, str(script_path)] + sys.argv[1:])
     except subprocess.CalledProcessError:
         print("\n[!] Failed to install dependencies automatically.")
-        print("[!] Please update and install manually:\n    sudo pacman -Syu python-rich python-tinycss2")
         sys.exit(1)
     except Exception as e:
         print(f"\n[!] Bootstrap exception: {e}")
@@ -57,7 +68,7 @@ from rich.prompt import Prompt
 from rich.syntax import Syntax
 
 # =============================================================================
-# ▼ CORE CONFIGURATION ▼
+# ▼ CORE CONFIGURATION & UTILITIES ▼
 # =============================================================================
 
 console = Console()
@@ -80,6 +91,12 @@ ROLES: dict[str, dict[str, str]] = {
     "14": {"name": "Make Text Transparent", "prop": "color", "var": "transparent"}
 }
 
+def safe_write_atomic(filepath: Path, content: str) -> None:
+    """Writes to a file atomically to prevent corruption on crash or interrupt."""
+    temp_path = filepath.with_suffix('.css.tmp')
+    temp_path.write_text(content, encoding='utf-8')
+    temp_path.replace(filepath)
+
 # =============================================================================
 # ▼ AST CSS ENGINE (tinycss2) ▼
 # =============================================================================
@@ -87,148 +104,178 @@ ROLES: dict[str, dict[str, str]] = {
 class DuskyASTManager:
     """
     Elite AST manipulation class. 
-    Parses stylesheets, extracts variables, and safely injects properties natively.
+    Parses stylesheets, extracts variables, safely merges AST tokens, and handles @rules.
     """
     def __init__(self, domain: str, filepath: Path):
         self.domain = domain
         self.filepath = filepath
-        self.raw_css = filepath.read_text('utf-8') if filepath.exists() else ""
+        self.raw_css = filepath.read_text(encoding='utf-8') if filepath.exists() else ""
         self.stylesheet = tinycss2.parse_stylesheet(self.raw_css, skip_comments=False)
 
-    def _get_target_moz_document(self) -> tuple[list, tinycss2.ast.AtRule | None]:
-        """Locates the specific @-moz-document block for the target domain."""
+    def _get_target_moz_documents(self) -> list[tinycss2.ast.AtRule]:
+        """Locates ALL @-moz-document blocks for the target domain."""
+        docs = []
+        # [FIX] Supports standard double/single quotes OR unquoted domains securely.
+        escaped_domain = re.escape(self.domain)
+        pattern = rf'(?:[\'"]{escaped_domain}[\'"]|\b{escaped_domain}\b)'
+        
         for node in self.stylesheet:
-            # FIXED: AST preserves the hyphen for at-rules like -moz-document
             if getattr(node, 'at_keyword', None) == '-moz-document':
                 prelude = tinycss2.serialize(node.prelude)
-                if re.search(rf'[\'"]{re.escape(self.domain)}[\'"]', prelude):
-                    return self.stylesheet, node
-        return self.stylesheet, None
+                if re.search(pattern, prelude):
+                    docs.append(node)
+        return docs
 
     def inject_rules(self, new_rules: list[dict]):
-        """Injects or intelligently merges rules into the AST."""
-        sheet, moz_node = self._get_target_moz_document()
+        """Injects or intelligently non-destructively merges rules into the AST."""
+        docs = self._get_target_moz_documents()
 
-        if not moz_node:
+        if not docs:
             moz_code = f'@-moz-document domain("{self.domain}") {{\n}}\n'
             moz_node = tinycss2.parse_stylesheet(moz_code)[0]
-            sheet.append(moz_node)
+            self.stylesheet.append(moz_node)
+            docs = [moz_node]
 
-        inner_nodes = moz_node.content if moz_node.content else []
+        target_moz_node = docs[-1] # Inject new items into the last matching block
+        inner_nodes = target_moz_node.content if target_moz_node.content else []
         inner_rules = tinycss2.parse_rule_list(inner_nodes)
 
         existing_rules_map = {}
         for r in inner_rules:
-            if r.type == 'qualified-rule':
+            if getattr(r, 'type', '') == 'qualified-rule':
                 sel = tinycss2.serialize(r.prelude).strip()
                 existing_rules_map[sel] = r
 
         for r_data in new_rules:
+            if r_data.get('type') == 'at-rule':
+                # [FIX] Smart-merge for nested @rules (like @media) to prevent exponential bloat.
+                new_node = r_data['ast_node']
+                prelude_str = tinycss2.serialize(new_node.prelude).strip()
+                keyword = getattr(new_node, 'at_keyword', '')
+                
+                replaced = False
+                for i, existing_rule in enumerate(inner_rules):
+                    if getattr(existing_rule, 'type', '') == 'at-rule' and getattr(existing_rule, 'at_keyword', '') == keyword:
+                        if tinycss2.serialize(existing_rule.prelude).strip() == prelude_str:
+                            inner_rules[i] = new_node
+                            replaced = True
+                            break
+                            
+                if not replaced:
+                    inner_rules.append(new_node)
+                continue
+
             sel = r_data['selector']
-            props = r_data['props']
+            props = r_data['props'] # List of tuples: [(key, val)]
             meta = r_data.get('meta')
 
             if sel in existing_rules_map:
-                # [AST MERGE MODE]
+                # [NON-DESTRUCTIVE AST MERGE MODE]
                 old_rule = existing_rules_map[sel]
-                decls = [d for d in tinycss2.parse_declaration_list(old_rule.content) if d.type == 'declaration']
-                decl_dict = {d.lower_name: d for d in decls}
-
-                existing_meta_node = decl_dict.get('--dusky-meta')
+                parsed_content = tinycss2.parse_declaration_list(old_rule.content)
+                
+                keys_to_update = {k.lower() for k, _ in props}
                 if meta:
-                    decl_dict['--dusky-meta'] = tinycss2.parse_declaration_list(f"--dusky-meta: \"{meta}\";")[0]
-                elif existing_meta_node:
-                    decl_dict['--dusky-meta'] = existing_meta_node
+                    keys_to_update.add('--dusky-meta')
 
-                for k, v in props.items():
-                    suffix = " !important" if "!important" not in v else ""
-                    new_decl_ast = tinycss2.parse_declaration_list(f"{k}: {v}{suffix};")[0]
-                    decl_dict[k.lower()] = new_decl_ast
+                new_content = []
+                for node in parsed_content:
+                    # Strip out ONLY the declarations we are directly overriding
+                    if getattr(node, 'type', '') == 'declaration' and node.lower_name in keys_to_update:
+                        continue
+                    new_content.append(node) # Preserves comments, whitespace, and fallbacks!
 
-                merged_css = "\n".join(f"        {d.serialize().strip()}" for d in decl_dict.values())
-                old_rule.content = tinycss2.parse_component_value_list(f"\n{merged_css}\n    ")
+                if meta:
+                    new_content.extend(tinycss2.parse_declaration_list(f"\n        --dusky-meta: \"{meta}\";"))
+                
+                for k, v in props:
+                    # Append new declarations at the bottom of the block
+                    suffix = " !important" if "!important" not in str(v).lower() else ""
+                    new_content.extend(tinycss2.parse_declaration_list(f"\n        {k}: {v}{suffix};"))
+
+                new_content.extend(tinycss2.parse_component_value_list("\n    "))
+                old_rule.content = new_content
             else:
                 # [CREATE NEW AST RULE]
-                css_lines = [f"    {sel} {{"]
+                css_lines = [f"\n    {sel} {{"]
                 if meta:
                     css_lines.append(f"        --dusky-meta: \"{meta}\";")
-                for k, v in props.items():
-                    suffix = " !important" if "!important" not in v else ""
+                for k, v in props:
+                    suffix = " !important" if "!important" not in str(v).lower() else ""
                     css_lines.append(f"        {k}: {v}{suffix};")
-                css_lines.append("    }")
+                css_lines.append("    }\n")
                 
                 new_rule_ast = tinycss2.parse_stylesheet("\n".join(css_lines))[0]
                 inner_rules.append(new_rule_ast)
 
-        self._repack_moz_node(moz_node, inner_rules)
+        self._repack_moz_node(target_moz_node, inner_rules)
 
     def get_semantic_audit_list(self) -> list[dict]:
-        """Scans the AST for the --dusky-meta property to build an audit list."""
-        _, moz_node = self._get_target_moz_document()
-        if not moz_node or not moz_node.content:
-            return []
-
+        """Scans the AST across all domain-matching @-moz-document blocks for metadata."""
         audit_list = []
-        inner_rules = tinycss2.parse_rule_list(moz_node.content)
-        for r in inner_rules:
-            if r.type == 'qualified-rule':
-                sel = tinycss2.serialize(r.prelude).strip()
-                decls = [d for d in tinycss2.parse_declaration_list(r.content) if d.type == 'declaration']
-                
-                meta_decl = next((d for d in decls if d.lower_name == '--dusky-meta'), None)
-                if meta_decl:
-                    meta_val = tinycss2.serialize(meta_decl.value).strip().strip('\'"')
-                    # Return immutable identities, avoiding volatile memory refs
-                    audit_list.append({'selector': sel, 'meta': meta_val})
+        for moz_node in self._get_target_moz_documents():
+            if not moz_node.content:
+                continue
+            inner_rules = tinycss2.parse_rule_list(moz_node.content)
+            for r in inner_rules:
+                if getattr(r, 'type', '') == 'qualified-rule':
+                    sel = tinycss2.serialize(r.prelude).strip()
+                    decls = [d for d in tinycss2.parse_declaration_list(r.content) if getattr(d, 'type', '') == 'declaration']
+                    meta_decl = next((d for d in decls if d.lower_name == '--dusky-meta'), None)
+                    if meta_decl:
+                        meta_val = tinycss2.serialize(meta_decl.value).strip().strip('\'"')
+                        audit_list.append({'selector': sel, 'meta': meta_val})
         return audit_list
 
     def update_rule_selector(self, target_selector: str, target_meta: str, new_selector: str):
-        """Mutates a rule's selector safely by locating it inside the actively parsed list."""
-        _, moz_node = self._get_target_moz_document()
-        if not moz_node: return
-        
-        inner_rules = tinycss2.parse_rule_list(moz_node.content)
-        for r in inner_rules:
-            if r.type == 'qualified-rule':
-                sel = tinycss2.serialize(r.prelude).strip()
-                decls = [d for d in tinycss2.parse_declaration_list(r.content) if d.type == 'declaration']
-                meta_decl = next((d for d in decls if d.lower_name == '--dusky-meta'), None)
-                meta_val = tinycss2.serialize(meta_decl.value).strip().strip('\'"') if meta_decl else None
-                
-                if sel == target_selector and meta_val == target_meta:
-                    r.prelude = tinycss2.parse_component_value_list(new_selector + " ")
-                    break
+        """Mutates a rule's selector safely across all domain blocks."""
+        for moz_node in self._get_target_moz_documents():
+            if not moz_node.content:
+                continue
+            inner_rules = tinycss2.parse_rule_list(moz_node.content)
+            modified = False
+            for r in inner_rules:
+                if getattr(r, 'type', '') == 'qualified-rule':
+                    sel = tinycss2.serialize(r.prelude).strip()
+                    decls = [d for d in tinycss2.parse_declaration_list(r.content) if getattr(d, 'type', '') == 'declaration']
+                    meta_decl = next((d for d in decls if d.lower_name == '--dusky-meta'), None)
+                    meta_val = tinycss2.serialize(meta_decl.value).strip().strip('\'"') if meta_decl else None
                     
-        self._repack_moz_node(moz_node, inner_rules)
+                    if sel == target_selector and meta_val == target_meta:
+                        r.prelude = tinycss2.parse_component_value_list(new_selector + " ")
+                        modified = True
+                        
+            if modified:
+                self._repack_moz_node(moz_node, inner_rules)
 
     def delete_rule(self, target_selector: str, target_meta: str):
         """Purges a specific rule from the AST using semantic identity matching."""
-        _, moz_node = self._get_target_moz_document()
-        if not moz_node: return
-        
-        inner_rules = tinycss2.parse_rule_list(moz_node.content)
-        new_rules = []
-        for r in inner_rules:
-            if r.type == 'qualified-rule':
-                sel = tinycss2.serialize(r.prelude).strip()
-                decls = [d for d in tinycss2.parse_declaration_list(r.content) if d.type == 'declaration']
-                meta_decl = next((d for d in decls if d.lower_name == '--dusky-meta'), None)
-                meta_val = tinycss2.serialize(meta_decl.value).strip().strip('\'"') if meta_decl else None
+        for moz_node in self._get_target_moz_documents():
+            if not moz_node.content:
+                continue
+            inner_rules = tinycss2.parse_rule_list(moz_node.content)
+            new_rules = []
+            modified = False
+            for r in inner_rules:
+                if getattr(r, 'type', '') == 'qualified-rule':
+                    sel = tinycss2.serialize(r.prelude).strip()
+                    decls = [d for d in tinycss2.parse_declaration_list(r.content) if getattr(d, 'type', '') == 'declaration']
+                    meta_decl = next((d for d in decls if d.lower_name == '--dusky-meta'), None)
+                    meta_val = tinycss2.serialize(meta_decl.value).strip().strip('\'"') if meta_decl else None
+                    
+                    if sel == target_selector and meta_val == target_meta:
+                        modified = True
+                        continue # Skip and prune
+                new_rules.append(r)
                 
-                if sel == target_selector and meta_val == target_meta:
-                    continue # Skip and prune
-            new_rules.append(r)
-            
-        self._repack_moz_node(moz_node, new_rules)
+            if modified:
+                self._repack_moz_node(moz_node, new_rules)
 
     def _repack_moz_node(self, moz_node: tinycss2.ast.AtRule, inner_rules: list):
-        """Formats and packs rules safely into the parent block."""
-        valid_rules = [r for r in inner_rules if getattr(r, 'type', '') in ('qualified-rule', 'at-rule')]
-        repacked_css = "\n\n".join("    " + r.serialize().strip().replace('\n', '\n    ') for r in valid_rules)
-        if repacked_css:
-            moz_node.content = tinycss2.parse_component_value_list(f"\n{repacked_css}\n\n")
-        else:
-            moz_node.content = tinycss2.parse_component_value_list("\n")
+        """Safely repacks inner rules, preventing multiline serialization corruption."""
+        # [FIX] Added explicit double newlines to prevent stylesheet compaction bloat
+        repacked_css = "\n\n".join(r.serialize().strip() for r in inner_rules)
+        moz_node.content = tinycss2.parse_component_value_list(f"\n    {repacked_css}\n")
 
     def generate_css(self) -> str:
         """Serializes the entire modified AST back to a pristine string."""
@@ -240,12 +287,13 @@ class DuskyASTManager:
 # =============================================================================
 
 def extract_domain(raw_input: str) -> str:
+    """Extracts base domain securely and truncates to prevent OS-level path crashes."""
     raw_input = raw_input.strip()
     if not raw_input.startswith(('http://', 'https://')):
         raw_input = 'https://' + raw_input
     parsed = urlparse(raw_input)
     domain = parsed.netloc.split(':')[0]
-    return re.sub(r'[^\w.-]', '', domain).removeprefix('www.')
+    return re.sub(r'[^\w.-]', '', domain).removeprefix('www.')[:200]
 
 def extract_css_variables(text: str) -> list[str]:
     """Bulletproof regex extraction to capture variables safely."""
@@ -253,16 +301,14 @@ def extract_css_variables(text: str) -> list[str]:
     return list(dict.fromkeys(matches)) # Deduplicate maintaining order
 
 def get_smart_input(prompt_msg: str) -> str:
-    """Safely captures massive multi-line CSS pastes."""
+    """Safely captures massive multi-line CSS pastes avoiding premature truncation."""
     console.print(f"[bold cyan]{prompt_msg}[/]")
-    console.print("[dim](Paste content. Type 'END' on a new line to finish, or press Enter twice)[/]")
+    console.print("[dim](Paste content. Type 'END' on a new line to finish, or press Ctrl+D)[/]")
     lines = []
     while True:
         try:
             line = input()
             if line.strip().upper() == "END":
-                break
-            if line.strip() == "" and (not lines or lines[-1].strip() == ""):
                 break
             lines.append(line)
         except EOFError:
@@ -270,7 +316,6 @@ def get_smart_input(prompt_msg: str) -> str:
     return "\n".join(lines).strip()
 
 def print_menu() -> None:
-    # FIXED: Rebuilt for properly mapped 4-column UI
     table = Table(show_header=True, header_style="bold magenta", border_style="dim", expand=True)
     table.add_column("Key", style="cyan", justify="center", width=5)
     table.add_column("Role / Semantic Element", style="white")
@@ -300,7 +345,8 @@ def flow_audit_mode():
     console.print(Panel.fit("=== Dusky Auditor: Fix or Prune Selectors ===", style="bold yellow"))
     
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    css_files = list(CONFIG_DIR.glob("*.css"))
+    # Sorted for deterministic TUI presentation
+    css_files = sorted(CONFIG_DIR.glob("*.css"), key=lambda f: f.name)
     
     if not css_files:
         console.print("[bold red]No themes found in ~/.config/dusky_sites/[/]")
@@ -312,7 +358,11 @@ def flow_audit_mode():
         
     file_choice = Prompt.ask("\nChoice", default="1")
     try:
-        selected_file = css_files[int(file_choice) - 1]
+        # [FIX] Prevent silent negative indexing wrapping to the end of the list
+        f_idx = int(file_choice) - 1
+        if f_idx < 0:
+            raise ValueError
+        selected_file = css_files[f_idx]
     except (IndexError, ValueError):
         return console.print("[red]Invalid choice.[/]")
 
@@ -343,7 +393,12 @@ def flow_audit_mode():
             break
             
         try:
-            target = audit_list[int(choice) - 1]
+            # [FIX] Prevent silent negative indexing mapping
+            c_idx = int(choice) - 1
+            if c_idx < 0:
+                raise ValueError
+            target = audit_list[c_idx]
+            
             console.print(f"\n[bold green]Targeting:[/] {target['meta']}")
             console.print(f"Selector: [dim]{target['selector']}[/]")
             
@@ -355,15 +410,15 @@ def flow_audit_mode():
                 new_sel = Prompt.ask("\n[bold cyan]Paste the new updated selector[/]").strip()
                 if new_sel and new_sel != target['selector']:
                     manager.update_rule_selector(target['selector'], target['meta'], new_sel)
-                    selected_file.write_text(manager.generate_css(), 'utf-8')
-                    console.print("[bold green]✔ Selector updated & AST saved![/]")
+                    safe_write_atomic(selected_file, manager.generate_css())
+                    console.print("[bold green]✔ Selector updated & AST safely saved![/]")
             
             elif action == "2":
                 confirm = Prompt.ask("[bold red]Are you sure you want to delete this rule?[/] (y/N)", default="n")
                 if confirm.lower() == 'y':
                     manager.delete_rule(target['selector'], target['meta'])
-                    selected_file.write_text(manager.generate_css(), 'utf-8')
-                    console.print("[bold green]✔ Rule purged & AST saved![/]")
+                    safe_write_atomic(selected_file, manager.generate_css())
+                    console.print("[bold green]✔ Rule purged & AST safely saved![/]")
                     
             if action in ["1", "2"]:
                 Prompt.ask("Press Enter to continue")
@@ -397,9 +452,54 @@ def flow_create_edit():
         if not user_input:
             break
             
+        # Path C: Prioritize parsing whole CSS Blocks natively (including @rules)
+        if "{" in user_input and "}" in user_input:
+            parsed_rules = tinycss2.parse_rule_list(user_input)
+            found_rules = False
+            for pr in parsed_rules:
+                if getattr(pr, 'type', '') == 'qualified-rule':
+                    sel = tinycss2.serialize(pr.prelude).strip()
+                    decls = [d for d in tinycss2.parse_declaration_list(pr.content) if getattr(d, 'type', '') == 'declaration']
+                    props = []
+                    for d in decls:
+                        val = tinycss2.serialize(d.value).strip()
+                        # Preserve existing !important tags natively written in the paste
+                        if getattr(d, 'important', False) and "!important" not in val.lower():
+                            val += " !important"
+                        if val:
+                            props.append((d.lower_name, val))
+                            
+                    if props:
+                        meta_name = Prompt.ask(f"[bold yellow]Name this block (Selector: {sel})[/] [dim](Enter to skip)[/]").strip()
+                        # [FIX] Sanitize metadata quotes to prevent CSS syntax injection breaking the file
+                        if meta_name: meta_name = meta_name.replace('"', "'")
+                        
+                        pending_rules.append({
+                            "selector": sel,
+                            "props": props,
+                            "meta": meta_name if meta_name else None
+                        })
+                        found_rules = True
+                        console.print(f"[bold green]✔ Added parsed block rule into memory: {sel}[/]")
+                        
+                elif getattr(pr, 'type', '') == 'at-rule':
+                    name = getattr(pr, 'at_keyword', 'unknown')
+                    meta_name = Prompt.ask(f"[bold yellow]Name this @{name} block[/] [dim](Enter to skip)[/]").strip()
+                    if meta_name: meta_name = meta_name.replace('"', "'")
+                    
+                    pending_rules.append({
+                        "type": "at-rule",
+                        "ast_node": pr,
+                        "meta": meta_name if meta_name else None
+                    })
+                    found_rules = True
+                    console.print(f"[bold green]✔ Added parsed @{name} block into memory[/]")
+                    
+            if found_rules:
+                continue
+
+        # Path A: User pasted explicit variables
         extracted_vars = extract_css_variables(user_input)
-        
-        # Path A: User pasted explicit variables natively
         if extracted_vars:
             console.print(f"\n[bold green]✔ Extracted {len(extracted_vars)} CSS Variables![/]")
             
@@ -416,36 +516,11 @@ def flow_create_edit():
                 if role_choice in ROLES:
                     pending_rules.append({
                         "selector": root_selector,
-                        "props": {var: ROLES[role_choice]['var']},
+                        "props": [(var, ROLES[role_choice]['var'])],
                         "meta": f"Variable {var}"
                     })
                     console.print(f"[bold green]✔ {var} mapped to {ROLES[role_choice]['name']}[/]")
             continue
-
-        # Path C (New): User pasted an entire CSS block with bracket syntax.
-        if "{" in user_input and "}" in user_input:
-            parsed_rules = tinycss2.parse_rule_list(user_input)
-            found_rules = False
-            for pr in parsed_rules:
-                if pr.type == 'qualified-rule':
-                    sel = tinycss2.serialize(pr.prelude).strip()
-                    decls = [d for d in tinycss2.parse_declaration_list(pr.content) if d.type == 'declaration']
-                    props = {}
-                    for d in decls:
-                        val = tinycss2.serialize(d.value).strip()
-                        if val:
-                            props[d.lower_name] = val
-                    if props:
-                        meta_name = Prompt.ask(f"[bold yellow]Name this block (Selector: {sel})[/] [dim](Enter to skip)[/]").strip()
-                        pending_rules.append({
-                            "selector": sel,
-                            "props": props,
-                            "meta": meta_name if meta_name else None
-                        })
-                        found_rules = True
-                        console.print(f"[bold green]✔ Added parsed block rule into memory: {sel}[/]")
-            if found_rules:
-                continue
             
         # Path B: User pasted a standard selector
         print_menu()
@@ -454,10 +529,11 @@ def flow_create_edit():
         if role_choice in ROLES:
             role_data = ROLES[role_choice]
             meta_name = Prompt.ask("[bold yellow]Optional: Name this element (for easy future fixes)[/] [dim](e.g. Like Button)[/]").strip()
+            if meta_name: meta_name = meta_name.replace('"', "'")
             
             pending_rules.append({
                 "selector": user_input,
-                "props": {role_data['prop']: role_data['var']},
+                "props": [(role_data['prop'], role_data['var'])],
                 "meta": meta_name if meta_name else None
             })
             console.print(f"[bold green]✔ Added {role_data['name']} rule into memory.[/]")
@@ -488,7 +564,7 @@ def flow_create_edit():
         return console.print("[bold yellow]Discarded. Returning to menu.[/]")
         
     try:
-        file_path.write_text(final_css, 'utf-8')
+        safe_write_atomic(file_path, final_css)
         console.print(f"\n[bold green]✔ AST safely written to:[/] {file_path}")
     except Exception as e:
         return console.print(f"[bold red]✖ Error writing file: {e}[/]")
