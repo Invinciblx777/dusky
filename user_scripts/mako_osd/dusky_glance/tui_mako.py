@@ -26,6 +26,15 @@ THEME_FILE = "~/.config/matugen/generated/dusky_tui.json"
 ENABLE_USER_PRESETS = True                 
 USER_PRESETS_TAB = "Profiles"              
 
+# Displays a popup when the TUI is first launched
+GLOBAL_POPUP = {
+    "title": "Color Application Notice",
+    "message": "To apply color changes, you must regenerate them by changing your wallpaper or using 'Regenerate' in the Profiles tab.",
+    "level": "info",           
+    "require_confirm": False,  
+    "cancel_quits": False      
+}
+
 # =============================================================================
 # 3. GLOBAL COLOR PALETTES (MATUGEN + HARDCODED)
 # =============================================================================
@@ -109,6 +118,16 @@ SCHEMA = {
             options=["top-right", "top-center", "top-left", "bottom-right", "bottom-center", "bottom-left", "center-right", "center-left", "center"],
             group="Geometry",
             extended_help="**Dashboard Anchor**\n\nThe exact quadrant of the physical screen where the Glance widget originates. Usually kept at `bottom-right` to stay out of the way of primary workspace tasks."
+        ),
+        ConfigItem(
+            label="Layer",
+            key="layer",
+            scope="app-name=dusky-glance",       
+            type_="cycle",
+            default="top",
+            options=["background", "bottom", "top", "overlay"],
+            group="Geometry",
+            extended_help="**Window Layering**\n\nArranges the widget at the specified layer relative to normal windows. Using `overlay` will cause notifications to be displayed above fullscreen windows."
         ),
         ConfigItem(
             label="Width",
