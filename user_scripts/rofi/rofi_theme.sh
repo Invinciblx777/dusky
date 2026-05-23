@@ -7,6 +7,7 @@
 #              - Fluid "Back" and "Cancel" propagation
 #              - Real-time state awareness via strict secure parsing
 #              - Logical submenus for Wallpapers and Color Presets
+#              - Frontend validation and notification feedback
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -53,7 +54,7 @@ readonly -A OPTS_COLORS=(
     ["⚫ Black"]="#000000"
 )
 
-# Keys array to maintain logical order in Rofi (Associative arrays are unordered by default)
+# Keys array to maintain logical order in Rofi
 readonly -a OPTS_COLOR_KEYS=(
     "🔴 Red" "🔵 Blue" "🟡 Yellow" "🟢 Green" "🌐 Cyan" "🟣 Purple"
     "🟠 Orange" "🌸 Pink" "🟤 Brown" "🪙 Golden" "🍃 Light Green"
@@ -134,7 +135,8 @@ run_menu() {
 get_current_state() {
     # Securely parse the live state without eval
     while IFS='=' read -r key val; do
-        val="${val%\"}"; val="${val#\"}" # Strip surrounding quotes
+        val="${val%\"}"; val="${val#\"}" # Strip double quotes
+        val="${val%\'}"; val="${val#\'}" # Strip single quotes
         case "$key" in
             THEME_MODE)          CUR_MODE="$val" ;;
             MATUGEN_TYPE)        CUR_TYPE="$val" ;;
@@ -198,6 +200,7 @@ wizard_theme() {
                     --contrast "${cfg[contrast]}" \
                     --index "${cfg[index]}" \
                     --base16 "${cfg[base16]}"; then
+                    notify critical "Theme Failed" "Check system logs for details."
                     log_error "Theme Backend Failed."
                 fi
                 return 0
@@ -258,6 +261,7 @@ wizard_animation() {
                     --trans-bezier "${cfg[bezier]}" \
                     --trans-angle "${cfg[angle]}" \
                     --trans-pos "${cfg[pos]}"; then
+                    notify critical "Animation Failed" "Check system logs for details."
                     log_error "Animation Backend Failed."
                 fi
                 return 0
@@ -281,8 +285,14 @@ submenu_regen() {
 
     case "$choice" in
         "[<-] Back"*) return 1 ;;
-        "🎨"*) "$THEME_CTL" "$action" || log_error "Failed: $action"; return 0 ;;
-        "🖼️"*) "$THEME_CTL" "$action" --no-regen || log_error "Failed: $action --no-regen"; return 0 ;;
+        "🎨"*) 
+            notify normal "Wallpaper & Theme" "Applying $action and extracting colors..."
+            "$THEME_CTL" "$action" || { notify critical "Failed" "Could not apply $action."; log_error "Failed: $action"; return 0; }
+            return 0 ;;
+        "🖼️"*) 
+            notify normal "Wallpaper Only" "Applying $action without regeneration..."
+            "$THEME_CTL" "$action" --no-regen || { notify critical "Failed" "Could not apply $action."; log_error "Failed: $action --no-regen"; return 0; }
+            return 0 ;;
     esac
 }
 
@@ -308,8 +318,16 @@ submenu_solid_color() {
                 # Empty array passed to run_menu gives a clean UI with NO list items. Just a typing bar.
                 # ESC cancels and continues the loop, bringing back the color preset list.
                 hex=$(run_menu "Enter Hex (e.g. FF0000) [ESC to Cancel]" true) || continue
+                
                 if [[ -n "$hex" ]]; then
-                    "$THEME_CTL" color "$hex" || log_error "Failed to apply color"
+                    # Rofi-side validation before hitting the backend
+                    if [[ ! "$hex" =~ ^#?[a-fA-F0-9]{6}$ ]]; then
+                        notify critical "Invalid Hex" "The input '$hex' is not a valid hex color."
+                        continue
+                    fi
+                    
+                    notify normal "Applying Solid Color" "Hex: $hex"
+                    "$THEME_CTL" color "$hex" || { notify critical "Failed" "Could not apply color."; log_error "Failed to apply color"; }
                     return 0
                 fi
                 ;;
@@ -317,7 +335,8 @@ submenu_solid_color() {
                 # Extract the hex code hidden in parenthesis (e.g. "🔴 Red (#FF0000)" -> "#FF0000")
                 if [[ "$choice" =~ \((#[A-Fa-f0-9]{6})\) ]]; then
                     hex="${BASH_REMATCH[1]}"
-                    "$THEME_CTL" color "$hex" || log_error "Failed to apply color"
+                    notify normal "Applying Preset" "Color: $hex"
+                    "$THEME_CTL" color "$hex" || { notify critical "Failed" "Could not apply preset."; log_error "Failed to apply preset color"; }
                     return 0
                 fi
                 ;;
@@ -374,8 +393,14 @@ main() {
             "🎨"*) wizard_theme || true ;;
             "✨"*) wizard_animation || true ;;
             "🖼️"*) submenu_wallpapers || true ;;
-            "🔄"*) "$THEME_CTL" refresh || log_error "Refresh failed" ;;
-            "🧹"*) "$THEME_CTL" set --defaults || log_error "Reset failed" ;;
+            "🔄"*) 
+                notify normal "Refreshing..." "Regenerating colors for current wallpaper."
+                "$THEME_CTL" refresh || { notify critical "Refresh Failed" "Check system logs."; log_error "Refresh failed"; }
+                ;;
+            "🧹"*) 
+                notify normal "Resetting Theme..." "Applying default configuration."
+                "$THEME_CTL" set --defaults || { notify critical "Reset Failed" "Check system logs."; log_error "Reset failed"; }
+                ;;
             "❌"*) exit 0 ;;
         esac
     done
