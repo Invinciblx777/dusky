@@ -957,7 +957,8 @@ class DuskyTUI(App):
     NoticeBox {
         width: 100%; height: auto; padding: 0 1; margin: 1 1 0 1; background: transparent;
     }
-    NoticeBox > Markdown { background: transparent; color: $foreground; }
+    NoticeBox > Markdown { background: transparent; color: $foreground; margin: 0; padding: 0; }
+    NoticeBox > Markdown > * { margin: 0; padding: 0; }
     NoticeBox.-info { border-left: solid $primary; background: $primary 10%; }
     NoticeBox.-warning { border-left: solid $warning; background: $warning 10%; }
     NoticeBox.-danger { border-left: solid $error; background: $error 10%; }
