@@ -9,6 +9,7 @@
 #              - Logical submenus for Wallpapers and Color Presets
 #              - Frontend validation and notification feedback
 #              - Theme & Animation Preset management system
+#              - Menu memory state persistence
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -17,6 +18,7 @@ shopt -s inherit_errexit
 # --- CONFIGURATION ---
 readonly THEME_CTL="${HOME}/user_scripts/theme_matugen/theme_ctl.sh"
 readonly PRESETS_FILE="${HOME}/.config/dusky/settings/dusky_theme/rofi_theme_presets"
+readonly MEMORY_FILE="${HOME}/.config/dusky/settings/dusky_theme/rofi_theme_memory"
 readonly APP_NAME="theme-ui"
 readonly ROFI_THEME_STR='window { width: 500px; } listview { lines: 12; }'
 
@@ -36,7 +38,7 @@ readonly -a OPTS_TRANS_BEZ=(disable ".54,0,.34,.99" "0,0,1,1" ".85,0,.15,1" ".17
 readonly -a OPTS_TRANS_ANG=(disable 0 45 90 135 180 225 270 315)
 readonly -a OPTS_TRANS_POS=(disable center top left right bottom top-left top-right bottom-left bottom-right)
 
-# 16 Comprehensive Color Presets (Cleaned of repetitive icons)
+# 16 Comprehensive Color Presets
 readonly -A OPTS_COLORS=(
     ["Red"]="#FF0000"
     ["Blue"]="#0000FF"
@@ -56,7 +58,6 @@ readonly -A OPTS_COLORS=(
     ["Black"]="#000000"
 )
 
-# Keys array to maintain logical order in Rofi
 readonly -a OPTS_COLOR_KEYS=(
     "Red" "Blue" "Yellow" "Green" "Cyan" "Purple"
     "Orange" "Pink" "Brown" "Golden" "Light Green"
@@ -96,6 +97,28 @@ require_commands() {
     [[ -f $THEME_CTL && -x $THEME_CTL ]] || fatal "Controller script missing/non-executable: $THEME_CTL"
 }
 
+# --- MEMORY STATE MANAGEMENT ---
+ensure_memory_file() {
+    if [[ ! -f "$MEMORY_FILE" ]]; then
+        mkdir -p -- "$(dirname "$MEMORY_FILE")"
+        touch -- "$MEMORY_FILE"
+    fi
+}
+
+read_memory() {
+    local menu_id="$1"
+    [[ -f "$MEMORY_FILE" ]] || return 0
+    grep -E "^${menu_id}=" "$MEMORY_FILE" | cut -d'=' -f2- || true
+}
+
+write_memory() {
+    local menu_id="$1"
+    local value="$2"
+    ensure_memory_file
+    sed -i "/^${menu_id}=/d" "$MEMORY_FILE"
+    printf '%s=%s\n' "$menu_id" "$value" >> "$MEMORY_FILE"
+}
+
 # --- ROFI WRAPPERS ---
 is_rofi_abort_exit() {
     local exit_code=$1
@@ -103,7 +126,7 @@ is_rofi_abort_exit() {
     (( exit_code >= 10 && exit_code <= 28 ))
 }
 
-# Core interface engine (Now supports automatic item highlighting)
+# Core interface engine with strict array index matching
 run_menu() {
     local prompt="$1"
     local allow_custom="$2"
@@ -114,12 +137,20 @@ run_menu() {
     
     local -a rofi_cmd=(uwsm-app -- rofi -dmenu -i -p "$prompt" -theme-str "$ROFI_THEME_STR" -format s)
     [[ "$allow_custom" == "false" ]] && rofi_cmd+=("-no-custom")
-    
-    # Automatically highlight the currently applied state
-    [[ -n "$default_selection" ]] && rofi_cmd+=("-select" "$default_selection")
 
-    # If options were passed, pipe them into rofi. Otherwise, open an empty input field.
     if (( ${#options[@]} > 0 )); then
+        # Strictly find the exact integer row index to prevent substring bugs (e.g. 0 matching -0.6)
+        local selected_row=0
+        if [[ -n "$default_selection" ]]; then
+            for i in "${!options[@]}"; do
+                if [[ "${options[$i]}" == "$default_selection" ]]; then
+                    selected_row=$i
+                    break
+                fi
+            done
+        fi
+        
+        rofi_cmd+=("-selected-row" "$selected_row")
         selected=$(printf '%s\n' "${options[@]}" | "${rofi_cmd[@]}") || exit_code=$?
     else
         selected=$("${rofi_cmd[@]}" </dev/null) || exit_code=$?
@@ -130,7 +161,6 @@ run_menu() {
         return 0
     fi
 
-    # Return 1 triggers a graceful back/abort to the previous state loop
     if is_rofi_abort_exit "$exit_code"; then
         return 1 
     fi
@@ -139,10 +169,9 @@ run_menu() {
 
 # --- STATE SYNC ---
 get_current_state() {
-    # Securely parse the live state without eval
     while IFS='=' read -r key val; do
-        val="${val%\"}"; val="${val#\"}" # Strip double quotes
-        val="${val%\'}"; val="${val#\'}" # Strip single quotes
+        val="${val%\"}"; val="${val#\"}" 
+        val="${val%\'}"; val="${val#\'}" 
         case "$key" in
             THEME_MODE)          CUR_MODE="$val" ;;
             MATUGEN_TYPE)        CUR_TYPE="$val" ;;
@@ -290,7 +319,6 @@ save_preset() {
     local preset_name
     preset_name=$(run_menu "Enter Preset Name [ESC to Cancel]" true "") || return 1
     
-    # Secure Validation
     if [[ -z "$preset_name" ]]; then
         notify critical "Invalid Name" "Preset name cannot be empty."
         return 1
@@ -308,7 +336,6 @@ save_preset() {
 
     get_current_state
 
-    # Flatten active configuration to arguments payload
     local args="--mode ${CUR_MODE} --type ${CUR_TYPE} --contrast ${CUR_CONTRAST} --index ${CUR_INDEX} --base16 ${CUR_BASE16} --trans-type ${CUR_T_TYPE} --trans-duration ${CUR_T_DUR} --trans-fps ${CUR_T_FPS} --trans-bezier ${CUR_T_BEZ} --trans-angle ${CUR_T_ANG} --trans-pos ${CUR_T_POS}"
 
     printf '%s|%s\n' "$preset_name" "$args" >> "$PRESETS_FILE"
@@ -345,7 +372,6 @@ load_preset() {
     
     if [[ -n "$args" ]]; then
         notify normal "Loading Preset" "Applying: $choice"
-        # Temporarily disable globbing to ensure bezier params or negatives apply strictly as args
         set -f
         if ! "$THEME_CTL" set --no-wall $args; then
             set +f
@@ -392,7 +418,7 @@ delete_preset() {
 }
 
 submenu_presets() {
-    local choice
+    local choice last_preset
     local -a opts=(
         "  Back to Main"
         "  Save Current State as Preset"
@@ -401,7 +427,10 @@ submenu_presets() {
     )
 
     while true; do
-        choice=$(run_menu "Theme Presets" false "" "${opts[@]}") || return 1
+        last_preset=$(read_memory "presets_menu")
+        choice=$(run_menu "Theme Presets" false "$last_preset" "${opts[@]}") || return 1
+        
+        [[ -n "$choice" && "$choice" != "  Back"* ]] && write_memory "presets_menu" "$choice"
 
         case "$choice" in
             "  Back"*) return 1 ;;
@@ -423,7 +452,8 @@ submenu_regen() {
         "󰹹  No (Just Change Wallpaper)"
     )
 
-    choice=$(run_menu "Regenerate Colors?" false "" "${opts[@]}") || return 1
+    # Defaults to 'Yes' to make rapid application snappy
+    choice=$(run_menu "Regenerate Colors?" false "  Yes (Regenerate Colors)" "${opts[@]}") || return 1
 
     case "$choice" in
         "  Back"*) return 1 ;;
@@ -439,30 +469,29 @@ submenu_regen() {
 }
 
 submenu_solid_color() {
-    local choice hex
+    local choice hex last_color
     local -a opts=(
         "  Back"
         "  Custom Hex Code..."
     )
 
-    # Populate preset colors cleanly
     local k
     for k in "${OPTS_COLOR_KEYS[@]}"; do
         opts+=("$k (${OPTS_COLORS[$k]})")
     done
 
     while true; do
-        choice=$(run_menu "Select Solid Color" false "" "${opts[@]}") || return 1
+        last_color=$(read_memory "color_menu")
+        choice=$(run_menu "Select Solid Color" false "$last_color" "${opts[@]}") || return 1
+        
+        [[ -n "$choice" && "$choice" != "  Back"* ]] && write_memory "color_menu" "$choice"
 
         case "$choice" in
             "  Back"*) return 1 ;;
             "  Custom"*)
-                # Empty array passed to run_menu gives a clean UI with NO list items. Just a typing bar.
-                # ESC cancels and continues the loop, bringing back the color preset list.
                 hex=$(run_menu "Enter Hex (e.g. FF0000) [ESC to Cancel]" true "") || continue
                 
                 if [[ -n "$hex" ]]; then
-                    # Rofi-side validation before hitting the backend
                     if [[ ! "$hex" =~ ^#?[a-fA-F0-9]{6}$ ]]; then
                         notify critical "Invalid Hex" "The input '$hex' is not a valid hex color."
                         continue
@@ -474,7 +503,6 @@ submenu_solid_color() {
                 fi
                 ;;
             *)
-                # Extract the hex code hidden in parenthesis (e.g. "Red (#FF0000)" -> "#FF0000")
                 if [[ "$choice" =~ \((#[A-Fa-f0-9]{6})\) ]]; then
                     hex="${BASH_REMATCH[1]}"
                     notify normal "Applying Preset" "Color: $hex"
@@ -487,7 +515,7 @@ submenu_solid_color() {
 }
 
 submenu_wallpapers() {
-    local choice
+    local choice last_wall
     local -a opts=(
         "  Back to Main"
         "  Next Wallpaper"
@@ -497,7 +525,10 @@ submenu_wallpapers() {
     )
 
     while true; do
-        choice=$(run_menu "Wallpaper Controls" false "" "${opts[@]}") || return 1
+        last_wall=$(read_memory "wallpaper_menu")
+        choice=$(run_menu "Wallpaper Controls" false "$last_wall" "${opts[@]}") || return 1
+
+        [[ -n "$choice" && "$choice" != "  Back"* ]] && write_memory "wallpaper_menu" "$choice"
 
         case "$choice" in
             "  Back"*) return 1 ;;
@@ -513,7 +544,7 @@ submenu_wallpapers() {
 main() {
     require_commands
 
-    local choice
+    local choice last_main
     local -a main_opts=(
         "  Theme Config Wizard (Matugen)"
         "󰹹  Animation Config Wizard (awww)"
@@ -524,11 +555,13 @@ main() {
         "  Exit"
     )
 
-    # Persistent execution loop. It only breaks entirely on 'Exit' or 'Escape'.
     while true; do
         get_current_state
+        last_main=$(read_memory "main_menu")
 
-        choice=$(run_menu "Dusky Theme Manager" false "" "${main_opts[@]}") || exit 0
+        choice=$(run_menu "Dusky Theme Manager" false "$last_main" "${main_opts[@]}") || exit 0
+        
+        [[ -n "$choice" && "$choice" != "  Exit" ]] && write_memory "main_menu" "$choice"
 
         case "$choice" in
             "  Theme"*) wizard_theme || true ;;
