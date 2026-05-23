@@ -215,7 +215,6 @@ declare -ra UPDATE_SEQUENCE=(
 #================= CUSTOM=====================
     "S | pacman_packages.sh"
     "U | paru_packages.sh"
-    "U | rofi_wallpaper_selctor.sh --cache-only --progress"
 #================= Scripts =====================
 
 
