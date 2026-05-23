@@ -199,7 +199,7 @@ check_dependencies() {
   local -a missing=()
   local cmd
 
-  for cmd in rofi awww magick matugen uwsm-app setsid flock sha256sum find sort xargs cmp stat nproc gawk mktemp; do
+  for cmd in rofi awww magick matugen uwsm-app setsid flock sha256sum find sort xargs cmp stat nproc gawk mktemp jq; do
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
   done
 
@@ -666,6 +666,26 @@ get_active_wallpaper_filename() {
   return 1
 }
 
+get_dynamic_theme_str() {
+  if command -v hyprctl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    local logical_height
+    logical_height=$(hyprctl monitors -j 2>/dev/null | jq -r '.[] | select(.focused == true) | (.height / .scale)' | cut -d. -f1)
+    
+    if [[ -n "$logical_height" && "$logical_height" =~ ^[0-9]+$ ]]; then
+      if (( logical_height <= 800 )); then
+        # High fractional scaling (e.g. 1080p @ 1.5x = 720p logical)
+        printf "%s" "window { height: 85%; width: 85%; } listview { columns: 4; lines: 3; } element-icon { size: 120px; }"
+        return 0
+      elif (( logical_height <= 1080 )); then
+        # Normal/slight fractional scaling
+        printf "%s" "window { height: 80%; width: 80%; } listview { columns: 4; lines: 3; } element-icon { size: 180px; }"
+        return 0
+      fi
+    fi
+  fi
+  printf ""
+}
+
 # --- STATE TRACKING & ANIMATION SYNC ---
 
 get_theme_mode() {
@@ -778,10 +798,10 @@ show_menu() {
     # Pango-styled, ultra-compact UI header to prevent the layout from feeling crammed.
     if [[ $mode == favorites ]]; then
       prompt="Liked"
-      message="<span size='small' color='#999999'><b>[Enter]</b> Apply   <b>[Alt+R]</b> Fast Apply   <b>[Alt+U]</b> Unlike   <b>[Alt+T]</b> View All   <b>[Alt+Y]</b> Rebuild Cache</span>"
+      message="<span size='small' color='#999999'><b>[Enter]</b> Apply   <b>[Alt+H]</b> Fast Apply   <b>[Alt+U]</b> Unlike   <b>[Alt+T]</b> View All   <b>[Alt+Y]</b> Rebuild Cache</span>"
     else
       prompt="Wallpaper"
-      message="<span size='small' color='#999999'><b>[Enter]</b> Apply   <b>[Alt+R]</b> Fast Apply   <b>[Alt+U]</b> Like/Unlike   <b>[Alt+T]</b> View Liked   <b>[Alt+Y]</b> Rebuild Cache</span>"
+      message="<span size='small' color='#999999'><b>[Enter]</b> Apply   <b>[Alt+H]</b> Fast Apply   <b>[Alt+U]</b> Like/Unlike   <b>[Alt+T]</b> View Liked   <b>[Alt+Y]</b> Rebuild Cache</span>"
     fi
 
     # UWSM Wrap applied with Custom Keybindings mapping
@@ -797,11 +817,17 @@ show_menu() {
       -kb-custom-1 "Alt+u"
       -kb-custom-2 "Alt+y"
       -kb-custom-3 "Alt+t"
-      -kb-custom-4 "Alt+r"
+      -kb-custom-4 "Alt+h"
     )
 
     if [[ -f "$ROFI_THEME" ]]; then
       rofi_cmd+=(-theme "$ROFI_THEME")
+    fi
+
+    local dynamic_theme
+    dynamic_theme=$(get_dynamic_theme_str)
+    if [[ -n "$dynamic_theme" ]]; then
+        rofi_cmd+=("-theme-str" "$dynamic_theme")
     fi
 
     if [[ -n $selection ]]; then
