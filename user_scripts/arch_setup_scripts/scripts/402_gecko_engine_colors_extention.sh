@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # MatugenFox – Autonomous Setup & Provisioning Script
-# Version: 3.6.0 (Golden Copy: Cutting-Edge Bash Optimized)
+# Version: 3.6.1 (Golden Copy: Cutting-Edge Bash Optimized)
 # Target:  Linux (Arch, Fedora, Debian, NixOS, etc.) + macOS
 # Purpose: Zero-touch detection of every installed Firefox-family browser,
 #          profile resolution, native messaging host installation, config
@@ -24,10 +24,15 @@ readonly HOST_DIR="$HOME/user_scripts/theme_matugen/firefox"
 readonly HOST_SCRIPT="$HOST_DIR/matugenfox_host.py"
 readonly REFRESH_SCRIPT="$HOME/user_scripts/theme_matugen/theme_ctl.sh"
 readonly MANIFEST_NAME="matugenfox.json"
-readonly CONFIG_FILE="$HOST_DIR/config.json"
+
+# [UPDATED]: Aligned with the new python host XDG standard
+readonly CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/matugenfox"
+readonly CONFIG_FILE="$CONFIG_DIR/config.json"
+readonly LEGACY_CONFIG_FILE="$HOST_DIR/config.json"
+
 readonly EXTENSION_ID="matugenfox@ubaid.com"
 readonly XPI_URL="https://addons.mozilla.org/firefox/downloads/latest/matugenfox/latest.xpi"
-readonly VERSION="3.6.0"
+readonly VERSION="3.6.1"
 
 # =============================================================================
 # ▼ VISUAL STYLING ▼
@@ -308,7 +313,8 @@ MANIFEST
                     local app_id="${nmh_dir#*.var/app/}"
                     app_id="${app_id%%/*}"
                     log_info "Applying Flatpak sandbox filesystem overrides for $app_id..."
-                    flatpak override --user --filesystem="$HOST_DIR" --filesystem="$HOME/.config/matugen" --filesystem="$HOME/.config/dusky_sites" "$app_id" || log_warn "Failed to apply Flatpak override."
+                    # [UPDATED]: Added access to the new XDG config directory so atomic_write works through the sandbox
+                    flatpak override --user --filesystem="$HOST_DIR" --filesystem="$HOME/.config/matugen" --filesystem="$HOME/.config/dusky_sites" --filesystem="$CONFIG_DIR" "$app_id" || log_warn "Failed to apply Flatpak override."
                 fi
 
                 break
@@ -454,7 +460,19 @@ bootstrap_profiles() {
 init_config() {
     local force_run=$1
     
-    mkdir -p "${CONFIG_FILE%/*}" || true
+    mkdir -p "$CONFIG_DIR" || true
+
+    # [UPDATED]: Critical State Migration Block. Ensures configurations aren't lost 
+    # during the shift from inline paths to the XDG standard.
+    if [[ -f "$LEGACY_CONFIG_FILE" ]] && [[ ! -f "$CONFIG_FILE" ]]; then
+        log_info "Forensic check: Legacy configuration found. Migrating to XDG directory..."
+        if cp "$LEGACY_CONFIG_FILE" "$CONFIG_FILE" 2>/dev/null; then
+            log_success "Configuration migrated seamlessly."
+            mv "$LEGACY_CONFIG_FILE" "${LEGACY_CONFIG_FILE}.bak" 2>/dev/null || true
+        else
+            log_warn "Failed to migrate legacy configuration automatically."
+        fi
+    fi
 
     if [[ -f "$CONFIG_FILE" ]] && [[ -s "$CONFIG_FILE" ]] && python3 -c "import json; json.load(open('$CONFIG_FILE'))" 2>/dev/null; then
         if (( ! force_run )); then
@@ -576,7 +594,8 @@ perform_uninstall() {
                 local app_id="${nmh_dir#*.var/app/}"
                 app_id="${app_id%%/*}"
                 log_info "Reverting Flatpak filesystem overrides for $app_id..."
-                flatpak override --user --nofilesystem="$HOST_DIR" --nofilesystem="$HOME/.config/matugen" --nofilesystem="$HOME/.config/dusky_sites" "$app_id" || true
+                # [UPDATED]: Cleans up the new XDG config override path
+                flatpak override --user --nofilesystem="$HOST_DIR" --nofilesystem="$HOME/.config/matugen" --nofilesystem="$HOME/.config/dusky_sites" --nofilesystem="$CONFIG_DIR" "$app_id" || true
             fi
         done
     done
@@ -632,10 +651,14 @@ perform_uninstall() {
         done
     done
 
-    # 4. Remove Config File
+    # 4. Remove Config File (Updated to handle both new and legacy locations)
     if [[ -f "$CONFIG_FILE" ]]; then
         rm -f "$CONFIG_FILE"
-        log_success "Removed config.json"
+        rmdir "$CONFIG_DIR" 2>/dev/null || true
+        log_success "Removed XDG config.json"
+    fi
+    if [[ -f "$LEGACY_CONFIG_FILE" || -f "${LEGACY_CONFIG_FILE}.bak" ]]; then
+        rm -f "$LEGACY_CONFIG_FILE" "${LEGACY_CONFIG_FILE}.bak" 2>/dev/null || true
     fi
 
     # 5. Remove Matugen TOML Block
