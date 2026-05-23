@@ -3,6 +3,12 @@
 # Rofi Wallpaper Selector (Matugen V4 Aligned & UWSM Patched)
 # Target: Arch Linux / Hyprland / Dusky / UWSM
 # -----------------------------------------------------------------------------
+# Updates:
+# - Synchronized with theme_ctl.sh state machine.
+# - Dynamically inherits Awww transitions from state.conf.
+# - Cleaned UI: Pango markup injected into Rofi to eliminate "crammed" text.
+# - Added Alt+R binding to Apply WITHOUT Matugen color regeneration.
+# -----------------------------------------------------------------------------
 
 set -Eeuo pipefail
 
@@ -39,6 +45,14 @@ declare -gi SHOW_PROGRESS=0
 declare -gi CACHE_ONLY=0
 declare -gi PROGRESS_ACTIVE=0
 declare -gi MAX_JOBS=1
+
+# --- DEFAULT ANIMATION STATE ---
+CUR_T_TYPE="random"
+CUR_T_DUR="2"
+CUR_T_FPS="60"
+CUR_T_BEZ=".54,0,.34,.99"
+CUR_T_ANG="30"
+CUR_T_POS="center"
 
 log() {
   local level=$1
@@ -350,7 +364,7 @@ cleanup_orphan_thumbs() {
 
 build_cache() {
   log INFO "Building wallpaper cache."
-  notify "Building wallpaper cache..."
+  notify "Building Cache" "Generating thumbnails for wallpapers..."
 
   local scan_tmp state_tmp cache_tmp
   local -a files=()
@@ -580,12 +594,12 @@ toggle_favorite() {
     updated+=("$rel")
     write_favorites_file updated
     rm -f -- "$FAVORITES_CACHE_FILE"
-    notify "Liked wallpaper." "$rel"
+    notify "Liked Wallpaper" "$rel"
     log INFO "Liked wallpaper: $rel"
   else
     write_favorites_file updated
     rm -f -- "$FAVORITES_CACHE_FILE"
-    notify "Removed from Liked." "$rel"
+    notify "Unliked Wallpaper" "$rel"
     log INFO "Unliked wallpaper: $rel"
   fi
 
@@ -648,7 +662,7 @@ get_active_wallpaper_filename() {
   return 1
 }
 
-# --- STATE TRACKING FUNCTIONS ---
+# --- STATE TRACKING & ANIMATION SYNC ---
 
 get_theme_mode() {
   local mode="dark"
@@ -658,6 +672,23 @@ get_theme_mode() {
     [[ -n "$val" ]] && mode="$val"
   fi
   printf "%s" "$mode"
+}
+
+get_animation_state() {
+  if [[ -f "$STATE_FILE" ]]; then
+    while IFS='=' read -r key val; do
+      val="${val%\"}"; val="${val#\"}" 
+      val="${val%\'}"; val="${val#\'}"
+      case "$key" in
+        AWWW_TRANS_TYPE)     CUR_T_TYPE="$val" ;;
+        AWWW_TRANS_DURATION) CUR_T_DUR="$val" ;;
+        AWWW_TRANS_FPS)      CUR_T_FPS="$val" ;;
+        AWWW_TRANS_BEZIER)   CUR_T_BEZ="$val" ;;
+        AWWW_TRANS_ANGLE)    CUR_T_ANG="$val" ;;
+        AWWW_TRANS_POS)      CUR_T_POS="$val" ;;
+      esac
+    done < <(grep -E '^[A-Z_]+=' "$STATE_FILE" 2>/dev/null || true)
+  fi
 }
 
 update_tracker() {
@@ -725,7 +756,7 @@ cycle_next_favorite() {
   local full_path="$WALLPAPER_DIR/$next_fav"
   log INFO "Cycling to next favorite: $next_fav"
   
-  apply_selection "$full_path" "$next_fav"
+  apply_selection "$full_path" "$next_fav" "REGEN"
   exit 0
 }
 
@@ -740,15 +771,16 @@ show_menu() {
   local -a rofi_cmd
 
   while true; do
+    # Pango-styled, ultra-compact UI header to prevent the layout from feeling crammed.
     if [[ $mode == favorites ]]; then
       prompt="Liked"
-      message="Enter: Apply | Alt+U: Unlike | Alt+Y: Regenerate | Alt+T: Show All"
+      message="<span size='small' color='#999999'><b>[Enter]</b> Apply   <b>[Alt+R]</b> Fast Apply   <b>[Alt+U]</b> Unlike   <b>[Alt+T]</b> View All   <b>[Alt+Y]</b> Rebuild Cache</span>"
     else
       prompt="Wallpaper"
-      message="Enter: Apply | Alt+U: Like | Alt+Y: Regenerate | Alt+T: Show Liked"
+      message="<span size='small' color='#999999'><b>[Enter]</b> Apply   <b>[Alt+R]</b> Fast Apply   <b>[Alt+U]</b> Like/Unlike   <b>[Alt+T]</b> View Liked   <b>[Alt+Y]</b> Rebuild Cache</span>"
     fi
 
-    # UWSM Wrap applied
+    # UWSM Wrap applied with Custom Keybindings mapping
     rofi_cmd=(
       uwsm-app -- rofi
       -dmenu
@@ -761,6 +793,7 @@ show_menu() {
       -kb-custom-1 "Alt+u"
       -kb-custom-2 "Alt+y"
       -kb-custom-3 "Alt+t"
+      -kb-custom-4 "Alt+r"
     )
 
     if [[ -f "$ROFI_THEME" ]]; then
@@ -785,14 +818,17 @@ show_menu() {
 
     case $exit_code in
       0)
+        # Standard Apply (With Matugen Regen)
         [[ -n $selection ]] || return 1
-        printf '%s\n' "$selection"
+        printf 'REGEN\n%s\n' "$selection"
         return 0
         ;;
       1)
+        # User Hit Escape
         return 1
         ;;
       10)
+        # Alt+U -> Toggle Liked
         [[ -n $selection ]] || continue
         toggle_favorite "$selection" || true
 
@@ -807,6 +843,7 @@ show_menu() {
         fi
         ;;
       11)
+        # Alt+Y -> Rebuild Cache
         build_cache || true
 
         if [[ $mode == favorites ]]; then
@@ -823,6 +860,7 @@ show_menu() {
         fi
         ;;
       12)
+        # Alt+T -> Toggle Favorites View
         selection=""
         if [[ $mode == all ]]; then
           if next_input=$(build_favorites_cache); then
@@ -839,6 +877,12 @@ show_menu() {
           [[ -s $input ]] || return 1
         fi
         ;;
+      13)
+        # Alt+R -> Apply Without Matugen Regen
+        [[ -n $selection ]] || continue
+        printf 'NO_REGEN\n%s\n' "$selection"
+        return 0
+        ;;
       *)
         log WARN "Rofi exited with unexpected code: $exit_code"
         return 1
@@ -850,31 +894,47 @@ show_menu() {
 apply_selection() {
   local full_path=$1
   local selection=$2
+  local action=$3
   local output
 
-  log INFO "Applying wallpaper: $full_path"
+  log INFO "Applying wallpaper: $full_path (Mode: $action)"
 
   # Sync tracker BEFORE theme_ctl runs so chronological order is maintained
   update_tracker "$selection"
-  
-  # Also sync the favorite state so the next `--next-fav` starts from the wallpaper we just applied via GUI
   update_fav_state "$selection"
 
-  # UWSM Wrap applied
-  if ! output=$(uwsm-app -- awww img "$full_path" \
-    --transition-type grow \
-    --transition-duration 2 \
-    --transition-fps 60 2>&1); then
+  # Dynamically pull the user's configured animation state
+  get_animation_state
+
+  # Construct the precise awww command matching the wizard settings
+  local -a awww_cmd=(uwsm-app -- awww img)
+  [[ -n "$CUR_T_TYPE" && "$CUR_T_TYPE" != "disable" ]] && awww_cmd+=(--transition-type "$CUR_T_TYPE")
+  [[ -n "$CUR_T_DUR"  && "$CUR_T_DUR"  != "disable" ]] && awww_cmd+=(--transition-duration "$CUR_T_DUR")
+  [[ -n "$CUR_T_FPS"  && "$CUR_T_FPS"  != "disable" ]] && awww_cmd+=(--transition-fps "$CUR_T_FPS")
+  [[ -n "$CUR_T_BEZ"  && "$CUR_T_BEZ"  != "disable" ]] && awww_cmd+=(--transition-bezier "$CUR_T_BEZ")
+  [[ -n "$CUR_T_ANG"  && "$CUR_T_ANG"  != "disable" ]] && awww_cmd+=(--transition-angle "$CUR_T_ANG")
+  [[ -n "$CUR_T_POS"  && "$CUR_T_POS"  != "disable" ]] && awww_cmd+=(--transition-pos "$CUR_T_POS")
+  
+  awww_cmd+=("$full_path")
+
+  if ! output=$("${awww_cmd[@]}" 2>&1); then
     die "Failed to set wallpaper." "$output"
   fi
 
   [[ -n $output ]] && log_output INFO "awww: " "$output"
+
+  # If Alt+R was pressed, exit here before Matugen engages.
+  if [[ "$action" == "NO_REGEN" ]]; then
+    notify "Wallpaper Applied" "Skipped Matugen regeneration."
+    return 0
+  fi
 
   if [[ ! -x "$THEME_CTL" ]]; then
     die "Theme controller not found or not executable." "$THEME_CTL"
   fi
 
   log INFO "Triggering theme_ctl to synchronize Matugen..."
+  notify "Generating Theme" "Matugen is processing colors..." "low" "2500"
   
   if ! output=$("$THEME_CTL" refresh 2>&1); then
     die "Failed to apply theme via theme_ctl." "$output"
@@ -930,8 +990,10 @@ main() {
   local input="$CACHE_FILE"
   local next_input=""
   local selection
+  local action
   local full_path
   local active_wal=""
+  local menu_output=""
 
   active_wal=$(get_active_wallpaper_filename) || true
 
@@ -944,12 +1006,16 @@ main() {
     fi
   fi
 
-  if ! selection=$(show_menu "$mode" "$input" "$active_wal"); then
+  if ! menu_output=$(show_menu "$mode" "$input" "$active_wal"); then
     log INFO "Menu closed without selection."
     exit 0
   fi
 
-  log INFO "Selected wallpaper: $selection"
+  # Safely parse the multiline return: Line 1 = Action, Line 2 = File
+  action=$(sed -n '1p' <<< "$menu_output")
+  selection=$(sed '1d' <<< "$menu_output")
+
+  log INFO "Selected wallpaper: $selection (Action: $action)"
 
   if ! full_path=$(resolve_path "$selection"); then
     die "Failed to resolve wallpaper path." "$selection"
@@ -958,7 +1024,7 @@ main() {
   # Release the lock BEFORE spawning awww/matugen and their background hooks
   release_lock
 
-  apply_selection "$full_path" "$selection"
+  apply_selection "$full_path" "$selection" "$action"
   log INFO "Wallpaper applied successfully."
 }
 
