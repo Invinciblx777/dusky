@@ -1381,6 +1381,21 @@ hl.window_rule({
     center = true
 })
 
+
+--- Dusky Wallpaper Selector---
+hl.window_rule({
+    name = "wallpaper_selectorpy",
+    match = {
+        class = "^(wallpaper_selector\\.py)$",
+    },
+    float = true,
+    size = {784, 553},
+    -- size = {"monitor_w * 0.49", "monitor_h * 0.6144"},
+
+    animation = "popin 60%",      -- scale in starting from 60% size
+})
+
+
 --- Hyprland Share Picker ---
 hl.window_rule({
     name = "float-share-picker",

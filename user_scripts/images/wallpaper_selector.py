@@ -5,7 +5,7 @@
 # ==============================================================================
 # Description: Native, lightning-fast GTK3 replacement for the Rofi wallpaper 
 #              selector. Features lazy-loading, instant grid mapping, smart 
-#              mtime caching, live search, and full Vim keybind navigation.
+#              mtime caching, live search, and full keyboard navigation.
 # ==============================================================================
 
 import os
@@ -41,8 +41,9 @@ THUMB_DIR = CACHE_DIR / "thumbs"
 LOCK_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "gtk-wallpaper-selector.lock"
 GTK_CSS_PATH = HOME / ".config/gtk-3.0/gtk.css"
 
-THUMB_SIZE = 300
-RENDER_SIZE = 200
+# Optimised image parameters for compact view & dynamic shrinkability
+THUMB_SIZE = 240
+RENDER_SIZE = 145
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
 
 # Pre-compile regex for ultra-fast sorting operations
@@ -110,7 +111,7 @@ class WallpaperApp(Gtk.Application):
         if not self.window:
             self.window = Gtk.ApplicationWindow(application=self)
             self.window.set_title("Wallpaper Selector")
-            self.window.set_default_size(1200, 800)
+            self.window.set_default_size(800, 600)
             self.window.set_position(Gtk.WindowPosition.CENTER)
             
             # Connect absolute kill-switch to prevent any background zombie processes
@@ -129,8 +130,8 @@ class WallpaperApp(Gtk.Application):
             # Left: Search
             self.search_entry = Gtk.SearchEntry()
             self.search_entry.set_placeholder_text("Search... (Press /)")
-            # Small width char so it doesn't artificially block window shrinking
-            self.search_entry.set_width_chars(15) 
+            # Slim design to prevent blocking horizontal window shrinking
+            self.search_entry.set_width_chars(12) 
             self.search_entry.get_style_context().add_class("search-bar")
             self.search_entry.connect("search-changed", self.on_search_changed)
             header.pack_start(self.search_entry, False, False, 0)
@@ -142,7 +143,7 @@ class WallpaperApp(Gtk.Application):
             # Right: Action Buttons (Shortened labels to reduce width limits)
             action_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             
-            btn_fast = Gtk.Button(label="Apply [Alt+H]")
+            btn_fast = Gtk.Button(label="Fast Apply [Alt+H]")
             btn_fast.connect("clicked", lambda w: self.trigger_action('fast'))
             
             btn_fav = Gtk.Button(label="Fav [Alt+U]")
@@ -157,6 +158,35 @@ class WallpaperApp(Gtk.Application):
 
             header.pack_start(action_box, False, False, 0)
             vbox.pack_start(header, False, False, 0)
+
+            # --- SHORTCUT HELPER RIBBON (Aesthetic & Informative) ---
+            shortcuts_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+            shortcuts_box.set_name("shortcuts_bar")
+            
+            shortcuts_data = [
+                ("Enter", "Apply & Theme"),
+                ("Alt+H", "Fast Apply"),
+                ("Alt+U", "Favorite"),
+                ("Alt+T", "Toggle Favs"),
+                ("Alt+Y", "Rebuild Cache"),
+                ("Esc", "Reset"),
+                ("Q", "Quit")
+            ]
+            
+            markup_parts = []
+            for key, desc in shortcuts_data:
+                markup_parts.append(
+                    f"<span background='#313244' foreground='#cdd6f4' font_family='monospace' size='7500'><b> {key} </b></span> "
+                    f"<span size='7800' foreground='#a6adc8'>{desc}</span>"
+                )
+            
+            shortcuts_label = Gtk.Label()
+            shortcuts_label.set_use_markup(True)
+            shortcuts_label.set_markup("  •  ".join(markup_parts))
+            shortcuts_label.set_halign(Gtk.Align.CENTER)
+            
+            shortcuts_box.pack_start(shortcuts_label, True, True, 0)
+            vbox.pack_start(shortcuts_box, False, False, 0)
 
             # --- STACK CONTAINER (Handles Empty State transitions natively) ---
             self.stack = Gtk.Stack()
@@ -242,18 +272,24 @@ class WallpaperApp(Gtk.Application):
         window { background-color: @window_bg_color; }
         #header_bar {
             background-color: shade(@window_bg_color, 0.97);
-            padding: 12px 18px;
+            padding: 10px 14px;
             border-bottom: 1px solid alpha(@window_fg_color, 0.1);
+        }
+        #shortcuts_bar {
+            background-color: shade(@window_bg_color, 0.94);
+            padding: 6px 12px;
+            border-bottom: 1px solid alpha(@window_fg_color, 0.08);
         }
         .search-bar {
             border-radius: 8px;
-            padding: 6px 12px;
-            font-size: 1.05em;
+            padding: 6px 10px;
+            font-size: 0.95em;
         }
         .action-btn {
-            padding: 6px 14px;
+            padding: 5px 12px;
             border-radius: 8px;
             font-weight: bold;
+            font-size: 0.9em;
             background-color: alpha(@window_fg_color, 0.04);
             border: 1px solid alpha(@window_fg_color, 0.08);
             transition: all 0.2s ease;
@@ -264,12 +300,12 @@ class WallpaperApp(Gtk.Application):
         }
         flowbox {
             background-color: @view_bg_color;
-            padding: 15px;
+            padding: 10px;
         }
         flowboxchild {
-            border-radius: 12px;
-            padding: 6px;
-            margin: 6px;
+            border-radius: 10px;
+            padding: 4px;
+            margin: 4px;
             background-color: transparent;
             transition: all 0.2s ease;
         }
@@ -287,9 +323,9 @@ class WallpaperApp(Gtk.Application):
         .wallpaper-name-overlay {
             background-color: alpha(@window_bg_color, 0.85);
             color: @window_fg_color;
-            border-radius: 6px;
-            padding: 4px 10px;
-            font-size: 0.85em;
+            border-radius: 4px;
+            padding: 3px 6px;
+            font-size: 0.75em;
             font-weight: bold;
             box-shadow: 0px 2px 4px rgba(0, 0, 0, 0.3);
         }
@@ -300,13 +336,13 @@ class WallpaperApp(Gtk.Application):
             margin-bottom: 10px;
         }
         .placeholder-title {
-            font-size: 1.6em;
+            font-size: 1.5em;
             font-weight: 800;
             color: alpha(@window_fg_color, 0.8);
             margin-bottom: 4px;
         }
         .placeholder-subtitle {
-            font-size: 1.1em;
+            font-size: 1.0em;
             color: alpha(@window_fg_color, 0.5);
         }
         """
@@ -486,12 +522,12 @@ class WallpaperApp(Gtk.Application):
 
         # Favorite Heart Tracker
         if rel_path in self.favorites:
-            heart = Gtk.Label(label="<span color='#f38ba8' size='x-large'>♥</span>")
+            heart = Gtk.Label(label="<span color='#f38ba8' size='large'>♥</span>")
             heart.set_use_markup(True)
             heart.set_halign(Gtk.Align.END)
             heart.set_valign(Gtk.Align.START)
-            heart.set_margin_top(8)
-            heart.set_margin_end(8)
+            heart.set_margin_top(6)
+            heart.set_margin_end(6)
             overlay.add_overlay(heart)
 
         # Base Name Overlay (Initially Hidden)
@@ -499,8 +535,8 @@ class WallpaperApp(Gtk.Application):
         name_label.get_style_context().add_class("wallpaper-name-overlay")
         name_label.set_halign(Gtk.Align.END)
         name_label.set_valign(Gtk.Align.END)
-        name_label.set_margin_bottom(8)
-        name_label.set_margin_end(8)
+        name_label.set_margin_bottom(6)
+        name_label.set_margin_end(6)
         name_label.set_no_show_all(True) # Prevent showing up universally
         
         # Keep a reference injected to manipulate easily on focus
@@ -587,7 +623,7 @@ class WallpaperApp(Gtk.Application):
 
         rel_path = self.get_selected_path()
 
-        # Modern Python 3.10+ Pattern Matching
+        # Modern Python 3.10+ Pattern Matching for action keybinds
         match keyval:
             case Gdk.KEY_Return | Gdk.KEY_KP_Enter:
                 if rel_path: self.apply_wallpaper(rel_path, regen=True)
@@ -611,28 +647,6 @@ class WallpaperApp(Gtk.Application):
                 print("Cache rebuild requested. Deleting thumb cache and refreshing...")
                 for f in THUMB_DIR.glob("*.png"): f.unlink()
                 self.refresh_ui()
-                return True
-
-            # --- VIM GRID NAVIGATION ---
-            # Using PyGObject GTK3 signal signature: only step & count needed
-            case Gdk.KEY_h if not is_alt and not is_ctrl:
-                if not self.flowbox.is_focus(): self.flowbox.grab_focus()
-                self.flowbox.emit("move-cursor", Gtk.MovementStep.VISUAL_POSITIONS, -1)
-                return True
-                
-            case Gdk.KEY_l if not is_alt and not is_ctrl:
-                if not self.flowbox.is_focus(): self.flowbox.grab_focus()
-                self.flowbox.emit("move-cursor", Gtk.MovementStep.VISUAL_POSITIONS, 1)
-                return True
-                
-            case Gdk.KEY_k if not is_alt and not is_ctrl:
-                if not self.flowbox.is_focus(): self.flowbox.grab_focus()
-                self.flowbox.emit("move-cursor", Gtk.MovementStep.DISPLAY_LINES, -1)
-                return True
-                
-            case Gdk.KEY_j if not is_alt and not is_ctrl:
-                if not self.flowbox.is_focus(): self.flowbox.grab_focus()
-                self.flowbox.emit("move-cursor", Gtk.MovementStep.DISPLAY_LINES, 1)
                 return True
 
         return False
