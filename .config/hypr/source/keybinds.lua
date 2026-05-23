@@ -77,7 +77,7 @@ hl.bind(
 
 hl.bind(
     "CTRL + SPACE",
-    hl.dsp.exec_cmd("pkill rofi; " .. dusky_scripts .. "rofi/rofi_wallpaper_selctor.sh"),
+    hl.dsp.exec_cmd(dusky_scripts .. "images/wallpaper_selector.py"),
     { description = "Rofi Wallpaper Selector" }
 )
 
