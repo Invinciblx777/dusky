@@ -21,6 +21,7 @@ readonly XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 readonly XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
 
 # --- Persistence Integration ---
+readonly STATE_FILE="${HOME}/.config/dusky/settings/clipboard_persistance"
 readonly DB_ENV_FILE="${HOME}/.config/dusky/settings/cliphist_db_env"
 if [[ -f "$DB_ENV_FILE" ]]; then
     source "$DB_ENV_FILE"
@@ -35,8 +36,7 @@ readonly ICON_PIN="📌"
 readonly ICON_IMG="📸"
 readonly ICON_BIN="📦"
 
-readonly LIST_PREVIEW_MAX=55
-readonly PIN_READ_MAX=512
+readonly SEARCH_INDEX_MAX=10000
 readonly PREVIEW_TEXT_LIMIT=50000
 readonly TEXT_LOCALE="C.UTF-8"
 readonly LIST_LOCALE="C"
@@ -104,14 +104,13 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 quote_sh() {
-    local s="$1" out="'" chunk
-    while [[ "$s" == *"'"* ]]; do
-        chunk=${s%%"'"*}
-        out+="${chunk}'\"'\"'"
-        s=${s#*"'"}
-    done
-    out+="${s}'"
-    printf '%s' "$out"
+    # -------------------------------------------------------------------------
+    # BASH 5.0+ OPTIMIZATION & BUG FIX
+    # -------------------------------------------------------------------------
+    # Replaces every single quote with '"'"' and wraps the entire string
+    # in single quotes. Safely escapes paths for fzf subshells without looping.
+    # -------------------------------------------------------------------------
+    printf "'%s'" "${1//\'/\'\"\'\"\'}"
 }
 
 dir_ready() {
@@ -194,22 +193,14 @@ generate_hash_file() {
 }
 
 parse_item() {
-    local input="$1" rest
-    local -n _visible="$2" _type="$3" _id="$4"
-
-    _visible=""
-    _type=""
-    _id=""
-
-    [[ "$input" == *"$SEP"*"$SEP"* ]] || return 1
-
-    _id="${input##*"${SEP}"}"
-    rest="${input%"${SEP}"*}"
-    _type="${rest##*"${SEP}"}"
-    _visible="${rest%"${SEP}"*}"
+    local input="$1"
+    local -n _type="$2" _id="$3"
+    
+    IFS="$SEP" read -r _ _type _id _ <<< "$input"
 
     [[ -n "$_type" ]] || return 1
     [[ "$_type" == "empty" || "$_type" == "error" || -n "$_id" ]] || return 1
+    return 0
 }
 
 proc_comm() {
@@ -277,13 +268,16 @@ safe_print_text_file() {
     local path="$1" max_chars="${2:-0}"
     LC_ALL="$TEXT_LOCALE" awk -v max_chars="$max_chars" '
     BEGIN {
-        esc = sprintf("%c", 27)
         out = 0
         truncated = 0
     }
     {
-        gsub(esc, "", $0)
-        gsub(/[[:cntrl:]]/, " ", $0)
+        # Strip ANSI escape sequences safely
+        gsub(/\x1B\[[0-9;]*[a-zA-Z]/, "", $0)
+
+        # Replace potentially unprintable control chars with space,
+        # but STRICTLY PRESERVE tabs (\t) and carriage returns (\r)
+        gsub(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/, " ", $0)
 
         if (max_chars > 0) {
             remaining = max_chars - out
@@ -344,7 +338,7 @@ render_text_preview() {
     print_text_preview "$path" "$max_chars"
     status=$?
     (( status == 0 || status == 10 )) || return "$status"
-    (( status == 10 )) && printf '\n\n\e[90m[...truncated...]\e[0m\n'
+    (( status == 10 )) && printf '\n\n\e[37m[...truncated...]\e[0m\n'
     return 0
 }
 
@@ -429,7 +423,7 @@ display_image() {
 
     [[ -f "$img" ]] || { printf '\e[31mImage not found\e[0m\n'; return 1; }
 
-    # Deduct lines to account for the preview header (title + wrapped info text + newlines).
+    # Deduct lines to account for the preview header (title + wrapped info text + timestamp + newlines).
     # This bounding logic is crucial so foot doesn't drop the Sixel payload for overflowing.
     (( rows > 8 )) && (( rows -= 6 )) || rows=2
     (( cols > 4 )) && (( cols -= 4 )) || cols=2
@@ -452,6 +446,38 @@ display_image() {
 }
 
 #==============================================================================
+# TIME FORMATTING (Zero-Fork Native Bash)
+#==============================================================================
+format_ts() {
+    local ts="$1"
+    [[ -n "$ts" && "$ts" =~ ^[0-9]+$ ]] || {
+        printf '[ 🕒 Unknown Time ]'
+        return 1
+    }
+    local now week_ago dow date_str time_str day_name
+    
+    printf -v now '%(%s)T' -1
+    week_ago=$(( now - 604800 ))
+
+    printf -v dow '%(%u)T' "$ts"
+    case "$dow" in
+        1) day_name="MON" ;; 2) day_name="TUE" ;; 3) day_name="WED" ;;
+        4) day_name="THU" ;; 5) day_name="FRI" ;; 6) day_name="SAT" ;;
+        7) day_name="SUN" ;; *) day_name="" ;;
+    esac
+
+    printf -v time_str '%(%-I:%M %p)T' "$ts"
+
+    if (( ts >= week_ago )); then
+        printf '[ 🕒 %s %s ]' "$day_name" "$time_str"
+    else
+        printf -v date_str '%(%m/%d)T' "$ts"
+        printf '[ 🕒 %s %s %s ]' "$date_str" "$day_name" "$time_str"
+    fi
+    return 0
+}
+
+#==============================================================================
 # CORE LOGIC: LIST GENERATION
 #==============================================================================
 cmd_list() {
@@ -467,7 +493,7 @@ cmd_list() {
         is_pin_hash "$hash" || continue
 
         content=""
-        LC_ALL=C IFS= read -r -d '' -n "$PIN_READ_MAX" content < "$pin" || true
+        LC_ALL=C IFS= read -r -d '' -n "$SEARCH_INDEX_MAX" content < "$pin" || true
         [[ -z "$content" ]] && continue
 
         preview="${content//$'\n'/ }"
@@ -476,7 +502,8 @@ cmd_list() {
         preview="${preview//"$SEP"/ }"
 
         ((n++))
-        ((${#preview} > LIST_PREVIEW_MAX)) && preview="${preview:0:LIST_PREVIEW_MAX}…"
+        # Provide up to 10,000 characters to FZF for full-depth fuzzy searching
+        ((${#preview} > SEARCH_INDEX_MAX)) && preview="${preview:0:SEARCH_INDEX_MAX}"
 
         printf '%d %s %s%s%s%s%s\n' \
             "$n" "$ICON_PIN" "$preview" "$SEP" "pin" "$SEP" "$hash"
@@ -491,7 +518,7 @@ cmd_list() {
         -v icon_img="$ICON_IMG" \
         -v icon_bin="$ICON_BIN" \
         -v sep="$SEP" \
-        -v max_len="$LIST_PREVIEW_MAX" \
+        -v max_len="$SEARCH_INDEX_MAX" \
     '
     BEGIN { FS = "\t"; n = 0 }
 
@@ -544,7 +571,7 @@ cmd_list() {
                 gsub(/  +/, " ", info)
                 gsub(/^ +| +$/, "", info)
                 if (info == "") info = "Binary"
-                if (length(info) > max_len) info = substr(info, 1, max_len) "…"
+                if (length(info) > max_len) info = substr(info, 1, max_len)
                 printf "%d %s %s%s%s%s%s\n", idx, icon_bin, info, sep, "bin", sep, id
             }
         } else {
@@ -554,7 +581,9 @@ cmd_list() {
             gsub(sep, " ", content)
 
             if (content == "") content = "[Whitespace]"
-            if (length(content) > max_len) content = substr(content, 1, max_len) "…"
+            if (length(content) > max_len) content = substr(content, 1, max_len)
+            
+            # Massive input sent directly to FZF buffer to allow full-depth fuzzy searching 
             printf "%d %s%s%s%s%s\n", idx, content, sep, "txt", sep, id
         }
     }
@@ -570,48 +599,33 @@ cmd_list() {
 #==============================================================================
 # PREVIEW LOGIC
 #==============================================================================
-preview_binary_entry() {
-    local id="$1" tmp mime info
-    tmp=$(decode_entry_to_tmp "$id" "$CACHE_DIR") || {
-        printf '\e[31mFailed to decode entry.\e[0m\n'
-        return 1
-    }
-
-    mime=$(mime_from_file "$tmp") || mime=""
-    info=$(describe_file "$tmp") || info="Unknown binary data."
-    info="${info:0:120}"
-
-    if mime_is_image "$mime"; then
-        printf '\e[1;36m━━━ %s IMAGE ━━━\e[0m\n' "$ICON_IMG"
-        printf '%s\n\n' "$info"
-        display_image "$tmp"
-    else
-        printf '\e[1;35m━━━ %s BINARY ━━━\e[0m\n\n' "$ICON_BIN"
-        printf '%s\n\n' "$info"
-        printf '\e[90mBinary preview unavailable.\e[0m\n'
-    fi
-
-    remove_tmpfile "$tmp"
-}
-
 cmd_preview() {
-    local input="${1:-}" visible type id pin_file img_path info tmp
+    local type="${1:-}" id="${2:-}" pin_file img_path info tmp ts_str=""
 
     is_kitty && kitty_clear
 
-    [[ -n "$input" ]] || {
-        printf '\e[90mNo selection.\e[0m\n'
+    [[ -n "$type" ]] || {
+        printf '\e[37mNo selection.\e[0m\n'
         return 0
     }
 
-    parse_item "$input" visible type id || {
-        printf '\e[31mInvalid selection.\e[0m\n'
-        return 1
-    }
+    # Derive accurate Timestamp for dynamic headers
+    if [[ "$type" == "pin" ]]; then
+        pin_file="${PINS_DIR:?}/${id}.pin"
+        local ts
+        ts=$(stat -c %Y "$pin_file" 2>/dev/null)
+        ts_str=$(format_ts "$ts")
+    elif [[ "$type" == "txt" || "$type" == "img" || "$type" == "bin" ]]; then
+        local ts="$id"
+        if (( ts > 1000000000000000 )); then ts=$(( ts / 1000000 ))
+        elif (( ts > 1000000000000 )); then ts=$(( ts / 1000 ))
+        fi
+        ts_str=$(format_ts "$ts")
+    fi
 
     case "$type" in
         empty)
-            printf '\n\e[90mClipboard is empty.\nCopy something to get started!\e[0m\n'
+            printf '\n\e[37mClipboard is empty.\nCopy something to get started!\e[0m\n'
             ;;
         error)
             printf '\n\e[31mClipboard backend unavailable.\nCheck cliphist and your session environment.\e[0m\n'
@@ -621,8 +635,8 @@ cmd_preview() {
                 printf '\e[31mInvalid pin id.\e[0m\n'
                 return 1
             }
-            printf '\e[1;33m━━━ %s PINNED ━━━\e[0m\n\n' "$ICON_PIN"
-            pin_file="${PINS_DIR:?}/${id}.pin"
+            printf '\e[1;33m━━━ %s PINNED ━━━\e[0m\n' "$ICON_PIN"
+            printf '\e[36m%s\e[0m\n\n' "$ts_str"
             if [[ -f "$pin_file" && ! -L "$pin_file" ]]; then
                 render_text_preview "$pin_file" "$PREVIEW_TEXT_LIMIT" || {
                     printf '\n\e[31mFailed to render pin preview.\e[0m\n'
@@ -640,7 +654,8 @@ cmd_preview() {
             printf '\e[1;36m━━━ %s IMAGE ━━━\e[0m\n' "$ICON_IMG"
             if img_path=$(cache_image "$id"); then
                 info=$(describe_file "$img_path") || info="Unknown image data."
-                printf '%s\n\n' "${info:0:120}"
+                printf '%s\n' "${info:0:120}"
+                printf '\e[36m%s\e[0m\n\n' "$ts_str"
                 display_image "$img_path"
             else
                 printf '\n\e[31mFailed to decode image.\e[0m\n'
@@ -651,14 +666,33 @@ cmd_preview() {
                 printf '\e[31mInvalid binary id.\e[0m\n'
                 return 1
             }
-            preview_binary_entry "$id"
+            printf '\e[1;35m━━━ %s BINARY ━━━\e[0m\n' "$ICON_BIN"
+            
+            tmp=$(decode_entry_to_tmp "$id" "$CACHE_DIR") || {
+                printf '\e[31mFailed to decode entry.\e[0m\n'
+                return 1
+            }
+            
+            info=$(describe_file "$tmp") || info="Unknown binary data."
+            printf '%s\n' "${info:0:120}"
+            printf '\e[36m%s\e[0m\n\n' "$ts_str"
+            
+            # Restored safety check: Just attempt to render it without butchering the UI logic
+            if mime_is_image "$(mime_from_file "$tmp")"; then
+                display_image "$tmp"
+            else
+                printf '\e[37mBinary preview unavailable.\e[0m\n'
+            fi
+            
+            remove_tmpfile "$tmp"
             ;;
         txt)
             is_uint "$id" || {
                 printf '\e[31mInvalid text id.\e[0m\n'
                 return 1
             }
-            printf '\e[1;32m━━━ TEXT ━━━\e[0m\n\n'
+            printf '\e[1;32m━━━ TEXT ━━━\e[0m\n'
+            printf '\e[36m%s\e[0m\n\n' "$ts_str"
             tmp=$(decode_entry_to_tmp "$id" "$CACHE_DIR") || {
                 printf '\e[31mFailed to decode entry.\e[0m\n'
                 return 1
@@ -683,9 +717,9 @@ cmd_preview() {
 # ACTIONS
 #==============================================================================
 cmd_copy() {
-    local input="$1" visible type id pin_file
+    local input="$1" type id
 
-    parse_item "$input" visible type id || return 1
+    parse_item "$input" type id || return 1
 
     case "$type" in
         empty|error)
@@ -693,7 +727,7 @@ cmd_copy() {
             ;;
         pin)
             is_pin_hash "$id" || return 1
-            pin_file="${PINS_DIR:?}/${id}.pin"
+            local pin_file="${PINS_DIR:?}/${id}.pin"
             [[ -f "$pin_file" && ! -L "$pin_file" ]] || return 1
             wl-copy < "$pin_file"
             ;;
@@ -716,9 +750,7 @@ cmd_copy() {
 }
 
 cmd_pin() {
-    local input="$1" visible type id tmp hash pin_file
-
-    parse_item "$input" visible type id || return 1
+    local type="${1:-}" id="${2:-}" tmp hash pin_file
 
     case "$type" in
         pin)
@@ -751,9 +783,7 @@ cmd_pin() {
 }
 
 cmd_delete() {
-    local input="$1" visible type id status
-
-    parse_item "$input" visible type id || return 1
+    local type="${1:-}" id="${2:-}" status
 
     case "$type" in
         empty|error)
@@ -864,21 +894,32 @@ show_menu() {
         exec "${term_cmd[@]}"
     fi
 
+    # Detect persistence state for Left-Aligned FZF UI Label
+    local mode_label="DISK"
+    if [[ -f "$STATE_FILE" ]]; then
+        local p_state
+        read -r p_state < "$STATE_FILE" 2>/dev/null || true
+        [[ "$p_state" == "false" ]] && mode_label="RAM"
+    fi
+
+    local combined_label=" 📋 Clipboard [${mode_label}] "
     local selection="" self_q copied=0
     self_q=$(quote_sh "$SELF")
 
+    # FZF 0.72.0 Features: Using history scheme to prefer chronological hits natively 
     selection=$(
         cmd_list | fzf \
-            --ansi --reverse --no-sort --exact --no-multi --cycle \
-            --margin=0 --padding=0 \
-            --border=rounded --border-label=" 📋 Clipboard " --border-label-pos=3 \
+            --ansi --reverse --no-sort --exact --no-multi --cycle --scheme=history \
+            --margin=0 --padding=0 --highlight-line \
+            --border=rounded --border-label="$combined_label" --border-label-pos=3 \
             --info=hidden --header="Alt-U pin/unpin  Alt-Y delete  Alt-T wipe" --header-first \
             --prompt="  " --pointer="▌" --delimiter="$SEP" --with-nth=1 \
-            --preview="${self_q} --preview {}" --preview-window="right,45%,~1,wrap" \
+            --track --id-nth=3 \
+            --preview="${self_q} --preview '{2}' '{3}'" --preview-window="right,45%,~3,wrap-word" \
             --bind="enter:accept" \
-            --bind="alt-u:execute-silent(${self_q} --pin {})+reload(${self_q} --list)" \
-            --bind="alt-y:execute-silent(${self_q} --delete {})+reload(${self_q} --list)" \
-            --bind="alt-t:execute-silent(${self_q} --wipe)+reload(${self_q} --list)" \
+            --bind="alt-u:execute-silent(${self_q} --pin '{2}' '{3}')+reload-sync(${self_q} --list)" \
+            --bind="alt-y:execute-silent(${self_q} --delete '{2}' '{3}')+reload-sync(${self_q} --list)" \
+            --bind="alt-t:execute-silent(${self_q} --wipe)+reload-sync(${self_q} --list)" \
             --bind="esc:abort" --bind="ctrl-c:abort"
     ) || true
 
@@ -907,18 +948,18 @@ main() {
         --preview)
             [[ $# -ge 2 ]] || { log_err "--preview requires an item"; exit 1; }
             shift
-            cmd_preview "$1"
+            cmd_preview "$1" "$2"
             ;;
         --pin)
             [[ $# -ge 2 ]] || { log_err "--pin requires an item"; exit 1; }
             setup_dirs >/dev/null 2>&1 || :
             shift
-            cmd_pin "$1"
+            cmd_pin "$1" "$2"
             ;;
         --delete)
             [[ $# -ge 2 ]] || { log_err "--delete requires an item"; exit 1; }
             shift
-            cmd_delete "$1"
+            cmd_delete "$1" "$2"
             ;;
         --wipe)
             setup_dirs >/dev/null 2>&1 || :
