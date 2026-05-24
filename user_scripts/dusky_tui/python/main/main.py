@@ -382,6 +382,9 @@ EXAMPLES:
         elif e_type == "ini":
             from python.engines.ini import IniConfigEngine
             engine = IniConfigEngine(config_path=config_path)
+        elif e_type == "bridged_ini":
+            from python.engines.bridged_ini import BridgedIniEngine
+            engine = BridgedIniEngine(config_path=config_path)
         elif e_type == "systemd":
             from python.engines.systemd import SystemdEngine
             engine = SystemdEngine()
@@ -393,7 +396,7 @@ EXAMPLES:
             engine = CmdlineEngine(config_path=config_path)
         else:
             print(f"[-] Fatal: Unknown ENGINE_TYPE '{e_type}' specified in schema '{schema_path.name}'.")
-            print("[i] Supported engines are: 'lua', 'ini', 'systemd', 'hyprlang', 'trackpad', 'monitor', 'cmdline'")
+            print("[i] Supported engines are: 'lua', 'ini', 'bridged_ini', 'systemd', 'hyprlang', 'trackpad', 'monitor', 'cmdline'")
             sys.exit(1)
             
         engine_pool[key] = engine
