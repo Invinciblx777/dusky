@@ -1043,3 +1043,59 @@ Libadwaita GTK 4 Prompt
 > #     engine_type_override = None,         # Changes the parsing engine for this item (e.g., "systemd", "ini").
 > # )
 > ```
+
+
+> [!NOTE]- engine router
+> ```ini
+> # Dusky TUI: Engine Routing Cheat Sheet
+> 
+> When you create a new schema, look at the target config file. Match its appearance to one of the visual examples below to know exactly what to set `ENGINE_TYPE` to.
+> 
+> ### 1. The `hyprlang` Engine
+> 
+> **When to use it:** For anything in the modern Hyprland ecosystem. It recognizes C-like braces, variables starting with `$`, and nested categories. **Target files:** `hyprland.conf`, `hypridle.conf`, `hyprpaper.conf`, `hyprlock.conf` **What the file looks like:** $mainMod = SUPER
+> 
+> general {
+>     gaps_in = 5
+>     border_size = 2
+> }
+> 
+> ### 2. The `flatdotconfig` Engine
+> 
+> **When to use it:** When a file has absolutely no `[sections]` or `{braces}`, but uses a hierarchy separated by dots, and the key is separated from the value by a single space. **Target files:** `config_ui` (GPU Screen Recorder) **What the file looks like:** record.record_options.fps 60 record.container mp4 screenshot.image_quality very_high
+> 
+> ### 3. The `ini` Engine
+> 
+> **When to use it:** For classic Linux configuration files divided into `[sections]`. It safely handles keys with or without spaces around the `=` sign, as well as valueless flags. **Target files:** `/etc/pacman.conf`, `~/.config/mako/config`, `makepkg.conf` **What the file looks like:** [options] Color ParallelDownloads = 5
+> 
+> ### 4. The `bridged_ini` Engine
+> 
+> **When to use it:** For INI-style files where the system defaults are explicitly written out but _commented out_. This engine reads the commented lines so the TUI can display the default values without marking them as "[Missing]". **Target files:** `/etc/systemd/logind.conf`, `/etc/ssh/sshd_config` **What the file looks like:** [Login] #NAutoVTs=6 #ReserveVT=6 HandlePowerKey=poweroff
+> 
+> ### 5. The `cmdline` Engine
+> 
+> **When to use it:** For flat, single-line configuration files where arguments are separated by spaces. **Target files:** `/etc/kernel/cmdline`, `/etc/default/grub` (specifically the `GRUB_CMDLINE_LINUX` line). **What the file looks like:** rw root=UUID=123 quiet splash nvidia-drm.modeset=1
+> 
+> ### 6. The `lua` Engine
+> 
+> **When to use it:** When the configuration file is literally a `.lua` programming script. **Target files:** `wezterm.lua`, or users who migrated their Hyprland config to Lua. **What the file looks like:** local config = {} config.fps = 60 return config
+> 
+> ### 7. The `env` Engine (NEW)
+> 
+> **When to use it:** For Arch Linux core system files that define environment variables. These strictly forbid spaces around the `=` sign and sometimes use the `export` keyword. 
+> **Target files:** `/etc/locale.conf`, `/etc/vconsole.conf`, `/etc/environment`, `~/.config/uwsm/env`
+> **What the file looks like:** LANG=en_US.UTF-8
+> export WAYLAND_DISPLAY=wayland-1
+> 
+> ### 8. The `systemd` Engine
+> 
+> **When to use it:** When you aren't editing a file at all, but rather want the TUI to act as a toggle switch to enable/disable background system or user services. **Target files:** None (Target keys are service names like `bluetooth.service`).
+> 
+> ### Missing Engines for the Future:
+> 
+> If you want to expand further, the only two major formats left on Arch Linux that require dedicated parsers are:
+> 
+> 1. **JSONC (`jsonc`):** Crucial for `~/.config/waybar/config`. Standard JSON parsers destroy comments, so a custom zero-destruction JSONC engine would be powerful.
+>     
+> 2. **TOML (`toml`):** Crucial for `~/.config/starship.toml` or `alacritty.toml`.
+> ```

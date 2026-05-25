@@ -397,9 +397,12 @@ EXAMPLES:
         elif e_type == "flatdotconfig":
             from python.engines.flatdotconfig import FlatDotConfigEngine
             engine = FlatDotConfigEngine(config_path=config_path)
+        elif e_type == "env":
+            from python.engines.environment_variables import ShellEnvEngine
+            engine = ShellEnvEngine(config_path=config_path)
         else:
             print(f"[-] Fatal: Unknown ENGINE_TYPE '{e_type}' specified in schema '{schema_path.name}'.")
-            print("[i] Supported engines are: 'lua', 'ini', 'bridged_ini', 'systemd', 'hyprlang', 'trackpad', 'monitor', 'cmdline', 'flatdotconfig'")
+            print("[i] Supported engines are: 'lua', 'ini', 'bridged_ini', 'systemd', 'hyprlang', 'trackpad', 'monitor', 'cmdline', 'flatdotconfig', 'env'")
             sys.exit(1)
             
         engine_pool[key] = engine
