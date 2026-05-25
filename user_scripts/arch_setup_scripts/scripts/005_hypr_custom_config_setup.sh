@@ -131,10 +131,10 @@ get_file_content() {
 -- -------------------------------------------------------------------------------------------------
 
 terminal    = "foot"
-fileManager = "nemo"
+fileManager = "thunar"
 menu        = "rofi -show drun"
 browser     = "firefox"
-textEditor  = "nvim"
+textEditor  = "mousepad"
 EOF
             ;;
 

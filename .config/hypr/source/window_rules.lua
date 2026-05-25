@@ -1062,6 +1062,17 @@ hl.window_rule({
     center = true
 })
 
+--  Mousepad --
+hl.window_rule({
+    name = "orgxfcemousepad",
+    match = {
+        class = "^(org\\.xfce\\.mousepad)$",
+    },
+    float = true,
+    size = {"monitor_w * 0.4", "monitor_h * 0.7"},
+    animation = "popin 60%",      -- scale in starting from 60% size
+})
+
 --- erroands-gnome ---
 hl.window_rule({
     name = "errands",

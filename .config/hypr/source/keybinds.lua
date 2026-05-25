@@ -9,10 +9,10 @@
 -- -------------------------------------------------------------------------------------------------
 
 -- terminal    = "foot"
--- fileManager = "nemo"
+-- fileManager = "thunar"
 -- menu        = "rofi -show drun"
 -- browser     = "firefox"
--- textEditor  = "nvim"
+-- textEditor  = "mousepad"
 --
 -- -- Path shortcut for cleaner config
 --
