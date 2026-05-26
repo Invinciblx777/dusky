@@ -23,12 +23,12 @@ cleanup() {
     local cmd mnt f
     if [[ "$ROLLBACK_ON_EXIT" == true ]] && (( ${#ROLLBACK_CMDS[@]} > 0 )); then
         warn "Executing transactional rollbacks..."
-        for cmd in "${ROLLBACK_CMDS[@]}\"; do
+        for cmd in "${ROLLBACK_CMDS[@]}"; do
             eval "$cmd" 2>/dev/null || true
         done
     fi
 
-    for mnt in "${ACTIVE_TEMP_MOUNTS[@]}\"; do
+    for mnt in "${ACTIVE_TEMP_MOUNTS[@]}"; do
         [[ -n "$mnt" ]] || continue
         if mountpoint -q "$mnt"; then
             sudo umount "$mnt" 2>/dev/null || true
@@ -36,7 +36,7 @@ cleanup() {
         rmdir "$mnt" 2>/dev/null || true
     done
 
-    for f in "${ACTIVE_TEMP_FILES[@]}\"; do
+    for f in "${ACTIVE_TEMP_FILES[@]}"; do
         [[ -n "$f" && -f "$f" ]] && sudo rm -f "$f" 2>/dev/null || true
     done
 
@@ -89,11 +89,11 @@ remove_array_value() {
     local -n arr_ref="$array_name"
     local -a new_arr=()
 
-    for item in "${arr_ref[@]}\"; do
+    for item in "${arr_ref[@]}"; do
         [[ -n "$item" && "$item" != "$value" ]] && new_arr+=("$item")
     done
 
-    arr_ref=("${new_arr[@]}\")
+    arr_ref=("${new_arr[@]}")
 }
 
 sudo_path_exists() { sudo test -e "$1"; }
@@ -178,7 +178,7 @@ clean_mount_opts() {
     local -a parts kept=()
 
     IFS=',' read -r -a parts <<< "$opts"
-    for opt in "${parts[@]}\"; do
+    for opt in "${parts[@]}"; do
         case "$opt" in
             subvol=*|subvolid=*|ro) continue ;;
             *) kept+=("$opt") ;;
