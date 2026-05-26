@@ -191,10 +191,14 @@ declare -g SUDO_PID=""
 declare -g LOGGING_INITIALIZED=0
 declare -g EXECUTION_PHASE=0
 
-# 4. O(1) Arrays
+# 4. O(1) Arrays & Tracking
 declare -gA COMPLETED_SCRIPTS=()
 declare -gA SCRIPT_CACHE=()
 declare -gA SCRIPT_INTERPRETERS=()
+declare -ga EXECUTED_SCRIPTS=()
+declare -ga SKIPPED_SCRIPTS=()
+declare -ga SOFT_FAILED_SCRIPTS=()
+declare -ga FAILED_SCRIPTS=()
 
 # 5. Colors
 declare -g RED="" GREEN="" BLUE="" YELLOW="" BOLD="" RESET=""
@@ -1043,7 +1047,6 @@ main() {
     local current_index=0
     log "INFO" "Processing ${total_scripts} scripts..."
 
-    local -a SKIPPED_OR_FAILED=()
     local -A seen_state_keys=()
 
     EXECUTION_PHASE=1
@@ -1080,7 +1083,7 @@ main() {
             case "${_choice,,}" in
                 s|skip)
                     log "WARN" "Skipping $display_name (User Selection)"
-                    SKIPPED_OR_FAILED+=("$display_name")
+                    SKIPPED_SCRIPTS+=("$display_name")
                     continue 2
                     ;;
                 r|retry)
@@ -1110,7 +1113,7 @@ main() {
             case "${_user_confirm,,}" in
                 s|skip)
                     log "WARN" "Skipping $display_name (User Selection)"
-                    SKIPPED_OR_FAILED+=("$display_name")
+                    SKIPPED_SCRIPTS+=("$display_name")
                     continue
                     ;;
                 q|quit)
@@ -1160,6 +1163,7 @@ main() {
                 printf '%s\n' "$state_key" >> "$STATE_FILE"
                 COMPLETED_SCRIPTS["$state_key"]=1
                 log "SUCCESS" "Finished $display_name"
+                EXECUTED_SCRIPTS+=("$display_name")
 
                 if [[ "$POST_SCRIPT_DELAY" != "0" ]]; then
                     sleep "$POST_SCRIPT_DELAY"
@@ -1170,7 +1174,7 @@ main() {
 
             if [[ $ignore_fail -eq 1 ]]; then
                 log "WARN" "Failed $display_name (Exit Code: $result) - ignored via ignore-fail flag"
-                SKIPPED_OR_FAILED+=("$display_name (soft failed)")
+                SOFT_FAILED_SCRIPTS+=("$display_name")
                 break
             fi
 
@@ -1185,12 +1189,16 @@ main() {
             auto_retry_limit=0
 
             echo -e "${YELLOW}Action Required:${RESET} Script execution failed."
-            read -r -p "Do you want to [S]kip to next, [R]etry, or [Q]uit? (s/r/q): " _fail_choice
+            
+            # --- STDIN SAFETY FIX: Fallback if 'read' abruptly closes (e.g. TTY detached) ---
+            if ! read -r -p "Do you want to [S]kip to next, [R]etry, or [Q]uit? (s/r/q): " _fail_choice; then
+                _fail_choice="q"
+            fi
 
             case "${_fail_choice,,}" in
                 s|skip)
                     log "WARN" "Skipping $display_name (User Selection). NOT marking as complete."
-                    SKIPPED_OR_FAILED+=("$display_name")
+                    FAILED_SCRIPTS+=("$display_name")
                     break
                     ;;
                 r|retry)
@@ -1206,31 +1214,45 @@ main() {
         done
     done
 
-    # --- SUMMARY OF FAILED / SKIPPED SCRIPTS ---
-    if [[ ${#SKIPPED_OR_FAILED[@]} -gt 0 ]]; then
-        echo -e "\n${YELLOW}================================================================${RESET}"
-        echo -e "${YELLOW}NOTE: Some scripts were skipped or failed:${RESET}"
+    # --- PHASE SUMMARY ---
+    local end_ts=$SECONDS
+    local duration=$((end_ts - start_ts))
+    local minutes=$((duration / 60))
+    local seconds=$((duration % 60))
 
-        local f=""
-        for f in "${SKIPPED_OR_FAILED[@]}"; do
-            echo " - $f"
-        done
+    echo -e "\n${BLUE}${BOLD}=== EXECUTION SUMMARY ===${RESET}"
+    
+    if (( ${#EXECUTED_SCRIPTS[@]} > 0 )); then
+        echo -e "${GREEN}[Executed]${RESET}    ${#EXECUTED_SCRIPTS[@]} script(s)"
+    fi
+    
+    if (( ${#SKIPPED_SCRIPTS[@]} > 0 )); then
+        echo -e "${YELLOW}[Skipped]${RESET}     ${#SKIPPED_SCRIPTS[@]} script(s):"
+        for f in "${SKIPPED_SCRIPTS[@]}"; do echo "  - $f"; done
+    fi
 
-        echo -e "\nYou can run them individually from their respective directories:"
+    if (( ${#SOFT_FAILED_SCRIPTS[@]} > 0 )); then
+        echo -e "${YELLOW}[Soft-Failed]${RESET} ${#SOFT_FAILED_SCRIPTS[@]} script(s) (Ignored):"
+        for f in "${SOFT_FAILED_SCRIPTS[@]}"; do echo "  - $f"; done
+    fi
+    
+    if (( ${#FAILED_SCRIPTS[@]} > 0 )); then
+        echo -e "${RED}[Failed]${RESET}      ${#FAILED_SCRIPTS[@]} script(s):"
+        for f in "${FAILED_SCRIPTS[@]}"; do echo "  - $f"; done
+    fi
+
+    echo -e "\n${BLUE}Execution Time:${RESET} ${minutes}m ${seconds}s"
+    echo -e "${BLUE}Log file:${RESET}       ${LOG_FILE}"
+
+    if (( ${#SKIPPED_SCRIPTS[@]} > 0 || ${#FAILED_SCRIPTS[@]} > 0 || ${#SOFT_FAILED_SCRIPTS[@]} > 0 )); then
+        echo -e "\n${YELLOW}You can run the missing scripts individually from their respective directories:${RESET}"
         local dir=""
         for dir in "${SCRIPT_SEARCH_DIRS[@]}"; do
             if [[ -d "$dir" ]]; then
                 echo -e "  ${BOLD}${dir}/${RESET}"
             fi
         done
-
-        echo -e "${YELLOW}================================================================${RESET}\n"
     fi
-
-    local end_ts=$SECONDS
-    local duration=$((end_ts - start_ts))
-    local minutes=$((duration / 60))
-    local seconds=$((duration % 60))
 
     # --- COMPLETION & REBOOT NOTICE ---
     echo -e "\n${GREEN}================================================================${RESET}"
