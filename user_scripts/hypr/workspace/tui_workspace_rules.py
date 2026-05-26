@@ -12,7 +12,7 @@ from python.frontend.core_types import ConfigItem
 # =============================================================================
 ENGINE_TYPE = "lua"
 TARGET_FILE = "~/.config/hypr/edit_here/source/workspace_rules.lua"
-APP_TITLE = "Hyprland Workspace Rules"
+APP_TITLE = "Workspace Rules"
 
 # =============================================================================
 # 2. UI & ENVIRONMENT BEHAVIOR

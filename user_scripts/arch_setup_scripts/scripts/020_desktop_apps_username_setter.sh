@@ -78,7 +78,7 @@ readonly TARGET_FILES=(
     "dusky_waybars.desktop"
     "dusky_wayclick_config.desktop"
     "dusky_window_rules.desktop"
-    "dusky_workspace_manager.desktop"
+    "dusky_workspace.desktop"
     "dusky_site_blocker.desktop"
     "dusky_quickpanal.desktop"
     "dusky_service_toggle.desktop"
