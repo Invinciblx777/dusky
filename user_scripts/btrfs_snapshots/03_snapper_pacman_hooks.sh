@@ -200,10 +200,25 @@ remove_sync_features() {
     pacman -Q snap-pac >/dev/null 2>&1 && pkgs_to_remove+=(snap-pac)
 
     # Completely purge the packages to kill ALPM pacman hooks
-    if (( ${#pkgs_to_remove[@]} > 0 )); then
-        info "Purging automated sync packages to enforce manual-only policy..."
-        sudo pacman -Rns --noconfirm "${pkgs_to_remove[@]}" || true
-    fi
+        if (( ${#pkgs_to_remove[@]} > 0 )); then
+            info "Purging automated sync packages to enforce manual-only policy..."
+            
+            # Perform a dry-run to detect dependency conflicts silently
+            if pacman -Rnsp "${pkgs_to_remove[@]}" >/dev/null 2>&1; then
+                sudo pacman -Rns --noconfirm "${pkgs_to_remove[@]}" >/dev/null 2>&1 || true
+            else
+                warn "Dependency constraint detected. Safely filtering packages to prevent breakage..."
+                local pkg
+                for pkg in "${pkgs_to_remove[@]}"; do
+                    # Test each package individually
+                    if pacman -Rnsp "$pkg" >/dev/null 2>&1; then
+                        sudo pacman -Rns --noconfirm "$pkg" >/dev/null 2>&1 || true
+                    else
+                        warn "Skipping removal of '$pkg' (required by other installed packages)."
+                    fi
+                done
+            fi
+        fi
     
     # Forensic sweep of ESP to prevent hostage capacity issues
     local esp_mnt
