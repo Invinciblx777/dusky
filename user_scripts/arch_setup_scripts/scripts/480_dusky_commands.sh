@@ -26,7 +26,7 @@ set -o pipefail
 declare -ra FLEET_COMMANDS=(
     'U | gsettings set org.gnome.desktop.interface icon-theme "Papirus"'
     'U | gsettings set org.gnome.desktop.interface gtk-theme "adw-gtk3"'
-    'U | gsettings set org.cinnamon.desktop.default-applications.terminal exec "kitty"'
+ #   'U | gsettings set org.cinnamon.desktop.default-applications.terminal exec "kitty"'
     'U | mkdir -p "$HOME/.config/gtk-3.0" "$HOME/.config/gtk-4.0"'
     'U | ln -nfs "$HOME/.config/matugen/generated/gtk-3.css" "$HOME/.config/gtk-3.0/gtk.css"'
     'U | ln -nfs "$HOME/.config/matugen/generated/gtk-4.css" "$HOME/.config/gtk-4.0/gtk.css"'
