@@ -23,7 +23,7 @@ _pkg_interactive() {
     # 1. Strict Environment Isolation
     emulate -L zsh
     setopt localoptions extendedglob
-    local init_mode="${1:-alpha}"
+    local init_mode="${1:-date_desc}"
     local init_target="${2:-all}"
     local LC_ALL=C
 
@@ -323,7 +323,7 @@ pkg() {
 
     # 5. Execution Router: Launch Interactive Atlas if no count is provided
     if (( count == -1 )); then
-        local init_mode="${metric:-alpha}"
+        local init_mode="${metric:-date_desc}"
         _pkg_interactive "$init_mode" "$target"
         return 0
     fi
