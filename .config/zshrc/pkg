@@ -1,10 +1,10 @@
 # =============================================================================
-# Dusky Package Atlas (Platinum Edition - Revision 9)
+# Dusky Package Atlas (Platinum Edition - Revision 10)
 # Architecture: FZF 0.72.0+ Responsive Layout, Zero-fork environment metadata,
 #               Zero-eval stream filtering, Interactive F1 Help Overlay,
 #               Zero-blink live reloading, Absolute Name-Over-Desc Tiebreaking,
 #               Anti-Shatter Horizontal Scroll Locking, Auto-Snap Top Search,
-#               Mathematically Aligned Header Geometry & Optimized Spacing.
+#               Edge-to-Edge UI, Bold-Stretch Immune ANSI Header Alignment.
 # Usage: pkg [command] [count]
 #        (Run without count to launch the Interactive FZF Atlas)
 # =============================================================================
@@ -13,7 +13,6 @@
 _pkg_header() {
     print -P "\n%F{blue}::%f %B${1}%b (Top ${2})"
     print -P "%F{238}------------------------------------------------------------%f"
-    # Precisely mathematically aligned for the CLI fallback printout
     print -P "%F{242}INSTALL DATE             SIZE  PACKAGE%f"
     print -P "%F{238}------------------------------------------------------------%f"
 }
@@ -65,12 +64,12 @@ fetch_data | sort "${sort_args[@]}" | awk -F"|" '\''
         else if (size_mb >= 1) { size_fmt = sprintf("%.2f MiB", size_mb) }
         else { size_fmt = sprintf("%.2f KiB", size / 1024) }
         
-        # Hard cap strings to maintain flawless table geometry (Precision Aligned)
-        disp_name = (length(name) > 24) ? substr(name, 1, 21) "..." : name
-        disp_ver  = (length(ver) > 14)  ? substr(ver, 1, 11) "..."  : ver
+        # Space Reclamation: Package (22), Version (12). Frees 12 columns for Description.
+        disp_name = (length(name) > 22) ? substr(name, 1, 19) "..." : name
+        disp_ver  = (length(ver) > 12)  ? substr(ver, 1, 9) "..."  : ver
         
         # Routing format: RAW_CMD|VISUAL_STRING
-        printf "%s|\033[1;38;5;39m%-24s\033[0m \033[38;5;238m│\033[0m \033[38;5;220m%-14s\033[0m \033[38;5;238m│\033[0m \033[38;5;208m%10s\033[0m \033[38;5;238m│\033[0m \033[38;5;250m%s\033[0m\n", name, disp_name, disp_ver, size_fmt, desc
+        printf "%s|\033[1;38;5;39m%-22s\033[0m \033[38;5;238m│\033[0m \033[38;5;220m%-12s\033[0m \033[38;5;238m│\033[0m \033[38;5;208m%10s\033[0m \033[38;5;238m│\033[0m \033[38;5;250m%s\033[0m\n", name, disp_name, disp_ver, size_fmt, desc
     }
 '\''
 '
@@ -138,7 +137,12 @@ pacman -Ql "$pkg" 2>/dev/null | awk '\''
         date_desc) prompt_str="   Newest (Date) ❯ " ;;
     esac
 
-    # 6. Data Stream Construction & Responsive FZF Execution
+    # 6. Bold-Stretch Immune Header Geometry
+    # Explicitly applies \033[1;... (BOLD) to the PACKAGE column to force the terminal 
+    # to perfectly match the pixel-width of the bolded data rows below it.
+    local visual_header="  \033[1;37mPACKAGE               \033[0m \033[38;5;238m│\033[0m \033[38;5;242mVERSION     \033[0m \033[38;5;238m│\033[0m \033[38;5;242m      SIZE\033[0m \033[38;5;238m│\033[0m \033[38;5;242mDESCRIPTION                                 [F1] Shortcuts\033[0m"
+
+    # 7. Data Stream Construction & Responsive FZF Execution
     local fzf_choice
     fzf_choice=$(bash -c "$DUSKY_PKG_LIST" _ "$init_mode" "$init_target" | fzf --ansi \
         --delimiter='\|' \
@@ -153,10 +157,8 @@ pacman -Ql "$pkg" 2>/dev/null | awk '\''
         --border=rounded \
         --border-label=" 󰏖 Dusky Package Atlas " \
         --border-label-pos=3 \
-        --padding=1,2 \
-        --margin=1%,2% \
         --info=inline-right \
-        --header="  PACKAGE                  │ VERSION        │       SIZE │ DESCRIPTION                     [F1] Shortcuts" \
+        --header="$visual_header" \
         --header-first \
         --bind="ctrl-s:reload-sync(bash -c \"\$DUSKY_PKG_LIST\" _ size_desc $init_target)+change-prompt(   Hogs (Largest) ❯ )" \
         --bind="alt-s:reload-sync(bash -c \"\$DUSKY_PKG_LIST\" _ size_asc $init_target)+change-prompt(   Tiny (Smallest) ❯ )" \
@@ -175,7 +177,7 @@ pacman -Ql "$pkg" 2>/dev/null | awk '\''
     unset DUSKY_PKG_PREVIEW
     unset DUSKY_PKG_HELP
 
-    # 7. Action Router
+    # 8. Action Router
     if [[ -n "$fzf_choice" ]]; then
         local target_pkg="${fzf_choice%%|*}"
         print -z "$target_pkg"
