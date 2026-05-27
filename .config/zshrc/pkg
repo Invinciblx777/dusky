@@ -14,7 +14,8 @@
 _pkg_header() {
     print -P "\n%F{blue}::%f %B${1}%b (Top ${2})"
     print -P "%F{238}------------------------------------------------------------%f"
-    print -P "%F{242}DATE                  SIZE  PACKAGE%f"
+    # Adjusted padding by -4 spaces to account for the new MM/DD date format geometry
+    print -P "%F{242}DATE              SIZE  PACKAGE%f"
     print -P "%F{238}------------------------------------------------------------%f"
 }
 
@@ -66,14 +67,15 @@ fetch_data | sort "${sort_args[@]}" | awk -F"|" '\''
         else if (size_mb >= 1) { size_fmt = sprintf("%.2f MiB", size_mb) }
         else { size_fmt = sprintf("%.2f KiB", size / 1024) }
         
-        date_fmt = strftime("%Y-%m-%d", date)
+        # Switched to MM/DD
+        date_fmt = strftime("%m/%d", date)
 
-        # Space Reclamation: Package (23), Version (10), Date (10)
-        disp_name = (length(name) > 23) ? substr(name, 1, 20) "..." : name
-        disp_ver  = (length(ver) > 10)  ? substr(ver, 1, 7) "..."  : ver
+        # Space Reclamation: Package (27), Version (11) [+1], Date (5) [-1]
+        disp_name = (length(name) > 27) ? substr(name, 1, 24) "..." : name
+        disp_ver  = (length(ver) > 11)  ? substr(ver, 1, 8) "..."  : ver
         
-        # Exact width visual string rendering
-        visual_str = sprintf("\033[1;38;5;39m%-23s\033[0m \033[38;5;238m│\033[0m \033[38;5;220m%-10s\033[0m \033[38;5;238m│\033[0m \033[38;5;114m%-10s\033[0m \033[38;5;238m│\033[0m \033[38;5;208m%10s\033[0m", disp_name, disp_ver, date_fmt, size_fmt)
+        # Exact width visual string rendering (Math verified: Geometry remains strictly identical)
+        visual_str = sprintf("\033[1;38;5;39m%-27s\033[0m \033[38;5;238m│\033[0m \033[38;5;220m%-11s\033[0m \033[38;5;238m│\033[0m \033[38;5;114m%-5s\033[0m \033[38;5;238m│\033[0m \033[38;5;208m%10s\033[0m", disp_name, disp_ver, date_fmt, size_fmt)
         
         # Hidden Search Hack: Appends 150 invisible spaces followed by the package description.
         # This pushes the searchable description out of the terminal view (--no-hscroll keeps it hidden).
@@ -193,8 +195,8 @@ bash -c "$DUSKY_PKG_PREVIEW" _ "$pkg" | sed -r "s/\x1B\[([0-9]{1,3}(;[0-9]{1,2})
     esac
 
     # 7. Mathematical Header Geometry Construction (Perfect FZF Auto-Alignment)
-    # Removing leading spaces because modern fzf automatically indents the header to match the pointer gutter
-    local visual_header=$(printf "\033[1;37m%-23s\033[0m \033[38;5;238m│\033[0m \033[38;5;242m%-10s\033[0m \033[38;5;238m│\033[0m \033[38;5;242m%-10s\033[0m \033[38;5;238m│\033[0m \033[38;5;242m%10s\033[0m" "PACKAGE" "VERSION" "DATE" "SIZE")
+    # Rebalanced geometry: Date (-1), Version (+1)
+    local visual_header=$(printf "\033[1;37m%-27s\033[0m \033[38;5;238m│\033[0m \033[38;5;242m%-11s\033[0m \033[38;5;238m│\033[0m \033[38;5;242m%-5s\033[0m \033[38;5;238m│\033[0m \033[38;5;242m%10s\033[0m" "PACKAGE" "VERSION" "DATE" "SIZE")
 
     # 8. Data Stream Construction & Responsive FZF Execution
     local fzf_choice
@@ -330,16 +332,17 @@ pkg() {
 
     # 6. Fallback: Classic CLI List Execution (if count > 0)
     metric="${metric:-size_desc}"
-    # Replaced %i with %l to fix Date parsing bug in fallback mode as well
-    local -a expac_args=(--timefmt='%Y-%m-%d %H:%M:%S' '%l|%m|%n')
+    # Migrated fallback to %s Epoch time. Guarantees cross-year numeric date sorting won't shatter.
+    local -a expac_args=(--timefmt='%s' '%l|%m|%n')
     local -a sort_cmd
     local title_metric=""
 
+    # Added -n (numeric) flag to Date logic since we are sorting Epoch integers now.
     case "$metric" in
         size_desc) title_metric="Largest"; sort_cmd=(sort -t '|' -k2 -rn) ;;
         size_asc)  title_metric="Smallest"; sort_cmd=(sort -t '|' -k2 -n) ;;
-        date_desc) title_metric="Newest"; sort_cmd=(sort -t '|' -k1 -r) ;;
-        date_asc)  title_metric="Oldest";   sort_cmd=(sort -t '|' -k1) ;;
+        date_desc) title_metric="Newest"; sort_cmd=(sort -t '|' -k1 -rn) ;;
+        date_asc)  title_metric="Oldest";   sort_cmd=(sort -t '|' -k1 -n) ;;
         alpha|*)   title_metric="Alpha"; sort_cmd=(sort -t '|' -k3) ;;
     esac
 
@@ -351,7 +354,10 @@ pkg() {
     fi
 
     _pkg_header "$title_full" "$count"
-    local awk_color='{ printf "\033[38;5;246m%-19s\033[0m \033[38;5;220m%10s\033[0m  \033[1;38;5;39m%s\033[0m\n", $1, $2, $3 }'
+    
+    # Mathematical Formatting Shift: Date is dynamically evaluated from Epoch ($1) to MM/DD.
+    # Geometry string strictly shifted by -4 chars (%-19s -> %-15s) to align perfectly with the updated header.
+    local awk_color='{ printf "\033[38;5;246m%-15s\033[0m \033[38;5;220m%10s\033[0m  \033[1;38;5;39m%s\033[0m\n", strftime("%m/%d", $1), $2, $3 }'
 
     if [[ "$target" == "explicit" ]]; then
         pacman -Qeq | expac "${expac_args[@]}" - 2>/dev/null | "${sort_cmd[@]}" | head -n "$count" | numfmt --to=iec-i --suffix=B --field=2 --delimiter='|' --padding=8 | awk -F '|' "$awk_color"
