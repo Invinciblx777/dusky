@@ -30,8 +30,9 @@ log_err()  { printf "%s[ERROR]%s %s\n" "${C_RED}${C_BOLD}" "${C_RESET}" "${*:-}"
 # to use double quotes (" ") inside the payload without needing backslashes.
 
 readonly -a PAYLOADS=(
+
     # 1. Target hyprland.lua (Spaces around the pipe are completely safe now)
-'.config/hypr/hyprland.lua | hl.on("hyprland.start", function() hl.exec_cmd([[foot --hold --title "Dusky Orchestra" bash -c "~/user_scripts/arch_setup_scripts/ORCHESTRA.sh"]]) end)'
+#     '.config/hypr/hyprland.lua | hl.on("hyprland.start", function() hl.exec_cmd([[foot --hold --title "Dusky Orchestra" bash -c "~/user_scripts/arch_setup_scripts/ORCHESTRA.sh"]]) end)'
 
     # 2. Target the exact same file with another line
 #    '.config/hypr/source/autostart.conf | exec-once = echo "Running | logging" > /tmp/log'

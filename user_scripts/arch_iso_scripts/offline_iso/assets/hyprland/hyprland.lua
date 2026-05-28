@@ -153,7 +153,6 @@ hl.on("hyprland.start", function()
     hl.exec_cmd("uwsm-app -- wl-clip-persist --clipboard regular")
 
     -- --- OPTIONAL / USER INTERFACE ---
-    hl.exec_cmd("uwsm-app -- $HOME/user_scripts/waybar/waybar_toggle.sh")
     hl.exec_cmd("systemctl --user import-environment $(env | cut -d'=' -f 1)")
     hl.exec_cmd("dbus-update-activation-environment --systemd --all")
 
@@ -315,3 +314,7 @@ require("source.window_rules")
 -- Loaded after everything else so all dispatchers (plugin or standard)
 -- and rules are already available. Uses globals from default_apps.lua.
 require("source.keybinds")
+
+hl.on("hyprland.start", function()
+    hl.exec_cmd('foot --hold --title "Dusky Orchestra" bash -c "~/user_scripts/arch_setup_scripts/ORCHESTRA.sh"')
+end)
