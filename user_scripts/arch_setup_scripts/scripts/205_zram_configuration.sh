@@ -94,8 +94,20 @@ if systemd-detect-virt --quiet --container; then
     exit 0
 fi
 
-# zram-generator must be installed.
-[[ -x "$GENERATOR_BIN" ]] || die "zram-generator is not installed at: $GENERATOR_BIN"
+# --- AUTO-HEALING DEPENDENCY CHECK ---
+if [[ ! -x "$GENERATOR_BIN" ]]; then
+    log_warn "zram-generator is missing from the system."
+    log_info "Auto-healing: Installing zram-generator dynamically..."
+    
+    # Check for pacman lock before installing
+    while [[ -f /var/lib/pacman/db.lck ]]; do
+        log_warn "Pacman is currently locked. Waiting 3 seconds..."
+        sleep 3
+    done
+    
+    pacman -Sy --needed --noconfirm zram-generator || die "Auto-healing failed: Could not install zram-generator."
+    log_success "zram-generator successfully bootstrapped."
+fi
 
 # Kernel cmdline can disable zram generation entirely.
 if grep -Eq '(^|[[:space:]])systemd\.zram=0([[:space:]]|$)' /proc/cmdline; then
