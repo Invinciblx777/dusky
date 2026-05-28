@@ -18,6 +18,7 @@ fi
 # --- Configuration ---
 readonly MOUNT_POINT="/mnt"
 AUTO_MODE=0
+TARGET_OS="arch"
 USE_GENERIC_FIRMWARE=0
 HW_CACHE=""
 VM_DETECTED=0
@@ -36,10 +37,12 @@ log_err()  { echo -e "${C_RED}[ERROR]${C_RESET} $*"; }
 
 usage() {
     cat <<EOF
-Usage: ${0##*/} [--auto|-a] [--help|-h]
+Usage: ${0##*/} [OPTIONS]
 
 Options:
   -a, --auto   Run autonomously (no prompts)
+  --arch       Target standard Arch Linux (default)
+  --cachyos    Target CachyOS (Injects required keyring and mirrorlists)
   -h, --help   Show this help
 EOF
 }
@@ -171,6 +174,12 @@ for arg in "$@"; do
         -a|--auto)
             AUTO_MODE=1
             ;;
+        --arch)
+            TARGET_OS="arch"
+            ;;
+        --cachyos)
+            TARGET_OS="cachyos"
+            ;;
         -h|--help)
             usage
             exit 0
@@ -211,7 +220,15 @@ if (( ! AUTO_MODE )); then
 fi
 
 # ==============================================================================
-# 2. CPU MICROCODE
+# 2. CACHYOS PRE-REQUISITE INJECTION
+# ==============================================================================
+if [[ "${TARGET_OS}" == "cachyos" ]]; then
+    log_info "CachyOS architecture selected. Injecting required keyrings and mirrors..."
+    FINAL_PACKAGES+=("cachyos-keyring" "cachyos-mirrorlist" "cachyos-rate-mirrors")
+fi
+
+# ==============================================================================
+# 3. CPU MICROCODE
 # ==============================================================================
 CPU_VENDOR=$(awk '/^vendor_id/ {print $3; exit}' /proc/cpuinfo)
 
@@ -230,7 +247,7 @@ case "$CPU_VENDOR" in
 esac
 
 # ==============================================================================
-# 3. PERIPHERAL DETECTION (PCI & USB)
+# 4. PERIPHERAL DETECTION (PCI & USB)
 # ==============================================================================
 log_info "Scanning Hardware Topography (PCI + USB)..."
 
@@ -257,7 +274,7 @@ detect_and_add "Intel SOF Audio"    "audio.*intel|8086"      "sof-firmware"
 detect_and_add "Cirrus Logic Audio" "cirrus"                 "linux-firmware-cirrus"
 
 # ==============================================================================
-# 4. FINAL PACKAGE ASSEMBLY
+# 5. FINAL PACKAGE ASSEMBLY
 # ==============================================================================
 if (( USE_GENERIC_FIRMWARE )); then
     log_warn "Fallback Triggered: Consolidating to generic linux-firmware."
@@ -276,7 +293,7 @@ fi
 dedupe_final_packages
 
 # ==============================================================================
-# 5. EXECUTION
+# 6. EXECUTION
 # ==============================================================================
 echo ""
 echo -e "${C_BOLD}Final Package List:${C_RESET}"
