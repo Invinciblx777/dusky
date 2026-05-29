@@ -203,33 +203,7 @@ backup_file() {
 }
 
 # ==============================================================================
-# SECTION 8 — NETWORK CONNECTIVITY CHECK
-# ==============================================================================
-
-check_network() {
-    local test_domain="archlinux.org"
-
-    if command -v curl &>/dev/null; then
-        if timeout -k 2 5 curl --silent --max-time 5 --head "https://${test_domain}" &>/dev/null; then
-            return 0
-        fi
-    fi
-
-    if command -v wget &>/dev/null; then
-        if timeout -k 2 5 wget --quiet --spider --timeout=5 "https://${test_domain}" &>/dev/null; then
-            return 0
-        fi
-    fi
-
-    if timeout -k 2 5 ping -c 1 -W 3 "${test_domain}" &>/dev/null; then
-        return 0
-    fi
-
-    return 1
-}
-
-# ==============================================================================
-# SECTION 9 — SWITCH TO ONLINE
+# SECTION 8 — SWITCH TO ONLINE
 # ==============================================================================
 
 switch_to_online() {
@@ -325,7 +299,7 @@ Server = https://mirror.theo546.fr/archlinux/$repo/os/x86_64
 Server = https://berlin.mirror.pkgbuild.com/$repo/os/x86_64
 ONLINE_MIRRORLIST_EOF
 
-    # Dynamically scaffold CachyOS mirrorlists to prevent `pacman -Syy` crashes
+    # Dynamically scaffold CachyOS mirrorlists to prevent `pacman -Syy` crashes later
     if [[ "${TARGET_OS}" == "cachyos" ]]; then
         log_info "Scaffolding base CachyOS mirrorlists..."
         write_file_atomically "/etc/pacman.d/cachyos-mirrorlist" << 'EOF'
@@ -336,31 +310,12 @@ Server = https://mirror.cachyos.org/repo/x86_64_v3/$repo
 EOF
     fi
 
-    log_step "Syncing Package Databases"
-
-    log_info "Verifying network connectivity and DNS resolution..."
-    if check_network; then
-        log_info "Network reachable. Running 'pacman -Syy'..."
-        local pacman_exit=0
-        pacman -Syy || pacman_exit=$?
-
-        if (( pacman_exit == 0 )); then
-            log_info "Package databases synced successfully."
-        else
-            log_warn "'pacman -Syy' exited with code ${pacman_exit}."
-            log_warn "Your configuration files are correctly written."
-        fi
-    else
-        log_warn "Network or DNS not reachable — skipping 'pacman -Syy'."
-        log_warn "Once connected, run: sudo pacman -Syy"
-    fi
-
     printf "\n%s%s[OK]%s  Online repository configuration applied.%s\n" \
         "${CLR_BOLD}" "${CLR_GREEN}" "${CLR_RESET}" "${CLR_RESET}"
 }
 
 # ==============================================================================
-# SECTION 10 — SWITCH TO OFFLINE
+# SECTION 9 — SWITCH TO OFFLINE
 # ==============================================================================
 
 switch_to_offline() {
@@ -462,6 +417,8 @@ OFFLINE_REPO_BLOCK_EOF
     log_info "Syncing offline package database..."
 
     local pacman_exit=0
+    # Note: Sy is kept here ONLY because it's accessing the local file:// repo 
+    # and takes milliseconds, which pacstrap needs to function correctly.
     pacman -Sy || pacman_exit=$?
 
     if (( pacman_exit == 0 )); then
@@ -475,7 +432,7 @@ OFFLINE_REPO_BLOCK_EOF
 }
 
 # ==============================================================================
-# SECTION 11 — INTERACTIVE MENU
+# SECTION 10 — INTERACTIVE MENU
 # ==============================================================================
 
 show_menu() {
@@ -522,7 +479,7 @@ show_menu() {
 }
 
 # ==============================================================================
-# SECTION 12 — USAGE / HELP
+# SECTION 11 — USAGE / HELP
 # ==============================================================================
 
 show_usage() {
@@ -537,7 +494,7 @@ show_usage() {
 }
 
 # ==============================================================================
-# SECTION 13 — ENTRY POINT
+# SECTION 12 — ENTRY POINT
 # ==============================================================================
 
 main() {
