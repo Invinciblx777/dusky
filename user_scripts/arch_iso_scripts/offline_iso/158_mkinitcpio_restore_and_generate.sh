@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Script: 158_mkinitcpio_generate.sh
+# Script: 158_mkinitcpio_finalize.sh
 # Context: Finalization (Chroot)
-# Description: Generates the definitive initramfs for the deployment.
+# Description: Restores ALPM hooks and generates the definitive initramfs.
 # ==============================================================================
 set -euo pipefail
 
@@ -16,10 +16,17 @@ else
     readonly C_BOLD="" C_CYAN="" C_GREEN="" C_YELLOW="" C_RESET=""
 fi
 
+printf "%s%s[INFO]%s Restoring pacman mkinitcpio hooks...\n" "${C_BOLD}" "${C_CYAN}" "${C_RESET}"
+
+# Remove the overrides so future kernel updates trigger initramfs generation normally
+rm -f /etc/pacman.d/hooks/90-mkinitcpio-install.hook
+rm -f /etc/pacman.d/hooks/60-mkinitcpio-remove.hook
+
 printf "%s%s[INFO]%s Generating definitive initramfs...\n" "${C_BOLD}" "${C_CYAN}" "${C_RESET}"
 printf "%s\n" "----------------------------------------"
 
 # We feed 'n' to safely bypass the limine-mkinitcpio-hook prompt if it fires.
+# -P processes all presets in /etc/mkinitcpio.d
 mkinitcpio -P < <(echo "n") || {
     printf "%s\n" "----------------------------------------"
     printf "%s%s[WARN]%s mkinitcpio returned a non-zero exit code (usually benign firmware warnings).\n" "${C_BOLD}" "${C_YELLOW}" "${C_RESET}"
