@@ -28,7 +28,7 @@ declare -ra CHROOT_SEQUENCE=(
   "101_skel_files_precision_edit.sh --inject"
   "110_post_chroot.sh --auto"
   "115_tty_autologin.sh --auto"
-  "120_mkintcpip_optimizer.sh | IGNORE"
+  "120_mkinitcpio_optimizer.sh | IGNORE"
   "135_plymouth_setup.sh"
   "130_chroot_package_installer.sh --auto --cachyos"
   "131_chroot_aur_packages.sh --auto --cachyos"
