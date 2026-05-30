@@ -12,6 +12,7 @@ import os
 import sys
 import re
 import uuid
+import time
 import shutil
 import hashlib
 import threading
@@ -19,6 +20,13 @@ import subprocess
 import argparse
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('Gdk', '3.0')
+gi.require_version('GdkPixbuf', '2.0')
+gi.require_version('Pango', '1.0')
+from gi.repository import Gtk, Gdk, GdkPixbuf, GLib, Gio, Pango
 
 # --- CONSTANTS & PATHS ---
 HOME = Path.home()
@@ -35,7 +43,6 @@ THEME_CTL = HOME / "user_scripts/theme_matugen/theme_ctl.sh"
 APP_SETTINGS_FILE = THEME_DIR / "gtk_wall_settings"
 CACHE_DIR = HOME / ".cache/dusky_images/wallpaper_selector/"
 THUMB_DIR = CACHE_DIR / "thumbs"
-GTK_CSS_PATH = HOME / ".config/gtk-3.0/gtk.css"
 
 THUMB_SIZE = 240
 RENDER_SIZE = 145
@@ -50,29 +57,33 @@ def natural_keys(text: str) -> list:
 
 
 def atomic_write(path: Path, content: str):
-    """Ensures state and setting files are never corrupted during abrupt process death."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(f".tmp.{uuid.uuid4().hex}")
+    """Ensures state and setting files are never corrupted and preserves symlinks."""
+    real_path = path.resolve()
+    real_path.parent.mkdir(parents=True, exist_ok=True)
+    # Safely append tmp suffix without stripping original extension
+    tmp_path = real_path.with_name(f"{real_path.name}.tmp.{uuid.uuid4().hex}")
+    
     try:
-        # Standard file objects safely handle write chunking, preventing partial-write truncation
         with open(tmp_path, 'w', encoding='utf-8') as f:
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
             
-        os.replace(tmp_path, path)
+        os.replace(tmp_path, real_path)
         
-        # fsync parent directory to ensure rename visibility on the journal
-        dir_fd = os.open(str(path.parent), os.O_RDONLY)
         try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+            dir_fd = os.open(str(real_path.parent), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+            
     except OSError as e:
-        print(f"Atomic write failed for {path}: {e}")
+        print(f"Atomic write failed for {real_path}: {e}")
         try:
-            if tmp_path.exists():
-                tmp_path.unlink()
+            tmp_path.unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -85,8 +96,8 @@ class CacheManager:
     def get_all_wallpapers() -> list[str]:
         """
         Scans the wallpaper directory via a safe recursive traversal.
-        Implements st_dev/st_ino tracking to completely neutralize infinite
-        symlink loops while safely preserving virtual relative path mappings.
+        Implements st_dev/st_ino tracking and iterator exhaustion to completely
+        neutralize symlink loops and prevent File Descriptor exhaustion.
         """
         wallpapers = []
         if not WALLPAPER_DIR.exists():
@@ -104,6 +115,7 @@ class CacheManager:
             except OSError:
                 return
 
+            dirs_to_visit = []
             try:
                 with os.scandir(virtual_dir) as it:
                     for entry in it:
@@ -115,7 +127,7 @@ class CacheManager:
 
                         virtual_path = virtual_dir / entry.name
                         if is_dir:
-                            traverse_dir(virtual_path)
+                            dirs_to_visit.append(virtual_path)
                         elif is_file:
                             if virtual_path.suffix.lower() in IMAGE_EXTENSIONS:
                                 try:
@@ -124,7 +136,10 @@ class CacheManager:
                                 except ValueError:
                                     wallpapers.append(virtual_path.name)
             except OSError:
-                pass
+                return
+
+            for d in dirs_to_visit:
+                traverse_dir(d)
 
         traverse_dir(WALLPAPER_DIR)
         wallpapers.sort(key=natural_keys)
@@ -164,20 +179,20 @@ class CacheManager:
 
             subprocess.run([
                 "nice", "-n", "19", "magick", "-limit", "thread", "1",
-                str(full_path), "-auto-orient", "-strip",
+                f"{full_path}[0]", "-auto-orient", "-strip",  # Ensure [0] extracts first frame for GIF/WebP natively
                 "-thumbnail", f"{THUMB_SIZE}x{THUMB_SIZE}^",
                 "-gravity", "center", "-extent", f"{THUMB_SIZE}x{THUMB_SIZE}",
                 "(", "-size", f"{THUMB_SIZE}x{THUMB_SIZE}", "xc:none", "-fill", "white",
                 "-draw", f"roundrectangle 0,0,{THUMB_SIZE - 1},{THUMB_SIZE - 1},24,24", ")",
                 "-alpha", "set", "-compose", "DstIn", "-composite",
                 str(tmp_thumb_path)
-            ], check=True, stderr=subprocess.DEVNULL)
+            ], check=True, capture_output=True, text=True)
 
             os.replace(tmp_thumb_path, thumb_path)
             return True
 
-        except subprocess.CalledProcessError:
-            print(f"Magick failed to process: {rel_path}")
+        except subprocess.CalledProcessError as e:
+            print(f"Magick failed to process {rel_path}:\n{e.stderr.strip()}")
         except Exception as e:
             print(f"Error processing {rel_path}: {e}")
         finally:
@@ -201,9 +216,11 @@ class CacheManager:
                 with os.scandir(THUMB_DIR) as it:
                     for entry in it:
                         if entry.is_file() and entry.name.endswith('.png'):
+                            # Prevent concurrency race: Only sweep stale tmp files older than 1 hour
                             if '.tmp.' in entry.name:
                                 try:
-                                    os.remove(entry.path)
+                                    if time.time() - entry.stat().st_mtime > 3600:
+                                        os.remove(entry.path)
                                 except OSError:
                                     pass
                                 continue
@@ -230,12 +247,10 @@ class CacheManager:
         print("Cache directory purged and recreated.")
 
     @staticmethod
-    def build_cache(force: bool = False, progress_callback=None):
+    def build_cache(force: bool = False, progress_callback=None) -> list[str]:
         """
         Unified cache builder.
-        force=False: Idempotent build — skips existing fresh thumbnails.
-        force=True:  Full rebuild — nukes cache dir, regenerates everything.
-        progress_callback: Optional callable(current, total, generated) for GUI updates.
+        Returns the finalized list of wallpapers to eliminate redundant I/O calls downstream.
         """
         if force:
             CacheManager.nuke_cache()
@@ -252,6 +267,7 @@ class CacheManager:
         print("Verifying cache and generating thumbnails...")
         workers = min(os.process_cpu_count() or 4, 8)
         generated_count = 0
+        last_update = 0.0
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
@@ -263,19 +279,24 @@ class CacheManager:
                 try:
                     if future.result():
                         generated_count += 1
-                    if progress_callback:
-                        progress_callback(i, total, generated_count)
-                    else:
-                        sys.stdout.write(
-                            f"\rProgress: [{i}/{total}] | Generated: {generated_count} "
-                        )
-                        sys.stdout.flush()
+                    
+                    now = time.monotonic()
+                    if now - last_update > 0.05 or i == total:
+                        if progress_callback:
+                            progress_callback(i, total, generated_count)
+                        else:
+                            sys.stdout.write(
+                                f"\rProgress: [{i}/{total}] | Generated: {generated_count} "
+                            )
+                            sys.stdout.flush()
+                        last_update = now
                 except Exception as e:
                     print(f"\nWorker exception on {futures[future]}: {e}")
 
         if not progress_callback:
             print()
         print(f"Done! Generated {generated_count} new/updated wallpapers. Cache is warm.")
+        return wallpapers
 
 
 # ==============================================================================
@@ -283,13 +304,6 @@ class CacheManager:
 # ==============================================================================
 class WallpaperApp:
     def __init__(self):
-        import gi
-        gi.require_version('Gtk', '3.0')
-        gi.require_version('Gdk', '3.0')
-        gi.require_version('GdkPixbuf', '2.0')
-        gi.require_version('Pango', '1.0')
-        from gi.repository import Gtk, Gdk, GdkPixbuf, GLib, Gio, Pango
-
         self.Gtk = Gtk
         self.Gdk = Gdk
         self.GdkPixbuf = GdkPixbuf
@@ -315,7 +329,6 @@ class WallpaperApp:
         self.btn_settings = None
         self.btn_help = None
 
-        # Loading state widgets for progress
         self._loading_progress_bar = None
         self._loading_status_label = None
 
@@ -337,7 +350,6 @@ class WallpaperApp:
         self._load_favorites()
 
     def _load_app_settings(self):
-        """Loads application-specific preferences dynamically."""
         self.app_settings = {
             "AUTO_CLOSE": False,
             "FAST_APPLY_AUTO_CLOSE": False,
@@ -368,7 +380,6 @@ class WallpaperApp:
         self.show_only_favorites = self.app_settings.get("START_IN_FAVORITES", False)
 
     def _save_app_settings(self):
-        """Saves settings safely using atomic writes."""
         lines = ["# Dusky GTK Wallpaper Selector Configuration"]
         for k, v in sorted(self.app_settings.items()):
             if isinstance(v, bool):
@@ -392,7 +403,6 @@ class WallpaperApp:
         atomic_write(FAVORITES_FILE, "\n".join(sorted(self.favorites)) + "\n")
 
     def set_view_mode(self, show_favorites: bool):
-        """Safely updates tab buttons and invalidates layout filter."""
         if not self.btn_all or not self.btn_fav:
             return
 
@@ -424,11 +434,9 @@ class WallpaperApp:
             vbox = self.Gtk.Box(orientation=self.Gtk.Orientation.VERTICAL, spacing=0)
             self.window.add(vbox)
 
-            # --- TOP HEADER BAR ---
             header = self.Gtk.Box(orientation=self.Gtk.Orientation.HORIZONTAL, spacing=0)
             header.set_name("header_bar")
 
-            # 1. Left Box (Search Entry)
             left_box = self.Gtk.Box(orientation=self.Gtk.Orientation.HORIZONTAL, spacing=15)
 
             self.search_entry = self.Gtk.SearchEntry()
@@ -439,7 +447,6 @@ class WallpaperApp:
             self.search_entry.connect("search-changed", self.on_search_changed)
             left_box.pack_start(self.search_entry, False, False, 0)
 
-            # 2. Center Box (Tab Container)
             center_box = self.Gtk.Box(orientation=self.Gtk.Orientation.HORIZONTAL, spacing=0)
 
             tab_container = self.Gtk.Box(orientation=self.Gtk.Orientation.HORIZONTAL, spacing=4)
@@ -465,7 +472,6 @@ class WallpaperApp:
             tab_container.pack_start(self.btn_fav, False, False, 0)
             center_box.pack_start(tab_container, False, False, 0)
 
-            # 3. Right Box (Actions)
             right_box = self.Gtk.Box(orientation=self.Gtk.Orientation.HORIZONTAL, spacing=8)
 
             self.btn_refresh = self.Gtk.Button()
@@ -499,14 +505,12 @@ class WallpaperApp:
             right_box.pack_start(self.btn_settings, False, False, 0)
             right_box.pack_start(self.btn_help, False, False, 0)
 
-            # --- GEOMETRY FIX ---
             header.pack_start(left_box, False, False, 0)
             header.set_center_widget(center_box)
             header.pack_end(right_box, False, False, 0)
 
             vbox.pack_start(header, False, False, 0)
 
-            # --- MAIN VIEW ---
             self.stack = self.Gtk.Stack()
             self.stack.set_transition_type(self.Gtk.StackTransitionType.CROSSFADE)
             self.stack.set_transition_duration(150)
@@ -646,7 +650,6 @@ class WallpaperApp:
         self.window = None
 
     def on_app_shutdown(self, application):
-        """Safely tears down background thread pools when application genuinely exits."""
         self.executor.shutdown(wait=False, cancel_futures=True)
 
     def _create_empty_state_placeholder(self):
@@ -688,7 +691,6 @@ class WallpaperApp:
         )
         subtitle.get_style_context().add_class("placeholder-subtitle")
 
-        # Progress bar for cache rebuild
         progress_bar = self.Gtk.ProgressBar()
         progress_bar.set_size_request(400, -1)
         progress_bar.set_show_text(True)
@@ -696,7 +698,6 @@ class WallpaperApp:
         progress_bar.get_style_context().add_class("rebuild-progress")
         self._loading_progress_bar = progress_bar
 
-        # Status label under the progress bar
         status_label = self.Gtk.Label(label="")
         status_label.get_style_context().add_class("placeholder-subtitle")
         self._loading_status_label = status_label
@@ -735,7 +736,6 @@ class WallpaperApp:
             padding: 6px 8px;
         }
 
-        /* Central Tabs Styling */
         .tab-container {
             background-color: alpha(@theme_fg_color, 0.03);
             border: 1px solid alpha(@theme_fg_color, 0.06);
@@ -841,17 +841,8 @@ class WallpaperApp:
         }
         """
 
-        final_css = ""
-        if GTK_CSS_PATH.exists():
-            try:
-                final_css += GTK_CSS_PATH.read_text(encoding='utf-8') + "\n"
-            except Exception as e:
-                print(f"Warning: Could not read {GTK_CSS_PATH}: {e}")
-
-        final_css += custom_css
-
         try:
-            css_provider.load_from_data(final_css.encode('utf-8'))
+            css_provider.load_from_data(custom_css.encode('utf-8'))
             self.Gtk.StyleContext.add_provider_for_screen(
                 self.Gdk.Screen.get_default(), css_provider,
                 self.Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
@@ -877,9 +868,6 @@ class WallpaperApp:
         return True
 
     def _update_visibility_and_selection(self):
-        # BUG FIX: If we are actively rebuilding the cache, ignore view-switch requests.
-        # This prevents the progress bar from magically disappearing if the user
-        # clicks a tab or types in the search bar while it is loading.
         if getattr(self, '_is_refreshing', False):
             return False
 
@@ -951,17 +939,28 @@ class WallpaperApp:
                 print(f"Error reading track file: {e}")
         return ""
 
-    def refresh_ui(self):
+    def refresh_ui(self, pre_scanned_wallpapers=None):
+        """
+        Reconstructs the UI state.
+        Uses pre_scanned_wallpapers to skip blocking the UI thread if triggered by a background rebuild.
+        """
         self.current_generation += 1
 
         for child in self.flowbox.get_children():
             self.flowbox.remove(child)
+            child.destroy()
+            
         self.ui_children.clear()
         self.loaded_pixbufs.clear()
 
         THUMB_DIR.mkdir(parents=True, exist_ok=True)
-        self.wallpapers = CacheManager.get_all_wallpapers()
+        
+        if pre_scanned_wallpapers is not None:
+            self.wallpapers = pre_scanned_wallpapers
+        else:
+            self.wallpapers = CacheManager.get_all_wallpapers()
 
+        # Orphan sweep safely relies on file age/timestamp thresholds to avoid race conditions
         if self.app_settings.get("AUTO_SWEEP_CACHE", False):
             self.executor.submit(CacheManager.sweep_orphaned_cache, self.wallpapers)
 
@@ -1047,7 +1046,6 @@ class WallpaperApp:
             pixbuf = self.GdkPixbuf.Pixbuf.new_from_file_at_scale(
                 str(thumb_path), RENDER_SIZE, RENDER_SIZE, True
             )
-            self.loaded_pixbufs[rel_path] = pixbuf
             self.GLib.idle_add(self._update_ui_child, rel_path, pixbuf, generation)
         except Exception as e:
             print(f"Failed loading {rel_path} into Pixbuf: {e}")
@@ -1056,12 +1054,16 @@ class WallpaperApp:
         if generation != -1 and generation != self.current_generation:
             return False
 
+        self.loaded_pixbufs[rel_path] = pixbuf
+
         child = self.ui_children.get(rel_path)
         if not child:
             return False
 
         for c in child.get_children():
             child.remove(c)
+            c.destroy()
+            
         if not pixbuf:
             return False
 
@@ -1119,7 +1121,6 @@ class WallpaperApp:
                 print("Force rebuilding entire cache...")
                 self.stack.set_visible_child_name("loading")
 
-                # Reset progress bar
                 if self._loading_progress_bar:
                     self._loading_progress_bar.set_fraction(0.0)
                     self._loading_progress_bar.set_text("Preparing...")
@@ -1132,18 +1133,18 @@ class WallpaperApp:
                     self.GLib.idle_add(self._update_rebuild_progress, fraction, text)
 
                 def _bg_rebuild():
+                    wallpapers = None
                     try:
-                        CacheManager.build_cache(force=True, progress_callback=_progress_callback)
+                        wallpapers = CacheManager.build_cache(force=True, progress_callback=_progress_callback)
                     finally:
                         def _on_done():
                             self._is_refreshing = False
-                            self.refresh_ui()
+                            self.refresh_ui(wallpapers)
                         self.GLib.idle_add(_on_done)
 
                 threading.Thread(target=_bg_rebuild, daemon=True).start()
 
     def _update_rebuild_progress(self, fraction: float, text: str):
-        """Called on the main thread to update the rebuild progress bar."""
         if self._loading_progress_bar:
             self._loading_progress_bar.set_fraction(fraction)
             self._loading_progress_bar.set_text(text)
@@ -1176,7 +1177,6 @@ class WallpaperApp:
         is_alt = (state & self.Gdk.ModifierType.MOD1_MASK) != 0
         is_ctrl = (state & self.Gdk.ModifierType.CONTROL_MASK) != 0
 
-        # --- GLOBAL BINDS (Work regardless of focus) ---
         if keyval == self.Gdk.KEY_Escape:
             if self.window:
                 self.window.close()
@@ -1203,7 +1203,6 @@ class WallpaperApp:
                 self.show_settings_popover(self.btn_settings)
             return True
 
-        # Ensure typing in the search box doesn't trigger app actions globally
         if self.search_entry.is_focus():
             return False
 
@@ -1215,7 +1214,6 @@ class WallpaperApp:
             self.search_entry.grab_focus()
             return True
 
-        # --- CONTEXT BINDS ---
         rel_path = self.get_selected_path()
 
         match keyval:
@@ -1388,7 +1386,6 @@ if __name__ == "__main__":
         '--rebuild-cache', action='store_true',
         help="Force: nuke entire cache directory and regenerate all thumbnails, then exit."
     )
-    # Keep --precache as a hidden alias for backwards compatibility
     group.add_argument('--precache', action='store_true', help=argparse.SUPPRESS)
 
     args, unknown = parser.parse_known_args()
