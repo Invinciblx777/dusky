@@ -2,7 +2,7 @@
 # ==============================================================================
 # Script: 151_systemd_bootloader.sh
 # Description: Automated, dynamically-mapped systemd-boot configuration.
-# Architecture: UEFI -> systemd-boot -> LUKS2 (sd-encrypt) -> BTRFS -> Plymouth
+# Architecture: UEFI -> systemd-boot -> [LUKS2 Auto-Detect] -> [FSTYPE Auto-Detect]
 # Standard: systemd v260.1+ (UAPI.1 Boot Loader Specification)
 # ==============================================================================
 
@@ -50,8 +50,8 @@ if ! mountpoint -q "$ESP_MNT"; then
     exit 1
 fi
 
-ESP_FSTYPE=$(findmnt -n -o FSTYPE "$ESP_MNT" 2>/dev/null || true)
-if [[ ! "$ESP_FSTYPE" =~ ^(vfat|fat32)$ ]]; then
+ESP_FSTYPE=$(findmnt -n -o FSTYPE "$ESP_MNT" | head -n1 2>/dev/null || true)
+if [[ ! "$ESP_FSTYPE" =~ ^(vfat|fat32|msdos)$ ]]; then
     log_error "$ESP_MNT is formatted as $ESP_FSTYPE, but systemd-boot requires FAT32."
     exit 1
 fi
@@ -60,26 +60,30 @@ log_info "Ensuring necessary bootloader packages..."
 pacman -S --needed --noconfirm efibootmgr gawk >/dev/null
 
 # ==============================================================================
-# 2. Dynamic Topology Traversal (LUKS + BTRFS)
+# 2. Dynamic Topology Traversal (Auto-Detects LUKS & FSTYPE)
 # ==============================================================================
 
 log_info "Analyzing filesystem topology..."
 
-RAW_ROOT_MNT=$(findmnt -n -e -o SOURCE -T /)
+# Safe extraction to prevent chroot multi-bind parsing failures
+RAW_ROOT_MNT=$(findmnt -n -e -o SOURCE -T / | head -n1)
 ROOT_BLK_DEV="${RAW_ROOT_MNT%%\[*}"
-ROOT_UUID=$(findmnt -n -e -o UUID -T / || true)
+ROOT_UUID=$(findmnt -n -e -o UUID -T / | head -n1 || true)
+ROOT_FSTYPE=$(findmnt -n -e -o FSTYPE -T / | head -n1 2>/dev/null || true)
 
 if [[ -z "$ROOT_UUID" || "$ROOT_UUID" == "-" ]]; then
-    ROOT_UUID=$(blkid -s UUID -o value "$ROOT_BLK_DEV")
+    ROOT_UUID=$(blkid -s UUID -o value "$ROOT_BLK_DEV" | head -n1)
 fi
-[[ -z "$ROOT_UUID" ]] && { log_error "Could not resolve root BTRFS UUID."; exit 1; }
+[[ -z "$ROOT_UUID" ]] && { log_error "Could not resolve root filesystem UUID."; exit 1; }
+[[ -z "$ROOT_FSTYPE" || "$ROOT_FSTYPE" == "-" ]] && ROOT_FSTYPE="btrfs"
 
-ROOT_OPTS=$(findmnt -n -e -o OPTIONS -T /)
+ROOT_OPTS=$(findmnt -n -e -o OPTIONS -T / | head -n1 || true)
 ROOT_SUBVOL=""
 if [[ "$ROOT_OPTS" =~ subvol=([^,]+) ]]; then
     ROOT_SUBVOL="${BASH_REMATCH[1]}"
 fi
 
+# Extract initramfs hooks to adjust kernel cmdline logically
 HOOKS_STR=$(env -i bash -c '
     source /etc/mkinitcpio.conf >/dev/null 2>&1 || true
     shopt -s nullglob
@@ -89,8 +93,16 @@ HOOKS_STR=$(env -i bash -c '
     echo "${HOOKS[*]:-}"
 ')
 
-CRYPT_DEV=$(lsblk -nrspo PATH,TYPE -s -- "$ROOT_BLK_DEV" | awk '$2 == "crypt" { print $1; exit }')
-CMDLINE_BASE="rw rootfstype=btrfs"
+# Base arguments inherited from original configurations
+CMDLINE_BASE="rw loglevel=3 zswap.enabled=0 rootfstype=${ROOT_FSTYPE}"
+
+# BTRFS lacks a boot-time fsck. Skip it to prevent harmless but annoying warnings.
+if [[ "$ROOT_FSTYPE" == "btrfs" ]]; then
+    CMDLINE_BASE="${CMDLINE_BASE} fsck.mode=skip"
+fi
+
+# Inverse trace block device dependencies to search for a crypt layer
+CRYPT_DEV=$(lsblk -nrspo PATH,TYPE -s -- "$ROOT_BLK_DEV" 2>/dev/null | awk '$2 == "crypt" { print $1; exit }')
 
 if [[ -n "$CRYPT_DEV" ]]; then
     log_info "LUKS2 Encryption detected on root device."
@@ -98,7 +110,7 @@ if [[ -n "$CRYPT_DEV" ]]; then
     BACKING_DEV=$(cryptsetup status "$MAPPER_NAME" | awk '/^[[:space:]]*device:/ { print $2; exit }')
     [[ -z "$BACKING_DEV" ]] && { log_error "Could not determine backing device for $MAPPER_NAME."; exit 1; }
     
-    LUKS_UUID=$(blkid -s UUID -o value "$BACKING_DEV")
+    LUKS_UUID=$(blkid -s UUID -o value "$BACKING_DEV" | head -n1)
     [[ -z "$LUKS_UUID" ]] && { log_error "Could not determine LUKS UUID for $BACKING_DEV."; exit 1; }
 
     if [[ " $HOOKS_STR " == *" sd-encrypt "* ]]; then
@@ -112,7 +124,7 @@ if [[ -n "$CRYPT_DEV" ]]; then
         exit 1
     fi
 else
-    log_info "No LUKS layer detected. Configuring for plain BTRFS."
+    log_info "No LUKS layer detected. Configuring for plain ${ROOT_FSTYPE^^}."
     CMDLINE_BASE="root=UUID=${ROOT_UUID} ${CMDLINE_BASE}"
 fi
 
@@ -120,10 +132,31 @@ if [[ -n "$ROOT_SUBVOL" ]]; then
     CMDLINE_BASE="${CMDLINE_BASE} rootflags=subvol=${ROOT_SUBVOL}"
 fi
 
+# Dynamically apply Plymouth arguments ONLY if the hook is installed
+PLYMOUTH_ARGS=""
+if [[ " $HOOKS_STR " == *" plymouth "* || " $HOOKS_STR " == *" sd-plymouth "* ]]; then
+    log_info "Plymouth integration detected. Appending splash arguments."
+    PLYMOUTH_ARGS="quiet splash rd.udev.log_level=3 vt.global_cursor_default=0 nowatchdog"
+fi
+
 log_success "Topology mapped securely. Base kernel command line established."
 
+# --- ASPM Power Saving Prompt ---
+if [[ -t 0 ]]; then
+    printf "\n${C_YELLOW}--- Power Saving ---${C_RESET}\n"
+    read -r -p "Enable 'pcie_aspm=force'? (Recommended for laptops) [y/N]: " response
+    if [[ "$response" =~ ^[yY] ]]; then
+        CMDLINE_BASE="${CMDLINE_BASE} pcie_aspm=force"
+        log_info "ASPM enabled."
+    else
+        log_info "ASPM disabled."
+    fi
+else
+    log_warn "Non-interactive mode: Skipping ASPM prompt."
+fi
+
 # ==============================================================================
-# 3. Systemd-Boot Installation (v260.1 Standard)
+# 3. Systemd-Boot Installation (v260.1+ Standard)
 # ==============================================================================
 
 log_info "Deploying systemd-boot to $ESP_MNT..."
@@ -160,10 +193,6 @@ EOF
 
 log_info "Staging kernels for deferred mkinitcpio generation..."
 
-# Because the 90-mkinitcpio-install hook was suppressed during pacstrap, 
-# the kernel binaries were never moved to /boot. We must copy them manually 
-# so mkinitcpio -P has a target to read from in Script 158.
-
 declare -a KERNELS=()
 for kdir in /usr/lib/modules/*; do
     if [[ -f "$kdir/pkgbase" && -f "$kdir/vmlinuz" ]]; then
@@ -185,13 +214,18 @@ UCODES=("$ESP_MNT"/*-ucode.img)
 shopt -u nullglob
 
 mkdir -p "$ESP_MNT/loader/entries"
-PLYMOUTH_ARGS="quiet splash loglevel=3 rd.udev.log_level=3 vt.global_cursor_default=0 nowatchdog"
 
 for KNAME in "${KERNELS[@]}"; do
     ENTRY_FILE="$ESP_MNT/loader/entries/arch-${KNAME}.conf"
     FALLBACK_FILE="$ESP_MNT/loader/entries/arch-${KNAME}-fallback.conf"
     
     log_info "Generating BLS Type #1 entries for: Arch Linux ($KNAME)"
+
+    # Formulate Primary Options Line
+    PRIMARY_OPTS="$CMDLINE_BASE"
+    if [[ -n "$PLYMOUTH_ARGS" ]]; then
+        PRIMARY_OPTS="${PRIMARY_OPTS} ${PLYMOUTH_ARGS}"
+    fi
 
     # --- Primary Entry ---
     {
@@ -203,10 +237,10 @@ for KNAME in "${KERNELS[@]}"; do
         done
         
         printf "initrd  /initramfs-%s.img\n" "$KNAME"
-        printf "options %s %s\n" "$CMDLINE_BASE" "$PLYMOUTH_ARGS"
+        printf "options %s\n" "$PRIMARY_OPTS"
     } > "$ENTRY_FILE"
 
-    # --- Fallback Entry ---
+    # --- Fallback Entry (Excludes Plymouth to ensure full debug verbosity) ---
     {
         printf "title   Arch Linux (%s - Fallback Recovery)\n" "$KNAME"
         printf "linux   /vmlinuz-%s\n" "$KNAME"
