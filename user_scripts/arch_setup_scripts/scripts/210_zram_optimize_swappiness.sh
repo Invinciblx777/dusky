@@ -111,25 +111,25 @@ declare -i EXPECTED_DIRTY_BG_BYTES
 # The 30 GB Demarcation Line
 if [[ "$MODE" == "AGGRESSIVE" ]] || [[ "$MODE" == "AUTO" && SYSTEM_RAM_GB -ge 30 ]]; then
     EXPECTED_MODE="ABSOLUTE_MAX (32GB+)"
-    EXPECTED_SWAPPINESS=180
+    EXPECTED_SWAPPINESS=150
     EXPECTED_VFS_PRESSURE=50
     EXPECTED_SCALE_FACTOR=125
-    EXPECTED_DIRTY_BYTES=536870912      # 512 MB — more write coalescing for high-RAM NVMe
-    EXPECTED_DIRTY_BG_BYTES=134217728   # 128 MB — bg flush at 25% of hard ceiling
+    EXPECTED_DIRTY_BYTES=4294967296
+    EXPECTED_DIRTY_BG_BYTES=1073741824
 else
     EXPECTED_MODE="DYNAMIC_EFFICIENCY (<32GB)"
-    EXPECTED_SWAPPINESS=180
+    EXPECTED_SWAPPINESS=150
     EXPECTED_VFS_PRESSURE=50
-    EXPECTED_SCALE_FACTOR=125
-    EXPECTED_DIRTY_BYTES=268435456      # 256 MB — conservative for tighter RAM budget
-    EXPECTED_DIRTY_BG_BYTES=67108864    # 64 MB  — bg flush at 25% of hard ceiling
+    EXPECTED_SCALE_FACTOR=10
+    EXPECTED_DIRTY_BYTES=268435456
+    EXPECTED_DIRTY_BG_BYTES=67108864
 fi
 
 # Static Constants
 readonly EXPECTED_PAGE_CLUSTER=0
 readonly EXPECTED_BOOST_FACTOR=0
 readonly EXPECTED_MAX_MAP_COUNT=16777216
-readonly EXPECTED_MGLRU_TTL=2000  # CPU Shield: Prevents ZRAM from thrashing hot memory pages
+readonly EXPECTED_MGLRU_TTL=100  # CPU Shield: Prevents ZRAM from thrashing hot memory pages
 
 # --- 5. Generation & Verification ---
 log_info "Initializing Platinum ZRAM & VM Policy Optimizer..."
