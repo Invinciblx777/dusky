@@ -3,14 +3,17 @@
 # -----------------------------------------------------------------------------
 # Elite Arch Linux ZRAM Configurator
 # Context: Hyprland / UWSM Environment
+# Objective: Disarm ZSWAP and configure ZRAM for maximum memory efficiency.
 # -----------------------------------------------------------------------------
 
 set -euo pipefail
 
+# --- Formatting & Colors ---
 GREEN=$'\033[32m'
 BLUE=$'\033[34m'
 YELLOW=$'\033[33m'
 RED=$'\033[31m'
+BOLD=$'\033[1m'
 NC=$'\033[0m'
 
 log_info()    { printf '%b %s\n' "${BLUE}[INFO]${NC}" "$1"; }
@@ -18,6 +21,21 @@ log_success() { printf '%b %s\n' "${GREEN}[SUCCESS]${NC}" "$1"; }
 log_warn()    { printf '%b %s\n' "${YELLOW}[WARN]${NC}" "$1"; }
 log_error()   { printf '%b %s\n' "${RED}[ERROR]${NC}" "$1" >&2; }
 die()         { log_error "$1"; exit 1; }
+
+# --- Critical Action Banner ---
+log_critical_action() {
+    printf '\n'
+    printf '%b\n' "${RED}${BOLD}======================================================================${NC}"
+    printf '%b\n' "${RED}${BOLD} [!] ACTION REQUIRED: BOOTLOADER MODIFIED [!]${NC}"
+    printf '%b\n' "${RED}${BOLD}======================================================================${NC}"
+    printf '%b\n' "${YELLOW} You MUST regenerate your initramfs/UKI before your next reboot.${NC}"
+    printf '%b\n' "${YELLOW} Failure to do so will result in ZSWAP remaining active on boot.${NC}"
+    printf '\n'
+    printf '%b\n' "${GREEN} Run this command at the very end of your setup:${NC}"
+    printf '%b\n' "   ${BOLD}mkinitcpio -P${NC}"
+    printf '%b\n' "${RED}${BOLD}======================================================================${NC}"
+    printf '\n'
+}
 
 readonly SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
 
@@ -31,10 +49,14 @@ if [[ $EUID -ne 0 ]]; then
     fi
 fi
 
+# --- Dependency Checks ---
 command -v systemctl >/dev/null 2>&1 || die "systemctl is required."
 command -v systemd-escape >/dev/null 2>&1 || die "systemd-escape is required."
 command -v findmnt >/dev/null 2>&1 || die "findmnt is required."
+command -v grep >/dev/null 2>&1 || die "grep is required."
+command -v sed >/dev/null 2>&1 || die "sed is required."
 
+readonly CMDLINE_FILE="/etc/kernel/cmdline"
 readonly CONFIG_DIR="/etc/systemd/zram-generator.conf.d"
 readonly CONFIG_FILE="${CONFIG_DIR}/99-elite-zram.conf"
 readonly MOUNT_POINT="/mnt/zram1"
@@ -93,6 +115,58 @@ if systemd-detect-virt --quiet --container; then
     log_warn "Container detected. zram-generator does nothing inside containers; skipping."
     exit 0
 fi
+
+# =============================================================================
+# --- 1. ZSWAP ANNIHILATION (THE MIDDLE-MANAGER) ---
+# =============================================================================
+
+log_info "Verifying ZSWAP status..."
+
+# A. Live Runtime Injection (No reboot required)
+readonly ZSWAP_PARAM="/sys/module/zswap/parameters/enabled"
+if [[ -w "$ZSWAP_PARAM" ]]; then
+    current_zswap=$(<"$ZSWAP_PARAM")
+    if [[ "$current_zswap" == "Y" || "$current_zswap" == "1" ]]; then
+        log_info "Live patching: Disabling zswap (middle-manager) in the running kernel..."
+        echo 0 > "$ZSWAP_PARAM" || log_warn "Failed to live-disable zswap."
+    else
+        log_success "Live memory: ZSWAP is already cleanly disabled."
+    fi
+else
+    log_warn "Zswap parameter not found at $ZSWAP_PARAM. Kernel might not have zswap compiled in."
+fi
+
+# B. Bootloader Idempotent Patching (Survives reboot)
+if [[ -f "$CMDLINE_FILE" ]]; then
+    needs_cmdline_update=0
+    
+    # Check if the exact correct string is already present
+    if grep -q -E '(^|[[:space:]])zswap\.enabled=0([[:space:]]|$)' "$CMDLINE_FILE"; then
+        log_success "Bootloader: zswap.enabled=0 is perfectly configured in $CMDLINE_FILE."
+    else
+        log_info "Bootloader: Patching $CMDLINE_FILE to enforce zswap.enabled=0..."
+        
+        # 1. Safely strip any existing variation of zswap.enabled (e.g., zswap.enabled=1 or Y)
+        sed -i -E 's/[[:space:]]*zswap\.enabled=[^[:space:]]*//g' "$CMDLINE_FILE"
+        # 2. Strip any trailing invisible whitespace that might have been left behind
+        sed -i -E 's/[[:space:]]+$//' "$CMDLINE_FILE"
+        # 3. Append the correct flag cleanly to the end of the line
+        sed -i -E 's/$/ zswap.enabled=0/' "$CMDLINE_FILE"
+        
+        needs_cmdline_update=1
+    fi
+
+    if (( needs_cmdline_update == 1 )); then
+        log_success "Bootloader cmdline successfully patched."
+        log_critical_action
+    fi
+else
+    log_warn "File $CMDLINE_FILE not found. If you use GRUB instead of systemd-boot, ensure you manually add 'zswap.enabled=0' to GRUB_CMDLINE_LINUX_DEFAULT."
+fi
+
+# =============================================================================
+# --- 2. ZRAM GENERATOR CONFIGURATION ---
+# =============================================================================
 
 # --- AUTO-HEALING DEPENDENCY CHECK ---
 if [[ ! -x "$GENERATOR_BIN" ]]; then
