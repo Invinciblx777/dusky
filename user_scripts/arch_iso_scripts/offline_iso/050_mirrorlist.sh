@@ -244,6 +244,38 @@ detect_cachyos() {
     return 1
 }
 
+# --- CACHYOS KEYRING BOOTSTRAP ---
+ensure_cachyos_keyring() {
+    if pacman -Qq cachyos-keyring &>/dev/null; then
+        log_info "CachyOS keyring already present, skipping bootstrap."
+        return 0
+    fi
+
+    log_info "CachyOS keyring not found. Bootstrapping..."
+
+    if ! pacman-key --recv-keys F3B607488DB35A47 --keyserver keyserver.ubuntu.com; then
+        log_warn "Failed to receive CachyOS key from keyserver.ubuntu.com. Trying hkps://keys.openpgp.org..."
+        pacman-key --recv-keys F3B607488DB35A47 --keyserver hkps://keys.openpgp.org || {
+            log_err "Could not import CachyOS signing key. Mirror sync may fail."
+            return 1
+        }
+    fi
+
+    pacman-key --lsign-key F3B607488DB35A47
+
+    local mirror_base="https://mirror.cachyos.org/repo/x86_64/cachyos"
+    manage_pacman_lock
+
+    if run_pacman -U --needed --noconfirm \
+        "${mirror_base}/cachyos-keyring-20240331-1-any.pkg.tar.zst" \
+        "${mirror_base}/cachyos-mirrorlist-27-1-any.pkg.tar.zst" \
+        "${mirror_base}/cachyos-v3-mirrorlist-27-1-any.pkg.tar.zst"; then
+        log_ok "CachyOS keyring and mirrorlist packages bootstrapped."
+    else
+        log_warn "Keyring bootstrap failed. Will attempt to continue — cachyos-rate-mirrors may still work."
+    fi
+}
+
 # --- SYSTEMD TIMER CONFIGURATION ---
 configure_arch_timer() {
     log_info "Configuring native systemd timer for automated weekly mirror updates..."
@@ -267,11 +299,53 @@ EOF
         return 0
     fi
 
-    if systemctl enable --now reflector.timer &>/dev/null; then
-        log_ok "reflector.timer is now active."
+    if systemctl stop --now reflector.timer &>/dev/null; then
+        log_warn "Disabled reflector.timer — the persistent path monitor handles repatching."
     else
-        log_warn "Failed to enable reflector.timer. Check systemctl status."
+        log_info "reflector.timer not active, skipping."
     fi
+}
+
+install_persistent_arch_patch() {
+    local helper="/usr/local/bin/fix-mirrorlist-arch"
+
+    cat > "$helper" << 'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+sed -i 's/\$arch_v3/x86_64_v3/g' /etc/pacman.d/cachyos-v3-mirrorlist 2>/dev/null || true
+sed -i 's/\$arch/x86_64_v3/g'    /etc/pacman.d/cachyos-v3-mirrorlist 2>/dev/null || true
+sed -i 's/\$arch/x86_64/g'       /etc/pacman.d/mirrorlist             2>/dev/null || true
+sed -i 's/\$arch/x86_64/g'       /etc/pacman.d/cachyos-mirrorlist     2>/dev/null || true
+SCRIPT
+    chmod +x "$helper"
+
+    cat > /etc/systemd/system/mirrorlist-arch-patch.service << 'SERVICE'
+[Unit]
+Description=Fix architecture variables in mirrorlists
+Documentation=https://wiki.archlinux.org/title/Pacman
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/fix-mirrorlist-arch
+SERVICE
+
+    cat > /etc/systemd/system/mirrorlist-arch-patch.path << 'PATH_UNIT'
+[Unit]
+Description=Monitor mirrorlists and reapply architecture variable fixes
+Documentation=https://wiki.archlinux.org/title/Pacman
+
+[Path]
+PathChanged=/etc/pacman.d/mirrorlist
+PathChanged=/etc/pacman.d/cachyos-mirrorlist
+PathChanged=/etc/pacman.d/cachyos-v3-mirrorlist
+
+[Install]
+WantedBy=multi-user.target
+PATH_UNIT
+
+    systemctl daemon-reload
+    systemctl enable --now mirrorlist-arch-patch.path &>/dev/null || true
+    log_ok "Persistent arch patch monitor (mirrorlist-arch-patch.path) active."
 }
 
 # --- MIRRORLIST ARCHITECTURE PATCHER ---
@@ -291,11 +365,15 @@ patch_mirrorlist_architectures() {
         sed -i 's/\$arch/x86_64_v3/g' "/etc/pacman.d/cachyos-v3-mirrorlist"
     fi
     log_ok "Architectures successfully patched."
+
+    install_persistent_arch_patch
 }
 
 # --- CACHYOS SYNC ---
 sync_cachyos() {
     log_info "Initializing CachyOS Mirror Sync..."
+
+    ensure_cachyos_keyring
 
     local attempt
     local max_attempts=3
@@ -324,13 +402,12 @@ sync_cachyos() {
             log_ok "CachyOS mirrors optimized."
         fi
 
-        if systemctl list-unit-files --type=timer --no-legend --plain 2>/dev/null | awk '{print $1}' | grep -Fxq 'cachyos-mirrorlist.timer'; then
-            if systemctl enable --now cachyos-mirrorlist.timer &>/dev/null; then
-                log_ok "cachyos-mirrorlist.timer is now active."
-            else
-                log_warn "Failed to enable cachyos-mirrorlist.timer. Check systemctl status."
+        for bad_timer in cachyos-mirrorlist.timer cachyos-rate-mirrors.timer reflector.timer; do
+            if systemctl list-unit-files --type=timer --no-legend --plain 2>/dev/null | awk '{print $1}' | grep -Fxq "$bad_timer"; then
+                systemctl stop --now "$bad_timer" &>/dev/null || true
+                log_warn "Disabled $bad_timer — the persistent path monitor handles repatching."
             fi
-        fi
+        done
     fi
 
     patch_mirrorlist_architectures

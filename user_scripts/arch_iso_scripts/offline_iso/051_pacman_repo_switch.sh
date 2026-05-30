@@ -246,7 +246,8 @@ ONLINE_PACMAN_CONF_EOF
         # Dynamically inject the CachyOS block if the flag was provided
         if [[ "${TARGET_OS}" == "cachyos" ]]; then
             cat << 'CACHYOS_BLOCK_EOF'
-Architecture = x86_64_v3 x86_64
+# Architecture must be auto for CachyOS repos on standard Arch
+Architecture = auto
 
 [cachyos-v3]
 Include = /etc/pacman.d/cachyos-v3-mirrorlist
@@ -375,9 +376,10 @@ LocalFileSigLevel = Optional
 
 OFFLINE_PACMAN_CONF_EOF
 
-        # Unlock x86_64_v3 architecture if offline packages demand it
+        # CachyOS packages natively present as x86_64 to pacman.
+        # Architecture must remain auto to prevent $arch string corruption.
         if [[ "${TARGET_OS}" == "cachyos" ]]; then
-            echo "Architecture = x86_64_v3 x86_64"
+            echo "Architecture = auto"
         else
             echo "Architecture = auto"
         fi
