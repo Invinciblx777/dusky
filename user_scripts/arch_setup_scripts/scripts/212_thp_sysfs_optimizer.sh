@@ -38,7 +38,7 @@ ${C_BOLD}Usage:${C_RESET} ${SCRIPT_NAME} [OPTIONS]
 
   --auto, -a           Auto-detect RAM size and set dynamic THP profile (default)
   --aggressive, -A     Force 32GB+ "Absolute Max" CPU/TLB-favored THP allocation
-  --standard, -S       Force <32GB "Absolute Conservative" RAM-favored THP allocation
+  --standard, -S       Force <32GB "Dynamic Efficiency" RAM-favored THP allocation
   --dry-run, -n        Print the generated systemd-tmpfiles config and exit
   --help, -h           Show this help menu
 EOF
@@ -88,20 +88,24 @@ fi
 
 # --- 5. Tuning Profile Resolution ---
 declare -i EXPECTED_MAX_PTES
+declare EXPECTED_ENABLED
+declare EXPECTED_DEFRAG
+declare EXPECTED_SHMEM
 
 # The 30 GB Demarcation Line
 if [[ "$MODE" == "AGGRESSIVE" ]] || [[ "$MODE" == "AUTO" && SYSTEM_RAM_GB -ge 30 ]]; then
     EXPECTED_MODE="ABSOLUTE_MAX (32GB+)"
-    EXPECTED_MAX_PTES=409  # Favors CPU/TLB speed, matches CachyOS
+    EXPECTED_MAX_PTES=511          # Max CPU/TLB speed, aligns with mainline kernel default
+    EXPECTED_ENABLED="always"      # Full THP utilization
+    EXPECTED_DEFRAG="defer+madvise" # Prevents synchronous UI stutter
+    EXPECTED_SHMEM="within_size"   # Hugepages for shmem only if perfectly sized
 else
-    EXPECTED_MODE="ABSOLUTE_CONSERVATIVE (<32GB)"
-    EXPECTED_MAX_PTES=64   # Ruthless elimination of internal fragmentation
+    EXPECTED_MODE="DYNAMIC_EFFICIENCY (<32GB)"
+    EXPECTED_MAX_PTES=409          # Balanced THP creation (Matches CachyOS)
+    EXPECTED_ENABLED="always"      # Recovers RAM from Page Table overhead
+    EXPECTED_DEFRAG="defer+madvise" # Prevents synchronous UI stutter
+    EXPECTED_SHMEM="within_size"   # Safe shared memory scaling for Wayland
 fi
-
-# Static Constants
-readonly EXPECTED_ENABLED="madvise"
-readonly EXPECTED_DEFRAG="defer+madvise"
-readonly EXPECTED_SHMEM="advise"
 
 # --- 6. Generation & Verification ---
 log_info "Initializing Platinum THP & Sysfs Optimizer..."
@@ -120,13 +124,13 @@ cat > "$tmpfile" <<EOF
 # Scope: Transparent HugePages (THP) systemd-tmpfiles initialization
 # Detected State: Desktop Mode=${EXPECTED_MODE}, RAM=${SYSTEM_RAM_GB}GB
 
-# Limit global THP to apps that explicitly request it (Prevents idle RAM waste)
+# Enable global THP to reduce Page Table overhead and TLB misses
 w /sys/kernel/mm/transparent_hugepage/enabled - - - - ${EXPECTED_ENABLED}
 
 # Defer THP creation if memory is fragmented (Prevents hard micro-stutters)
 w /sys/kernel/mm/transparent_hugepage/defrag - - - - ${EXPECTED_DEFRAG}
 
-# Lock down shared memory HugePages to request-only
+# Optimize shared memory HugePages to prevent tmpfs RAM waste
 w /sys/kernel/mm/transparent_hugepage/shmem_enabled - - - - ${EXPECTED_SHMEM}
 
 # Control the "Empty Box" internal fragmentation limit
