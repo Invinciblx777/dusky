@@ -4,6 +4,7 @@
 # Target: Arch Linux Cutting-Edge (Kernel 7.0+, Bash 5.3+)
 # Scope: Platinum Grade. Dynamically scales mTHP & MGLRU via systemd-tmpfiles.
 # Priority: Absolute Minimum RAM Footprint & Lowest Idle CPU Overhead.
+# Updates: Added exhaustive 256k/512k/1024k tier definitions and MGLRU hardware lock.
 # =============================================================================
 
 set -euo pipefail
@@ -109,13 +110,13 @@ if [[ "$MODE" == "AGGRESSIVE" ]] || [[ "$MODE" == "AUTO" && SYSTEM_RAM_GB -ge 30
     EXPECTED_MGLRU_TTL=1000        # Standard 1s NVMe shield.
 else
     EXPECTED_MODE="STRICT_RAM_SAVINGS (<32GB)"
-    EXPECTED_MAX_PTES=16           # (Research Report) Enforces extreme density, killing RAM waste.
-    EXPECTED_SCAN_SLEEP=30000      # (Research Report) 30s wakeups drops daemon idle CPU usage.
+    EXPECTED_MAX_PTES=16           # Enforces extreme density, killing RAM waste.
+    EXPECTED_SCAN_SLEEP=30000      # 30s wakeups drops daemon idle CPU usage.
     EXPECTED_PAGES_TO_SCAN=1024    # Drops the duration of the CPU spike during wakeups.
     EXPECTED_ENABLED="madvise"     # Only give THP to apps that explicitly ask.
-    EXPECTED_DEFRAG="defer+madvise" # (Research Report) Pushes defrag stalls to background threads.
+    EXPECTED_DEFRAG="defer+madvise" # Pushes defrag stalls to background threads.
     EXPECTED_SHMEM="within_size"   # Zero RAM bloat for Wayland shared memory.
-    EXPECTED_MGLRU_TTL=300         # (Research Report) 300ms prevents ZRAM thrashing without stalling.
+    EXPECTED_MGLRU_TTL=300         # 300ms prevents ZRAM thrashing without stalling.
 fi
 
 # --- 6. Generation & Verification ---
@@ -135,18 +136,29 @@ cat > "$tmpfile" <<EOF
 # Scope: Transparent HugePages (mTHP) and MGLRU systemd-tmpfiles initialization
 # Detected State: Desktop Mode=${EXPECTED_MODE}, RAM=${SYSTEM_RAM_GB}GB
 
-# --- MULTI-SIZE THP (mTHP) ---
-# Enable zero-waste small-size THP (16k, 32k, 64k) globally for massive TLB speedups
+# --- MULTI-SIZE THP (mTHP) TIER DEFINITIONS ---
+
+# TIER 1: Accelerated Allocations (Zero-Waste Small THP)
 w /sys/kernel/mm/transparent_hugepage/hugepages-16kB/enabled - - - - always
 w /sys/kernel/mm/transparent_hugepage/hugepages-32kB/enabled - - - - always
 w /sys/kernel/mm/transparent_hugepage/hugepages-64kB/enabled - - - - always
+w /sys/kernel/mm/transparent_hugepage/hugepages-16kB/shmem_enabled - - - - inherit
+w /sys/kernel/mm/transparent_hugepage/hugepages-32kB/shmem_enabled - - - - inherit
+w /sys/kernel/mm/transparent_hugepage/hugepages-64kB/shmem_enabled - - - - inherit
 
-# Restrict larger mTHP and legacy 2MB pages to explicit requests to prevent RAM bloat
+# TIER 2: Intermediate Bloat Prevention (Explicit Ban)
+w /sys/kernel/mm/transparent_hugepage/hugepages-256kB/enabled - - - - never
+w /sys/kernel/mm/transparent_hugepage/hugepages-512kB/enabled - - - - never
+w /sys/kernel/mm/transparent_hugepage/hugepages-1024kB/enabled - - - - never
+w /sys/kernel/mm/transparent_hugepage/hugepages-256kB/shmem_enabled - - - - never
+w /sys/kernel/mm/transparent_hugepage/hugepages-512kB/shmem_enabled - - - - never
+w /sys/kernel/mm/transparent_hugepage/hugepages-1024kB/shmem_enabled - - - - never
+
+# TIER 3: Legacy / Large Mappings (Restricted to madvise)
 w /sys/kernel/mm/transparent_hugepage/hugepages-128kB/enabled - - - - madvise
 w /sys/kernel/mm/transparent_hugepage/hugepages-2048kB/enabled - - - - madvise
-
-# Sync Wayland shared memory with the mTHP matrix
-w /sys/kernel/mm/transparent_hugepage/hugepages-*/shmem_enabled - - - - inherit
+w /sys/kernel/mm/transparent_hugepage/hugepages-128kB/shmem_enabled - - - - inherit
+w /sys/kernel/mm/transparent_hugepage/hugepages-2048kB/shmem_enabled - - - - inherit
 
 # --- GLOBAL THP CONTROLS ---
 # Enable THP ONLY for applications that explicitly request it (madvise)
@@ -159,7 +171,8 @@ w /sys/kernel/mm/transparent_hugepage/khugepaged/max_ptes_none - - - - ${EXPECTE
 w /sys/kernel/mm/transparent_hugepage/khugepaged/scan_sleep_millisecs - - - - ${EXPECTED_SCAN_SLEEP}
 w /sys/kernel/mm/transparent_hugepage/khugepaged/pages_to_scan - - - - ${EXPECTED_PAGES_TO_SCAN}
 
-# --- MGLRU TUNING ---
+# --- MGLRU HARDWARE LOCK & TUNING ---
+w /sys/kernel/mm/lru_gen/enabled - - - - 0x0007
 w /sys/kernel/mm/lru_gen/min_ttl_ms - - - - ${EXPECTED_MGLRU_TTL}
 EOF
 
@@ -216,7 +229,7 @@ if [[ "$actual_pages_to_scan" != "$EXPECTED_PAGES_TO_SCAN" ]]; then
     die "Verification failed: THP 'pages_to_scan' is '${actual_pages_to_scan}', expected '${EXPECTED_PAGES_TO_SCAN}'."
 fi
 
-# Safely Verify mTHP sizes (avoids crashing if CPU doesn't support a specific size)
+# Safely Verify all 8 mTHP sizes dynamically
 verify_mthp() {
     local size="$1"
     local param="$2"
@@ -231,17 +244,29 @@ verify_mthp() {
     fi
 }
 
+# Verify Tier 1
 verify_mthp 16 enabled always
 verify_mthp 32 enabled always
 verify_mthp 64 enabled always
+# Verify Tier 2
+verify_mthp 256 enabled never
+verify_mthp 512 enabled never
+verify_mthp 1024 enabled never
+# Verify Tier 3
 verify_mthp 128 enabled madvise
 verify_mthp 2048 enabled madvise
 
-for sz in 16 32 64 128 2048; do 
-    verify_mthp "$sz" shmem_enabled inherit
-done
+for sz in 16 32 64 128 2048; do verify_mthp "$sz" shmem_enabled inherit; done
+for sz in 256 512 1024; do verify_mthp "$sz" shmem_enabled never; done
 
-# Verify MGLRU
+# Verify MGLRU Hardware Lock & TTL
+if [[ -f "${MGLRU_BASE_DIR}/enabled" ]]; then
+    actual_mglru="$(< "${MGLRU_BASE_DIR}/enabled")"
+    if [[ "$actual_mglru" != "0x0007" ]]; then
+        die "Verification failed: MGLRU 'enabled' is '${actual_mglru}', expected '0x0007'."
+    fi
+fi
+
 if [[ -f "${MGLRU_BASE_DIR}/min_ttl_ms" ]]; then
     actual_ttl="$(< "${MGLRU_BASE_DIR}/min_ttl_ms")"
     if [[ "$actual_ttl" != "$EXPECTED_MGLRU_TTL" ]]; then
@@ -256,8 +281,9 @@ log_success "  shmem_enabled = [${EXPECTED_SHMEM}]"
 log_success "  max_ptes_none = ${actual_ptes} (Strict RAM Cap)"
 log_success "  scan_sleep_millisecs = ${actual_scan_sleep} (Low CPU Wakeups)"
 log_success "  pages_to_scan = ${actual_pages_to_scan} (Low CPU Spike)"
+log_success "  MGLRU enabled = 0x0007 (Hardware Lock Active)"
 log_success "  MGLRU min_ttl_ms = ${EXPECTED_MGLRU_TTL} (ZRAM Thrash Shield)"
-log_success "  mTHP Matrix = Verified successfully for supported hardware tiers."
+log_success "  mTHP Matrix = Exhaustively verified across all 8 supported hardware tiers."
 log_success "  Active Tuning Profile: [${C_BOLD}${EXPECTED_MODE}${C_RESET}]"
 
 exit 0

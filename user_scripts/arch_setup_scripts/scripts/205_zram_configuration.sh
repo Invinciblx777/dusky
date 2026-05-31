@@ -3,7 +3,7 @@
 # Elite Arch Linux ZRAM Configurator
 # Target: Arch Linux Cutting-Edge (Kernel 7.0+, Bash 5.3+, systemd 260+)
 # Scope: Platinum Grade. Maximum Memory Efficiency via pure ZRAM & Tmpfs.
-# Updates: Integrated Kernel 7.0 Direct Writeback Pipeline
+# Updates: Integrated Kernel 7.0 Direct Writeback Pipeline (Pure zstd, 20-min flush)
 # =============================================================================
 
 set -euo pipefail
@@ -92,7 +92,7 @@ readonly MOUNT_POINT="/mnt/zram1"
 
 readonly ZRAM_SWAP_DEV="/dev/zram0"
 readonly ZRAM_SIZE_EXPR="ram"
-readonly COMPRESSION_ALGORITHM="zstd"
+readonly COMPRESSION_ALGORITHM="zstd" 
 
 readonly GENERATOR_BIN="/usr/lib/systemd/system-generators/zram-generator"
 readonly SWAP_SETUP_UNIT="systemd-zram-setup@zram0.service"
@@ -193,39 +193,40 @@ swap-priority = 100
 options = discard
 EOF
 
-# Integrate Kernel 7.0 Writeback if specified
+# Integrate Kernel 7.0 Writeback & Timer if specified
 if [[ -n "$WRITEBACK_DEV" ]]; then
     log_info "Integrating Kernel 7.0 Direct Writeback device: $WRITEBACK_DEV"
     echo "writeback-device = $WRITEBACK_DEV" >> "$tmp_config"
     
-    # Create the idle flush systemd timer
+    # Create the recurring NVMe flush service
     cat > "/etc/systemd/system/zram-writeback.service" <<EOF
 [Unit]
 Description=ZRAM Kernel 7.0 Idle Writeback Flush
 After=systemd-zram-setup@zram0.service
+Requires=systemd-zram-setup@zram0.service
 
 [Service]
 Type=oneshot
-# Ensure writeback limits are respected, then trigger idle flush
+# Ensure writeback limits are respected, then trigger idle flush directly to NVMe
 ExecStartPre=/usr/bin/bash -c 'echo 1 > /sys/block/zram0/writeback_limit_enable 2>/dev/null || true'
 ExecStart=/usr/bin/bash -c 'echo idle > /sys/block/zram0/writeback || true'
 EOF
 
+    # Timer runs every 20 minutes specifically as requested
     cat > "/etc/systemd/system/zram-writeback.timer" <<EOF
 [Unit]
-Description=Daily ZRAM Writeback Flush (Idle Pages)
+Description=ZRAM Writeback Flush (Every 20 Minutes)
 
 [Timer]
-OnCalendar=daily
+OnCalendar=*:0/20
 Persistent=true
-RandomizedDelaySec=1h
 
 [Install]
 WantedBy=timers.target
 EOF
     systemctl daemon-reload
     systemctl enable --now zram-writeback.timer >/dev/null 2>&1 || true
-    log_success "ZRAM Writeback timer configured and enabled."
+    log_success "ZRAM Writeback timer configured and enabled (Every 20 minutes)."
 fi
 
 cat > "$tmp_mount" <<EOF
@@ -277,7 +278,7 @@ if systemctl is-active --quiet "$SWAP_UNIT"; then
     log_info "$SWAP_UNIT is currently active."
 fi
 
-log_success "Platinum ZRAM & Tmpfs architecture installed safely."
+log_success "Platinum ZRAM (Pure ZSTD + Writeback) architecture installed safely."
 log_info "Reboot the system to apply the new memory topology natively."
 
 exit 0

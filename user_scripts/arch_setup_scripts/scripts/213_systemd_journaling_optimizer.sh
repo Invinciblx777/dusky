@@ -3,8 +3,8 @@
 # Elite Arch Linux systemd-journald Optimizer
 # Target: Arch Linux Cutting-Edge (systemd 260+, Bash 5.3+)
 # Scope: Platinum Grade. Hard-caps logging memory to prevent silent RAM bloat.
-# Priority: Caps tmpfs RAM waste at 50MB, mitigates CVE-2026-40228, 
-#           and minimizes VFS slab bloat via 1-week retention constraints.
+# Priority: Caps tmpfs RAM waste, mitigates CVE-2026-40228, and utilizes 
+#           systemd.service(5) cgroup v2 limits to chain the daemon's RSS.
 # =============================================================================
 
 set -euo pipefail
@@ -12,8 +12,12 @@ set -euo pipefail
 readonly SCRIPT_NAME="${0##*/}"
 readonly SELF_PATH="$(realpath -e -- "${BASH_SOURCE[0]}")"
 
-readonly CONFIG_DIR="/etc/systemd/journald.conf.d"
-readonly CONFIG_FILE="${CONFIG_DIR}/99-ram-optimization.conf"
+# --- Target Configurations ---
+readonly CONF_DIR="/etc/systemd/journald.conf.d"
+readonly CONF_FILE="${CONF_DIR}/99-ram-optimization.conf"
+
+readonly SVC_DIR="/etc/systemd/system/systemd-journald.service.d"
+readonly SVC_FILE="${SVC_DIR}/99-cgroup-memory-limit.conf"
 
 # --- Formatting ---
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -65,36 +69,34 @@ fi
 log_info "Initializing Platinum systemd-journald Optimizer..."
 
 # --- 3. Temp File Generation ---
-tmp_config="$(umask 077 && mktemp)"
-trap 'rm -f "$tmp_config"' EXIT
+tmp_conf="$(umask 077 && mktemp)"
+tmp_svc="$(umask 077 && mktemp)"
+trap 'rm -f "$tmp_conf" "$tmp_svc"' EXIT
 
-# Generate strictly bounded Journal limits
-cat > "$tmp_config" <<EOF
+# -----------------------------------------------------------------------------
+# LAYER 1: The Payload Limits (journald.conf)
+# -----------------------------------------------------------------------------
+cat > "$tmp_conf" <<EOF
 # Managed by ${SCRIPT_NAME}
-# Scope: Prevent systemd-journald from consuming massive amounts of RAM, Disk, and CPU.
+# Scope: Prevent systemd-journald log payloads from consuming RAM and Disk.
 
 [Journal]
-# --- STORAGE LIMITS ---
 # Volatile Storage (RAM in /run/log/journal): Hard cap at 50MB.
-# Prevents the default behavior of eating up to 10% of total system RAM.
 RuntimeMaxUse=50M
 
 # Persistent Storage (Disk in /var/log/journal): Hard cap at 250MB.
-# Prevents logs from silently bloating your SSD over time.
 SystemMaxUse=250M
 
 # Rotate files frequently to keep read times instantaneous.
 SystemMaxFileSize=50M
 
-# Housekeeping: Discard logs older than 1 week. 
-# (Research Report: Shrinks dentry/inode cache overhead by tracking fewer files in the VFS layer).
+# Housekeeping: Discard logs older than 1 week to shrink VFS slab (inode) cache.
 MaxRetentionSec=1week
 
-# --- PERFORMANCE & CPU SHIELDS ---
 # Compression: Force zstd compression on log payloads before writing.
 Compress=yes
 
-# SSD Wear & Latency Shield: Batch disk writes every 5 minutes instead of continuously.
+# SSD Wear & Latency Shield: Batch disk writes every 5 minutes.
 SyncIntervalSec=5m
 
 # CPU/IO Shield: Disable kernel audit logging. Bypasses rate limits and spikes CPU.
@@ -107,46 +109,86 @@ MaxLevelStore=info
 RateLimitIntervalSec=10s
 RateLimitBurst=100
 
-# --- IPC & CVE-2026-40228 MITIGATION ---
-# CPU Optimization: Disable legacy broadcast logging to save idle CPU cycles.
-# Note: ForwardToWall=no strictly nullifies IPC overhead and closes terminal escape sequence vectors.
+# IPC & CVE-2026-40228 MITIGATION: Disable legacy broadcast logging.
+# ForwardToWall=no nullifies IPC overhead and closes terminal escape sequence vectors.
 ForwardToSyslog=no
 ForwardToWall=no
 ForwardToKMsg=no
 ForwardToConsole=no
 EOF
 
+# -----------------------------------------------------------------------------
+# LAYER 2: The Process Limits (systemd.service cgroups)
+# -----------------------------------------------------------------------------
+cat > "$tmp_svc" <<EOF
+# Managed by ${SCRIPT_NAME}
+# Scope: Hard cgroup v2 RAM limits for the systemd-journald daemon process itself.
+# Prevents mmap cache bloat regardless of journal file size.
+
+[Service]
+# Aggressively throttle the daemon if its RSS exceeds 50MB
+MemoryHigh=50M
+
+# Absolute hard-kill boundary. If the daemon leaks >100MB, execute OOM kill.
+MemoryMax=100M
+
+# systemd.service(5): Ensures clean termination and flush on OOM pressure.
+# Daemon will automatically respawn via Restart=always and empty its RAM buffers.
+OOMPolicy=kill
+EOF
+
 # --- 4. Dry Run Check ---
 if (( DRY_RUN == 1 )); then
-    log_info "DRY RUN EXECUTED. Would generate the following configuration:"
-    echo -e "\n${C_BOLD}[ ${CONFIG_FILE} ]${C_RESET}"
-    cat "$tmp_config"
+    log_info "DRY RUN EXECUTED. Would generate the following configurations:"
+    echo -e "\n${C_BOLD}[ ${CONF_FILE} (Payload Limits) ]${C_RESET}"
+    cat "$tmp_conf"
+    echo -e "\n${C_BOLD}[ ${SVC_FILE} (Process Limits) ]${C_RESET}"
+    cat "$tmp_svc"
     exit 0
 fi
 
 # --- 5. Atomic Installation ---
-install -d -m 0755 "$CONFIG_DIR"
+declare -i CHANGED=0
 
-if [[ -f "$CONFIG_FILE" ]] && cmp -s "$tmp_config" "$CONFIG_FILE"; then
-    log_success "No changes required. systemd-journald is already strictly capped."
+install -d -m 0755 "$CONF_DIR"
+if [[ -f "$CONF_FILE" ]] && cmp -s "$tmp_conf" "$CONF_FILE"; then
+    log_info "${CONF_FILE} is already up to date."
 else
-    install -Dm0644 "$tmp_config" "$CONFIG_FILE"
-    log_success "Updated ${CONFIG_FILE}"
-    
-    log_info "Restarting systemd-journald to apply memory caps..."
+    install -Dm0644 "$tmp_conf" "$CONF_FILE"
+    log_success "Updated ${CONF_FILE}"
+    CHANGED=1
+fi
+
+install -d -m 0755 "$SVC_DIR"
+if [[ -f "$SVC_FILE" ]] && cmp -s "$tmp_svc" "$SVC_FILE"; then
+    log_info "${SVC_FILE} is already up to date."
+else
+    install -Dm0644 "$tmp_svc" "$SVC_FILE"
+    log_success "Updated ${SVC_FILE}"
+    CHANGED=1
+fi
+
+if (( CHANGED == 1 )); then
+    log_info "Reloading systemd daemon to ingest new cgroup boundaries..."
+    systemctl daemon-reload
+
+    log_info "Restarting systemd-journald to apply dual-layer memory caps..."
     if systemctl restart systemd-journald.service; then
-        log_success "systemd-journald successfully restarted. RAM limits active."
+        log_success "systemd-journald successfully restarted. Dual RAM limits active."
     else
         log_warn "Failed to seamlessly restart systemd-journald. Changes will apply on next reboot."
     fi
+else
+    log_success "No changes required. systemd-journald is already strictly chained."
 fi
 
 # --- 6. Live Vacuuming ---
-log_info "Vacuuming current journals to enforce new limits immediately..."
-# This forces journald to instantly drop any logs exceeding our new rules, freeing RAM right now.
+log_info "Vacuuming current journals to enforce payload limits immediately..."
 journalctl --vacuum-size=250M >/dev/null 2>&1 || true
 journalctl --vacuum-time=1weeks >/dev/null 2>&1 || true
 
-log_success "Logging topology is fully optimized for maximum RAM efficiency and SSD protection."
+log_success "Logging topology is fully optimized for absolute maximum RAM efficiency."
 
 exit 0
+
+```eof

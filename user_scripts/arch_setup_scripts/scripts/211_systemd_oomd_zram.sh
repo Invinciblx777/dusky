@@ -4,6 +4,7 @@
 # Target: Arch Linux Cutting-Edge (systemd 255+, Bash 5.3+)
 # Scope: Platinum Grade. Arms oomd with surgical kill policies, shields Hyprland.
 # Priority: Recalibrated for aggressive ZRAM. Prevents premature application kills.
+# Updates: Added Search & Destroy for competing OOM daemons to prevent policy sabotage.
 # =============================================================================
 
 set -euo pipefail
@@ -73,6 +74,20 @@ if [[ $EUID -ne 0 && $DRY_RUN -eq 0 ]]; then
 fi
 
 log_info "Initializing Platinum systemd-oomd & UWSM Optimizer..."
+
+# --- 2.5 Search & Destroy: Competing OOM Daemons ---
+# Legacy daemons that read % free RAM will panic on ZRAM and destroy the session.
+if (( DRY_RUN == 0 )); then
+    log_info "Scanning for competing legacy OOM daemons..."
+    for rogue_daemon in earlyoom nohang; do
+        if systemctl is-enabled "$rogue_daemon" &>/dev/null || systemctl is-active "$rogue_daemon" &>/dev/null; then
+            log_warn "Sabotage risk detected: '${rogue_daemon}' is active or enabled."
+            systemctl disable --now "$rogue_daemon" >/dev/null 2>&1 || true
+            systemctl mask "$rogue_daemon" >/dev/null 2>&1 || true
+            log_success "Neutralized ${rogue_daemon}. systemd-oomd now has absolute authority."
+        fi
+    done
+fi
 
 # --- 3. Temp File Generation ---
 tmp_oomd="$(umask 077 && mktemp)"
