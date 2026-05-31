@@ -127,8 +127,8 @@ parse_sysfs_file() {
     display_name="${display_name#*/sys/kernel/mm/}"
     local val
 
-    # Fast native read avoiding 'cat' subprocess
-    [[ -r "$file" ]] && val=$(<"$file") || val="[Unreadable]"
+    # Safely extract avoiding subprocess crash logic via pure cat
+    [[ -r "$file" ]] && val=$(cat "$file" 2>/dev/null) || val="[Unreadable]"
 
     echo "  ▸ $display_name"
 
@@ -210,18 +210,43 @@ generate_report() {
     for key in "${SYSCTL_NET[@]}"; do get_sysctl_val "$key"; done
     echo ""
 
-    print_header "ZRAM Block Devices"
+    print_header "systemd Cgroup & OOMD Policies"
+    for svc in systemd-oomd.service systemd-journald.service; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            echo "  ▸ $svc"
+            echo "    MemoryHigh = $(systemctl show "$svc" -p MemoryHigh --value 2>/dev/null)"
+            echo "    MemoryMax  = $(systemctl show "$svc" -p MemoryMax --value 2>/dev/null)"
+            echo "    OOMPolicy  = $(systemctl show "$svc" -p OOMPolicy --value 2>/dev/null)"
+            echo ""
+        fi
+    done
+
+    print_header "ZRAM Block Devices & Writeback Status"
     if command -v zramctl &>/dev/null; then
         zramctl --output-all 2>/dev/null | sed 's/^/  /' || echo "  [No ZRAM devices configured]"
+        echo ""
+        for zram_dev in /sys/block/zram*; do
+            [[ -d "$zram_dev" ]] || continue
+            local dev_name="${zram_dev##*/}"
+            local backing_dev
+            backing_dev=$(cat "$zram_dev/backing_dev" 2>/dev/null || echo "none")
+            if [[ "$backing_dev" != "none" && -n "$backing_dev" ]]; then
+                echo "  ▸ $dev_name Direct Writeback (Kernel 7.0+)"
+                echo "    backing_dev            = $backing_dev"
+                echo "    writeback_limit_enable = $(cat "$zram_dev/writeback_limit_enable" 2>/dev/null || echo 'N/A')"
+                echo "    writeback_limit        = $(cat "$zram_dev/writeback_limit" 2>/dev/null || echo 'N/A')"
+                echo "    bd_stat                = $(cat "$zram_dev/bd_stat" 2>/dev/null || echo 'N/A')"
+            fi
+        done
     else
         echo "  [zramctl command not found]"
     fi
     echo ""
 
     print_header "Quick Focus / Triage"
-    [[ -r "$THP_ROOT/enabled" ]] && echo "THP enabled             = $(<"$THP_ROOT/enabled")"
-    [[ -r "$THP_ROOT/defrag" ]]  && echo "THP defrag              = $(<"$THP_ROOT/defrag")"
-    [[ -r "$MGLRU_ROOT/enabled" ]] && echo "MGLRU enabled           = $(<"$MGLRU_ROOT/enabled")"
+    [[ -r "$THP_ROOT/enabled" ]] && echo "THP enabled             = $(cat "$THP_ROOT/enabled" 2>/dev/null)"
+    [[ -r "$THP_ROOT/defrag" ]]  && echo "THP defrag              = $(cat "$THP_ROOT/defrag" 2>/dev/null)"
+    [[ -r "$MGLRU_ROOT/enabled" ]] && echo "MGLRU enabled           = $(cat "$MGLRU_ROOT/enabled" 2>/dev/null)"
     echo "---"
     get_sysctl_val "vm.swappiness"
     get_sysctl_val "vm.compaction_proactiveness"

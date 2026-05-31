@@ -7,12 +7,13 @@
 #   • Race-condition immune, zero-fork smaps_rollup PSS engine
 #   • Hyprland-specific IPC diagnostics via JSON (jq) & Signature
 #   • Transparent Hugepage (THP & mTHP) analysis
-#   • ZRAM / ZSWAP efficiency & Physical Pool tracking
+#   • ZRAM / ZSWAP efficiency, Physical Pool tracking & Kernel 7.0 Writeback
 #   • Mlocked / QEMU memory tracking
 #   • Wayland/tmpfs shared memory & XDG_RUNTIME sockets
 #   • Universal DMA-BUF GPU buffers (debugfs & sysfs fallbacks)
 #   • Kernel slab leak detection
 #   • Hyprland Headless / Render Leak vectors (Dynamic IPC) & OOM History
+#   • systemd cgroup pressure limits and user slice shields
 # ============================================================================
 
 set -euo pipefail
@@ -266,6 +267,20 @@ if zramctl --raw 2>/dev/null | grep -q '/dev/zram'; then
     zramctl --output NAME,ALGORITHM,DISKSIZE,DATA,COMPR,TOTAL,STREAMS 2>/dev/null || \
     zramctl --output NAME,ALGORITHM,DISKSIZE,DATA,COMPR,TOTAL 2>/dev/null
     echo "\`\`\`"
+
+    # Kernel 7.0+ Direct Writeback Native Verification
+    if [[ -r "/sys/block/zram0/backing_dev" ]]; then
+        BACKING_DEV=$(cat /sys/block/zram0/backing_dev 2>/dev/null || echo "none")
+        if [[ "$BACKING_DEV" != "none" && -n "$BACKING_DEV" ]]; then
+            echo ""
+            echo "- **ZRAM Direct Writeback (Kernel 7.0+):**"
+            echo "\`\`\`text"
+            echo "  Backing Device: $BACKING_DEV"
+            echo "  Writeback Limit Enable: $(cat /sys/block/zram0/writeback_limit_enable 2>/dev/null || echo 'N/A')"
+            echo "  bd_stat (reads/writes/etc): $(cat /sys/block/zram0/bd_stat 2>/dev/null || echo 'N/A')"
+            echo "\`\`\`"
+        fi
+    fi
 else
     echo "ZRAM is not active."
 fi
@@ -340,7 +355,7 @@ echo ""
 echo "### Wayland Compositor & Daemon RSS Summary"
 echo "| Process | PID | RSS (MB) |"
 echo "|---|---|---|"
-PROCS=(Hyprland waybar xdg-desktop-portal xdg-desktop-portal-hyprland pipewire wireplumber hypridle hyprlock swaybg swww-daemon mako dunst fnott eww ags)
+PROCS=(Hyprland uwsm waybar xdg-desktop-portal xdg-desktop-portal-hyprland pipewire wireplumber hypridle hyprlock swaybg swww-daemon mako dunst fnott eww ags)
 for proc in "${PROCS[@]}"; do
     pid=$(pgrep -x "$proc" 2>/dev/null | head -1 || true)
     if [[ -n "$pid" ]]; then
@@ -656,6 +671,23 @@ echo "\`\`\`text"
     echo "  No OOM events found in kernel log."
 )
 echo "\`\`\`"
+
+echo "### Userspace OOM Daemon (systemd-oomd & Slices)"
+echo "\`\`\`text"
+if command -v oomctl >/dev/null 2>&1; then
+    oomctl | awk '/Swap Used Limit:|Default Memory Pressure Limit:|Default Memory Pressure Duration:|user.slice|system.slice|app-graphical-session.slice|Managed OOM/ {print "  " $0}' || echo "  oomctl output filtered or empty."
+else
+    echo "  systemd-oomd not active or oomctl missing."
+fi
+echo ""
+for svc in systemd-oomd.service systemd-journald.service; do
+    mh=$(systemctl show "$svc" -p MemoryHigh --value 2>/dev/null || echo "")
+    mm=$(systemctl show "$svc" -p MemoryMax --value 2>/dev/null || echo "")
+    [[ -n "$mh" && "$mh" != "infinity" ]] && echo "  [$svc] MemoryHigh limits active: $mh"
+    [[ -n "$mm" && "$mm" != "infinity" ]] && echo "  [$svc] MemoryMax limits active: $mm"
+done
+echo "\`\`\`"
+echo ""
 
 echo "### Pressure Stall Information (PSI)"
 echo "\`\`\`text"
