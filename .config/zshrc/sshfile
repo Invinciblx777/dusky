@@ -192,13 +192,13 @@ _sshfile_pick_path() {
     local selected_path_raw
     selected_path_raw=$(
         echo "$initial_list" |
-        fzf --ansi --print-query --expect=ctrl-y,ctrl-space,enter \
+        fzf --ansi --print-query --expect=ctrl-y,alt-c,enter \
             --prompt="$prompt_str" \
             --pointer="▶" --marker="✓" \
             --border=rounded \
             --border-label="$border_label" \
             --border-label-pos=center \
-            --header=" 💡 TAB: Auto-Complete │ ENTER: Select │ CTRL-SPACE: Force Exact Typed " \
+            --header=" 💡 TAB: Auto-Complete │ ENTER: Select │ ALT+C: Force Exact Typed " \
             --header-border=line \
             --info=inline-right \
             --height=60% --layout=reverse \
