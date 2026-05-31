@@ -197,7 +197,6 @@ UPDATE_SEQUENCE = [
     "S | 051_pacman_hooks.sh --auto",
     "U | 130_copy_service_files.sh --default",
     "U | 131_dbus_copy_service_files.sh",
-    "U | 170_waypaper_config_reset.sh",
     "U | 235_file_manager_switch.sh --apply-state",
     "U | 236_browser_switcher.sh --apply-state",
     "U | 237_text_editer_switcher.sh --apply-state",
