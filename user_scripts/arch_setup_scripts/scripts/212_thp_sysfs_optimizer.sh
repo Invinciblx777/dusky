@@ -101,7 +101,7 @@ declare EXPECTED_SHMEM
 # The 30 GB Demarcation Line
 if [[ "$MODE" == "AGGRESSIVE" ]] || [[ "$MODE" == "AUTO" && SYSTEM_RAM_GB -ge 30 ]]; then
     EXPECTED_MODE="PERFORMANCE_LEAN (32GB+)"
-    EXPECTED_MAX_PTES=255
+    EXPECTED_MAX_PTES=500
     EXPECTED_SCAN_SLEEP=15000
     EXPECTED_PAGES_TO_SCAN=4096
     EXPECTED_ENABLED="madvise"
@@ -110,7 +110,7 @@ if [[ "$MODE" == "AGGRESSIVE" ]] || [[ "$MODE" == "AUTO" && SYSTEM_RAM_GB -ge 30
     EXPECTED_MGLRU_TTL=1000
 else
     EXPECTED_MODE="STRICT_RAM_SAVINGS (<32GB)"
-    EXPECTED_MAX_PTES=16           # Enforces extreme density, killing RAM waste.
+    EXPECTED_MAX_PTES=206           # Enforces extreme density, killing RAM waste.
     EXPECTED_SCAN_SLEEP=15000      # 15s wakeups. Perfect deep-sleep CPU balance.
     EXPECTED_PAGES_TO_SCAN=12288   # 48MB burst defrag per cycle. No UI stutters.
     EXPECTED_ENABLED="madvise"     # Only give THP to apps that explicitly ask.
