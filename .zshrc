@@ -185,7 +185,7 @@ local conf_dir="$HOME/.config/zshrc"
 local -a my_modules=(
     batstat git kvm lmstudio logs logs_old mon_info
     pkg res_mon vfio waydroid win10 wthr cmd_atlas
-    sshfile
+    sshfile scripts
 )
 
 for mod in "${my_modules[@]}"; do

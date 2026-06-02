@@ -1,0 +1,127 @@
+# ==============================================================================
+# FZF Scripts Finder - Absolute Cutting-Edge for Arch Linux
+# Requires: zsh 5.9+, fzf 0.73.1+, bat, wl-clipboard (or xclip), Nerd Fonts
+# ==============================================================================
+
+function scripts() {
+    # 1. Globbing Initialization
+    # extendedglob: Advanced pattern matching
+    # nullglob: Fail silently if no matches are found, keeping the array empty
+    setopt localoptions extendedglob nullglob
+
+    local files=("$HOME"/user_scripts/**/*.(sh|py)(N.))
+
+    if (( ${#files[@]} == 0 )); then
+        print -P "%F{red}󰚌 No Python (.py) or Bash (.sh) scripts found in ~/user_scripts/%f"
+        return 1
+    fi
+
+    # Replace the exact $HOME path with '~' for all entries
+    local display_files=("${files[@]/#$HOME/\~}")
+    local script_path
+
+    # 2. Primary FZF Interface
+    # Using standard command substitution ensures FZF keeps TTY control
+    script_path=$(
+        print -N "${display_files[@]}" | fzf \
+            --read0 \
+            --exact \
+            --layout=reverse \
+            --tiebreak=end,pathname,length \
+            --style=full \
+            --border=rounded \
+            --border-label=" 󰟆 user_scripts " \
+            --border-label-pos=center \
+            --prompt=" " \
+            --marker="󰐕" \
+            --pointer="" \
+            --info=inline-right \
+            --scheme=path \
+            --algo=v2 \
+            --header=" Select a Python or Bash script " \
+            --header-border=horizontal \
+            --preview='file={}; file="${file/\~/$HOME}"; bat --color=always --style=numbers --line-range=:500 "$file" 2>/dev/null || cat "$file"' \
+            --preview-window="right,50%,border-rounded,~3" \
+            --color='bg+:#313244,bg:#1e1e2e,spinner:#f5e0dc,hl:#f38ba8' \
+            --color='fg:#cdd6f4,header:#f38ba8,info:#cba6f7,pointer:#f5e0dc' \
+            --color='marker:#f5e0dc,fg+:#cdd6f4,prompt:#cba6f7,hl+:#f38ba8' \
+            --height=~80%
+    )
+
+    # Abort if the user presses Esc or Ctrl-C
+    [[ -z "$script_path" ]] && return 0
+
+    local action
+    local action_menu=(
+        "1. 󰜎 Run the script (Default)"
+        "2.  Type in terminal (don't run)"
+        "3.  Copy to clipboard"
+        "4. 󰆧 Copy & Type in terminal"
+    )
+
+    # 3. Secondary FZF Action Menu
+    action=$(
+        print -N "${action_menu[@]}" | fzf \
+            --read0 \
+            --style=minimal \
+            --border=rounded \
+            --border-label=" 󰢱 Action " \
+            --prompt=" " \
+            --header=" Target: $script_path " \
+            --header-border=horizontal \
+            --color='bg+:#313244,bg:#1e1e2e,hl:#f38ba8,fg+:#cdd6f4,header:#89b4fa' \
+            --info=hidden \
+            --height=~30% \
+            --layout=reverse
+    )
+
+    [[ -z "$action" ]] && return 0
+
+    # Expand the '~' back to '$HOME' for background execution checks
+    local expanded_path="${script_path/#\~/$HOME}"
+
+    # 4. Action Execution Engine
+    case "$action" in
+        1*)
+            # ACTION 1: Run the script
+            print -P "\n%F{green}󰜎 Running:%f $script_path\n"
+            if [[ -x "$expanded_path" ]]; then
+                "$expanded_path"
+            elif [[ "$expanded_path" == *.py ]]; then
+                python "$expanded_path"
+            elif [[ "$expanded_path" == *.sh ]]; then
+                bash "$expanded_path"
+            fi
+            ;;
+        2*)
+            # ACTION 2: Type in terminal buffer
+            print -z "$script_path"
+            ;;
+        3*)
+            # ACTION 3: Copy to clipboard
+            if command -v wl-copy >/dev/null 2>&1; then
+                print -rn -- "$script_path" | wl-copy
+            elif command -v xclip >/dev/null 2>&1; then
+                print -rn -- "$script_path" | xclip -selection clipboard
+            else
+                print -P "%F{red}󰚌 No clipboard utility found (wl-clipboard or xclip).%f"
+                return 1
+            fi
+            print -P "%F{green} Copied to clipboard:%f $script_path"
+            ;;
+        4*)
+            # ACTION 4: Copy to clipboard AND type in buffer
+            if command -v wl-copy >/dev/null 2>&1; then
+                print -rn -- "$script_path" | wl-copy
+            elif command -v xclip >/dev/null 2>&1; then
+                print -rn -- "$script_path" | xclip -selection clipboard
+            else
+                print -P "%F{red}󰚌 No clipboard utility found. Pushed to buffer only.%f"
+            fi
+            print -z "$script_path"
+            ;;
+    esac
+}
+
+# Alias for lightning-fast invocation
+alias s="scripts"
