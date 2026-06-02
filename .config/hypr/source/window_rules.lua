@@ -1149,7 +1149,6 @@ hl.window_rule({
 hl.window_rule({
     name = "dusky_quickpanal.py",
     match = {
-        title = "^(dusky_quickpanal.py)$",
         class = "^(org.dusky.quickpanal)$"
     },
     float = true,

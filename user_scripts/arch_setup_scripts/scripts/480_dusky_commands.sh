@@ -33,7 +33,10 @@ declare -ra FLEET_COMMANDS=(
     'U | ln -nfs "/usr/share/themes/adw-gtk3/gtk-4.0/libadwaita.css" "$HOME/.config/gtk-4.0/libadwaita.css"'
     'U | ln -nfs "/usr/share/themes/adw-gtk3/gtk-4.0/libadwaita-tweaks.css" "$HOME/.config/gtk-4.0/libadwaita-tweaks.css"'
     'U | mkdir -p "$HOME/Documents/dusky_backups/"'
-    'U | TARGET="$HOME/user_scripts/dusky_system/click_away_to_dismiss" && wayland-scanner client-header "$TARGET/hyprland-focus-grab-v1.xml" "$TARGET/hyprland-focus-grab-v1-client-protocol.h" && wayland-scanner private-code "$TARGET/hyprland-focus-grab-v1.xml" "$TARGET/hyprland-focus-grab-v1-client-protocol.c" && gcc -shared -fPIC -o "$TARGET/libwaylandgrab.so" "$TARGET/dusky.c" "$TARGET/hyprland-focus-grab-v1-client-protocol.c" $(pkg-config --cflags --libs gtk4 wayland-client)'
+    'U | TARGET="$HOME/user_scripts/dusky_system/click_away_to_dismiss" && \
+          wayland-scanner client-header "$TARGET/hyprland-focus-grab-v1.xml" "$TARGET/hyprland-focus-grab-v1-client-protocol.h" && \
+          wayland-scanner private-code "$TARGET/hyprland-focus-grab-v1.xml" "$TARGET/hyprland-focus-grab-v1-client-protocol.c" && \
+          gcc -shared -fPIC -o "$TARGET/libwaylandgrab.so" "$TARGET/dusky.c" "$TARGET/hyprland-focus-grab-v1-client-protocol.c" -lwayland-client -lpthread -ldl'
 
     'U | systemctl --user daemon-reload && systemctl --user restart dusky_quickpanal.service || true'
     'U | "$HOME/user_scripts/dusky_system/reload_cc/cc_restart.sh" --quiet &'
