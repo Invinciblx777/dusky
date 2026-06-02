@@ -16,15 +16,23 @@ function scripts() {
         return 1
     fi
 
-    # Replace the exact $HOME path with '~' for all entries
-    local display_files=("${files[@]/#$HOME/\~}")
+    # Replace the exact $HOME path with '~' and colorize JUST the script name
+    local display_files=()
+    for f in "${files[@]}"; do
+        local rel_path="${f/#$HOME/\~}"
+        # :h extracts the directory path, :t extracts the base filename.
+        # We inject 24-bit True Color (RGB) Bold Neon Cyan to bypass muted terminal themes.
+        display_files+=("${rel_path:h}/"$'\e[1;38;2;0;255;255m'"${rel_path:t}"$'\e[0m')
+    done
+    
     local script_path
 
     # 2. Primary FZF Interface
-    # Using standard command substitution ensures FZF keeps TTY control
+    # Added --ansi so FZF natively renders the injected color codes
     script_path=$(
         print -N "${display_files[@]}" | fzf \
             --read0 \
+            --ansi \
             --exact \
             --layout=reverse \
             --tiebreak=end,pathname,length \
@@ -51,6 +59,10 @@ function scripts() {
     # Abort if the user presses Esc or Ctrl-C
     [[ -z "$script_path" ]] && return 0
 
+    # 3. Security Hardening: Strip out residual ANSI colors seamlessly using Zsh internals
+    # This guarantees the path used in execution and the clipboard is perfectly clean.
+    script_path=${script_path//$'\e'\[[0-9;]*m/}
+
     local action
     local action_menu=(
         "1. 󰜎 Run the script (Default)"
@@ -59,7 +71,7 @@ function scripts() {
         "4. 󰆧 Copy & Type in terminal"
     )
 
-    # 3. Secondary FZF Action Menu
+    # 4. Secondary FZF Action Menu
     action=$(
         print -N "${action_menu[@]}" | fzf \
             --read0 \
@@ -80,7 +92,7 @@ function scripts() {
     # Expand the '~' back to '$HOME' for background execution checks
     local expanded_path="${script_path/#\~/$HOME}"
 
-    # 4. Action Execution Engine
+    # 5. Action Execution Engine
     case "$action" in
         1*)
             # ACTION 1: Run the script
