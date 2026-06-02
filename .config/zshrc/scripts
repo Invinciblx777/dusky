@@ -38,7 +38,7 @@ function scripts() {
             --tiebreak=end,pathname,length \
             --style=full \
             --border=rounded \
-            --border-label=" 󰟆 user_scripts " \
+            --border-label=" 󰟆 dusky scripts " \
             --border-label-pos=center \
             --prompt=" " \
             --marker="󰐕" \
@@ -53,7 +53,7 @@ function scripts() {
             --color='bg+:#313244,bg:#1e1e2e,spinner:#f5e0dc,hl:#f38ba8' \
             --color='fg:#cdd6f4,info:#cba6f7,pointer:#f5e0dc' \
             --color='marker:#f5e0dc,fg+:#cdd6f4,prompt:#cba6f7,hl+:#f38ba8' \
-            --height=~80%
+            --height=100%
     )
 
     # Abort if the user presses Esc or Ctrl-C
