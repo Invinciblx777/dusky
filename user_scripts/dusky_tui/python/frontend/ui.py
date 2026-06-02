@@ -1351,7 +1351,14 @@ class DuskyTUI(App):
 
             match item.type_:
                 case "bool":
-                    if not exists:
+                    # NEW FEATURE: Treat specific booleans as stateless UI Push-Buttons
+                    is_trigger = item.options and isinstance(item.options, list) and len(item.options) > 0 and str(item.options[0]).lower() == "trigger"
+                    if is_trigger:
+                        if not exists:
+                            txt.append(" Apply ", style=f"{self.theme_colors['muted']} italic")
+                        else:
+                            txt.append(" Apply ", style=f"bold {self.theme_colors['bg']} on {self.theme_colors['accent']}" if item.value else f"bold {self.theme_colors['accent']}")
+                    elif not exists:
                         txt.append(f" {'◉ ON' if item.value else '◯ OFF'} ", style=f"{self.theme_colors['muted']} italic")
                     elif item.value:
                         txt.append(" ◉ ON  ", style=f"bold {self.theme_colors['bg']} on {self.theme_colors['success']}")

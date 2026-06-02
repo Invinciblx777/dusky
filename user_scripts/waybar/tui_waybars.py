@@ -49,7 +49,7 @@ SCHEMA = {
             scope="DEFAULT",
             type_="string",
             default="unknown",
-            options=THEMES, # Native support for searching themes rapidly
+            options=THEMES, 
             group="Themes",
             extended_help="**System Theme Tracker**\n\nThis strictly tracks the currently applied Waybar theme folder in memory. You can manually type a theme name here, or simply hit 'Apply' on the presets below."
         ),
@@ -72,10 +72,10 @@ dynamic_theme_items = []
 for name in THEMES:
     dynamic_theme_items.append(
         ConfigItem(
-            label=name,  # Clean label without the "Theme:" prefix
+            label=name,
             key=f"__waybar_theme_{name}",
             scope="DEFAULT",
-            type_="preset",  # Natively displays Apply/Active and uses internal caching memory without spawning OS shells!
+            type_="preset",
             default=None,
             parent_ref="active_theme_folder",
             group="Themes",
@@ -89,22 +89,26 @@ for name in THEMES:
 SCHEMA[0].extend(dynamic_theme_items)
 
 # --- Inject Layout & Healing Actions ---
+# CRITICAL FIX: Utilizing the new `options=["trigger"]` flag allows these to natively
+# render as "Apply" buttons while communicating completely safely with the backend engine.
 SCHEMA[0].extend([
     ConfigItem(
         label="Toggle Waybar Position",
-        key="action_invert_pos_cli",
+        key="action_invert_pos",
         scope="DEFAULT",
-        type_="action", # Displayed as "Run" cleanly
-        default=f"{_EXECUTABLE} {_CLI_PATH} --toggle-pos",
+        type_="bool", 
+        default=False,
+        options=["trigger"], 
         group="Layout",
         extended_help="**Toggle Position**\n\nInstantly inverts the current screen position (Top becomes Bottom, Left becomes Right). Equivalent to pressing Spacebar in the old bash script."
     ),
     ConfigItem(
         label="Heal Broken Symlinks",
-        key="action_heal_state_cli",
+        key="action_heal_state",
         scope="DEFAULT",
-        type_="action",
-        default=f"{_EXECUTABLE} {_CLI_PATH} --heal",
+        type_="bool",
+        default=False,
+        options=["trigger"], 
         group="Layout",
         extended_help="**Heal Broken Configuration**\n\nIf your Waybar symlinks break, this action rebuilds the exact symlink paths needed and restarts Waybar automatically."
     )

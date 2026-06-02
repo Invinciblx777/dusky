@@ -82,7 +82,6 @@ class WaybarEngine(BaseEngine):
         
         active_idx = -1
         active_name = "unknown"
-        current_pos = "unknown"
         
         if self.config_path.is_symlink():
             target = self.config_path.resolve()
@@ -90,7 +89,6 @@ class WaybarEngine(BaseEngine):
             if target.parent in self.theme_dirs:
                 active_idx = self.theme_dirs.index(target.parent)
                 active_name = self.theme_names[active_idx]
-                current_pos = self._get_theme_position(target)
                 
         elif self.state_file.exists():
             try:
@@ -100,17 +98,24 @@ class WaybarEngine(BaseEngine):
                     active_name = saved_name
                     active_idx = self.theme_names.index(saved_name)
                     self._apply_symlinks_sync(self.theme_dirs[active_idx])
-                    current_pos = self._get_theme_position(self.config_path.resolve())
             except (OSError, json.JSONDecodeError):
                 pass
         
-        # We strictly expose active_theme_name so the TUI preset architecture natively
-        # matches the payload and generates the "Apply / Active" button labels.
+        # PREVENTING [Missing] STRIKETHROUGH:
+        # We explicitly lock the momentary push-button states to False on every load.
+        # This brilliantly ensures the UI Preset engine never thinks they are "Active"
+        # and always shows the "Apply" button ready to be clicked again.
         self.cache = {
             "active_theme_index": active_idx,
             "active_theme_name": active_name,
             "DEFAULT/active_theme_index": active_idx,
             "DEFAULT/active_theme_name": active_name,
+            
+            "action_invert_pos": False,
+            "DEFAULT/action_invert_pos": False,
+            
+            "action_heal_state": False,
+            "DEFAULT/action_heal_state": False,
         }
         
         return self.cache
@@ -179,8 +184,7 @@ class WaybarEngine(BaseEngine):
 
         # UI CACHE REFRESH TRIGGER
         # Pauses slightly to let the UI's write mask expire, then artificially 
-        # bumps the directory mtime. This brilliantly forces the UI to reload the state natively,
-        # resolving the active_theme_name instantly.
+        # bumps the directory mtime. This brilliantly forces the UI to reload the state natively.
         await asyncio.sleep(0.5)
         try:
             os.utime(self.config_root, None)
@@ -196,7 +200,12 @@ class WaybarEngine(BaseEngine):
         if not self.theme_dirs:
             return False, "No valid themes found in ~/.config/waybar/", ""
 
-        current_idx = self.cache.get("active_theme_index", 0)
+        # PREVENT NEGATIVE INDEXING BUG: If symlinks are broken, fallback to 0. 
+        # This prevents the script from accidentally altering the very last theme in the folder.
+        current_idx = self.cache.get("active_theme_index", -1)
+        if current_idx < 0:
+            current_idx = 0
+            
         target_idx = current_idx
         requires_restart = False
         requires_detached = True 
