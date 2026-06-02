@@ -38,12 +38,12 @@ function scripts() {
             --info=inline-right \
             --scheme=path \
             --algo=v2 \
-            --header=" Select a Python or Bash script " \
-            --header-border=horizontal \
+            --delimiter="/" \
+            --with-nth="3.." \
             --preview='file={}; file="${file/\~/$HOME}"; bat --color=always --style=numbers --line-range=:500 "$file" 2>/dev/null || cat "$file"' \
             --preview-window="right,50%,border-rounded,~3" \
             --color='bg+:#313244,bg:#1e1e2e,spinner:#f5e0dc,hl:#f38ba8' \
-            --color='fg:#cdd6f4,header:#f38ba8,info:#cba6f7,pointer:#f5e0dc' \
+            --color='fg:#cdd6f4,info:#cba6f7,pointer:#f5e0dc' \
             --color='marker:#f5e0dc,fg+:#cdd6f4,prompt:#cba6f7,hl+:#f38ba8' \
             --height=~80%
     )
