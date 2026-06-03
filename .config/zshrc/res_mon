@@ -1,20 +1,23 @@
 res_mon() {
     # Isolate shell options for predictable execution and silence debug traces
     emulate -L zsh
-    setopt localoptions no_xtrace no_verbose
+    # localtraps ensures our EXIT trap does not overwrite global zsh traps
+    setopt localoptions no_xtrace no_verbose localtraps
 
     # CRITICAL: Force standard numeric locale so floats use '.' reliably across 
     # all systems, while preserving UTF-8 for process names to prevent garbling.
     local LC_NUMERIC=C
 
-    # Defaults: RAM Sort, 2s Interval, 15 Count, Full Process Arguments
+    # Defaults: RAM Sort, 2s Interval, ALL Processes (0), Full Process Arguments
     local target_sort="ram"
     local ps_sort="-rss"
     local display_mode="full"
     local interval="2"
-    local count="15"
+    local count="0"
     local target_pids=""
     local target_name=""
+    local is_watching=""
+    local original_target_pids=""
     local -a plain_nums=()
 
     # 1. Advanced Order-Agnostic Argument Tokenizer
@@ -38,8 +41,8 @@ res_mon() {
                 print -P "  %F{cyan}-p, --pid <pids>%f       - Target specific PID(s) (comma-separated: 123,456)"
                 print -P "  %F{cyan}-n, --name <name>%f      - Fuzzy filter processes by name or argument\n"
                 
-                print -P "%BNumbers:%b (Defaults: 2s interval, 15 processes)"
-                print -P "  %F{cyan}<number>%f               - Sets the initial view height count (e.g., 20)"
+                print -P "%BNumbers:%b (Defaults: 2s interval, all processes)"
+                print -P "  %F{cyan}<number>%f               - Limit the number of top processes shown (e.g., 20)"
                 print -P "  %F{cyan}<number>s%f              - Sets the interval in seconds (e.g., 1s or .5s)\n"
                 return 0 
                 ;;
@@ -63,7 +66,6 @@ res_mon() {
                     print -u2 -P "\n%F{red}✖ Error:%f Missing argument for %B$arg%b."
                     return 1
                 fi
-                # Normalize spaces to commas natively
                 target_pids="${1// /,}"
                 ;;
             -n|--name)
@@ -115,31 +117,47 @@ res_mon() {
         fi
     fi
 
-    # Strip decimal from count if a user made a typo
     count=${count%.*} 
-
-    # Set hard interval floor for the fzf event loop (0.01 is absolute minimum for fzf)
     local -F check_interval="$interval"
     if (( check_interval < 0.01 )); then
         interval="0.01"
     fi
 
-    local title_metric=$([[ "$target_sort" == "cpu" ]] && echo "CPU Sort" || echo "RAM Sort")
-    [[ -n "$target_pids" ]] && title_metric+=" | PIDs: $target_pids"
-
-    # 3. Secure Execution Context
-    local ps_target="-e"
-    [[ -n "$target_pids" ]] && ps_target="-p $target_pids"
-    
+    # 3. Secure State Context & Alternate Screen Management
+    local state_dir="$HOME/.config/dusky/settings/res_mon"
+    local state_file="$state_dir/state"
+    command mkdir -p "$state_dir"
+    export __RES_MON_STATE="$state_file"
     export __RES_MON_DISPLAY="$display_mode"
-    export __RES_MON_PS="ps ${ps_target} --sort=$ps_sort -o pid=,pcpu=,pmem=,rss=,time=,args="
+
+    # Enter alternate screen buffer to strictly prevent UI leakage/spillage
+    if (( $+commands[tput] )); then
+        tput smcup
+        clear
+    fi
+    # Guarantees cleanup & terminal restore even if forcefully killed
+    trap '(( $+commands[tput] )) && tput rmcup' EXIT INT TERM
+    
+    # 4. Compiling the FZF AWK Engine (State-Aware, Bulletproof Geometry)
     export __RES_MON_AWK='
     BEGIN {
-        # Perfectly mathematically aligned headers mapped to the printf footprint
-        print "\033[38;5;242mPID         CPU%   MEM%    RAM(MB)        TIME   COMMAND\033[0m"
+        state_file = ENVIRON["__RES_MON_STATE"]
+        # Secure stream ingestion: Safely load historically interacted processes
+        if ((getline line < state_file) > 0) {
+            do {
+                split(line, parts, "\t")
+                if (parts[1] ~ /^[0-9]+$/) {
+                    weights[parts[2]] = parts[1]
+                }
+            } while ((getline line < state_file) > 0)
+            close(state_file)
+        }
+        
+        # Perfectly mathematically aligned headers mapped to the printf footprint below
+        print "\033[38;5;242mPID       CPU%    MEM%    RAM(MB)     TIME         FREQ     COMMAND\033[0m"
     }
     {
-        # Reconstruct the full arguments string
+        # Reconstruct the full arguments string for visual payload
         args = $6
         for(i=7; i<=NF; i++) args = args " " $i
         
@@ -153,58 +171,220 @@ res_mon() {
             sub(/:$/, "", comm)
         }
         
-        printf "\033[38;5;246m%-8s\033[0m \033[38;5;220m%6s\033[0m \033[38;5;218m%6s\033[0m \033[38;5;213m%10s\033[0m \033[38;5;114m%11s\033[0m   ", \
-               $1, sprintf("%.1f%%", $2), sprintf("%.1f%%", $3), sprintf("%.1f", $4/1024.0), $5
+        # Geometry Formulation
+        vis_pid = "\033[38;5;246m" sprintf("%-8s", $1) "\033[0m"
+        vis_cpu = "\033[38;5;220m" sprintf("%6s", sprintf("%.1f%%", $2)) "\033[0m"
+        vis_mem = "\033[38;5;218m" sprintf("%6s", sprintf("%.1f%%", $3)) "\033[0m"
+        vis_ram = "\033[38;5;213m" sprintf("%10s", sprintf("%.1f", $4/1024.0)) "\033[0m"
+        vis_time = "\033[38;5;114m" sprintf("%11s", $5) "\033[0m"
         
-        if (ENVIRON["__RES_MON_DISPLAY"] == "clean") {
-            printf "\033[1;38;5;39m%s\033[0m\n", comm
+        # SDF State Badge Logic (Matches exact width of 7 padding spaces)
+        w = weights[comm] ? weights[comm] : 0
+        if (w > 0) {
+            badge = "\033[3;38;2;249;226;175m " sprintf("%-4d", w) "\033[0m "
         } else {
-            # Display full arguments directly for native, robust searching
-            printf "\033[1;38;5;39m%s\033[0m\n", args
+            badge = "       "
         }
+        
+        display_cmd = (ENVIRON["__RES_MON_DISPLAY"] == "clean") ? comm : args
+        vis_cmd = "\033[1;38;5;39m" display_cmd "\033[0m"
+        
+        # Hidden Payload Hack: Pushes raw command target out of terminal view
+        # Allows for exact state mapping regardless of spacing/argument parsing
+        pad = sprintf("%150s", "")
+        
+        # 2 spaces between all columns perfectly aligns with the header
+        printf "%s  %s  %s  %s  %s  %s  %s%s__COMM__=%s\n", \
+            vis_pid, vis_cpu, vis_mem, vis_ram, vis_time, badge, vis_cmd, pad, comm
     }'
     
-    local data_cmd='eval "$__RES_MON_PS" 2>/dev/null | awk "$__RES_MON_AWK"'
-
-    # 4. Launch the Cutting-Edge fzf Live Interactive UI
-    local -a fzf_opts=(
-        --ansi
-        --no-sort                       # Respect ps sorting (top CPU/RAM stays top)
-        --layout=reverse                # Prompt at the top, list below
-        --header-lines=1                # Pin the AWK column headers
-        --freeze-left=5                 # KEEP metrics pinned when scrolling horizontally!
-        --track --id-nth=1              # Lock the selection cursor to the PID as it moves!
-        --bind "start,every(${interval}):reload-sync:${data_cmd}"
-        --bind "ctrl-r:reload-sync:${data_cmd}"
+    # 5. The Core Interactive Event Loop
+    while true; do
+        # Dynamically build PS stream inside loop to support live Watch toggling
+        local ps_target="-e"
+        [[ -n "$target_pids" ]] && ps_target="-p $target_pids"
+        export __RES_MON_PS="ps ${ps_target} --sort=$ps_sort -o pid=,pcpu=,pmem=,rss=,time=,args="
         
-        # EXACT-MATCH ANCHOR: Using left-aligned PIDs allows us to strictly match 
-        # the beginning of the line using '^' and an escaped trailing space '\ ',
-        # preventing false positives from UUIDs or arguments containing the PID.
-        --bind 'enter:transform-query(echo "^{r1}\ ")'       
-        --bind 'double-click:transform-query(echo "^{r1}\ ")' 
-        
-        --info=inline
-        --prompt=" ⚡ ${title_metric} > "
-        --header=" ❯ Live Fuzzy Monitor | Refresh: ${interval}s | Type to fuzzy search live (ESC to quit) "
-        --pointer="▶"
-        --color="prompt:#5fd7ff,header:#87d75f,pointer:#ff00af,info:#ff8700"
-    )
-    
-    # Preload user query to instantly highlight and filter
-    [[ -n "$target_name" ]] && fzf_opts+=(--query="$target_name")
-    
-    # Intelligently adapt height logic to map to the old `count` paradigm.
-    if (( count > 0 && count <= 50 )); then
-        fzf_opts+=(--height=$((count + 4))) # Count + prompt + header + info + awk line
-    else
-        fzf_opts+=(--height=100%)
-    fi
+        local limit_cmd=""
+        if (( count > 0 )); then
+            limit_cmd=" | head -n $((count + 1))"
+        fi
+        local data_cmd='eval "$__RES_MON_PS" 2>/dev/null | awk "$__RES_MON_AWK"'"$limit_cmd"
 
-    # Trigger Engine (Output redirected to /dev/null to prevent terminal clutter on exit)
-    FZF_DEFAULT_COMMAND="$data_cmd" fzf "${fzf_opts[@]}" > /dev/null
+        # Re-evaluate visual titles
+        local title_metric=$([[ "$target_sort" == "cpu" ]] && echo "CPU Sort" || echo "RAM Sort")
+        if [[ -n "$is_watching" ]]; then
+            title_metric="󰈈 WATCHING PID: $target_pids"
+        elif [[ -n "$target_pids" ]]; then
+            title_metric+=" | Filter: $target_pids"
+        fi
+
+        # Reset cursor to top-left to seamlessly paint 100% height over previous frames
+        (( $+commands[tput] )) && tput cup 0 0
+        
+        local -a fzf_opts=(
+            --ansi
+            --no-sort                       # Respect ps sorting (top CPU/RAM stays top)
+            --layout=reverse                # Prompt at the top, list below
+            --header-lines=1                # Pin the AWK column headers
+            --freeze-left=6                 # FZF 0.73+: Keeps metrics strictly pinned on horizontal scroll!
+            --track --id-nth=1              # Lock the selection cursor to the PID as it moves!
+            --bind "start,every(${interval}):reload-sync:${data_cmd}"
+            --bind "ctrl-r:reload-sync:${data_cmd}"
+            
+            # Key bindings
+            --expect=ctrl-l                 # Bubble CTRL-L out of FZF to act as a pure hotkey
+            
+            --style=full
+            --border=rounded
+            --border-label=" 󰒓 Dusky Resource Monitor "
+            --border-label-pos=center
+            --header-border=horizontal
+            --list-border=none
+            --info=inline-right
+            --prompt=" ⚡ ${title_metric} > "
+            --header=" ❯ Live Mode | Refresh: ${interval}s | [CTRL-L] Toggle Watch | [ENTER] Actions | [ESC] Quit/Back "
+            --pointer="▶"
+            --marker="✓"
+            --color='bg+:#313244,bg:#1e1e2e,spinner:#f5e0dc,hl:#f38ba8'
+            --color='fg:#cdd6f4,info:#cba6f7,pointer:#f5e0dc'
+            --color='marker:#f5e0dc,fg+:#cdd6f4,prompt:#87d75f,hl+:#f38ba8'
+            --color='header:#87d75f,border:#585b70,label:#89b4fa'
+            
+            # Using 100% forces FZF to defer smcup/rmcup to our custom wrapper, preventing terminal flashing
+            --height=100%
+        )
+        
+        [[ -n "$target_name" ]] && fzf_opts+=(--query="$target_name")
+        
+        # Execute Live Engine
+        local fzf_output
+        fzf_output=$(FZF_DEFAULT_COMMAND="$data_cmd" fzf "${fzf_opts[@]}")
+        
+        # ESC handling routing
+        if [[ -z "$fzf_output" ]]; then
+            if [[ -n "$is_watching" ]]; then
+                # Revert from Watch Mode to standard monitor
+                target_pids="$original_target_pids"
+                is_watching=""
+                continue
+            else
+                break
+            fi
+        fi
+
+        # Extract Key (Line 1) and Selection (Line 2) safely across edge cases
+        local key="${fzf_output%%$'\n'*}"
+        local fzf_choice="${fzf_output#*$'\n'}"
+
+        [[ -z "$fzf_choice" ]] && continue
+        
+        # 6. Extraction Router (FZF outputs the raw selected string)
+        local target_pid=$(echo "$fzf_choice" | awk '{print $1}')
+        local target_comm=$(echo "$fzf_choice" | sed -n 's/.*__COMM__=//p')
+        target_pid=${target_pid//$'\e'\[[0-9;]*m/}
+
+        # Intercept Global Hotkeys (CTRL-L Watch Toggle)
+        if [[ "$key" == "ctrl-l" ]]; then
+            if [[ -n "$is_watching" ]]; then
+                target_pids="$original_target_pids"
+                is_watching=""
+            else
+                is_watching="1"
+                original_target_pids="$target_pids"
+                target_pids="$target_pid"
+            fi
+            continue
+        fi
+
+        # Dynamic Action Menu Formulation (If ENTER was pressed)
+        local action_menu=(
+            "1. 󰆧 Terminate Process (SIGTERM)"
+            "2. 󰯈 Force Kill Process (SIGKILL)"
+            "3.  Copy PID to Clipboard"
+            "4.  Copy Command to Clipboard"
+        )
+        
+        if [[ -n "$is_watching" ]]; then
+            action_menu+=("5. 󰜺 Stop Watching / Return to Full List")
+        else
+            action_menu+=("5. 󰈈 Watch / Monitor this Process")
+        fi
+
+        # Over-paint cursor position to launch Modal Popup Menu
+        (( $+commands[tput] )) && tput cup 0 0
+        local action
+        action=$(
+            print -N "${action_menu[@]}" | fzf \
+                --read0 \
+                --style=full \
+                --border=rounded \
+                --border-label=" 󰢱 Action: PID $target_pid ($target_comm) " \
+                --border-label-pos=center \
+                --prompt=" " \
+                --color='bg+:#313244,bg:#1e1e2e,hl:#f38ba8,fg+:#cdd6f4,header:#89b4fa' \
+                --info=hidden \
+                --layout=reverse \
+                --height=100% \
+                --margin=15%,20%
+        )
+
+        # ESC pressed on Action Menu -> Loops directly back into Live Monitor
+        [[ -z "$action" ]] && continue
+
+        # 7. Execute Action
+        case "$action" in
+            1*) kill -15 "$target_pid" 2>/dev/null ;;
+            2*) kill -9 "$target_pid" 2>/dev/null ;;
+            3*) 
+                if command -v wl-copy >/dev/null 2>&1; then
+                    print -rn -- "$target_pid" | wl-copy
+                elif command -v xclip >/dev/null 2>&1; then
+                    print -rn -- "$target_pid" | xclip -selection clipboard
+                fi
+                ;;
+            4*) 
+                if command -v wl-copy >/dev/null 2>&1; then
+                    print -rn -- "$target_comm" | wl-copy
+                elif command -v xclip >/dev/null 2>&1; then
+                    print -rn -- "$target_comm" | xclip -selection clipboard
+                fi
+                ;;
+            5*)
+                if [[ -n "$is_watching" ]]; then
+                    target_pids="$original_target_pids"
+                    is_watching=""
+                else
+                    is_watching="1"
+                    original_target_pids="$target_pids"
+                    target_pids="$target_pid"
+                fi
+                continue
+                ;;
+        esac
+
+        # 8. State Persistence Updates (Atomically logs frequency metrics)
+        typeset -A weights
+        if [[ -f "$state_file" ]]; then
+            while IFS=$'\t' read -r w p || [[ -n "$w" ]]; do
+                if [[ "$w" =~ ^[0-9]+$ && -n "$p" ]]; then
+                    weights[$p]=$w
+                fi
+            done < "$state_file"
+        fi
+
+        local current_weight=${weights[$target_comm]:-0}
+        weights[$target_comm]=$((current_weight + 1))
+        
+        local tmp_state="${state_file}.tmp.$$.$RANDOM"
+        for k v in "${(@kv)weights}"; do
+            printf "%d\t%s\n" "$v" "$k"
+        done > "$tmp_state" && command mv -f "$tmp_state" "$state_file"
+    done
     
-    # Teardown
+    # 9. Teardown Sandbox
     unset __RES_MON_PS
     unset __RES_MON_AWK
     unset __RES_MON_DISPLAY
+    unset __RES_MON_STATE
 }
