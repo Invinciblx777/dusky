@@ -56,7 +56,6 @@ INSTALL_SEQUENCE=(
 
     "U | 005_hypr_custom_config_setup.sh"
     "U | 010_package_removal.sh"
-    "U | 013_snapper_isolation_subvolume.sh --auto"
     "U | 015_set_thunar_terminal.py -t foot"
     "U | 020_desktop_apps_username_setter.sh"
     "U | 025_configure_keyboard.sh"
@@ -83,6 +82,7 @@ INSTALL_SEQUENCE=(
     "U | 130_copy_service_files.sh"
     "U | 131_dbus_copy_service_files.sh"
     "U | 135_battery_notify_service.sh"
+    "U | 137_snapper_isolation_subvolume.sh --auto"
 
     "U | dusky_matugen_config_tui.sh --smart"
 

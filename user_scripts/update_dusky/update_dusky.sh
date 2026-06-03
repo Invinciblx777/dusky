@@ -204,7 +204,6 @@ declare -ra UPDATE_SEQUENCE=(
     "U | paru_packages.sh"
 #================= Scripts =====================
 
-#    "U | 013_snapper_isolation_subvolume.sh --auto"
     "U | 015_set_thunar_terminal.py -t foot"
     "U | 020_desktop_apps_username_setter.sh --quiet"
     "U | 025_configure_keyboard.sh"
@@ -230,6 +229,7 @@ declare -ra UPDATE_SEQUENCE=(
     "U | 130_copy_service_files.sh --default"
     "U | 131_dbus_copy_service_files.sh"
 #    "U | 135_battery_notify_service.sh"
+#    "U | 137_snapper_isolation_subvolume.sh --auto"
 #    "U | 140_fc_cache_fv.sh"
     "U | 145_matugen_directories.py"
 #    "U | 150_wallpapers_download.sh"
