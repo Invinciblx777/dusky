@@ -247,7 +247,7 @@ _check_sudo_access() {
 
 _check_dependencies() {
     log_info "Checking required tools"
-    local -a required=(curl python3 bsdtar repo-add pacman git timeout bc paru)
+    local -a required=(python3 bsdtar repo-add pacman git timeout bc paru)
     local tool
     local -i missing=0
 
@@ -335,7 +335,18 @@ _init_isolated_db() {
         log_step "Generating pacman.conf with CachyOS v3 prioritization..."
         
         find /etc/pacman.d -maxdepth 1 -type f -exec cp {} "${ISOLATED_DB_DIR}/pacman.d/" \;
-        find "${ISOLATED_DB_DIR}/pacman.d" -type f -exec sed -i 's/\$arch/x86_64/g' {} +
+
+        # Precise architecture patching synchronized directly from 010 script logic
+        if [[ -f "${ISOLATED_DB_DIR}/pacman.d/cachyos-v3-mirrorlist" ]]; then
+            sed -i 's/\$arch_v3/x86_64_v3/g' "${ISOLATED_DB_DIR}/pacman.d/cachyos-v3-mirrorlist"
+            sed -i 's/\$arch/x86_64_v3/g'    "${ISOLATED_DB_DIR}/pacman.d/cachyos-v3-mirrorlist"
+        fi
+        if [[ -f "${ISOLATED_DB_DIR}/pacman.d/cachyos-mirrorlist" ]]; then
+            sed -i 's/\$arch/x86_64/g'       "${ISOLATED_DB_DIR}/pacman.d/cachyos-mirrorlist"
+        fi
+        if [[ -f "${ISOLATED_DB_DIR}/pacman.d/mirrorlist" ]]; then
+            sed -i 's/\$arch/x86_64/g'       "${ISOLATED_DB_DIR}/pacman.d/mirrorlist"
+        fi
 
         awk -v sandbox="${ISOLATED_DB_DIR}" '
         /^#?VerbosePkgLists/ { print "VerbosePkgLists"; next }
@@ -392,22 +403,41 @@ _aur_get_version() {
     local pkg="$1"
     local version
 
+    # Backported: Pure Python request prevents the bash pipe (|) from hanging indefinitely
+    # when the network drops (like with a VPN), handles URL encoding automatically, 
+    # and avoids curl's dangerous globbing behavior with '[]' characters.
+    # Restored: 3-retry loop with a 2-second delay to mimic previous curl resilience.
     version=$(
-        curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors --max-time 15 \
-            "${AUR_RPC_BASE_URL}?arg[]=${pkg}" 2>/dev/null \
-        | python3 -c "
-import sys, json
-target = sys.argv[1]
+        python3 -c "
+import sys, json, urllib.request, urllib.parse, time
+
 try:
-    data = json.load(sys.stdin)
-    for r in data.get('results', []):
-        if r.get('Name') == target:
-            print(r['Version'])
-            sys.exit(0)
+    pkg_name = urllib.parse.quote(sys.argv[1])
+    base_url = sys.argv[2]
+    url = f'{base_url}?arg[]={pkg_name}'
+    
+    # Arch AUR rate-limits generic curl/python User-Agents; a custom UA ensures stability
+    req = urllib.request.Request(url, headers={'User-Agent': 'DuskyISO-Builder/3.0'})
+    
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode('utf-8'))
+                    for r in data.get('results', []):
+                        if r.get('Name') == sys.argv[1]:
+                            print(r['Version'])
+                            sys.exit(0)
+                    sys.exit(1)
+        except Exception:
+            if attempt < 3:
+                time.sleep(2)
+            else:
+                sys.exit(1)
     sys.exit(1)
 except Exception:
     sys.exit(1)
-" "$pkg"
+" "$pkg" "$AUR_RPC_BASE_URL"
     ) || return 1
 
     [[ -n "$version" ]] || return 1
