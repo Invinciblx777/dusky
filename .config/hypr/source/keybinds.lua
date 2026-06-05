@@ -427,7 +427,7 @@ hl.bind(
 )
 
 hl.bind(
-    "SUPER + SHIFT + S",
+    "SUPER + CTRL + S",
     hl.dsp.exec_cmd(dusky_scripts .. "images/dusky_screenshot.sh --region --freeze --annotate --no-notify --tool arrow"),
     { description = "Screenshot and Annotation", submap_universal = true }
 )
@@ -447,7 +447,7 @@ hl.bind(
 
 -- --- Screen Recorder ---
 hl.bind(
-    "SUPER + CTRL + S",
+    "SUPER + SHIFT + S",
     hl.dsp.exec_cmd(dusky_scripts .. "screen_recorder/dusky_recorder.sh"),
     { description = "Screen Recorder", submap_universal = true }
 )
