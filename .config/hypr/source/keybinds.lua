@@ -47,8 +47,8 @@
 
 hl.bind(
     "ALT + SPACE",
-    hl.dsp.exec_cmd("pkill rofi; " .. "~/user_scripts/rofi/dusky_launcher.sh"),
-    { description = "Launch Unified Search Menu", submap_universal = true }
+    hl.dsp.exec_cmd([[pkill rofi; rofi -show drun -run-command "{cmd}"]]),
+    { description = "Launch Menu for Apps", submap_universal = true }
 )
 
 hl.bind(
