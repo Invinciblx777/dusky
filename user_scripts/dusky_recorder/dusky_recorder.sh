@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# ARCH LINUX :: WAYLAND :: ROFI DUSKY RECORDER
+# ARCH LINUX :: WAYLAND :: ROFI DUSKY RECORDER (PRO EDITION)
 # ==============================================================================
-# Description: Interactive Rofi interface for gpu-screen-recorder.
+# Description: Advanced Rofi interface for gpu-screen-recorder.
 #              - State-aware Start/Stop/Replay controls
-#              - Full Screen vs Region selection
-#              - Quick settings editor (FPS, Cursor, Audio, Indicator)
-#              - Async blinking Mako red-dot indicator
-#              - Dynamic Split Audio Device Discovery
+#              - Multi-tiered configuration submenus
+#              - Dynamic Audio Device Discovery (PipeWire)
+#              - Intelligent Bitrate/Quality conflict resolution
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -21,17 +20,32 @@ readonly INDICATOR_PID="/tmp/dusky_recorder_daemon.pid"
 # Ensure config exists and load it
 [[ -f "$CFG" ]] && source "$CFG"
 
-# Fallbacks
+# --- FALLBACKS & DEFAULTS ---
 fps="${fps:-60}"
 cursor="${cursor:-yes}"
+show_indicator="${show_indicator:-yes}"
+
+# Video & Encoding
+encoder="${encoder:-gpu}"
+codec="${codec:-auto}"
+quality="${quality:-very_high}"
+bitrate_mode="${bitrate_mode:-auto}"
+frame_mode="${frame_mode:-vfr}"
+color_range="${color_range:-limited}"
 container="${container:-mp4}"
 output_dir="${output_dir:-$HOME/Videos}"
 output_dir="${output_dir/#\~/$HOME}"
+
+# Audio
+audio_codec="${audio_codec:-opus}"
+audio_bitrate="${audio_bitrate:-128}"
+
+# Replay
 replay_buffer="${replay_buffer:-0}"
-show_indicator="${show_indicator:-yes}"
+replay_storage="${replay_storage:-ram}"
+restart_replay="${restart_replay:-no}"
 
 # --- AUDIO STATE MIGRATION ---
-# Silently migrate old single 'audio' config to split 'audio_output' and 'audio_input'
 if [[ -n "${audio:-}" && -z "${audio_output:-}" && -z "${audio_input:-}" ]]; then
     if [[ "$audio" == *"|"* ]]; then
         audio_output="${audio%|*}"
@@ -49,9 +63,7 @@ if [[ -n "${audio:-}" && -z "${audio_output:-}" && -z "${audio_input:-}" ]]; the
         audio_output="default_output"
         audio_input="none"
     fi
-    # Remove legacy key and save new keys
     sed -i '/^audio=/d' "$CFG" 2>/dev/null || true
-    # We don't call update_config here to avoid sourcing loops, just append
     echo "audio_output=${audio_output}" >> "$CFG"
     echo "audio_input=${audio_input}" >> "$CFG"
 fi
@@ -70,7 +82,6 @@ run_menu() {
 update_config() {
     local key="$1"
     local value="$2"
-    # Using ~ as delimiter so pipe characters (|) in hardware strings don't crash sed
     if grep -q "^${key}=" "$CFG"; then
         sed -i "s~^${key}=.*~${key}=${value}~" "$CFG"
     else
@@ -86,12 +97,10 @@ get_audio_name() {
     [[ "$target_id" == "default_input" ]] && echo "Default Mic" && return
     
     local name
-    # Exact string match the ID to pull the friendly name
     name=$(gpu-screen-recorder --list-audio-devices 2>/dev/null | grep -F "${target_id}|" | cut -d'|' -f2 | head -n1)
     if [[ -n "$name" ]]; then
         echo "$name"
     else
-        # Fallback to ID if device was unplugged but still in config
         echo "Disconnected Device"
     fi
 }
@@ -101,7 +110,6 @@ manage_indicator() {
     
     if [[ "$action" == "start" ]]; then
         [[ "$show_indicator" != "yes" ]] && return 0
-
         (
             local notif_id
             notif_id=$(notify-send -a "dusky-recorder" -p "" "")
@@ -187,7 +195,7 @@ start_recording() {
     [[ "$target_mode" == "region" && -n "$region_coords" ]] && args+=(-region "$region_coords")
     [[ "$cursor" == "no" ]] && args+=(-cursor "no")
     
-    # --- DYNAMIC AUDIO INJECTION ---
+    # Audio Routing
     local final_audio=""
     if [[ "$audio_output" != "none" && "$audio_input" != "none" ]]; then
         final_audio="${audio_output}|${audio_input}"
@@ -197,17 +205,25 @@ start_recording() {
         final_audio="${audio_input}"
     fi
     [[ -n "$final_audio" ]] && args+=(-a "$final_audio")
+    
+    # Audio Specs
+    [[ -n "$audio_codec" ]] && args+=(-ac "$audio_codec")
+    [[ -n "$audio_bitrate" && "$audio_bitrate" != "0" ]] && args+=(-ab "$audio_bitrate")
 
-    # Hardware/backend variables
-    [[ -n "${codec:-}" ]] && args+=(-k "$codec")
-    [[ -n "${quality:-}" ]] && args+=(-q "$quality")
-    [[ -n "${encoder:-}" ]] && args+=(-encoder "$encoder")
-    [[ -n "${bitrate_mode:-}" ]] && args+=(-bm "$bitrate_mode")
-    [[ -n "${frame_mode:-}" ]] && args+=(-fm "$frame_mode")
+    # Video Encoding Specs
+    [[ -n "$encoder" && "$encoder" != "gpu" ]] && args+=(-encoder "$encoder")
+    [[ -n "$codec" && "$codec" != "auto" ]] && args+=(-k "$codec")
+    [[ -n "$quality" ]] && args+=(-q "$quality")
+    [[ -n "$bitrate_mode" && "$bitrate_mode" != "auto" ]] && args+=(-bm "$bitrate_mode")
+    [[ -n "$frame_mode" && "$frame_mode" != "vfr" ]] && args+=(-fm "$frame_mode")
+    [[ -n "$color_range" && "$color_range" != "limited" ]] && args+=(-cr "$color_range")
 
+    # File Routing
     local OUT=""
     if [[ -n "$replay_buffer" && "$replay_buffer" -gt 0 ]]; then
         args+=(-r "$replay_buffer")
+        [[ -n "$replay_storage" ]] && args+=(-replay-storage "$replay_storage")
+        [[ "$restart_replay" == "yes" ]] && args+=(-restart-replay-on-save "yes")
         OUT="$output_dir"
     else
         OUT="${output_dir}/Video_$(date +%Y-%m-%d_%H-%M-%S).${container}"
@@ -231,10 +247,80 @@ start_recording() {
     fi
 }
 
-# --- SUBMENUS ---
-settings_menu() {
+# --- SUBMENU: VIDEO & ENCODING ---
+video_menu() {
     while true; do
-        # Fetch friendly display names and truncate to prevent UI breakage
+        # Format the display so users know if they are in CBR or VBR mode
+        local q_disp="$quality"
+        [[ "$bitrate_mode" == "cbr" ]] && q_disp="${quality} kbps (CBR)"
+
+        local -a opts=(
+            "  Back"
+            "󰘚  Encoder     [${encoder}]"
+            "󰈰  Codec       [${codec}]"
+            "󰄬  Quality     [${q_disp}]"
+            "󰹑  Frame Mode  [${frame_mode}]"
+            "󰃐  Container   [${container}]"
+            "󰸱  Color Range [${color_range}]"
+        )
+        local choice
+        choice=$(run_menu "󰕧  Video Settings" "${opts[@]}") || return 0
+
+        case "$choice" in
+            "  Back") return 0 ;;
+            "󰘚  Encoder"*)
+                local new_enc
+                new_enc=$(run_menu "Select Encoder" "gpu" "cpu") || continue
+                [[ -n "$new_enc" ]] && { encoder="$new_enc"; update_config "encoder" "$encoder"; }
+                ;;
+            "󰈰  Codec"*)
+                local -a codecs=("auto" "h264" "hevc" "av1" "vp8" "vp9" "hevc_10bit" "av1_10bit" "hevc_vulkan" "av1_vulkan")
+                local new_codec
+                new_codec=$(run_menu "Select Codec" "${codecs[@]}") || continue
+                [[ -n "$new_codec" ]] && { codec="$new_codec"; update_config "codec" "$codec"; }
+                ;;
+            "󰄬  Quality"*)
+                local -a q_opts=("󰄬  Ultra (VBR)" "󰄬  Very High (VBR)" "󰄬  High (VBR)" "󰄬  Medium (VBR)" "  Custom Bitrate (CBR)...")
+                local q_choice
+                q_choice=$(run_menu "󰄬  Quality Mode" "${q_opts[@]}") || continue
+                case "$q_choice" in
+                    "󰄬  Ultra"*) update_config "quality" "ultra"; update_config "bitrate_mode" "auto" ;;
+                    "󰄬  Very High"*) update_config "quality" "very_high"; update_config "bitrate_mode" "auto" ;;
+                    "󰄬  High"*) update_config "quality" "high"; update_config "bitrate_mode" "auto" ;;
+                    "󰄬  Medium"*) update_config "quality" "medium"; update_config "bitrate_mode" "auto" ;;
+                    "  Custom"*)
+                        local custom_q
+                        custom_q=$(rofi -dmenu -p "Bitrate (kbps, e.g. 40000)" -theme-str "$ROFI_THEME_STR listview { enabled: false; }" < /dev/null) || continue
+                        if [[ -n "$custom_q" && "$custom_q" =~ ^[0-9]+$ ]]; then
+                            update_config "quality" "$custom_q"
+                            # CRITICAL FIX: Custom bitrates demand Constant Bitrate Mode or the backend crashes
+                            update_config "bitrate_mode" "cbr"
+                        fi
+                        ;;
+                esac
+                ;;
+            "󰹑  Frame Mode"*)
+                local new_fm
+                new_fm=$(run_menu "Select Frame Mode" "vfr" "cfr" "content") || continue
+                [[ -n "$new_fm" ]] && { frame_mode="$new_fm"; update_config "frame_mode" "$frame_mode"; }
+                ;;
+            "󰃐  Container"*)
+                local new_cont
+                new_cont=$(run_menu "Select Container" "mp4" "mkv" "flv" "webm") || continue
+                [[ -n "$new_cont" ]] && { container="$new_cont"; update_config "container" "$container"; }
+                ;;
+            "󰸱  Color Range"*)
+                local new_cr
+                new_cr=$(run_menu "Select Color Range" "limited" "full") || continue
+                [[ -n "$new_cr" ]] && { color_range="$new_cr"; update_config "color_range" "$color_range"; }
+                ;;
+        esac
+    done
+}
+
+# --- SUBMENU: AUDIO & ROUTING ---
+audio_menu() {
+    while true; do
         local disp_out; disp_out=$(get_audio_name "$audio_output")
         [[ ${#disp_out} -gt 18 ]] && disp_out="${disp_out:0:15}..."
         
@@ -243,18 +329,97 @@ settings_menu() {
 
         local -a opts=(
             "  Back"
-            "󰣖  FPS         [${fps}]"
-            "󰇀  Cursor      [${cursor}]"
             "󰓃  Output      [${disp_out}]"
             "  Input       [${disp_in}]"
-            "󰂚  Indicator   [${show_indicator}]"
-            "  Replay Buf  [${replay_buffer}s]"
+            "󰎆  Codec       [${audio_codec}]"
+            "󰡰  Bitrate     [${audio_bitrate}k]"
         )
         local choice
-        choice=$(run_menu "  Quick Settings" "${opts[@]}") || return 0
+        choice=$(run_menu "󰎆  Audio Settings" "${opts[@]}") || return 0
 
         case "$choice" in
-            "  Back"*) return 0 ;;
+            "  Back") return 0 ;;
+            "󰓃  Output"*)
+                local -a rofi_out_list=("  None" "  Default Desktop Audio")
+                local -A out_map=(["  None"]="none" ["  Default Desktop Audio"]="default_output")
+
+                while IFS='|' read -r dev_id dev_name; do
+                    [[ -z "$dev_id" || "$dev_id" == "default_output" || "$dev_id" == "default_input" ]] && continue
+                    [[ -z "$dev_name" ]] && dev_name="$dev_id"
+                    
+                    if [[ "$dev_id" == *"output"* ]]; then
+                        local entry="  $dev_name"
+                        local count=2
+                        while [[ -n "${out_map[$entry]:-}" ]]; do
+                            entry="  $dev_name ($count)"
+                            ((count++))
+                        done
+                        rofi_out_list+=("$entry")
+                        out_map["$entry"]="$dev_id"
+                    fi
+                done < <(gpu-screen-recorder --list-audio-devices 2>/dev/null)
+
+                local choice_out
+                choice_out=$(run_menu "Desktop Audio (Output)" "${rofi_out_list[@]}") || continue
+                if [[ -n "$choice_out" && -n "${out_map[$choice_out]:-}" ]]; then
+                    audio_output="${out_map[$choice_out]}"; update_config "audio_output" "$audio_output"
+                fi
+                ;;
+            "  Input"*)
+                local -a rofi_in_list=("  None" "  Default Microphone")
+                local -A in_map=(["  None"]="none" ["  Default Microphone"]="default_input")
+
+                while IFS='|' read -r dev_id dev_name; do
+                    [[ -z "$dev_id" || "$dev_id" == "default_output" || "$dev_id" == "default_input" ]] && continue
+                    [[ -z "$dev_name" ]] && dev_name="$dev_id"
+                    
+                    if [[ "$dev_id" == *"input"* ]]; then
+                        local entry="  $dev_name"
+                        local count=2
+                        while [[ -n "${in_map[$entry]:-}" ]]; do
+                            entry="  $dev_name ($count)"
+                            ((count++))
+                        done
+                        rofi_in_list+=("$entry")
+                        in_map["$entry"]="$dev_id"
+                    fi
+                done < <(gpu-screen-recorder --list-audio-devices 2>/dev/null)
+
+                local choice_in
+                choice_in=$(run_menu "Microphone (Input)" "${rofi_in_list[@]}") || continue
+                if [[ -n "$choice_in" && -n "${in_map[$choice_in]:-}" ]]; then
+                    audio_input="${in_map[$choice_in]}"; update_config "audio_input" "$audio_input"
+                fi
+                ;;
+            "󰎆  Codec"*)
+                local new_ac
+                new_ac=$(run_menu "Audio Codec" "opus" "aac" "flac") || continue
+                [[ -n "$new_ac" ]] && { audio_codec="$new_ac"; update_config "audio_codec" "$audio_codec"; }
+                ;;
+            "󰡰  Bitrate"*)
+                local new_ab
+                new_ab=$(run_menu "Audio Bitrate (kbps)" "0 (Auto)" "128" "192" "256" "320") || continue
+                new_ab="${new_ab%% *}" # Strip the (Auto) text if present
+                [[ -n "$new_ab" ]] && { audio_bitrate="$new_ab"; update_config "audio_bitrate" "$audio_bitrate"; }
+                ;;
+        esac
+    done
+}
+
+# --- SUBMENU: CAPTURE & INTERFACE ---
+capture_menu() {
+    while true; do
+        local -a opts=(
+            "  Back"
+            "󰣖  FPS         [${fps}]"
+            "󰇀  Cursor      [${cursor}]"
+            "󰂚  Indicator   [${show_indicator}]"
+        )
+        local choice
+        choice=$(run_menu "󰆋  Capture Settings" "${opts[@]}") || return 0
+
+        case "$choice" in
+            "  Back") return 0 ;;
             "󰣖  FPS"*)
                 local new_fps
                 new_fps=$(run_menu "Select FPS" "30" "60" "120" "144") || continue
@@ -265,89 +430,66 @@ settings_menu() {
                 new_cursor=$(run_menu "Record Cursor?" "yes" "no") || continue
                 [[ -n "$new_cursor" ]] && { cursor="$new_cursor"; update_config "cursor" "$cursor"; }
                 ;;
-                
-            # --- OUTPUT AUDIO SUBMENU ---
-            "󰓃  Output"*)
-                local -a rofi_out_list=()
-                local -A out_map=()
-
-                rofi_out_list+=("  None")
-                out_map["  None"]="none"
-                rofi_out_list+=("  Default Desktop Audio")
-                out_map["  Default Desktop Audio"]="default_output"
-
-                while IFS='|' read -r dev_id dev_name; do
-                    [[ -z "$dev_id" || "$dev_id" == "default_output" || "$dev_id" == "default_input" ]] && continue
-                    [[ -z "$dev_name" ]] && dev_name="$dev_id"
-                    
-                    if [[ "$dev_id" == *"output"* ]]; then
-                        local entry="  $dev_name"
-                        # Handle duplicate device names
-                        local count=2
-                        while [[ -n "${out_map[$entry]:-}" ]]; do
-                            entry="  $dev_name ($count)"
-                            ((count++))
-                        done
-                        
-                        rofi_out_list+=("$entry")
-                        out_map["$entry"]="$dev_id"
-                    fi
-                done < <(gpu-screen-recorder --list-audio-devices 2>/dev/null)
-
-                local choice_out
-                choice_out=$(run_menu "Select Output (Desktop)" "${rofi_out_list[@]}") || continue
-                if [[ -n "$choice_out" && -n "${out_map[$choice_out]:-}" ]]; then
-                    audio_output="${out_map[$choice_out]}"
-                    update_config "audio_output" "$audio_output"
-                fi
-                ;;
-                
-            # --- INPUT AUDIO SUBMENU ---
-            "  Input"*)
-                local -a rofi_in_list=()
-                local -A in_map=()
-
-                rofi_in_list+=("  None")
-                in_map["  None"]="none"
-                rofi_in_list+=("  Default Microphone")
-                in_map["  Default Microphone"]="default_input"
-
-                while IFS='|' read -r dev_id dev_name; do
-                    [[ -z "$dev_id" || "$dev_id" == "default_output" || "$dev_id" == "default_input" ]] && continue
-                    [[ -z "$dev_name" ]] && dev_name="$dev_id"
-                    
-                    if [[ "$dev_id" == *"input"* ]]; then
-                        local entry="  $dev_name"
-                        # Handle duplicate device names
-                        local count=2
-                        while [[ -n "${in_map[$entry]:-}" ]]; do
-                            entry="  $dev_name ($count)"
-                            ((count++))
-                        done
-                        
-                        rofi_in_list+=("$entry")
-                        in_map["$entry"]="$dev_id"
-                    fi
-                done < <(gpu-screen-recorder --list-audio-devices 2>/dev/null)
-
-                local choice_in
-                choice_in=$(run_menu "Select Input (Mic)" "${rofi_in_list[@]}") || continue
-                if [[ -n "$choice_in" && -n "${in_map[$choice_in]:-}" ]]; then
-                    audio_input="${in_map[$choice_in]}"
-                    update_config "audio_input" "$audio_input"
-                fi
-                ;;
-                
             "󰂚  Indicator"*)
                 local new_ind
                 new_ind=$(run_menu "Show Red Dot Indicator?" "yes" "no") || continue
                 [[ -n "$new_ind" ]] && { show_indicator="$new_ind"; update_config "show_indicator" "$show_indicator"; }
                 ;;
-            "  Replay"*)
+        esac
+    done
+}
+
+# --- SUBMENU: REPLAY BUFFER ---
+replay_menu() {
+    while true; do
+        local -a opts=(
+            "  Back"
+            "  Duration    [${replay_buffer}s]"
+            "󰋊  Storage     [${replay_storage}]"
+            "  Restart     [${restart_replay}]"
+        )
+        local choice
+        choice=$(run_menu "  Replay Settings" "${opts[@]}") || return 0
+
+        case "$choice" in
+            "  Back") return 0 ;;
+            "  Duration"*)
                 local new_buf
                 new_buf=$(run_menu "Replay Buffer (0 to disable)" "0" "30" "60" "120" "300") || continue
                 [[ -n "$new_buf" ]] && { replay_buffer="$new_buf"; update_config "replay_buffer" "$replay_buffer"; }
                 ;;
+            "󰋊  Storage"*)
+                local new_store
+                new_store=$(run_menu "Buffer Medium" "ram" "disk") || continue
+                [[ -n "$new_store" ]] && { replay_storage="$new_store"; update_config "replay_storage" "$replay_storage"; }
+                ;;
+            "  Restart"*)
+                local new_rest
+                new_rest=$(run_menu "Restart after save?" "yes" "no") || continue
+                [[ -n "$new_rest" ]] && { restart_replay="$new_rest"; update_config "restart_replay" "$restart_replay"; }
+                ;;
+        esac
+    done
+}
+
+# --- SETTINGS HUB (ROUTER) ---
+settings_hub() {
+    while true; do
+        local -a opts=(
+            "  Back"
+            "󰕧  Video & Encoding"
+            "󰎆  Audio & Routing"
+            "󰆋  Capture & Interface"
+            "  Replay Buffer"
+        )
+        local choice
+        choice=$(run_menu "  Settings Hub" "${opts[@]}") || return 0
+        case "$choice" in
+            "  Back") return 0 ;;
+            "󰕧  Video"*) video_menu ;;
+            "󰎆  Audio"*) audio_menu ;;
+            "󰆋  Capture"*) capture_menu ;;
+            "  Replay"*) replay_menu ;;
         esac
     done
 }
@@ -375,7 +517,7 @@ main() {
     else
         main_opts+=("  Record Full Screen")
         main_opts+=("  Record Region")
-        main_opts+=("  Quick Settings")
+        main_opts+=("  Settings Hub")
         main_opts+=("  Cancel")
     fi
 
@@ -387,7 +529,7 @@ main() {
         "  Save"*) save_replay ;;
         "  Record"*) start_recording "screen" ;;
         "  Record"*) start_recording "region" ;;
-        "  Quick"*) settings_menu; main ;;
+        "  Settings"*) settings_hub; main ;;
         "  Cancel"*) exit 0 ;;
     esac
 }

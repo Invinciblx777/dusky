@@ -193,7 +193,7 @@ SCHEMA = {
             group="Format",
             extended_help="**Video Codec** (`-k`)\n\nVulkan codecs are highly recommended for NVIDIA Wayland users to prevent the 'cuda p2 state' GPU downclock bug."
         ),
-        ConfigItem(
+ConfigItem(
             label="Quality",
             key="quality",
             scope="DEFAULT",
@@ -201,6 +201,7 @@ SCHEMA = {
             default="very_high",
             options=["ultra", "very_high", "high", "medium", "low", "40000", "80000"],
             group="Format",
+            warning_msg="CRITICAL: If you type a custom numeric bitrate here, you MUST change the Bitrate Mode below to 'cbr' or the recorder will crash.",
             extended_help="**Quality / Bitrate** (`-q`)\n\nIf Bitrate is 'auto/vbr', select a text preset (e.g., 'very_high'). If Bitrate is 'cbr', type a raw numeric value in kbps (e.g., '40000')."
         ),
         ConfigItem(
