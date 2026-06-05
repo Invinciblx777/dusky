@@ -27,4 +27,3 @@ Terminal=false
 Icon=system-software-update
 StartupNotify=true
 StartupWMClass=dusky_update
-NoDisplay=true

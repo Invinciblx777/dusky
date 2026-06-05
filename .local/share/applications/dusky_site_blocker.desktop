@@ -9,4 +9,3 @@ Terminal=false
 Categories=System;Utility;ConsoleOnly;
 Keywords=dusky;site;websites;hosts;block;focus;distraction;
 StartupNotify=true
-NoDisplay=true

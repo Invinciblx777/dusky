@@ -9,4 +9,3 @@ Categories=Utility;System;Settings;
 Keywords=rofi;monitor;timer;pomodoro;clock;system;cpu;ram;
 Icon=utilities-system-monitor
 StartupNotify=true
-NoDisplay=true

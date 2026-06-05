@@ -9,4 +9,3 @@ Terminal=false
 Categories=System;Settings;Utility;ConsoleOnly;
 Keywords=arch;systemd;timezone;locale;ntp;keymap;time;date;region;
 StartupNotify=true
-NoDisplay=true

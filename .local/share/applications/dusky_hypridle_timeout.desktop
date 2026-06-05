@@ -9,4 +9,3 @@ Categories=Settings;System;
 Keywords=dusky;idle;lock;sleep;timeout;
 Icon=preferences-system-power
 StartupNotify=true
-NoDisplay=true

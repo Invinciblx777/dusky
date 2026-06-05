@@ -10,4 +10,3 @@ Keywords=wayclick;keyboard;sounds;type;audio;trackpad;tui;config;settings;
 Icon=preferences-desktop-keyboard
 StartupNotify=true
 StartupWMClass=dusky_tui_wayclick.sh
-NoDisplay=true

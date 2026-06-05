@@ -11,4 +11,3 @@ Icon=preferences-desktop-display
 StartupNotify=true
 # This needs to match your --app-id so the desktop environment knows which window belongs to this launcher
 StartupWMClass=dusky_tui
-NoDisplay=true

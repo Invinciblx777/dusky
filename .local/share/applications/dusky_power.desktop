@@ -10,4 +10,3 @@ Keywords=dusky;power;logind;systemd;suspend;hibernate;lid;config;tui;
 Icon=system-shutdown
 StartupNotify=true
 StartupWMClass=dusky_power_tui
-NoDisplay=true

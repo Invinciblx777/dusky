@@ -10,4 +10,3 @@ Keywords=dusky;hyprland;gsettings;gtk;theme;appearance;nemo;nautilus;tui;config;
 Icon=preferences-desktop-theme
 StartupNotify=true
 StartupWMClass=dusky_gsettings.sh
-NoDisplay=true

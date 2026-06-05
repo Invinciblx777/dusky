@@ -9,4 +9,3 @@ Categories=Settings;System;
 Keywords=dusky;notification;battery;timeout;
 Icon=preferences-system-power
 StartupNotify=true
-NoDisplay=true

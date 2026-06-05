@@ -10,4 +10,3 @@ Categories=System;Settings;GTK;
 Keywords=dusky;settings;control;panel;sound;audio;network;wifi;bluetooth;display;monitor;theme;appearance;update;power;dotfiles;
 StartupWMClass=com.github.dusky.controlcenter
 StartupNotify=true
-NoDisplay=true

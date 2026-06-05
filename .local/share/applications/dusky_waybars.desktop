@@ -9,4 +9,3 @@ Categories=Settings;DesktopSettings;
 Keywords=dusky;waybar;panel;bar;toggle;switch;
 Icon=image-x-generic
 StartupNotify=true
-NoDisplay=true

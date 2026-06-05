@@ -8,4 +8,3 @@ Categories=System;
 Keywords=dusky;hypridle;toggle;switch;
 Icon=system-suspend
 StartupNotify=true
-NoDisplay=true

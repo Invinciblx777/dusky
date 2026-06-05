@@ -10,4 +10,3 @@ Keywords=dusky;hyprland;input;mouse;keyboard;touchpad;gestures;tui;config;settin
 Icon=preferences-desktop-keyboard
 StartupNotify=true
 StartupWMClass=dusky_input.sh
-NoDisplay=true

@@ -9,4 +9,3 @@ Categories=Settings;System;
 Keywords=dusky;service;network;nightlight;timeout;battery;toggle;
 Icon=preferences-system-power
 StartupNotify=true
-NoDisplay=true

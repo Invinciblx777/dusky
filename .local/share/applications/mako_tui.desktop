@@ -10,4 +10,3 @@ Keywords=dusky;mako;notifications;alert;dnd;notify;tui;config;settings;
 Icon=preferences-system-notifications
 StartupNotify=true
 StartupWMClass=tui_mako
-NoDisplay=true

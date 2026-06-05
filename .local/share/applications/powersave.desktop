@@ -9,4 +9,3 @@ Categories=System;Settings;
 Keywords=battery;power;save;energy;
 Icon=battery-low
 StartupNotify=true
-NoDisplay=true
