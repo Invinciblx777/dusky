@@ -97,6 +97,14 @@ declare -ar pkgs_btrfs_snapshot=(
 # SECTION 3 — CONFIGURATION & DYNAMIC VARIABLES
 # ==============================================================================
 
+if [[ -n "${SUDO_USER:-}" ]]; then
+    REAL_HOME=$(getent passwd "${SUDO_USER}" | cut -d: -f6)
+else
+    REAL_HOME="${HOME}"
+fi
+
+readonly EXTERNAL_PKG_LIST="${REAL_HOME}/user_scripts/arch_iso_scripts/offline_iso/assets/iso_temp_packages/packages.x86_64"
+
 readonly REPO_NAME='archrepo'
 readonly ISOLATED_DB_DIR='/tmp/offline_pacman_isolated_db'
 readonly PACCACHE_KEEP=1
@@ -329,7 +337,7 @@ _check_single_instance() {
 declare -ga MASTER_PKGS=()
 
 _build_master_list() {
-  log_info "Scanning for package arrays (prefix: pkgs_)"
+  log_info "Scanning for package arrays (prefix: pkgs_) and external list"
   local varname decl element
   local -A _seen=()
   local -i group_count=0 raw_count=0
@@ -354,13 +362,39 @@ _build_master_list() {
     unset -n _arr_ref
   done < <(compgen -A variable 'pkgs_' | sort)
 
+  # --- INJECT EXTERNAL PACKAGES FILE ---
+  if [[ -f "${EXTERNAL_PKG_LIST}" ]]; then
+    log_step "Reading external list: ${EXTERNAL_PKG_LIST}"
+    local -i ext_count=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%%#*}"  # Strip inline comments
+      
+      # Read all words/packages safely (handles multiple pkgs per line & tabs)
+      for pkg in $line; do
+        pkg="${pkg//$'\r'/}" # Strip Windows carriage returns if present
+        [[ -z "$pkg" ]] && continue
+        
+        (( ++raw_count )) || true
+        (( ++ext_count )) || true
+        if [[ -z "${_seen[$pkg]+_}" ]]; then
+          _seen[$pkg]=1
+          MASTER_PKGS+=("$pkg")
+        fi
+      done
+    done < "${EXTERNAL_PKG_LIST}"
+    log_step "external_file  →  ${ext_count} package(s)"
+  else
+    log_warn "External package list not found at: ${EXTERNAL_PKG_LIST}"
+  fi
+  # -------------------------------------
+
   if (( REPO_MODE == 2 )); then
       log_step "Injecting CachyOS prerequisite packages (cachyos-keyring, mirrorlist, rate-mirrors)..."
       MASTER_PKGS+=("cachyos-keyring" "cachyos-mirrorlist" "cachyos-v3-mirrorlist" "cachyos-rate-mirrors")
       (( raw_count += 3 )) || true
   fi
 
-  log_ok "${group_count} groups | ${raw_count} raw | ${#MASTER_PKGS[@]} unique packages."
+  log_ok "${group_count} groups + list | ${raw_count} raw | ${#MASTER_PKGS[@]} unique packages."
   (( ${#MASTER_PKGS[@]} > 0 )) || die "No packages found."
 }
 
