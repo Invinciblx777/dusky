@@ -217,8 +217,8 @@ hl.bind(
 
 -- --- Screen Recorder ---
 hl.bind(
-    "ALT + F9", 
-    hl.dsp.exec_cmd("~/user_scripts/recorder/toggle_record.sh"), 
+    "ALT + F9",
+    hl.dsp.exec_cmd("~/user_scripts/recorder/toggle_record.sh"),
     { description = "Screen Recorder", submap_universal = true }
 )
 
