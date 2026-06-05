@@ -112,21 +112,25 @@ manage_indicator() {
         [[ "$show_indicator" != "yes" ]] && return 0
         (
             local notif_id
-            notif_id=$(notify-send -a "dusky-recorder" -p "" "")
+            # 1. Capture the master ID ONCE for the stop function to use later
+            notif_id=$(notify-send -a "dusky-recorder" -h string:x-canonical-private-synchronous:recorder -p "" "")
             echo "$notif_id" > "$INDICATOR_TMP"
             
             local visible=true
             while true; do
                 sleep 1
                 if $visible; then
-                    notify-send -a "dusky-recorder" -r "$notif_id" " " ""
+                    # 2. Update state purely via the sync hint. NO explicit -r ID.
+                    # This prevents the double-free race condition in Mako's heap.
+                    notify-send -a "dusky-recorder" -h string:x-canonical-private-synchronous:recorder " " ""
                     visible=false
                 else
-                    notify-send -a "dusky-recorder" -r "$notif_id" "" ""
+                    notify-send -a "dusky-recorder" -h string:x-canonical-private-synchronous:recorder "" ""
                     visible=true
                 fi
             done
         ) & 
+        echo $! > "$INDICATOR_PID"
         echo $! > "$INDICATOR_PID"
         
     elif [[ "$action" == "stop" ]]; then
