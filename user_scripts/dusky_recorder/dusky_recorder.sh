@@ -5,14 +5,14 @@
 # Description: Interactive Rofi interface for gpu-screen-recorder.
 #              - State-aware Start/Stop/Replay controls
 #              - Full Screen vs Region selection
-#              - Quick settings editor (FPS, Cursor, Audio)
+#              - Quick settings editor (FPS, Cursor, Audio, Indicator)
 #              - Async blinking Mako red-dot indicator
 # ==============================================================================
 
 set -Eeuo pipefail
 
 # --- CONFIGURATION ---
-readonly CFG="$HOME/.config/dusky_recorder/config.conf"
+readonly CFG="$HOME/.config/screen_recorder/config.conf"
 readonly ROFI_THEME_STR='window { width: 450px; } listview { lines: 8; }'
 readonly INDICATOR_TMP="/tmp/dusky_recorder_notif_id"
 readonly INDICATOR_PID="/tmp/dusky_recorder_daemon.pid"
@@ -28,6 +28,7 @@ container="${container:-mp4}"
 output_dir="${output_dir:-$HOME/Videos}"
 output_dir="${output_dir/#\~/$HOME}"
 replay_buffer="${replay_buffer:-0}"
+show_indicator="${show_indicator:-yes}"
 
 # --- HELPERS ---
 run_menu() {
@@ -53,6 +54,9 @@ manage_indicator() {
     local action="$1"
     
     if [[ "$action" == "start" ]]; then
+        # Check if the user wants the indicator enabled
+        [[ "$show_indicator" != "yes" ]] && return 0
+
         # Launch an async subshell to handle the blinking loop
         (
             local notif_id
@@ -79,7 +83,7 @@ manage_indicator() {
         echo $! > "$INDICATOR_PID"
         
     elif [[ "$action" == "stop" ]]; then
-        # 1. Kill the blink daemon
+        # 1. Kill the blink daemon (if it exists)
         if [[ -f "$INDICATOR_PID" ]]; then
             kill "$(cat "$INDICATOR_PID")" 2>/dev/null || true
             rm -f "$INDICATOR_PID"
@@ -197,6 +201,7 @@ settings_menu() {
             "󰣖  FPS         [${fps}]"
             "󰇀  Cursor      [${cursor}]"
             "󰎆  Audio       [${audio}]"
+            "󰂚  Indicator   [${show_indicator}]"
             "  Replay Buf  [${replay_buffer}s]"
         )
         local choice
@@ -218,6 +223,11 @@ settings_menu() {
                 local new_audio
                 new_audio=$(run_menu "Select Audio Source" "default_output" "default_input" "default_output|default_input" "none") || continue
                 [[ -n "$new_audio" ]] && { audio="$new_audio"; update_config "audio" "$audio"; }
+                ;;
+            "󰂚  Indicator"*)
+                local new_ind
+                new_ind=$(run_menu "Show Red Dot Indicator?" "yes" "no") || continue
+                [[ -n "$new_ind" ]] && { show_indicator="$new_ind"; update_config "show_indicator" "$show_indicator"; }
                 ;;
             "  Replay"*)
                 local new_buf

@@ -85,6 +85,16 @@ SCHEMA = {
             group="Playback",
             extended_help="**Show Cursor** (`-cursor`)\n\nToggle whether your mouse cursor is visible in the final output file."
         ),
+        ConfigItem(
+            label="Indicator",
+            key="show_indicator",
+            scope="DEFAULT",
+            type_="cycle",
+            default="yes",
+            options=["yes", "no"],
+            group="Playback",
+            extended_help="**Recording Indicator**\n\nToggle the blinking red dot notification that appears while recording."
+        ),
     ],
 
     # -------------------------------------------------------------------------
