@@ -1,6 +1,7 @@
 import os
 import re
 import stat
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -234,8 +235,28 @@ class CmdlineEngine(BaseEngine):
             self.file_mtime_ns = temp_mtime_ns
             success = True
             
+        except PermissionError:
+            if 'temp_file_path' in locals() and temp_file_path and temp_file_path.exists():
+                try: temp_file_path.unlink()
+                except OSError: pass
+            try:
+                with tempfile.NamedTemporaryFile(mode='w', delete=False, encoding='utf-8') as tf:
+                    tf.write(final_content)
+                    tmp_path = tf.name
+                res = subprocess.run(
+                    ["sudo", "-n", "tee", str(self.config_path)],
+                    input=final_content.encode(), capture_output=True, timeout=5
+                )
+                try: os.unlink(tmp_path)
+                except OSError: pass
+                if res.returncode == 0:
+                    self.file_mtime_ns = self.config_path.stat().st_mtime_ns
+                    return True, f"Successfully batched {len(applied_commits)} commits (sudo).", ""
+                return False, "AUTH_REQUIRED", ""
+            except Exception:
+                return False, "AUTH_REQUIRED", ""
         except OSError as e:
-            return False, f"Atomic commit failed: {e}", ""
+            status_msg = f"Atomic commit failed: {e}"
         finally:
             if 'temp_file_path' in locals() and temp_file_path and temp_file_path.exists() and not success:
                 try: temp_file_path.unlink()

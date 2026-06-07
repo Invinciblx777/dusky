@@ -262,6 +262,7 @@ class PasswordScreen(ModalScreen[str | None]):
             yield Input(placeholder="Password...", password=True, id="password-input")
             with Horizontal(classes="modal-btn-container"):
                 yield Label(" Cancel ", classes="modal-cancel-btn", id="btn-cancel")
+                yield Label(" Authenticate ", classes="modal-close-btn", id="btn-authenticate")
 
     def on_mount(self) -> None:
         self.query_one(Input).focus()
@@ -277,6 +278,12 @@ class PasswordScreen(ModalScreen[str | None]):
     @on(events.Click, "#btn-cancel")
     def on_cancel_click(self) -> None:
         self.dismiss(None)
+
+    @on(events.Click, "#btn-authenticate")
+    def on_authenticate_click(self) -> None:
+        inp = self.query_one(Input)
+        if inp.value:
+            self.dismiss(inp.value)
 
     @on(events.Click)
     def on_background_click(self, event: events.Click) -> None:
@@ -2165,13 +2172,13 @@ class DuskyTUI(App):
             except OSError: pass
             self.notify_status(f"Updated {item.label}")
         elif msg == "AUTH_REQUIRED" or "AUTH_REQUIRED" in msg:
-            def on_pwd(pwd: str | None) -> None:
+            async def on_pwd(pwd: str | None) -> None:
                 if pwd:
-                    # Validate password and refresh the system-level sudo ticket
-                    auth_res = subprocess.run(["sudo", "-S", "-v"], input=(pwd + "\n").encode(), capture_output=True)
+                    auth_res = await asyncio.to_thread(
+                        subprocess.run, ["sudo", "-S", "-v"], input=(pwd + "\n").encode(), capture_output=True
+                    )
                     if auth_res.returncode == 0:
                         self.notify_status("Sudo authenticated. Retrying...")
-                        # Start background keep-alive to permanently hold the ticket open for the TUI session
                         if not hasattr(self, "_sudo_keepalive"):
                             self._sudo_keepalive = self.set_interval(60.0, lambda: subprocess.run(["sudo", "-n", "-v"], capture_output=True))
                         self._do_auto_save(tab_idx, item_idx, item, val_str, old_val)
@@ -2179,9 +2186,20 @@ class DuskyTUI(App):
                         self.notify_status("Incorrect sudo password.")
                         item.value = old_val
                         self._refresh_single_ui(tab_idx, item_idx, item)
+                        if self.undo_stack:
+                            top_tx = self.undo_stack[-1]
+                            if len(top_tx) == 1 and top_tx[0][:2] == (tab_idx, item_idx):
+                                self.undo_stack.pop()
+                        self.play_reset_sound()
                 else:
+                    self.notify_status("Sudo authentication cancelled.")
                     item.value = old_val
                     self._refresh_single_ui(tab_idx, item_idx, item)
+                    if self.undo_stack:
+                        top_tx = self.undo_stack[-1]
+                        if len(top_tx) == 1 and top_tx[0][:2] == (tab_idx, item_idx):
+                            self.undo_stack.pop()
+
             self.push_screen(PasswordScreen(), on_pwd)
         else:
             self.notify_status(f"Error: {msg}")
@@ -2285,14 +2303,15 @@ class DuskyTUI(App):
                     final_success = False
 
         if auth_required_detected:
-            def on_pwd_batch(pwd: str | None) -> None:
+            async def on_pwd_batch(pwd: str | None) -> None:
                 if pwd:
-                    auth_res = subprocess.run(["sudo", "-S", "-v"], input=(pwd + "\n").encode(), capture_output=True)
+                    auth_res = await asyncio.to_thread(
+                        subprocess.run, ["sudo", "-S", "-v"], input=(pwd + "\n").encode(), capture_output=True
+                    )
                     if auth_res.returncode == 0:
                         self.notify_status("Sudo authenticated. Retrying batch...")
                         if not hasattr(self, "_sudo_keepalive"):
                             self._sudo_keepalive = self.set_interval(60.0, lambda: subprocess.run(["sudo", "-n", "-v"], capture_output=True))
-                        # Retry the batch completely now that the ticket is active
                         self.action_save_batch()
                     else:
                         self.notify_status("Incorrect sudo password. Batch aborted.")

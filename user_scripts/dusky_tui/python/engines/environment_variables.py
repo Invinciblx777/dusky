@@ -3,6 +3,7 @@ import os
 import re
 import stat
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -263,6 +264,21 @@ class ShellEnvEngine(BaseEngine):
             self.file_mtime_ns = self.config_path.stat().st_mtime_ns
             success = True
             
+        except PermissionError:
+            if temp_file_path:
+                temp_file_path.unlink(missing_ok=True)
+            try:
+                content = "".join(out_lines)
+                res = subprocess.run(
+                    ["sudo", "-n", "tee", str(self.config_path)],
+                    input=content.encode(), capture_output=True, timeout=5
+                )
+                if res.returncode == 0:
+                    self.file_mtime_ns = self.config_path.stat().st_mtime_ns
+                    return True, f"Successfully batched {len(applied_commits)} env commits (sudo).", ""
+                return False, "AUTH_REQUIRED", ""
+            except Exception:
+                return False, "AUTH_REQUIRED", ""
         except OSError as e:
             status_msg = f"Atomic commit failed: {e}"
         finally:

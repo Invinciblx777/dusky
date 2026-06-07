@@ -7,7 +7,7 @@ from python.frontend.core_types import ConfigItem
 ENGINE_TYPE = "cmdline"                       
 TARGET_FILE = "/etc/kernel/cmdline"           
 APP_TITLE = "Kernel Parameter Editor"         
-REQUIRE_ROOT = True                           
+REQUIRE_ROOT = True
 
 # =============================================================================
 # 2. UI & ENVIRONMENT BEHAVIOR

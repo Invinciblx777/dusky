@@ -272,6 +272,22 @@ class IniConfigEngine(BaseEngine):
             self.file_mtime = self.config_path.stat().st_mtime
             success = True
             
+        except PermissionError:
+            if temp_file_path and temp_file_path.exists():
+                try: temp_file_path.unlink()
+                except OSError: pass
+            try:
+                content = "".join(out_lines)
+                res = subprocess.run(
+                    ["sudo", "-n", "tee", str(self.config_path)],
+                    input=content.encode(), capture_output=True, timeout=5
+                )
+                if res.returncode == 0:
+                    self.file_mtime = self.config_path.stat().st_mtime
+                    return True, f"Successfully batched {len(changes)} INI commits (sudo).", ""
+                return False, "AUTH_REQUIRED", ""
+            except Exception:
+                return False, "AUTH_REQUIRED", ""
         except OSError as e:
             status_msg = f"Atomic commit failed: {e}"
         finally:

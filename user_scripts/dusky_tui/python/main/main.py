@@ -8,7 +8,6 @@ import shutil
 import logging
 import hashlib
 import pwd
-import signal
 import subprocess
 import shlex
 from datetime import datetime
@@ -275,7 +274,7 @@ EXAMPLES:
     # =========================================================================
     if REQUIRE_ROOT and os.geteuid() != 0:
         print(f"[*] '{APP_TITLE}' requires root privileges. Escalating...")
-        logger.info("Elevating privileges via pkexec/sudo.")
+        logger.info("Elevating privileges via sudo.")
         
         # Arch Linux + Wayland requires explicit preservation of environment to maintain GUI/Audio/Clipboard hooks,
         # as well as the active python PATH execution space (crucial if running in a venv).
@@ -293,7 +292,7 @@ EXAMPLES:
         # sys.executable securely hardlinks the exact Python binary, solving the virtual-env scrubbing issue.
         # os.path.realpath ensures symlinked wrappers resolve securely.
         
-        # CRITICAL FIX: pkexec and some sudo configs scrub the Current Working Directory (CWD).
+        # CRITICAL FIX: sudo configs may scrub the Current Working Directory (CWD).
         # We must rewrite the target argument to its absolute resolved path before escalating,
         # otherwise the root process will look in /root/ and fail to find the schema.
         escalated_args = list(sys.argv[1:])
@@ -315,39 +314,8 @@ EXAMPLES:
             # os.execvp completely replaces the current process without waiting. TTY control is seamlessly transferred.
             os.execvp(cmd[0], cmd)
             
-        # 2. Smart GUI Polkit vs Terminal Routing
-        has_display = bool(os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"))
-        
-        if has_display and shutil.which("pkexec"):
-            cmd = ["pkexec", "env"] + env_args + target_cmd
-            
-            # Mask SIGINT in the parent so the child TUI process handles Ctrl+C gracefully without tearing down the terminal
-            old_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
-            try:
-                res = subprocess.run(cmd)
-            finally:
-                signal.signal(signal.SIGINT, old_handler)
-            
-            # Forensic Polkit Exit Code Analysis:
-            if res.returncode == 126:
-                print("[-] Authentication canceled by user.")
-                sys.exit(126)
-            elif res.returncode == 127:
-                # Code 127 explicitly signifies Polkit is installed, but the graphical authentication daemon is dead/missing.
-                print("[-] GUI Polkit agent missing or failed (Exit 127). Falling back to terminal auth...")
-                if shutil.which("sudo"):
-                    cmd = ["sudo", "env"] + env_args + target_cmd
-                    os.execvp(cmd[0], cmd)
-                elif shutil.which("su"):
-                    su_cmd_str = " ".join([shlex.quote(arg) for arg in (["env"] + env_args + target_cmd)])
-                    cmd = ["su", "-c", su_cmd_str]
-                    os.execvp(cmd[0], cmd)
-                else:
-                    sys.exit(127)
-            else:
-                sys.exit(res.returncode)
-                
-        elif shutil.which("sudo"):
+        # 2. Terminal Auth: Direct sudo prompt (no Polkit dependency)
+        if shutil.which("sudo"):
             cmd = ["sudo", "env"] + env_args + target_cmd
             os.execvp(cmd[0], cmd)
             
@@ -357,7 +325,7 @@ EXAMPLES:
             os.execvp(cmd[0], cmd)
             
         else:
-            print("[-] Fatal: Root privileges required, but no escalation tool (sudo/pkexec/su) was found.")
+            print("[-] Fatal: Root privileges required, but no escalation tool (sudo/su) was found.")
             sys.exit(1)
 
 
