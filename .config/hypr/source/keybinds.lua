@@ -1142,6 +1142,13 @@ hl.bind(
     { description = "Toggle Pause", locked = true }
 )
 
+-- MPRIS module Rofi toggle
+hl.bind(
+    "SUPER + SHIFT + P",
+    hl.dsp.exec_cmd(dusky_scripts .. "audio/mpris_toggle/mpris_playback_selection.sh"),
+    { description = "Toggle Audio Active Stream" }
+)
+
 -- Custom Audio/Mic Switching Scripts
 hl.bind(
     "ALT + P",
