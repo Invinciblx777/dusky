@@ -132,7 +132,11 @@ class SystemdEngine(BaseEngine):
         
         if success_count == len(changes):
             return True, f"Batched {success_count} systemd states seamlessly.", "\n".join(debug_logs)
-        elif success_count > 0:
+            
+        if any("AUTH_REQUIRED" in err for err in err_msgs):
+            return False, "AUTH_REQUIRED", "\n".join(debug_logs)
+            
+        if success_count > 0:
             return False, f"Partial success. Errors: {' | '.join(err_msgs)}", "\n".join(debug_logs)
         else:
             return False, f"Batch failed: {' | '.join(err_msgs)}", "\n".join(debug_logs)
