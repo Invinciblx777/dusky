@@ -62,9 +62,9 @@ if sys.stdout.isatty() and not os.environ.get('NO_COLOR'):
     C_BLUE   = '\033[34m'
     C_YELLOW = '\033[33m'
     C_RED    = '\033[31m'
-    C_GRAY   = '\033[90m'
+    C_CYAN   = '\033[36m'
 else:
-    C_RESET = C_BOLD = C_GREEN = C_BLUE = C_YELLOW = C_RED = C_GRAY = ''
+    C_RESET = C_BOLD = C_GREEN = C_BLUE = C_YELLOW = C_RED = C_CYAN = ''
 
 # ------------------------------------------------------------------------------
 # 2. Advanced Helper Subsystems
@@ -198,10 +198,10 @@ def main():
         sys.stdout = open(os.devnull, 'w')
 
     print(f"{C_BOLD}{C_BLUE}Arch Linux Desktop Entry Synchronizer{C_RESET}")
-    print(f"{C_GRAY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C_RESET}")
-    print(f"{C_GRAY}Source Dir:{C_RESET} {SRC_DIR}")
-    print(f"{C_GRAY}Target Dir:{C_RESET} {DEST_DIR}")
-    print(f"{C_GRAY}Target User:{C_RESET} {C_BOLD}{USER}{C_RESET}\n")
+    print(f"{C_BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C_RESET}")
+    print(f"{C_CYAN}Source Dir:{C_RESET} {SRC_DIR}")
+    print(f"{C_CYAN}Target Dir:{C_RESET} {DEST_DIR}")
+    print(f"{C_CYAN}Target User:{C_RESET} {C_BOLD}{USER}{C_RESET}\n")
 
     if SRC_DIR.is_symlink() or SRC_DIR.exists():
         if not SRC_DIR.is_dir():
@@ -209,7 +209,7 @@ def main():
             sys.exit(1)
     else:
         print(f"{C_YELLOW}⚠ Source directory missing: {SRC_DIR}{C_RESET}")
-        print(f"{C_GRAY}Creating directory structure for future tracking...{C_RESET}")
+        print(f"{C_CYAN}Creating directory structure for future tracking...{C_RESET}")
         ensure_dir(SRC_DIR)
         return
 
@@ -253,7 +253,6 @@ def main():
                     new_tracked_files[filename] = old_tracked_files[filename]
         else:
             new_tracked_files[filename] = current_hash
-            print(f"{C_GRAY}• Skipped:{C_RESET} {filename} {C_GRAY}(Unchanged){C_RESET}")
             skipped_count += 1
 
     # --- Phase 2: Idempotent Garbage Collection (Orphans) ---
@@ -274,9 +273,9 @@ def main():
 
     # --- Phase 4: Execution Summary Output ---
     print(f"\n{C_BOLD}{C_BLUE}Summary{C_RESET}")
-    print(f"{C_GRAY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C_RESET}")
+    print(f"{C_BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C_RESET}")
     print(f"  {C_GREEN}✔ Updated/Added:{C_RESET} {updated_count}")
-    print(f"  {C_GRAY}• Skipped:{C_RESET}       {skipped_count}")
+    print(f"  {C_CYAN}• Skipped:{C_RESET}       {skipped_count}")
     if removed_count > 0:
         print(f"  {C_RED}✖ Pruned:{C_RESET}        {removed_count}")
     print()
