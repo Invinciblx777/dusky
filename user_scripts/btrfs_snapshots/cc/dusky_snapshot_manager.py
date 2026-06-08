@@ -825,7 +825,8 @@ def handle_tui_preview(view: str, line: str, show_diff: bool = False) -> None:
         snap_desc = parts[4] if len(parts) > 4 else "No Description"
         
         # 1. Cleanly Aligned Shortcuts Panel
-        print("\033[1;38;5;220m╭─ 󰏖 KEYBOARD SHORTCUTS \033[38;5;238m" + "─"*30 + "\033[1;38;5;220m╮\033[0m")
+        # Modified the top right boundary to cleanly render in yellow instead of gray to match layout symmetry
+        print("\033[1;38;5;220m╭─ 󰏖 KEYBOARD SHORTCUTS " + "─"*30 + "╮\033[0m")
         print("\033[1;38;5;220m│\033[0m \033[1;38;5;114m[ENTER]\033[0m   \033[38;5;253mRestore Selected\033[0m" + " "*26 + "\033[1;38;5;220m│\033[0m")
         print("\033[1;38;5;220m│\033[0m \033[1;38;5;196m[DEL]\033[0m     \033[38;5;253mDelete Selected\033[0m" + " "*27 + "\033[1;38;5;220m│\033[0m")
         print("\033[1;38;5;220m│\033[0m \033[1;38;5;81m[CTRL-S]\033[0m  \033[38;5;253mCreate New Snapshot\033[0m" + " "*23 + "\033[1;38;5;220m│\033[0m")
@@ -916,10 +917,11 @@ def launch_tui() -> None:
     view_idx = 0
 
     # Catppuccin Mocha vivid theme styling extracted from pkg reference
+    # Marker swapped to visually striking green (#a6e3a1) to form the arrow indicator
     fzf_colors = (
         "bg+:#1e1e2e,bg:#11111b,spinner:#f5e0dc,"
         "fg:#cdd6f4,fg+:#cdd6f4,header:#89b4fa,info:#cba6f7,"
-        "pointer:#a6e3a1,marker:#f5e0dc,prompt:#cba6f7,"
+        "pointer:#f5e0dc,marker:#a6e3a1,prompt:#cba6f7,"
         "hl:#f38ba8,hl+:#f38ba8,border:#585b70,label:#a6e3a1"
     )
 
@@ -935,6 +937,27 @@ def launch_tui() -> None:
         
         # Vivid Nerd Font System Storage Header
         storage_hdr = f" \033[1;38;5;81m󰋊 BTRFS STORAGE:\033[0m \033[38;5;253m{total/gb:.1f} GB Total\033[0m \033[38;5;238m|\033[0m \033[38;5;203m{used/gb:.1f} GB Used\033[0m \033[38;5;238m|\033[0m \033[38;5;114m{free/gb:.1f} GB Free\033[0m "
+        
+        # --- DYNAMIC INTERACTIVE TABS GENERATION ---
+        # Defines fixed widths mathematically allowing mouse mapping via fzf click-header col targeting
+        tab_defs = [
+            ("coordinated", "󰑐 ROOT+HOME", "213"),
+            ("root", "󰒋 ROOT ONLY", "39"),
+            ("home", "󰋜 HOME ONLY", "114")
+        ]
+
+        tab_strs = []
+        for v_id, label, color in tab_defs:
+            if v_id == current_view:
+                # Active tab styling: Deep matching background block
+                tab_strs.append(f"\033[1;38;5;232;48;5;{color}m {label} \033[0m")
+            else:
+                # Inactive tab styling: Transparent/dimmer
+                tab_strs.append(f"\033[38;5;246m {label} \033[0m")
+
+        # Two spaces before and in between tabs constructs precise hit-boxes for mouse clicks
+        mode_hdr = "  " + "  ".join(tab_strs)
+        # ---------------------------------------------
         
         config_to_query = "root" if current_view in ("coordinated", "root") else "home"
         snaps = load_snapshot_list_for_gui(config_to_query)
@@ -962,13 +985,6 @@ def launch_tui() -> None:
         else:
             lines_for_fzf.append(f"\033[1;38;5;196m No snapshots found for '{config_to_query}' configuration.\033[0m")
         
-        if current_view == "coordinated":
-            mode_hdr = f" \033[1;38;5;213m󰑐 VIEW: ROOT+HOME (Coordinated)\033[0m"
-        elif current_view == "root":
-            mode_hdr = f" \033[1;38;5;39m󰒋 VIEW: ROOT ONLY\033[0m"
-        else:
-            mode_hdr = f" \033[1;38;5;114m󰋜 VIEW: HOME ONLY\033[0m"
-        
         # Static Matrix Header Table
         table_hdr = f"  \033[1;38;5;242mID\033[0m   {c_sep} \033[1;38;5;242mTYPE\033[0m    {c_sep} \033[1;38;5;242mAGE\033[0m        {c_sep} \033[1;38;5;242mDATE\033[0m               {c_sep} \033[1;38;5;242mDESCRIPTION\033[0m"
         hr_width = min(80, shutil.get_terminal_size().columns - 4)
@@ -991,12 +1007,13 @@ def launch_tui() -> None:
             "--border=rounded",
             "--prompt= :: Time Machine ❯ ",
             f"--color={fzf_colors}",
-            "--pointer=",
-            "--marker=✓",
+            "--pointer=▌", 
+            "--marker=▶",
             "--no-hscroll",
             "--ellipsis=",
             "--expect=enter,ctrl-d,delete,tab,ctrl-s,alt-s",
-            f"--bind=ctrl-a:select-all,ctrl-x:deselect-all,ctrl-space:toggle,shift-down:toggle+down,shift-up:toggle+up,ctrl-p:toggle-preview,ctrl-v:change-preview({preview_diff_cmd})+change-prompt( :: Diff Mode ON (Slower) ❯ ),ctrl-b:change-preview({preview_cmd})+change-prompt( :: Time Machine ❯ )",
+            # Leverages advanced FZF `become` execution to elegantly resolve interactive mouse hits on the dynamically styled header
+            f"--bind=click-header:become(echo click-header; echo $FZF_CLICK_HEADER_LINE; echo $FZF_CLICK_HEADER_COLUMN),ctrl-a:select-all,ctrl-x:deselect-all,ctrl-space:toggle,shift-down:toggle+down,shift-up:toggle+up,ctrl-p:toggle-preview,ctrl-v:change-preview({preview_diff_cmd})+change-prompt( :: Diff Mode ON (Slower) ❯ ),ctrl-b:change-preview({preview_cmd})+change-prompt( :: Time Machine ❯ )",
             "--info=hidden",
             "--preview", preview_cmd,
             "--preview-window", "right,45%,border-left,wrap"
@@ -1014,6 +1031,22 @@ def launch_tui() -> None:
         output_lines = stdout.strip().split("\n")
         key_pressed = output_lines[0]
         
+        # --- Handle Active Tab Toggle (Via Mouse / click-header) ---
+        if key_pressed == "click-header":
+            line = int(output_lines[1]) if len(output_lines) > 1 and output_lines[1].isdigit() else 0
+            col = int(output_lines[2]) if len(output_lines) > 2 and output_lines[2].isdigit() else 0
+            
+            # Map structural columns directly to the respective rendered tab
+            if line == 2:
+                if col <= 16:
+                    view_idx = 0
+                elif col <= 31:
+                    view_idx = 1
+                elif col <= 46:
+                    view_idx = 2
+            continue
+        
+        # --- Handle Active Tab Toggle (Via Keyboard / TAB key) ---
         if key_pressed == "tab":
             view_idx = (view_idx + 1) % len(views)
             continue
