@@ -560,6 +560,14 @@ def snapshot_records_to_gui(records: list[dict[str, object]]) -> list[dict[str, 
 
         raw_date_value = first_present(record, "date", "timestamp", "time")
         raw_date = "" if raw_date_value is None else str(raw_date_value)
+        
+        # Enhanced Metadata Extraction for Preview Pane enrichment
+        cleanup = str(first_present(record, "cleanup", "cleanup_algorithm") or "")
+        userdata = str(first_present(record, "userdata", "user_data") or "")
+        user = str(first_present(record, "user", "creator") or "root")
+        pre_num = str(first_present(record, "pre_number", "pre_num") or "")
+        if pre_num == "0": 
+            pre_num = ""
 
         gui_data.append(
             {
@@ -568,6 +576,10 @@ def snapshot_records_to_gui(records: list[dict[str, object]]) -> list[dict[str, 
                 "date": format_snapshot_date(raw_date_value),
                 "raw_date": raw_date,
                 "description": str(first_present(record, "description", "desc") or ""),
+                "cleanup": cleanup,
+                "userdata": userdata,
+                "user": user,
+                "pre_number": pre_num
             }
         )
 
@@ -589,16 +601,31 @@ def parse_snapper_table(stdout: str) -> list[dict[str, str]]:
         if snap_id == "0" or not snap_id.isdigit():
             continue
 
+        # Column Layout from Snapper Text:
+        # # | Type | Pre # | Date | User | Cleanup | Description | Userdata
+        snap_type = parts[1]
+        pre_num = parts[2] if parts[2] != "-" else ""
         raw_date = parts[3]
-        description = "|".join(parts[6:]).strip()
+        user = parts[4] if len(parts) > 4 else "root"
+        cleanup = parts[5] if len(parts) > 5 else ""
+        description = parts[6] if len(parts) > 6 else ""
+        
+        # Safely extract trailing userdata even if description internally contained pipes
+        userdata = parts[7] if len(parts) > 7 else ""
+        if len(parts) > 8:
+            userdata = "|".join(parts[7:]).strip()
 
         gui_data.append(
             {
                 "id": snap_id,
-                "type": parts[1],
+                "type": snap_type,
                 "date": format_snapshot_date(raw_date),
                 "raw_date": raw_date,
                 "description": description,
+                "cleanup": cleanup,
+                "userdata": userdata,
+                "user": user,
+                "pre_number": pre_num
             }
         )
 
@@ -810,9 +837,14 @@ def handle_delete_pair(config1: str, snap_id1: str, config2: str, snap_id2: str)
 def handle_tui_preview(view: str, line: str, show_diff: bool = False) -> None:
     """Invoked asynchronously by FZF to generate the dynamic side-pane preview."""
     try:
+        # Separate the visible fzf text from the hidden metadata payload packed via JSON
+        line_parts = line.split('\x1f')
+        visible_line = line_parts[0]
+        extra_data = json.loads(line_parts[1]) if len(line_parts) > 1 else {}
+        
         # Strip all ANSI escape sequences to process raw FZF line natively
         ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-        clean_line = ansi_escape.sub('', line)
+        clean_line = ansi_escape.sub('', visible_line)
         parts = [p.strip() for p in clean_line.split("│")]
         
         if not parts or not parts[0].isdigit():
@@ -824,24 +856,37 @@ def handle_tui_preview(view: str, line: str, show_diff: bool = False) -> None:
         snap_date = parts[3] if len(parts) > 3 else "Unknown"
         snap_desc = parts[4] if len(parts) > 4 else "No Description"
         
-        # 1. Cleanly Aligned Shortcuts Panel
+        # Robustly unpack the highly specific hidden data provided by the engine
+        snap_user = extra_data.get("user", "root")
+        snap_cleanup = extra_data.get("cleanup", "")
+        snap_userdata = extra_data.get("userdata", "")
+        snap_pre_num = extra_data.get("pre_number", "")
+        
+        # 1. Cleanly Aligned Shortcuts Panel (Math-Calculated Padding ensuring right-side borders lock tight)
         print("\033[1;38;5;220m╭─ 󰏖 KEYBOARD SHORTCUTS " + "─"*30 + "╮\033[0m")
-        print("\033[1;38;5;220m│\033[0m \033[1;38;5;114m[ENTER]\033[0m   \033[38;5;253mRestore Selected\033[0m" + " "*26 + "\033[1;38;5;220m│\033[0m")
-        print("\033[1;38;5;220m│\033[0m \033[1;38;5;196m[DEL]\033[0m     \033[38;5;253mDelete Selected\033[0m" + " "*27 + "\033[1;38;5;220m│\033[0m")
-        print("\033[1;38;5;220m│\033[0m \033[1;38;5;81m[CTRL-S]\033[0m  \033[38;5;253mCreate New Snapshot\033[0m" + " "*23 + "\033[1;38;5;220m│\033[0m")
-        print("\033[1;38;5;220m│\033[0m \033[1;38;5;213m[TAB]\033[0m     \033[38;5;253mSwitch View (Root/Home)\033[0m" + " "*19 + "\033[1;38;5;220m│\033[0m")
-        print("\033[1;38;5;220m│\033[0m \033[1;38;5;246m[CTRL-A]\033[0m  \033[38;5;253mSelect All\033[0m" + " "*32 + "\033[1;38;5;220m│\033[0m")
-        print("\033[1;38;5;220m│\033[0m \033[1;38;5;246m[CTRL-X]\033[0m  \033[38;5;253mDeselect All\033[0m" + " "*30 + "\033[1;38;5;220m│\033[0m")
+        print("\033[1;38;5;220m│\033[0m \033[1;38;5;114m[ENTER]\033[0m   \033[38;5;253m󰁯 Restore Selected\033[0m" + " "*25 + "\033[1;38;5;220m│\033[0m")
+        print("\033[1;38;5;220m│\033[0m \033[1;38;5;196m[DEL]\033[0m     \033[38;5;253m󰆴 Delete Selected\033[0m" + " "*26 + "\033[1;38;5;220m│\033[0m")
+        print("\033[1;38;5;220m│\033[0m \033[1;38;5;81m[CTRL-S]\033[0m  \033[38;5;253m󰎈 Create New Snapshot\033[0m" + " "*22 + "\033[1;38;5;220m│\033[0m")
+        print("\033[1;38;5;220m│\033[0m \033[1;38;5;213m[TAB]\033[0m     \033[38;5;253m󰓡 Switch View (Root/Home)\033[0m" + " "*18 + "\033[1;38;5;220m│\033[0m")
+        print("\033[1;38;5;220m│\033[0m \033[1;38;5;246m[CTRL-A]\033[0m  \033[38;5;253m󰒉 Select All\033[0m" + " "*31 + "\033[1;38;5;220m│\033[0m")
+        print("\033[1;38;5;220m│\033[0m \033[1;38;5;246m[CTRL-X]\033[0m  \033[38;5;253m󰒓 Deselect All\033[0m" + " "*29 + "\033[1;38;5;220m│\033[0m")
         print("\033[1;38;5;220m╰" + "─"*53 + "╯\033[0m\n")
 
-        # 2. Snapshot Meta Data
+        # 2. Expanded Snapshot Meta Data leveraging hidden JSON payloads
         print(f"\033[1;38;5;81m󰆑 SNAPSHOT DETAILS\033[0m")
         print(f"\033[38;5;238m" + "─" * 55 + "\033[0m")
-        print(f" \033[1;38;5;246mConfig\033[0m │ \033[1;38;5;253m{view.upper()}\033[0m")
-        print(f" \033[1;38;5;246mID    \033[0m │ \033[1;38;5;39m{snap_id}\033[0m")
-        print(f" \033[1;38;5;246mType  \033[0m │ \033[38;5;213m{snap_type}\033[0m")
-        print(f" \033[1;38;5;246mDate  \033[0m │ \033[38;5;220m{snap_date}\033[0m")
-        print(f" \033[1;38;5;246mDesc  \033[0m │ \033[38;5;253m{snap_desc}\033[0m\n")
+        print(f" \033[1;38;5;246mConfig \033[0m │ \033[1;38;5;253m{view.upper()}\033[0m")
+        print(f" \033[1;38;5;246mID     \033[0m │ \033[1;38;5;39m{snap_id}\033[0m")
+        print(f" \033[1;38;5;246mType   \033[0m │ \033[38;5;213m{snap_type}\033[0m")
+        if snap_type.lower() == "post" and snap_pre_num:
+            print(f" \033[1;38;5;246mPre-ID \033[0m │ \033[38;5;216m{snap_pre_num}\033[0m")
+        print(f" \033[1;38;5;246mDate   \033[0m │ \033[38;5;220m{snap_date}\033[0m")
+        print(f" \033[1;38;5;246mUser   \033[0m │ \033[38;5;114m{snap_user}\033[0m")
+        if snap_cleanup and snap_cleanup.lower() != "none":
+            print(f" \033[1;38;5;246mCleanup\033[0m │ \033[38;5;216m{snap_cleanup}\033[0m")
+        if snap_userdata and snap_userdata.lower() != "none":
+            print(f" \033[1;38;5;246mData   \033[0m │ \033[38;5;253m{snap_userdata}\033[0m")
+        print(f" \033[1;38;5;246mDesc   \033[0m │ \033[38;5;253m{snap_desc}\033[0m\n")
 
         # 3. Dynamic Diff generation via snapper status (Snapshot -> Current)
         # Only runs when explicitly requested via Ctrl+V for instant UI responsiveness
@@ -1001,7 +1046,19 @@ def launch_tui() -> None:
                 date_str = f"\033[38;5;220m{s['date']:<18}\033[0m"     
                 desc_str = f"\033[38;5;253m{s['description']}\033[0m"  
                 
-                lines_for_fzf.append(f"{id_str} {c_sep} {type_str} {c_sep} {age_colored} {c_sep} {date_str} {c_sep} {desc_str}")
+                visible_line = f"{id_str} {c_sep} {type_str} {c_sep} {age_colored} {c_sep} {date_str} {c_sep} {desc_str}"
+                
+                # Bundle extended meta-data properties extracted from snapper into an invisible FZF payload
+                # This guarantees 0-latency previews for FZF by injecting the raw metadata entirely off-screen
+                extra_data = {
+                    "user": s.get("user", "root"),
+                    "cleanup": s.get("cleanup", ""),
+                    "userdata": s.get("userdata", ""),
+                    "pre_number": s.get("pre_number", "")
+                }
+                
+                # Separated by hex control char '\x1f' ensuring zero collisions with UI aesthetics
+                lines_for_fzf.append(f"{visible_line}\x1f{json.dumps(extra_data)}")
         else:
             lines_for_fzf.append(f"\033[1;38;5;196m No snapshots found for '{config_to_query}' configuration.\033[0m")
 
@@ -1014,11 +1071,14 @@ def launch_tui() -> None:
         # 2. `--prompt` shifted to strictly say ":: Snapshots ❯"
         # 3. `--header` isolates the Storage metric and `--header-first` pins it exactly above the prompt
         # 4. `--header-lines=3` pins the Tabs and Table aligned exactly underneath the prompt.
+        # 5. `--delimiter=\x1f` and `--with-nth=1` silently truncate JSON payloads from FZF display!
         fzf_cmd = [
             "fzf",
             "--multi",
             "--ansi",
             "--reverse",
+            "--delimiter=\\x1f",
+            "--with-nth=1",
             "--header", storage_hdr,
             "--header-first",
             "--header-lines=3",
