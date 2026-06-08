@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 NeoDiff - Advanced Side-by-Side Diffing Engine with Frecency & FZF Tab-Completion.
-Optimized for the Dusky Ecosystem (Arch / FZF 0.73.1+).
+Optimized for the Dusky Ecosystem.
+[HEADLESS MODE] Strictly relies on ZSH proxy for UI and routing.
 """
 
 # ---------------------------------------------------------
@@ -176,7 +177,6 @@ def ensure_system_dependencies() -> None:
 ensure_system_dependencies()
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Prompt
 
 console = Console()
 
@@ -216,79 +216,7 @@ def update_frecency(filepath: str) -> None:
             tmp_file.unlink()
 
 # ==========================================
-# 3. FZF Interface (Updated for 0.73.1 Styling)
-# ==========================================
-def fuzzy_find_file(prompt_str: str, label_str: str = " dusky fzf ") -> str | None:
-    python_exec = shlex.quote(sys.executable)
-    script_path = shlex.quote(sys.argv[0])
-    
-    fzf_cmd = [
-        "fzf", "--ansi", "--exact", "--layout=reverse", "--tiebreak=index",
-        "--style=full", "--border=none", "--list-border=rounded", "--input-border=rounded",
-        f"--list-label= {label_str} ", "--list-label-pos=center",
-        "--input-label= 󰍉 Search / Filter ", "--input-label-pos=center",
-        "--padding=1,2", "--margin=1",
-        "--print-query", "--expect=ctrl-y,alt-c",
-        f"--prompt={prompt_str}", "--pointer= ", "--marker= ✓",
-        "--header= 💡 TAB: Auto-Complete │ ENTER: Select/Dive │ ALT-C: Force Exact ",
-        "--header-border=line",
-        "--info=inline-right", "--tabstop=4",
-        f"--delimiter={DELIM}", "--with-nth=3..",
-        "--color=bg:-1,bg+:#1e1e2e,spinner:#f5e0dc,fg:#cdd6f4,fg+:#cdd6f4",
-        "--color=header:#89b4fa,info:#cba6f7,pointer:#a6e3a1,marker:#f5e0dc",
-        "--color=prompt:#cba6f7,hl:#f38ba8,hl+:#f38ba8,border:#585b70",
-        "--color=label:#a6e3a1,list-border:#585b70,input-border:#585b70",
-        "--color=list-label:#a6e3a1,input-label:#a6e3a1",
-        "--height=80%"
-    ]
-
-    env = os.environ.copy()
-    env["FZF_DEFAULT_COMMAND"] = f"{python_exec} {script_path} --_fzf_explore ."
-    
-    tab_transform = f"transform({python_exec} {script_path} --_fzf_tab {{q}} {{2}})"
-    enter_transform = f"transform({python_exec} {script_path} --_fzf_enter {{q}} {{2}})"
-    
-    fzf_cmd.extend(["--bind", f"tab:{tab_transform}", "--bind", f"enter:{enter_transform}"])
-    
-    try:
-        result = subprocess.run(fzf_cmd, env=env, text=True, capture_output=True)
-    except KeyboardInterrupt:
-        return None
-
-    if result.returncode in (130, 2):
-        return None
-
-    lines = result.stdout.splitlines()
-    if not lines: return None
-
-    query_str = lines[0] if len(lines) > 0 else ""
-    key_pressed = lines[1] if len(lines) > 1 else ""
-    list_selection = lines[2] if len(lines) > 2 else ""
-
-    actual_path = ""
-    if list_selection:
-        parts = list_selection.split(DELIM)
-        if len(parts) >= 2:
-            actual_path = parts[1]
-
-    if key_pressed in ("ctrl-y", "alt-c"):
-        final_path = query_str
-    else:
-        final_path = actual_path if actual_path else query_str
-
-    if not final_path: return None
-
-    p = Path(final_path).expanduser().resolve()
-    if p.exists() and p.is_file():
-        update_frecency(str(p))
-        return str(p)
-    else:
-        console.print(f"[bold red]Error:[/] File not found or is a directory: {final_path}")
-        Prompt.ask("Press Enter to continue", default="")
-        return None
-
-# ==========================================
-# 4. Neovim Headless Engine & File Readers
+# 3. Neovim Headless Engine & File Readers
 # ==========================================
 def extract_nvim_previous_state(filepath: str) -> list[str]:
     target_file = Path(filepath).resolve()
@@ -329,12 +257,10 @@ def extract_nvim_previous_state(filepath: str) -> list[str]:
         
         except subprocess.CalledProcessError:
             console.print("[bold red]Failed to execute Neovim API. Check if the file has an active undo history.[/]")
-            Prompt.ask("Press Enter to continue", default="")
-            return []
+            sys.exit(1)
         except OSError:
             console.print("[bold red]Error:[/] Neovim failed to write the state dump.")
-            Prompt.ask("Press Enter to continue", default="")
-            return []
+            sys.exit(1)
 
 def read_file_lines(filepath: str) -> list[str]:
     p = Path(filepath)
@@ -348,13 +274,13 @@ def read_file_lines(filepath: str) -> list[str]:
             return p.read_text(encoding='latin-1').splitlines()
         except Exception as e:
             console.print(f"[bold red]Error:[/] File could not be decoded as text: {filepath}\n{e}")
-            return []
+            sys.exit(1)
     except PermissionError:
         console.print(f"[bold red]Error:[/] Permission denied: {filepath}")
-        return []
+        sys.exit(1)
 
 # ==========================================
-# 5. Delta Side-by-Side Rendering
+# 4. Delta Side-by-Side Rendering
 # ==========================================
 def render_with_delta(old_lines: list[str], new_lines: list[str], title_old: str, title_new: str, filename: str) -> None:
     diff = list(difflib.unified_diff(
@@ -366,7 +292,6 @@ def render_with_delta(old_lines: list[str], new_lines: list[str], title_old: str
 
     if not diff:
         console.print(Panel("[bold green]No differences found![/] Both states are identical.", border_style="green"))
-        Prompt.ask("Press Enter to continue", default="")
         return
 
     diff_text = "\n".join(diff) + "\n"
@@ -393,84 +318,37 @@ def render_with_delta(old_lines: list[str], new_lines: list[str], title_old: str
         pass
 
 # ==========================================
-# 6. Interactive CLI Menu & Execution Loop
+# 5. Core Execution Routing
 # ==========================================
-def run_interactive() -> None:
-    menu_options = [
-        "1. 󰋚  Neovim Undo History Diff (Time Travel)",
-        "2. 󰑭  Standard Two-File Diff",
-        "3. 󰗼  Exit"
-    ]
-    
-    fzf_cmd = [
-        "fzf", "--layout=reverse", "--style=full", "--border=none", 
-        "--list-border=rounded", "--input-border=rounded",
-        "--list-label= 󰘚 NeoDiff Menu ", "--list-label-pos=center",
-        "--input-label= 󰍉 Mode Selection ", "--input-label-pos=center",
-        "--padding=1,2", "--margin=1", "--prompt=   ",
-        "--pointer= ", "--marker= ✓", "--info=inline-right", "--height=40%",
-        "--color=bg:-1,bg+:#1e1e2e,spinner:#f5e0dc,fg:#cdd6f4,fg+:#cdd6f4",
-        "--color=header:#89b4fa,info:#cba6f7,pointer:#a6e3a1,marker:#f5e0dc",
-        "--color=prompt:#cba6f7,hl:#f38ba8,hl+:#f38ba8,border:#585b70",
-        "--color=label:#a6e3a1,list-border:#585b70,input-border:#585b70",
-        "--color=list-label:#a6e3a1,input-label:#a6e3a1"
-    ]
-    
-    while True:
-        try:
-            result = subprocess.run(fzf_cmd, input="\n".join(menu_options), text=True, capture_output=True)
-            choice = result.stdout.strip()
-        except KeyboardInterrupt:
-            sys.exit(0)
-
-        if result.returncode != 0 or not choice or choice.startswith("3"):
-            sys.exit(0)
-            
-        if choice.startswith("1"):
-            target_file = fuzzy_find_file("   ", " 󰋚 Target File > Undo Diff ")
-            if not target_file: continue
-                
-            with console.status(f"[bold yellow]Extracting temporal state of {Path(target_file).name} via Neovim RPC...[/]"):
-                old_lines = extract_nvim_previous_state(target_file)
-                if not old_lines: continue
-                new_lines = read_file_lines(target_file)
-                
-            render_with_delta(old_lines, new_lines, f"Neovim Undo History ({target_file})", f"Current State ({target_file})", target_file)
-            
-        elif choice.startswith("2"):
-            file1 = fuzzy_find_file("   ", " 󰑭 FIRST file (Old) > Diff Source ")
-            if not file1: continue
-            file2 = fuzzy_find_file("   ", f" 󰑭 SECOND file (New) > Diff Target for '{Path(file1).name}' ")
-            if not file2: continue
-                
-            old_lines = read_file_lines(file1)
-            new_lines = read_file_lines(file2)
-            render_with_delta(old_lines, new_lines, file1, file2, file2)
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="NeoDiff - Advanced side-by-side diffing engine.")
-    parser.add_argument("files", nargs="*", help="Files to compare (0, 1, or 2 files).")
+    parser.add_argument("files", nargs="*", help="Files to compare (1 or 2 files).")
     parser.add_argument("-n", "--nvim", action="store_true", help="Compare a file against its previous Neovim undo state.")
-    parser.add_argument("-m", "--multiple", action="store_true", help="Alias flag (handled automatically via positional args).")
+    parser.add_argument("-m", "--multiple", action="store_true", help="Alias flag (handled via ZSH proxy).")
     
     args = parser.parse_args()
     files = args.files
     
     if len(files) == 0:
-        run_interactive()
-        sys.exit(0)
+        console.print("[bold red]Error:[/] Engine executed autonomously without file arguments. Check ZSH Proxy.")
+        sys.exit(1)
         
-    if args.nvim:
+    if args.nvim and len(files) >= 1:
         target = str(Path(files[0]).expanduser().resolve())
-        if Path(target).exists():
-            update_frecency(target)
+        if not Path(target).exists():
+            console.print(f"[bold red]Error:[/] Target File not found: {target}")
+            sys.exit(1)
+            
+        update_frecency(target)
+        
         with console.status("[bold yellow]Extracting temporal state via Neovim RPC...[/]"):
             old_lines = extract_nvim_previous_state(target)
             new_lines = read_file_lines(target)
+            
         render_with_delta(old_lines, new_lines, f"Neovim Undo History ({target})", f"Current State ({target})", target)
         sys.exit(0)
         
-    if len(files) >= 2:
+    elif len(files) >= 2:
         file1 = str(Path(files[0]).expanduser().resolve())
         file2 = str(Path(files[1]).expanduser().resolve())
         
@@ -481,70 +359,18 @@ def main() -> None:
             console.print(f"[bold red]Error:[/] File 2 not found: {file2}")
             sys.exit(1)
 
-        # Force frecency updates on explicit file arguments
         update_frecency(file1)
         update_frecency(file2)
 
         old_lines = read_file_lines(file1)
         new_lines = read_file_lines(file2)
         render_with_delta(old_lines, new_lines, file1, file2, file2)
-
-    elif len(files) == 1:
-        file1 = str(Path(files[0]).expanduser().resolve())
-        if not Path(file1).exists():
-            console.print(f"[bold red]Error:[/] File not found: {file1}")
-            sys.exit(1)
-            
-        update_frecency(file1)
-        console.print(f"[\033[96m*\033[0m] [bold cyan]Primary File Loaded:[/] {file1}")
+        sys.exit(0)
         
-        menu_options = [
-            f"1. 󰋚  Compare '{Path(file1).name}' with its Neovim Undo History",
-            f"2. 󰑭  Compare '{Path(file1).name}' with a different file"
-        ]
-        
-        fzf_cmd = [
-            "fzf", "--layout=reverse", "--style=full", "--border=none",
-            "--list-border=rounded", "--input-border=rounded",
-            "--list-label= NeoDiff Action ", "--list-label-pos=center",
-            f"--input-label= 󰢱 Action: {Path(file1).name} > ", "--input-label-pos=center",
-            "--padding=1,2", "--margin=1", "--prompt=   ",
-            "--pointer= ", "--marker= ✓", "--info=inline-right", "--height=40%",
-            "--color=bg:-1,bg+:#1e1e2e,spinner:#f5e0dc,fg:#cdd6f4,fg+:#cdd6f4",
-            "--color=header:#89b4fa,info:#cba6f7,pointer:#a6e3a1,marker:#f5e0dc",
-            "--color=prompt:#cba6f7,hl:#f38ba8,hl+:#f38ba8,border:#585b70",
-            "--color=label:#a6e3a1,list-border:#585b70,input-border:#585b70",
-            "--color=list-label:#a6e3a1,input-label:#a6e3a1"
-        ]
-        
-        try:
-            result = subprocess.run(fzf_cmd, input="\n".join(menu_options), text=True, capture_output=True)
-            choice = result.stdout.strip()
-        except KeyboardInterrupt:
-            sys.exit(0)
-
-        if result.returncode != 0 or not choice:
-            sys.exit(0)
-            
-        if choice.startswith("1"):
-            with console.status(f"[bold yellow]Extracting temporal state via Neovim RPC...[/]"):
-                old_lines = extract_nvim_previous_state(file1)
-                new_lines = read_file_lines(file1)
-            render_with_delta(old_lines, new_lines, f"Neovim Undo History ({file1})", f"Current State ({file1})", file1)
-            sys.exit(0)
-            
-        elif choice.startswith("2"):
-            file2 = fuzzy_find_file("   ", f" 󰑭 Select target to compare with {Path(file1).name} ")
-            if not file2:
-                sys.exit(0)
-            if not Path(file2).exists():
-                console.print(f"[bold red]Error:[/] Target File not found: {file2}")
-                sys.exit(1)
-
-            old_lines = read_file_lines(file1)
-            new_lines = read_file_lines(file2)
-            render_with_delta(old_lines, new_lines, file1, file2, file2)
-            sys.exit(0)
+    else:
+        # Fallback if ZSH fails to inject -n for a single file
+        console.print("[bold red]Error:[/] Invalid arguments passed to engine. Requires 2 files or 1 file with -n flag.")
+        sys.exit(1)
 
 if __name__ == "__main__":
     try:

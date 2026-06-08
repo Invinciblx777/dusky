@@ -12,10 +12,8 @@ _d_execute() {
     emulate -L zsh
     local -a run_args=("$@")
     
-    # Automatically pipe an empty newline into the engine.
-    # Instantly satisfies the Python "Press Enter to continue" prompt 
-    # guaranteeing terminal cursor returns immediately!
-    print -r -- "" | "$DUSKY_DIFF_ENGINE" "${run_args[@]}"
+    # Engine is now 100% autonomous. Direct execution.
+    "$DUSKY_DIFF_ENGINE" "${run_args[@]}"
     
     # Force reset terminal color, restore cursor visibility, and clear dirty states
     print -n '\e[?25h\e[0m'
@@ -27,10 +25,9 @@ _d_execute() {
 d() {
     emulate -L zsh
     
-    # Bypass user aliases for system operations
     command mkdir -p -- "$DUSKY_DIFF_DIR"
 
-    # No arguments passed? Re-run the absolute last diff.
+    # Re-run the absolute last diff.
     if [[ $# -eq 0 ]]; then
         if [[ ! -s "$DUSKY_DIFF_HISTORY" ]]; then
             print -u2 -P "%F{red}󰑤 No previous diff history found. Try 'd <file>' first.%f"
@@ -38,8 +35,6 @@ d() {
         fi
         
         local last_cmd=$(command tail -n 1 -- "$DUSKY_DIFF_HISTORY")
-        
-        # Flawless ZSH array reconstruction (strips quotes and splits safely)
         local -a run_args=("${(@Q)${(@z)last_cmd}}")
         
         print -u2 -P "%F{blue}󰑤 Rerunning: d ${run_args[*]}%f"
@@ -47,7 +42,6 @@ d() {
         return $?
     fi
 
-    # Argument Parser: Convert relative paths to absolute & track file count
     local -a new_args=()
     local file_count=0
     local has_nvim_flag=0
@@ -76,7 +70,6 @@ d() {
         new_args=("-n" "${new_args[@]}")
     fi
 
-    # Format arguments into safe, shell-escaped string for history file
     local args_quoted="${(j: :)${(q)new_args[@]}}"
     
     if [[ -f "$DUSKY_DIFF_HISTORY" ]]; then
