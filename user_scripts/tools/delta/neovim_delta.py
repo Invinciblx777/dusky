@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 NeoDiff - Advanced Side-by-Side Diffing Engine with Frecency & FZF Tab-Completion.
-Optimized for Arch Linux / Python 3.14+ ecosystems.
+Optimized for the Dusky Ecosystem (Arch / FZF 0.73.1+).
 """
 
 # ---------------------------------------------------------
@@ -12,8 +12,6 @@ import os
 import shlex
 from pathlib import Path
 
-# The absolute internal delimiter. \x1f (Unit Separator) guarantees zero collision 
-# with spaces, tabs, or standard path characters, while remaining safe for execve.
 DELIM = '\x1f'
 
 # ==========================================
@@ -25,10 +23,8 @@ if len(sys.argv) > 1 and sys.argv[1].startswith("--_fzf_"):
         state_file = Path.home() / ".config" / "dusky" / "settings" / "neodiff" / "state.tsv"
         weights = {}
         try:
-            # Optimized native file reading for fast path
             with open(state_file, 'r', encoding='utf-8') as f:
                 for line in f:
-                    # Explicitly use rstrip to preserve trailing spaces in valid filenames
                     parts = line.rstrip('\n').split(DELIM)
                     if len(parts) == 2 and parts[0].isdigit():
                         weights[parts[1]] = int(parts[0])
@@ -37,8 +33,6 @@ if len(sys.argv) > 1 and sys.argv[1].startswith("--_fzf_"):
         return weights
 
     def get_fzf_action(actions: list[tuple[str, str]]) -> str:
-        # Dynamically picks a safe delimiter for FZF actions. 
-        # Excludes ':' as FZF treats it as an open-ended terminator.
         combined = "".join(arg for _, arg in actions if arg)
         for d in "!@#$%^&*|~/":
             if d not in combined:
@@ -88,7 +82,6 @@ if len(sys.argv) > 1 and sys.argv[1].startswith("--_fzf_"):
                 parent_prefix = prefix + "../" if prefix else "../"
                 items.append((9999999, parent_prefix, f"  \033[1;34m{parent_prefix}\033[0m"))
             
-            # Using os.scandir for high-performance C-level iteration without full object allocation
             for entry in os.scandir(scan_dir):
                 if entry.name in {".git", ".svn", "node_modules", "__pycache__"}:
                     continue
@@ -160,9 +153,6 @@ import importlib.util
 import shutil
 import argparse
 
-# ==========================================
-# 1. Dependency Management (Arch Native)
-# ==========================================
 def ensure_system_dependencies() -> None:
     missing_sys = []
     if not shutil.which("fzf"): missing_sys.append("fzf")
@@ -226,25 +216,29 @@ def update_frecency(filepath: str) -> None:
             tmp_file.unlink()
 
 # ==========================================
-# 3. FZF Interface (Interactive God Mode)
+# 3. FZF Interface (Updated for 0.73.1 Styling)
 # ==========================================
-def fuzzy_find_file(prompt: str, border_label: str = " dusky fzf ") -> str | None:
+def fuzzy_find_file(prompt_str: str, label_str: str = " dusky fzf ") -> str | None:
     python_exec = shlex.quote(sys.executable)
     script_path = shlex.quote(sys.argv[0])
     
     fzf_cmd = [
         "fzf", "--ansi", "--exact", "--layout=reverse", "--tiebreak=index",
+        "--style=full", "--border=none", "--list-border=rounded", "--input-border=rounded",
+        f"--list-label= {label_str} ", "--list-label-pos=center",
+        "--input-label= 󰍉 Search / Filter ", "--input-label-pos=center",
+        "--padding=1,2", "--margin=1",
         "--print-query", "--expect=ctrl-y,alt-c",
-        f"--prompt={prompt}", "--pointer=▶", "--marker=✓",
-        "--border=rounded", f"--border-label= {border_label} ", "--border-label-pos=center",
+        f"--prompt={prompt_str}", "--pointer= ", "--marker= ✓",
         "--header= 💡 TAB: Auto-Complete │ ENTER: Select/Dive │ ALT-C: Force Exact ",
         "--header-border=line",
         "--info=inline-right", "--tabstop=4",
         f"--delimiter={DELIM}", "--with-nth=3..",
-        "--color=bg+:#1e1e2e,bg:#11111b,spinner:#f5e0dc,hl:#f38ba8,hl+:#f38ba8",
-        "--color=fg:#cdd6f4,fg+:#cdd6f4,header:#89b4fa,info:#cba6f7",
-        "--color=pointer:#a6e3a1,marker:#f5e0dc,prompt:#cba6f7,query:#cdd6f4",
-        "--color=border:#585b70,label:#a6e3a1",
+        "--color=bg:-1,bg+:#1e1e2e,spinner:#f5e0dc,fg:#cdd6f4,fg+:#cdd6f4",
+        "--color=header:#89b4fa,info:#cba6f7,pointer:#a6e3a1,marker:#f5e0dc",
+        "--color=prompt:#cba6f7,hl:#f38ba8,hl+:#f38ba8,border:#585b70",
+        "--color=label:#a6e3a1,list-border:#585b70,input-border:#585b70",
+        "--color=list-label:#a6e3a1,input-label:#a6e3a1",
         "--height=80%"
     ]
 
@@ -275,7 +269,6 @@ def fuzzy_find_file(prompt: str, border_label: str = " dusky fzf ") -> str | Non
     if list_selection:
         parts = list_selection.split(DELIM)
         if len(parts) >= 2:
-            # Explicitly avoiding .strip() to preserve trailing spaces from the filesystem
             actual_path = parts[1]
 
     if key_pressed in ("ctrl-y", "alt-c"):
@@ -410,13 +403,17 @@ def run_interactive() -> None:
     ]
     
     fzf_cmd = [
-        "fzf", "--layout=reverse", "--prompt= 󰘚 NeoDiff Mode > ",
-        "--border=rounded", "--border-label= 󰘚 NeoDiff Menu ", "--border-label-pos=center",
-        "--pointer=▶", "--height=20%",
-        "--color=bg+:#1e1e2e,bg:#11111b,spinner:#f5e0dc,hl:#f38ba8,hl+:#f38ba8",
-        "--color=fg:#cdd6f4,fg+:#cdd6f4,header:#89b4fa,info:#cba6f7",
-        "--color=pointer:#a6e3a1,marker:#f5e0dc,prompt:#cba6f7",
-        "--color=border:#585b70,label:#a6e3a1"
+        "fzf", "--layout=reverse", "--style=full", "--border=none", 
+        "--list-border=rounded", "--input-border=rounded",
+        "--list-label= 󰘚 NeoDiff Menu ", "--list-label-pos=center",
+        "--input-label= 󰍉 Mode Selection ", "--input-label-pos=center",
+        "--padding=1,2", "--margin=1", "--prompt=   ",
+        "--pointer= ", "--marker= ✓", "--info=inline-right", "--height=40%",
+        "--color=bg:-1,bg+:#1e1e2e,spinner:#f5e0dc,fg:#cdd6f4,fg+:#cdd6f4",
+        "--color=header:#89b4fa,info:#cba6f7,pointer:#a6e3a1,marker:#f5e0dc",
+        "--color=prompt:#cba6f7,hl:#f38ba8,hl+:#f38ba8,border:#585b70",
+        "--color=label:#a6e3a1,list-border:#585b70,input-border:#585b70",
+        "--color=list-label:#a6e3a1,input-label:#a6e3a1"
     ]
     
     while True:
@@ -430,7 +427,7 @@ def run_interactive() -> None:
             sys.exit(0)
             
         if choice.startswith("1"):
-            target_file = fuzzy_find_file(" 󰋚 Target File > ", " 󰋚 Undo Diff ")
+            target_file = fuzzy_find_file("   ", " 󰋚 Target File > Undo Diff ")
             if not target_file: continue
                 
             with console.status(f"[bold yellow]Extracting temporal state of {Path(target_file).name} via Neovim RPC...[/]"):
@@ -441,9 +438,9 @@ def run_interactive() -> None:
             render_with_delta(old_lines, new_lines, f"Neovim Undo History ({target_file})", f"Current State ({target_file})", target_file)
             
         elif choice.startswith("2"):
-            file1 = fuzzy_find_file(" 󰑭 FIRST file (Old) > ", " 󰑭 Diff: Old Source ")
+            file1 = fuzzy_find_file("   ", " 󰑭 FIRST file (Old) > Diff Source ")
             if not file1: continue
-            file2 = fuzzy_find_file(f" 󰑭 SECOND file (New) > ", f" 󰑭 Diff: New Target for '{Path(file1).name}' ")
+            file2 = fuzzy_find_file("   ", f" 󰑭 SECOND file (New) > Diff Target for '{Path(file1).name}' ")
             if not file2: continue
                 
             old_lines = read_file_lines(file1)
@@ -465,6 +462,8 @@ def main() -> None:
         
     if args.nvim:
         target = str(Path(files[0]).expanduser().resolve())
+        if Path(target).exists():
+            update_frecency(target)
         with console.status("[bold yellow]Extracting temporal state via Neovim RPC...[/]"):
             old_lines = extract_nvim_previous_state(target)
             new_lines = read_file_lines(target)
@@ -482,6 +481,10 @@ def main() -> None:
             console.print(f"[bold red]Error:[/] File 2 not found: {file2}")
             sys.exit(1)
 
+        # Force frecency updates on explicit file arguments
+        update_frecency(file1)
+        update_frecency(file2)
+
         old_lines = read_file_lines(file1)
         new_lines = read_file_lines(file2)
         render_with_delta(old_lines, new_lines, file1, file2, file2)
@@ -492,6 +495,7 @@ def main() -> None:
             console.print(f"[bold red]Error:[/] File not found: {file1}")
             sys.exit(1)
             
+        update_frecency(file1)
         console.print(f"[\033[96m*\033[0m] [bold cyan]Primary File Loaded:[/] {file1}")
         
         menu_options = [
@@ -500,13 +504,17 @@ def main() -> None:
         ]
         
         fzf_cmd = [
-            "fzf", "--layout=reverse", f"--prompt= 󰢱 Action: {Path(file1).name} > ",
-            "--border=rounded", "--border-label= NeoDiff Action ", "--border-label-pos=center",
-            "--pointer=▶", "--height=20%",
-            "--color=bg+:#1e1e2e,bg:#11111b,spinner:#f5e0dc,hl:#f38ba8,hl+:#f38ba8",
-            "--color=fg:#cdd6f4,fg+:#cdd6f4,header:#89b4fa,info:#cba6f7",
-            "--color=pointer:#a6e3a1,marker:#f5e0dc,prompt:#cba6f7",
-            "--color=border:#585b70,label:#a6e3a1"
+            "fzf", "--layout=reverse", "--style=full", "--border=none",
+            "--list-border=rounded", "--input-border=rounded",
+            "--list-label= NeoDiff Action ", "--list-label-pos=center",
+            f"--input-label= 󰢱 Action: {Path(file1).name} > ", "--input-label-pos=center",
+            "--padding=1,2", "--margin=1", "--prompt=   ",
+            "--pointer= ", "--marker= ✓", "--info=inline-right", "--height=40%",
+            "--color=bg:-1,bg+:#1e1e2e,spinner:#f5e0dc,fg:#cdd6f4,fg+:#cdd6f4",
+            "--color=header:#89b4fa,info:#cba6f7,pointer:#a6e3a1,marker:#f5e0dc",
+            "--color=prompt:#cba6f7,hl:#f38ba8,hl+:#f38ba8,border:#585b70",
+            "--color=label:#a6e3a1,list-border:#585b70,input-border:#585b70",
+            "--color=list-label:#a6e3a1,input-label:#a6e3a1"
         ]
         
         try:
@@ -526,7 +534,7 @@ def main() -> None:
             sys.exit(0)
             
         elif choice.startswith("2"):
-            file2 = fuzzy_find_file(f" 󰑭 Select target to compare with {Path(file1).name} > ", f" 󰑭 Diff Target ")
+            file2 = fuzzy_find_file("   ", f" 󰑭 Select target to compare with {Path(file1).name} ")
             if not file2:
                 sys.exit(0)
             if not Path(file2).exists():

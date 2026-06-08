@@ -2,42 +2,47 @@
 # NeoDiff Engine Proxy & ZLE Completion
 # ==========================================
 
-# 1. State Configuration
-typeset -g DUSKY_DIFF_HISTORY="$HOME/.config/dusky/settings/dusky_diff/history"
+# 1. State Configuration (UNIFIED DIRECTORY)
+typeset -g DUSKY_DIFF_DIR="$HOME/.config/dusky/settings/neodiff"
+typeset -g DUSKY_DIFF_HISTORY="$DUSKY_DIFF_DIR/history"
 typeset -g DUSKY_DIFF_ENGINE="$HOME/user_scripts/tools/delta/neovim_delta.py"
 
 # Helper Function: Guarantees clean terminal execution and state restoration
 _d_execute() {
+    emulate -L zsh
     local -a run_args=("$@")
     
-    # Automatically pipe an empty newline into the engine. This instantly satisfies the 
-    # Python "Press Enter to continue" prompt in the background, guaranteeing your 
-    # terminal cursor returns immediately to the prompt without freezing/hanging!
-    echo "" | "$DUSKY_DIFF_ENGINE" "${run_args[@]}"
+    # Automatically pipe an empty newline into the engine.
+    # Instantly satisfies the Python "Press Enter to continue" prompt 
+    # guaranteeing terminal cursor returns immediately!
+    print -r -- "" | "$DUSKY_DIFF_ENGINE" "${run_args[@]}"
     
-    # Force reset terminal color and ensure strict prompt restoration
+    # Force reset terminal color, restore cursor visibility, and clear dirty states
+    print -n '\e[?25h\e[0m'
     print -P "%b%f%k"
     return 0
 }
 
 # 2. The Zero-Cost Proxy
 d() {
-    # Ensure history directory exists
-    mkdir -p "${DUSKY_DIFF_HISTORY:h}"
+    emulate -L zsh
+    
+    # Bypass user aliases for system operations
+    command mkdir -p -- "$DUSKY_DIFF_DIR"
 
     # No arguments passed? Re-run the absolute last diff.
     if [[ $# -eq 0 ]]; then
         if [[ ! -s "$DUSKY_DIFF_HISTORY" ]]; then
-            print -u2 "󰑤 No previous diff history found. Try 'd <file>' first."
+            print -u2 -P "%F{red}󰑤 No previous diff history found. Try 'd <file>' first.%f"
             return 1
         fi
         
-        local last_cmd=$(tail -n 1 "$DUSKY_DIFF_HISTORY")
+        local last_cmd=$(command tail -n 1 -- "$DUSKY_DIFF_HISTORY")
         
-        # Flawless ZSH array reconstruction (strips quotes and splits safely - avoids `eval` bugs)
+        # Flawless ZSH array reconstruction (strips quotes and splits safely)
         local -a run_args=("${(@Q)${(@z)last_cmd}}")
         
-        print -u2 "󰑤 Rerunning: d ${run_args[@]}"
+        print -u2 -P "%F{blue}󰑤 Rerunning: d ${run_args[*]}%f"
         _d_execute "${run_args[@]}"
         return $?
     fi
@@ -50,7 +55,6 @@ d() {
 
     for arg in "$@"; do
         if (( options_done )); then
-            # Everything after '--' is strictly a file
             new_args+=("${arg:a}")
             ((file_count++))
         elif [[ "$arg" == "--" ]]; then
@@ -60,49 +64,46 @@ d() {
             has_nvim_flag=1
             new_args+=("$arg")
         elif [[ "$arg" == -* ]]; then
-            # Any other flags like -m or --multiple
             new_args+=("$arg")
         else
-            # It's a file path. Convert to absolute path so it works from ANY directory
             new_args+=("${arg:a}")
             ((file_count++))
         fi
     done
 
-    # Implicit Neovim State: If exactly 1 file was passed and no explicit '-n' was provided, inject it.
+    # Implicit Neovim State
     if (( file_count == 1 && has_nvim_flag == 0 )); then
         new_args=("-n" "${new_args[@]}")
     fi
 
-    # Format the arguments into a safe, shell-escaped string for the history file
+    # Format arguments into safe, shell-escaped string for history file
     local args_quoted="${(j: :)${(q)new_args[@]}}"
     
-    # Remove this exact command if it's already in the history to avoid dupes, then append to bottom (newest)
     if [[ -f "$DUSKY_DIFF_HISTORY" ]]; then
-        grep -v -F -x "$args_quoted" "$DUSKY_DIFF_HISTORY" > "${DUSKY_DIFF_HISTORY}.tmp"
-        mv -f "${DUSKY_DIFF_HISTORY}.tmp" "$DUSKY_DIFF_HISTORY"
+        command grep -v -F -x -- "$args_quoted" "$DUSKY_DIFF_HISTORY" > "${DUSKY_DIFF_HISTORY}.tmp"
+        command mv -f -- "${DUSKY_DIFF_HISTORY}.tmp" "$DUSKY_DIFF_HISTORY"
     fi
     
-    echo "$args_quoted" >> "$DUSKY_DIFF_HISTORY"
+    print -r -- "$args_quoted" >> "$DUSKY_DIFF_HISTORY"
     
-    # Keep history clean (Max 100 entries)
-    tail -n 100 "$DUSKY_DIFF_HISTORY" > "${DUSKY_DIFF_HISTORY}.tmp"
-    mv -f "${DUSKY_DIFF_HISTORY}.tmp" "$DUSKY_DIFF_HISTORY"
+    command tail -n 100 -- "$DUSKY_DIFF_HISTORY" > "${DUSKY_DIFF_HISTORY}.tmp"
+    command mv -f -- "${DUSKY_DIFF_HISTORY}.tmp" "$DUSKY_DIFF_HISTORY"
 
     _d_execute "${new_args[@]}"
 }
 
-# 3. The Interactive FZF Fuzzy Finder
+# 3. Interactive FZF Fuzzy Finder
 di() {
+    emulate -L zsh
+    
     if [[ ! -s "$DUSKY_DIFF_HISTORY" ]]; then
-        print -u2 "󰑤 No previous diff history found. Run 'd <target>' to populate your history."
+        print -u2 -P "%F{red}󰑤 No previous diff history found. Run 'd <target>' to populate your history.%f"
         return 1
     fi
 
     local selected
     
-    # Ultra-modern full-screen interface using FZF 0.73.1 independent borders & Catppuccin Surface2 Palette
-    selected=$(fzf \
+    selected=$(command fzf \
         --height=100% \
         --style=full \
         --layout=reverse \
@@ -129,14 +130,13 @@ di() {
     )
 
     if [[ -n "$selected" ]]; then
-        # Bump the executed selection to the bottom of the history file (making it the newest)
-        grep -v -F -x "$selected" "$DUSKY_DIFF_HISTORY" > "${DUSKY_DIFF_HISTORY}.tmp"
-        echo "$selected" >> "${DUSKY_DIFF_HISTORY}.tmp"
-        tail -n 100 "${DUSKY_DIFF_HISTORY}.tmp" > "$DUSKY_DIFF_HISTORY"
-        rm -f "${DUSKY_DIFF_HISTORY}.tmp"
+        command grep -v -F -x -- "$selected" "$DUSKY_DIFF_HISTORY" > "${DUSKY_DIFF_HISTORY}.tmp"
+        print -r -- "$selected" >> "${DUSKY_DIFF_HISTORY}.tmp"
+        command tail -n 100 -- "${DUSKY_DIFF_HISTORY}.tmp" > "$DUSKY_DIFF_HISTORY"
+        command rm -f -- "${DUSKY_DIFF_HISTORY}.tmp"
 
         local -a run_args=("${(@Q)${(@z)selected}}")
-        print -u2 "󰑤 Running: d ${run_args[@]}"
+        print -u2 -P "%F{blue}󰑤 Running: d ${run_args[*]}%f"
         
         _d_execute "${run_args[@]}"
     fi
@@ -145,15 +145,12 @@ di() {
 # 4. Context-Aware Zsh Completion
 _d_neodiff() {
     local ret=1
-    
     _arguments -s -S \
         '(-n --nvim)'{-n,--nvim}'[Compare target against its previous Neovim undo state]' \
         '(-m --multiple)'{-m,--multiple}'[Compare multiple files]' \
         '*:file:_files' && ret=0
-        
     return ret
 }
 
-# 5. Bind the completion engine to the proxy functions
 compdef _d_neodiff d
 compdef _d_neodiff di
