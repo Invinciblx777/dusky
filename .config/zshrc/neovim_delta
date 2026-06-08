@@ -5,7 +5,7 @@
 # 1. State Configuration (UNIFIED DIRECTORY)
 typeset -g DUSKY_DIFF_DIR="$HOME/.config/dusky/settings/neodiff"
 typeset -g DUSKY_DIFF_HISTORY="$DUSKY_DIFF_DIR/history"
-typeset -g DUSKY_DIFF_ENGINE="$HOME/user_scripts/tools/delta/neovim_delta.py"
+typeset -g DUSKY_DIFF_ENGINE="$HOME/user_scripts/tools/delta/neo_delta_zsh_engine.py"
 
 # Helper Function: Guarantees clean terminal execution and state restoration
 _d_execute() {
