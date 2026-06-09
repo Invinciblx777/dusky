@@ -518,7 +518,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
 
     def _on_bt_state_set(self, switch, state):
         if state and self._is_bt_rfkill_blocked():
-            execute_cmd("pkexec /usr/bin/rfkill unblock bluetooth")
+            execute_cmd("sudo -n /usr/bin/rfkill unblock bluetooth")
         val = "true" if state else "false"
         execute_cmd(f"busctl set-property org.bluez /org/bluez/hci0 org.bluez.Adapter1 Powered b {val}")
         icon = "bluetooth-active-symbolic" if state else "bluetooth-disabled-symbolic"
