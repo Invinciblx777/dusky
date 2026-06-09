@@ -291,7 +291,7 @@ install_packages() {
 
 verify_snapper_runtime() {
     # CHROOT FIX: Inject --no-dbus
-    snapper --no-dbus --help >/dev/null 2>&1 || fatal "snapper is installed but not runnable. This usually indicates a package/runtime mismatch."
+    snapper --no-dbus --help >/dev/null 2>&1 || fatal "snapper is installed but not runnable. This usually indicates a package/runtime mismatch (commonly snapper vs boost-libs)."
 }
 
 post_install_checks() {
@@ -299,6 +299,8 @@ post_install_checks() {
     require_cmd snapper
     require_cmd systemctl
     verify_snapper_runtime
+    # PORTED FROM LIVE: Ensure /home is a subvolume before we touch it
+    path_is_btrfs_subvolume "/home" || fatal "/home is not a Btrfs subvolume."
 }
 
 ensure_snapper_config() {
@@ -405,14 +407,15 @@ migrate_single_legacy_snapshot_entry() {
                 fatal "Unexpected nested subvolume ${item} inside legacy Snapper entry ${src_entry}."
             fi
 
+            # PORTED FROM LIVE: Better error logs
             if path_exists "${dst_entry}/snapshot"; then
-                fatal "Destination snapshot subvolume ${dst_entry}/snapshot already exists."
+                fatal "Destination snapshot subvolume ${dst_entry}/snapshot already exists. Manual conflict resolution required."
             fi
 
             if btrfs_subvolume_is_ro "$item"; then
-                btrfs subvolume snapshot -r "$item" "${dst_entry}/snapshot" >/dev/null || fatal "Failed to clone read-only snapshot ${item}."
+                btrfs subvolume snapshot -r "$item" "${dst_entry}/snapshot" >/dev/null || fatal "Failed to clone read-only snapshot ${item} to ${dst_entry}/snapshot."
             else
-                btrfs subvolume snapshot "$item" "${dst_entry}/snapshot" >/dev/null || fatal "Failed to clone writable snapshot ${item}."
+                btrfs subvolume snapshot "$item" "${dst_entry}/snapshot" >/dev/null || fatal "Failed to clone writable snapshot ${item} to ${dst_entry}/snapshot."
             fi
 
             btrfs subvolume delete "$item" >/dev/null || fatal "Failed to delete old snapshot subvolume ${item} after cloning."
@@ -591,7 +594,8 @@ tune_snapper() {
 
 quiesce_snapper() {
     # Handled carefully since chroot environment doesn't run systemd init
-    if systemctl is-active --quiet snapper-timeline.timer 2>/dev/null; then
+    # PORTED FROM LIVE: Check both timers
+    if systemctl is-active --quiet snapper-timeline.timer 2>/dev/null || systemctl is-active --quiet snapper-cleanup.timer 2>/dev/null; then
         systemctl stop snapper-timeline.timer snapper-cleanup.timer 2>/dev/null || true
     fi
 }
@@ -625,6 +629,8 @@ enforce_flat_topology() {
 
     for sv in /var/lib/machines /var/lib/portables; do
         if findmnt -M "$sv" >/dev/null 2>&1; then
+            # PORTED FROM LIVE: Adding descriptive logging
+            info "$sv is an actively mounted filesystem. Preserving explicit layout."
             continue
         fi
 
@@ -735,6 +741,10 @@ preflight_checks() {
     require_cmd mktemp
     require_cmd mountpoint
     require_cmd btrfs
+    
+    # PORTED FROM LIVE: Prevent executing on incorrect filesystems right away
+    [[ "$(stat -f -c %T /)" == "btrfs" ]] || fatal "Root is not Btrfs."
+    [[ "$(stat -f -c %T /home)" == "btrfs" ]] || fatal "/home is not Btrfs."
 }
 
 preflight_checks
