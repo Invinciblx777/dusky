@@ -294,6 +294,6 @@ case "$choice" in
     '🌐  Network Speed')  "$DAEMON_SCRIPT" --network & disown ;;
     '🚀  System Uptime')  "$DAEMON_SCRIPT" --uptime & disown ;;
     '🖥️  Active Workspace')"$DAEMON_SCRIPT" --workspace & disown ;;
-    '🎨  Edit appearances') foot --app-id=dusky_tui python ~/user_scripts/dusky_tui/python/main/main.py ~/user_scripts/mako_osd/dusky_glance/tui_mako.py & disown ;;
+    '🎨  Edit appearances') foot --app-id=dusky_tui python ~/user_scripts/dusky_tui/python/main/main.py ~/user_scripts/mako_osd/dusky_glance/tui_glance_mako.py & disown ;;
     '🛑  Stop / Clear')   "$DAEMON_SCRIPT" --stop & disown ;;
 esac
