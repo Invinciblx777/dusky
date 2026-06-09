@@ -4,8 +4,8 @@ from python.frontend.core_types import ConfigItem
 # =============================================================================
 # 1. CORE APPLICATION ROUTING
 # =============================================================================
-ENGINE_TYPE = "cmdline"                       
-TARGET_FILE = "/etc/kernel/cmdline"           
+ENGINE_TYPE = "systemd_boot"                       
+TARGET_FILE = "/boot/loader/entries/arch-linux.conf"           
 APP_TITLE = "Kernel Parameter Editor"         
 # REQUIRE_ROOT = True
 
