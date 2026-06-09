@@ -149,6 +149,8 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         self._slider_rows: list[CompactSliderRow] = []
         self.dynamic_toggles: dict[str, QuickIconToggle] = {}
         self._grab_active = False
+        self._wifi_pending = False
+        self._bt_pending = False
 
         # CRITICAL UI FIX: Exact 15% physical reduction mapped out flawlessly (380 -> 320)
         self.set_default_size(320, -1)
@@ -459,6 +461,13 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         if is_active: tg.update_state(icon="applications-graphics-symbolic", css_class="active", tooltip="Visuals: Blur & Shadow ON\nLMB: Toggle")
         else: tg.update_state(icon="edit-opacity-symbolic", css_class="normal", tooltip="Visuals: Performance Mode\nLMB: Toggle")
 
+    @staticmethod
+    def _is_bt_rfkill_blocked() -> bool:
+        r = run_command(["rfkill", "list", "bluetooth"], timeout=0.5, capture_stdout=True)
+        if r is not None and r.returncode == 0 and r.stdout:
+            return "Soft blocked: yes" in r.stdout
+        return False
+
     def _fetch_net_bt_state(self):
         if not hasattr(self, "wifi_switch"): return
         try:
@@ -473,36 +482,55 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
                 ["busctl", "get-property", "org.bluez", "/org/bluez/hci0",
                  "org.bluez.Adapter1", "Powered"],
                 timeout=1.0, capture_stdout=True)
-            bt_on = bt_r is not None and bt_r.returncode == 0 and "true" in bt_r.stdout
+            bt_powered = bt_r is not None and bt_r.returncode == 0 and "true" in bt_r.stdout
+            bt_rfkill_blocked = self._is_bt_rfkill_blocked()
+            bt_on = bt_powered and not bt_rfkill_blocked
 
             GLib.idle_add(self._apply_net_bt_state, wifi_on, bt_on)
         except Exception: pass
 
     def _apply_net_bt_state(self, wifi_on: bool, bt_on: bool):
-        if self.wifi_switch.get_active() != wifi_on:
-            self.wifi_switch.set_active(wifi_on)
-        if self.bt_switch.get_active() != bt_on:
-            self.bt_switch.set_active(bt_on)
-            
         wifi_icon = "network-wireless-symbolic" if wifi_on else "network-wireless-disconnected-symbolic"
         self.wifi_icon.set_from_icon_name(wifi_icon, Gtk.IconSize.BUTTON)
-        
         bt_icon = "bluetooth-active-symbolic" if bt_on else "bluetooth-disabled-symbolic"
         self.bt_icon.set_from_icon_name(bt_icon, Gtk.IconSize.BUTTON)
+
+        if self._wifi_pending: return
+        if self.wifi_switch.get_active() != wifi_on:
+            self.wifi_switch.set_active(wifi_on)
+        if self._bt_pending: return
+        if self.bt_switch.get_active() != bt_on:
+            self.bt_switch.set_active(bt_on)
 
     def _on_wifi_state_set(self, switch, state):
         val = "true" if state else "false"
         execute_cmd(f"busctl set-property org.freedesktop.NetworkManager /org/freedesktop/NetworkManager org.freedesktop.NetworkManager WirelessEnabled b {val}")
         icon = "network-wireless-symbolic" if state else "network-wireless-disconnected-symbolic"
         self.wifi_icon.set_from_icon_name(icon, Gtk.IconSize.BUTTON)
+        self._wifi_pending = True
+        GLib.timeout_add(800, self._clear_wifi_pending)
         return False
 
+    def _clear_wifi_pending(self):
+        self._wifi_pending = False
+        self.pool.submit(self._fetch_net_bt_state)
+        return GLib.SOURCE_REMOVE
+
     def _on_bt_state_set(self, switch, state):
+        if state and self._is_bt_rfkill_blocked():
+            execute_cmd("pkexec /usr/bin/rfkill unblock bluetooth")
         val = "true" if state else "false"
         execute_cmd(f"busctl set-property org.bluez /org/bluez/hci0 org.bluez.Adapter1 Powered b {val}")
         icon = "bluetooth-active-symbolic" if state else "bluetooth-disabled-symbolic"
         self.bt_icon.set_from_icon_name(icon, Gtk.IconSize.BUTTON)
+        self._bt_pending = True
+        GLib.timeout_add(800, self._clear_bt_pending)
         return False
+
+    def _clear_bt_pending(self):
+        self._bt_pending = False
+        self.pool.submit(self._fetch_net_bt_state)
+        return GLib.SOURCE_REMOVE
 
     def _fetch_power_profile(self):
         if not hasattr(self, "power_container"): return
