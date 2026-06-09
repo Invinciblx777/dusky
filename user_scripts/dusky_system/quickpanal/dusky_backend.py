@@ -76,6 +76,31 @@ _RE_UPDATES_TOTAL: Final = re.compile(r'Total:\s*(\d+)')
 _LIBC: Final = ctypes.CDLL("libc.so.6", use_errno=True)
 _MADV_PAGEOUT: Final = 21
 
+def _resolve_cgroup_file(name: str) -> str | None:
+    try:
+        with open("/proc/self/cgroup") as f:
+            line = f.read().strip()
+        cgroup_path = line.split(":", 2)[2]
+        path = f"/sys/fs/cgroup{cgroup_path}/{name}"
+        return path if os.path.isfile(path) else None
+    except Exception:
+        return None
+
+_CGROUP_MEMORY_CURRENT: Final = _resolve_cgroup_file("memory.current")
+_CGROUP_MEMORY_HIGH: Final = _resolve_cgroup_file("memory.high")
+
+def _should_pageout() -> bool:
+    try:
+        with open(_CGROUP_MEMORY_HIGH) as f:
+            high = f.read().strip()
+        if high == "max":
+            return False
+        with open(_CGROUP_MEMORY_CURRENT) as f:
+            current = int(f.read().strip())
+        return current > int(high) * 80 // 100
+    except Exception:
+        return False
+
 def _reclaim_idle_memory() -> None:
     re.purge()
     if hasattr(sys, "_clear_internal_caches"):
@@ -88,7 +113,8 @@ def _reclaim_idle_memory() -> None:
         _LIBC.malloc_trim(0)
     except Exception:
         pass
-    _pageout_idle_pages()
+    if _should_pageout():
+        _pageout_idle_pages()
 
 def _pageout_idle_pages() -> None:
     try:

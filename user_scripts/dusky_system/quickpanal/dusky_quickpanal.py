@@ -682,7 +682,6 @@ class QuickPanalApp(Gtk.Application):
         if self._local_brightness_worker: self._local_brightness_worker.stop()
         if DDC_MANAGER: DDC_MANAGER.stop()
         if self._volume_worker: self._volume_worker.stop()
-        _reclaim_idle_memory()
 
     def resume_workers(self):
         gc.unfreeze()
@@ -724,6 +723,7 @@ class QuickPanalApp(Gtk.Application):
             sunset_submit=self.submit_sunset if HAS_SUNSET else None
         )
         self.suspend_workers()
+        _reclaim_idle_memory()
 
     @override
     def do_activate(self):

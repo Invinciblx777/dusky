@@ -49,7 +49,7 @@ OOMPolicy=kill
 # By setting a soft limit (MemoryHigh), we instruct the Arch Linux kernel: 
 # "If this panel uses more than 50MB of RAM, aggressively swap its idle pages into ZRAM (ZSTD compression)."
 # This drastically shrinks its active footprint.
-MemoryHigh=150M
+MemoryHigh=40M
 # Hard limit to prevent memory leaks from crashing the compositor.
 MemoryMax=200M
 
