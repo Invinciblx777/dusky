@@ -290,21 +290,55 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
 
         # --- Power Profiles ---
         if self.layout_cfg.get("show_power_profiles", True):
-            self.power_container = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            self.power_container = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
             _add_css_class(self.power_container, "power-profile-row")
-            power_icon = Gtk.Image.new_from_icon_name("power-profile-balanced-symbolic", Gtk.IconSize.BUTTON)
-            _add_css_class(power_icon, "accent-icon")
-            self.power_container.pack_start(power_icon, False, False, 0)
-            
-            power_label = Gtk.Label(label="Power Profile")
-            # CRITICAL UI FIX: Text width constraint
-            power_label.set_ellipsize(Pango.EllipsizeMode.END)
-            power_label.set_width_chars(1)
-            _add_css_class(power_label, "power-label")
-            power_label.set_halign(Gtk.Align.START)
-            power_label.set_xalign(0.0)
-            self.power_container.pack_start(power_label, True, True, 0)
 
+            # Wi-Fi toggle (Static Icon + Switch)
+            self.wifi_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            self.wifi_icon = Gtk.Image.new_from_icon_name("network-wireless-symbolic", Gtk.IconSize.BUTTON)
+            _add_css_class(self.wifi_icon, "accent-icon")
+            self.wifi_box.pack_start(self.wifi_icon, False, False, 0)
+            
+            self.wifi_switch = Gtk.Switch()
+            self.wifi_switch.set_valign(Gtk.Align.CENTER)
+            self.wifi_switch.set_can_focus(False)
+            _add_css_class(self.wifi_switch, "compact-switch")
+            self.wifi_switch.connect("state-set", self._on_wifi_state_set)
+            self.wifi_box.pack_start(self.wifi_switch, False, False, 0)
+            self.power_container.pack_start(self.wifi_box, False, False, 0)
+
+            # Tiny separator/spacer between Wifi and BT
+            spacer_wbt = Gtk.Box()
+            spacer_wbt.set_size_request(12, -1)
+            self.power_container.pack_start(spacer_wbt, False, False, 0)
+
+            # Bluetooth toggle (Static Icon + Switch)
+            self.bt_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            self.bt_icon = Gtk.Image.new_from_icon_name("bluetooth-active-symbolic", Gtk.IconSize.BUTTON)
+            _add_css_class(self.bt_icon, "accent-icon")
+            self.bt_box.pack_start(self.bt_icon, False, False, 0)
+            
+            self.bt_switch = Gtk.Switch()
+            self.bt_switch.set_valign(Gtk.Align.CENTER)
+            self.bt_switch.set_can_focus(False)
+            _add_css_class(self.bt_switch, "compact-switch")
+            self.bt_switch.connect("state-set", self._on_bt_state_set)
+            self.bt_box.pack_start(self.bt_switch, False, False, 0)
+            self.power_container.pack_start(self.bt_box, False, False, 0)
+
+            # Expanding Spacer to dynamically push Power Profiles to the right edge
+            expand_spacer = Gtk.Box()
+            self.power_container.pack_start(expand_spacer, True, True, 0)
+
+            # Vertical separator to define zones beautifully
+            sep = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+            sep.set_margin_start(4)
+            sep.set_margin_end(6)
+            sep.set_margin_top(4)
+            sep.set_margin_bottom(4)
+            self.power_container.pack_start(sep, False, False, 0)
+
+            # Restored TLP Power Logic Exactly as you had it
             self.power_cmds = { "Balanced": "tlpctl balanced", "Performance": "tlpctl performance", "Power Saver": "tlpctl power-saver" }
             self.power_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
             self.btn_save = Gtk.RadioButton(); self.btn_save.set_mode(False); self.btn_save.set_image(Gtk.Image.new_from_icon_name("power-profile-power-saver-symbolic", Gtk.IconSize.BUTTON)); _add_css_class(self.btn_save, "power-ring-btn")
@@ -360,6 +394,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         self.pool.submit(self._fetch_mako)
         self.pool.submit(self._fetch_idle)
         self.pool.submit(self._fetch_blur)
+        self.pool.submit(self._fetch_net_bt_state)
         self.pool.submit(self._fetch_power_profile)
         self.pool.submit(self._fetch_hardware_metrics)
         self.pool.submit(self._fetch_network)
@@ -423,6 +458,51 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         if not tg: return
         if is_active: tg.update_state(icon="applications-graphics-symbolic", css_class="active", tooltip="Visuals: Blur & Shadow ON\nLMB: Toggle")
         else: tg.update_state(icon="edit-opacity-symbolic", css_class="normal", tooltip="Visuals: Performance Mode\nLMB: Toggle")
+
+    def _fetch_net_bt_state(self):
+        if not hasattr(self, "wifi_switch"): return
+        try:
+            wifi_r = run_command(
+                ["busctl", "get-property", "org.freedesktop.NetworkManager",
+                 "/org/freedesktop/NetworkManager", "org.freedesktop.NetworkManager",
+                 "WirelessEnabled"],
+                timeout=1.0, capture_stdout=True)
+            wifi_on = wifi_r is not None and wifi_r.returncode == 0 and "true" in wifi_r.stdout
+
+            bt_r = run_command(
+                ["busctl", "get-property", "org.bluez", "/org/bluez/hci0",
+                 "org.bluez.Adapter1", "Powered"],
+                timeout=1.0, capture_stdout=True)
+            bt_on = bt_r is not None and bt_r.returncode == 0 and "true" in bt_r.stdout
+
+            GLib.idle_add(self._apply_net_bt_state, wifi_on, bt_on)
+        except Exception: pass
+
+    def _apply_net_bt_state(self, wifi_on: bool, bt_on: bool):
+        if self.wifi_switch.get_active() != wifi_on:
+            self.wifi_switch.set_active(wifi_on)
+        if self.bt_switch.get_active() != bt_on:
+            self.bt_switch.set_active(bt_on)
+            
+        wifi_icon = "network-wireless-symbolic" if wifi_on else "network-wireless-disconnected-symbolic"
+        self.wifi_icon.set_from_icon_name(wifi_icon, Gtk.IconSize.BUTTON)
+        
+        bt_icon = "bluetooth-active-symbolic" if bt_on else "bluetooth-disabled-symbolic"
+        self.bt_icon.set_from_icon_name(bt_icon, Gtk.IconSize.BUTTON)
+
+    def _on_wifi_state_set(self, switch, state):
+        val = "true" if state else "false"
+        execute_cmd(f"busctl set-property org.freedesktop.NetworkManager /org/freedesktop/NetworkManager org.freedesktop.NetworkManager WirelessEnabled b {val}")
+        icon = "network-wireless-symbolic" if state else "network-wireless-disconnected-symbolic"
+        self.wifi_icon.set_from_icon_name(icon, Gtk.IconSize.BUTTON)
+        return False
+
+    def _on_bt_state_set(self, switch, state):
+        val = "true" if state else "false"
+        execute_cmd(f"busctl set-property org.bluez /org/bluez/hci0 org.bluez.Adapter1 Powered b {val}")
+        icon = "bluetooth-active-symbolic" if state else "bluetooth-disabled-symbolic"
+        self.bt_icon.set_from_icon_name(icon, Gtk.IconSize.BUTTON)
+        return False
 
     def _fetch_power_profile(self):
         if not hasattr(self, "power_container"): return
@@ -573,8 +653,14 @@ class QuickPanalApp(Gtk.Application):
 
         settings = Gtk.Settings.get_default()
         if settings: settings.set_property("gtk-application-prefer-dark-theme", True)
+        
+        # Inject custom compact switch styling on top of the imported CSS
         provider = Gtk.CssProvider()
-        provider.load_from_data(CSS.encode("utf-8"))
+        extended_css = CSS + """
+        switch.compact-switch { min-width: 38px; min-height: 20px; }
+        switch.compact-switch slider { min-width: 18px; min-height: 18px; }
+        """
+        provider.load_from_data(extended_css.encode("utf-8"))
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
         self.window = QuickPanalWindow(self, self.pool, config_data,
