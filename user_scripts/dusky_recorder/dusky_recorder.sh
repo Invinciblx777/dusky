@@ -112,8 +112,9 @@ manage_indicator() {
         [[ "$show_indicator" != "yes" ]] && return 0
         (
             local notif_id
-            # 1. Capture the master ID ONCE for the stop function to use later
-            notif_id=$(notify-send -a "dusky-recorder" -h string:x-canonical-private-synchronous:recorder -p "" "")
+            # 1. Capture master ID ONCE. 
+            # FIX: Used -t 0 to ensure infinite timeout, preventing ID drift.
+            notif_id=$(notify-send -a "dusky-recorder" -t 0 -h string:x-canonical-private-synchronous:recorder -p "" "")
             echo "$notif_id" > "$INDICATOR_TMP"
             
             local visible=true
@@ -121,23 +122,30 @@ manage_indicator() {
                 sleep 1
                 if $visible; then
                     # 2. Update state purely via the sync hint. NO explicit -r ID.
-                    # This prevents the double-free race condition in Mako's heap.
-                    notify-send -a "dusky-recorder" -h string:x-canonical-private-synchronous:recorder " " ""
+                    notify-send -a "dusky-recorder" -t 0 -h string:x-canonical-private-synchronous:recorder " " ""
                     visible=false
                 else
-                    notify-send -a "dusky-recorder" -h string:x-canonical-private-synchronous:recorder "" ""
+                    notify-send -a "dusky-recorder" -t 0 -h string:x-canonical-private-synchronous:recorder "" ""
                     visible=true
                 fi
             done
         ) & 
         echo $! > "$INDICATOR_PID"
-        echo $! > "$INDICATOR_PID"
         
     elif [[ "$action" == "stop" ]]; then
         if [[ -f "$INDICATOR_PID" ]]; then
-            kill "$(cat "$INDICATOR_PID")" 2>/dev/null || true
+            local d_pid
+            d_pid=$(cat "$INDICATOR_PID")
+            # Kill the subshell
+            kill "$d_pid" 2>/dev/null || true
+            # FIX: Kill any lingering child sleep or notify-send processes immediately
+            pkill -P "$d_pid" 2>/dev/null || true
             rm -f "$INDICATOR_PID"
         fi
+        
+        # FIX: Bulletproof Wayland cleanup. In case the ID drifted, we overwrite the 
+        # synchronous hint group with a 1-millisecond timeout to force Mako to drop it.
+        notify-send -a "dusky-recorder" -t 1 -h string:x-canonical-private-synchronous:recorder " " "" >/dev/null 2>&1 || true
         
         if [[ -f "$INDICATOR_TMP" ]]; then
             local notif_id
