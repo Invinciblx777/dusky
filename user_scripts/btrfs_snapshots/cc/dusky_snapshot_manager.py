@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -86,10 +87,10 @@ def run_passthrough(cmd: list[str]) -> int:
 
 
 def get_btrfs_device(mountpoint: str) -> str:
-    # Use live mount info (-T) instead of fstab to natively support LUKS2 and LVM.
+    # Use live mount info (-M) instead of fstab to natively support LUKS2 and LVM.
     # The -v (--nofsroot) flag cleanly strips the Btrfs subvolume brackets (e.g., [/var/log]).
     # The -e (--evaluate) flag safely resolves UUIDs/labels to raw block device paths.
-    result = run_cmd(["findmnt", "-n", "-v", "-e", "-o", "SOURCE", "-T", mountpoint])
+    result = run_cmd(["findmnt", "-n", "-v", "-e", "-o", "SOURCE", "-M", mountpoint])
     device = result.stdout.strip()
     
     if not device.startswith("/dev/"):
@@ -98,13 +99,35 @@ def get_btrfs_device(mountpoint: str) -> str:
     return os.path.realpath(device)
 
 
-def get_subvol_from_fstab(mountpoint: str) -> str:
-    result = run_cmd(["findmnt", "--fstab", "-n", "-o", "OPTIONS", "--target", mountpoint])
-    options = result.stdout.strip()
-    match = re.search(r"(?:^|,)subvol=([^,]+)(?:,|$)", options)
-    if not match:
-        fail(f"[!] Fatal: No 'subvol=' option found in fstab for {mountpoint}.")
-    return match.group(1).lstrip("/")
+def get_active_subvol(mountpoint: str) -> str:
+    """
+    Bulletproof resolution of the active subvolume name mirroring bash script fail-safes.
+    Accounts for edge cases like subvolid= usage or absent fstab entries.
+    """
+    # 1. Try fstab first (Source of truth for boot)
+    result = run_cmd(["findmnt", "--fstab", "-n", "-o", "OPTIONS", "-M", mountpoint], check=False)
+    if result.returncode == 0:
+        match = re.search(r"(?:^|,)subvol=([^,]+)(?:,|$)", result.stdout.strip())
+        if match:
+            return match.group(1).lstrip("/")
+
+    # 2. Try live mount info (Crucial if mounted manually or via systemd mount units without fstab)
+    result = run_cmd(["findmnt", "-n", "-o", "OPTIONS", "-M", mountpoint], check=False)
+    if result.returncode == 0:
+        match = re.search(r"(?:^|,)subvol=([^,]+)(?:,|$)", result.stdout.strip())
+        if match:
+            return match.group(1).lstrip("/")
+
+    # 3. Fallback to native btrfs tools (Ultimate fallback if mounted purely by subvolid)
+    result = run_cmd(["btrfs", "subvolume", "show", mountpoint], check=False)
+    if result.returncode == 0:
+        match = re.search(r"^[ \t]*Path:[ \t]*(.+)$", result.stdout, re.MULTILINE)
+        if match:
+            path = match.group(1).strip().lstrip("/")
+            if path and path not in ("<FS_TREE>", ""):
+                return path
+
+    fail(f"[!] Fatal: Could not determine active Btrfs subvolume path for {mountpoint}. No 'subvol=' option found.")
 
 
 def get_target_mount_from_snapper_config(config: str) -> str:
@@ -181,8 +204,9 @@ def resolve_restore_spec(config: str, snap_id: str) -> RestoreSpec:
     target_mnt = get_target_mount_from_snapper_config(config)
     snapshots_mnt = "/.snapshots" if target_mnt == "/" else f"{target_mnt}/.snapshots"
     device = get_btrfs_device(target_mnt)
-    active_subvol = get_subvol_from_fstab(target_mnt)
-    snapshots_subvol = get_subvol_from_fstab(snapshots_mnt)
+    
+    active_subvol = get_active_subvol(target_mnt)
+    snapshots_subvol = get_active_subvol(snapshots_mnt)
 
     if not active_subvol:
         fail(f"[!] Fatal: Empty active subvolume path is not supported for {target_mnt}.")
@@ -336,9 +360,61 @@ def apply_prepared_restores(plans: list[PreparedRestore]) -> None:
             print(
                 f"\033[1;38;5;81m[*] Permanently deleting previous system state for '{plan.spec.config}'...\033[0m"
             )
-            del_res = run_cmd(["btrfs", "subvolume", "delete", str(plan.temp_delete_path)], check=False)
-            if del_res.returncode != 0:
-                print(f"\033[1;38;5;220m[!] Warning: Failed to cleanly delete old subvolume. You may need to delete it manually: {error_text(del_res)}\033[0m", file=sys.stderr)
+            deleted = False
+            
+            # 1. Immediate Retry Loop for transient Btrfs locking
+            for attempt in range(3):
+                del_res = run_cmd(["btrfs", "subvolume", "delete", str(plan.temp_delete_path)], check=False)
+                if del_res.returncode == 0:
+                    deleted = True
+                    break
+                time.sleep(1)
+
+            # 2. Aggressive Background Cleanup Fallback
+            if not deleted:
+                print(f"\033[1;38;5;220m[!] Warning: Immediate deletion failed. Scheduling aggressive background cleanup on next boot...\033[0m", file=sys.stderr)
+                try:
+                    # Dynamically capture UUID to perfectly handle LUKS and LVM mappings upon next boot
+                    uuid_res = run_cmd(["findmnt", "-n", "-e", "-o", "UUID", "-M", plan.spec.target_mnt], check=False)
+                    uuid = uuid_res.stdout.strip()
+                    
+                    # Mirroring defensive bash logic: fallback to blkid if findmnt returns blank/dash
+                    if not uuid or uuid == "-":
+                        device_res = run_cmd(["findmnt", "-n", "-v", "-e", "-o", "SOURCE", "-M", plan.spec.target_mnt], check=False)
+                        device = device_res.stdout.strip()
+                        if device.startswith("/dev/"):
+                            blkid_res = run_cmd(["blkid", "-s", "UUID", "-o", "value", device], check=False)
+                            uuid = blkid_res.stdout.strip()
+
+                    if not uuid:
+                        print(f"\033[1;38;5;196m[!] Error: Could not determine UUID for {plan.spec.target_mnt}. Manual deletion of '{plan.temp_delete_path.name}' required.\033[0m", file=sys.stderr)
+                        continue
+
+                    subvol_name = plan.temp_delete_path.name
+                    service_name = f"dusky-cleanup-{subvol_name}.service"
+                    service_path = Path("/etc/systemd/system") / service_name
+                    
+                    # Generate a self-destructing, one-shot systemd service executing right after decryption/mount targets
+                    service_content = f"""[Unit]
+Description=Dusky Btrfs Cleanup ({subvol_name})
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bash -c "/usr/bin/mkdir -p /run/dusky_mnt && /usr/bin/mount -t btrfs -o subvolid=5 UUID={uuid} /run/dusky_mnt && {{ /usr/bin/btrfs subvolume delete '/run/dusky_mnt/{subvol_name}'; /usr/bin/umount /run/dusky_mnt; }}"
+ExecStartPost=/usr/bin/systemctl disable {service_name}
+ExecStartPost=/usr/bin/rm -f /etc/systemd/system/{service_name}
+
+[Install]
+WantedBy=multi-user.target
+"""
+                    service_path.write_text(service_content)
+                    run_cmd(["systemctl", "daemon-reload"])
+                    run_cmd(["systemctl", "enable", service_name])
+                    
+                    print(f"\033[1;38;5;114m[+] Scheduled one-shot systemd service '{service_name}' to eradicate subvolume on next boot.\033[0m")
+                except Exception as e:
+                    print(f"\033[1;38;5;196m[!] Failed to schedule boot cleanup: {e}\n[!] Manual deletion of '{plan.temp_delete_path.name}' required.\033[0m", file=sys.stderr)
 
     except (OSError, RuntimeError) as exc:
         rollback_prepared_restores(plans, exc)
@@ -350,6 +426,10 @@ def is_mountpoint(path: str) -> bool:
 
 
 def activate_nonroot_restore(target_mnt: str) -> None:
+    """
+    Attempts to live-remount a non-root subvolume (like /home).
+    Gracefully handles busy states by returning success and notifying the user to reboot.
+    """
     if not is_mountpoint(target_mnt):
         print(
             f"\033[1;38;5;81m[*] {target_mnt} is not currently mounted as its own mountpoint. "
@@ -357,25 +437,30 @@ def activate_nonroot_restore(target_mnt: str) -> None:
         )
         return
 
-    print(f"\033[1;38;5;81m[*] Remounting {target_mnt} to activate restored snapshot...\033[0m")
+    print(f"\033[1;38;5;81m[*] Attempting to live-remount {target_mnt} to activate restored snapshot...\033[0m")
 
     umount_result = run_cmd(["umount", target_mnt], check=False)
     if umount_result.returncode != 0:
-        fail(
-            f"[!] Restore completed on disk, but {target_mnt} could not be unmounted for live activation.\n"
-            f"{error_text(umount_result)}\n"
-            f"[!] Reboot or manually unmount/remount {target_mnt} to use the restored snapshot."
+        # Target is busy (expected for live mounts like /home where terminal/DE is running)
+        print(
+            f"\n\033[1;38;5;220m[!] Notice: {target_mnt} is currently in use (target is busy).\n"
+            f"[!] The restore was successful on disk, but the live filesystem cannot be swapped.\n"
+            f"[\033[1;38;5;196m!\033[1;38;5;220m] WARNING: Any changes made to {target_mnt} right now will be lost upon reboot.\n"
+            f"[!] Please REBOOT IMMEDIATELY to activate the restored snapshot.\033[0m"
         )
+        return
 
+    # If unmount succeeds, we MUST remount it to avoid breaking the active session
     mount_result = run_cmd(["mount", target_mnt], check=False)
     if mount_result.returncode != 0:
+        # This is an actual critical failure: it's no longer mounted at all.
         fail(
-            f"[!] Restore completed on disk, but remount of {target_mnt} failed.\n"
+            f"[!] CRITICAL: Restore completed on disk, but remount of {target_mnt} failed!\n"
             f"{error_text(mount_result)}\n"
-            f"[!] Do not continue until {target_mnt} is mounted again or the restore is corrected."
+            f"[!] Your {target_mnt} directory is currently unmounted. Please resolve manually before rebooting."
         )
 
-    print(f"\033[1;38;5;114m[+] {target_mnt} successfully remounted.\033[0m")
+    print(f"\033[1;38;5;114m[+] {target_mnt} successfully remounted live.\033[0m")
 
 
 def first_present(mapping: dict[str, object], *keys: str) -> object | None:
