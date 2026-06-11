@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # configures /etc/tlp.conf for ASUS TUF F15 (personal, dusk)
 # -----------------------------------------------------------------------------
-# Script: configure_tlp.sh
+# Script: 200_tlp_config.sh
 # Description: Conditionally configures /etc/tlp.conf for ASUS TUF F15.
-#              Includes backup logic and strict state detection.
+#              Includes auto-installation, backup logic, and strict state detection.
 # Author: Elite DevOps (Arch/Hyprland)
-# Dependencies: tlp, systemd, bash 5+
+# Dependencies: pacman, systemd, bash 5.3+
 # -----------------------------------------------------------------------------
 
 # 1. Strict Safety & Error Handling
@@ -77,32 +77,26 @@ STOP_CHARGE_THRESH_BAT1=75
 EOF
 
 # 3. Aesthetics & Logging
-readonly C_RESET=$'\033[0m'
-readonly C_GREEN=$'\033[1;32m'
-readonly C_BLUE=$'\033[1;34m'
-readonly C_RED=$'\033[1;31m'
-readonly C_YELLOW=$'\033[1;33m'
+readonly C_RESET=$'\E[0m'
+readonly C_GREEN=$'\E[1;32m'
+readonly C_BLUE=$'\E[1;34m'
+readonly C_RED=$'\E[1;31m'
+readonly C_YELLOW=$'\E[1;33m'
 
-log_info() { printf "${C_BLUE}[INFO]${C_RESET} %s\n" "$1"; }
-log_success() { printf "${C_GREEN}[OK]${C_RESET} %s\n" "$1"; }
-log_warn() { printf "${C_YELLOW}[WARN]${C_RESET} %s\n" "$1"; }
-log_error() { printf "${C_RED}[ERROR]${C_RESET} %s\n" "$1" >&2; }
+log_info() { printf "%b[INFO]%b %s\n" "${C_BLUE}" "${C_RESET}" "$1"; }
+log_success() { printf "%b[OK]%b %s\n" "${C_GREEN}" "${C_RESET}" "$1"; }
+log_warn() { printf "%b[WARN]%b %s\n" "${C_YELLOW}" "${C_RESET}" "$1"; }
+log_error() { printf "%b[ERROR]%b %s\n" "${C_RED}" "${C_RESET}" "$1" >&2; }
 
 # 4. Root Privilege Check (Auto-Elevation)
-if [[ $EUID -ne 0 ]]; then
+if [[ "${EUID}" -ne 0 ]]; then
     log_info "Root privileges required. Elevating..."
     exec sudo "$0" "$@"
 fi
 
-# 5. Environment Validation
-if ! command -v tlp &>/dev/null; then
-    log_warn "TLP is not installed. Skipping TLP configuration to prevent Orchestrator failure."
-    exit 0
-fi
-
-# 6. Main Execution
+# 5. Main Execution
 main() {
-    local target_file="/etc/tlp.conf"
+    local -r target_file="/etc/tlp.conf"
     
     # ---------------------------------------------------------
     # A. User Interaction & Warnings
@@ -112,52 +106,61 @@ main() {
     log_warn "ASUS TUF F15 Gaming Laptop"
     echo ""
     printf "  %bIf you do not own this specific device, it is HIGHLY advised not to apply this.%b\n" "${C_RED}" "${C_RESET}"
-    printf "  For other laptops, we recommend manually configuring %s to achieve\n" "$target_file"
+    printf "  For other laptops, we recommend manually configuring %s to achieve\n" "${target_file}"
     printf "  the best battery life for your specific hardware.\n\n"
 
+    local response
     read -r -p "Do you want to proceed with applying this configuration? [y/N] " response
-    if [[ ! "$response" =~ ^[yY]$ ]]; then
+    
+    # Modern Bash syntax for case-insensitive string matching
+    if [[ "${response,,}" != "y" && "${response,,}" != "yes" ]]; then
         log_info "Operation cancelled by user."
         exit 0
     fi
 
     # ---------------------------------------------------------
-    # B. Backup Logic
+    # B. Dependency Installation (Idempotent)
     # ---------------------------------------------------------
-    # Detect the real user behind sudo to find the correct Home directory
-    local real_user="${SUDO_USER:-$USER}"
-    local real_home
-    # Use getent to strictly find the home dir (handles edge cases better than $HOME)
-    real_home=$(getent passwd "$real_user" | cut -d: -f6)
+    local -r pkgs=("tlp" "tlp-pd" "tlp-rdw")
+    log_info "Ensuring required packages are installed: ${pkgs[*]}"
     
-    local backup_dir="${real_home}/Documents"
-    local backup_file="${backup_dir}/tlp_backup.conf"
+    if sudo pacman -S --needed --noconfirm "${pkgs[@]}"; then
+        log_success "Packages are installed and up-to-date."
+    else
+        log_error "Failed to install required packages via pacman."
+        exit 1
+    fi
+
+    # ---------------------------------------------------------
+    # C. Backup Logic
+    # ---------------------------------------------------------
+    local -r real_user="${SUDO_USER:-${USER}}"
+    local real_home
+    real_home="$(getent passwd "${real_user}" | cut -d: -f6)"
+    
+    local -r backup_dir="${real_home}/Documents"
+    local -r backup_file="${backup_dir}/tlp_backup.conf"
     local file_existed=false
 
-    # Check if target exists before we touch it
-    if [[ -f "$target_file" ]]; then
+    if [[ -f "${target_file}" ]]; then
         file_existed=true
         
-        # Ensure backup directory exists
-        if [[ ! -d "$backup_dir" ]]; then
+        if [[ ! -d "${backup_dir}" ]]; then
             log_info "Creating directory ${backup_dir}..."
-            mkdir -p "$backup_dir"
-            chown "$real_user:$(id -gn "$real_user")" "$backup_dir"
+            mkdir -p "${backup_dir}"
+            chown "${real_user}:$(id -gn "${real_user}")" "${backup_dir}"
         fi
 
-        # Perform Backup
         log_info "Backing up current config to ${backup_file}..."
-        cp "$target_file" "$backup_file"
-        
-        # Fix permissions so the regular user owns the backup, not root
-        chown "$real_user:$(id -gn "$real_user")" "$backup_file"
+        cp "${target_file}" "${backup_file}"
+        chown "${real_user}:$(id -gn "${real_user}")" "${backup_file}"
         log_success "Backup verified."
     fi
 
     # ---------------------------------------------------------
-    # C. Write Configuration
+    # D. Write Configuration
     # ---------------------------------------------------------
-    if [[ "$file_existed" == "true" ]]; then
+    if [[ "${file_existed}" == true ]]; then
         log_info "Overwriting existing file at ${target_file}..."
     else
         log_info "File did not exist. Creating new file at ${target_file}..."
@@ -171,22 +174,26 @@ main() {
     fi
 
     # ---------------------------------------------------------
-    # D. Reload Service
+    # E. Service Management
     # ---------------------------------------------------------
-    log_info "Reloading TLP systemd service..."
+    log_info "Enabling and starting required systemd services..."
     
-    if systemctl reload tlp; then
-        log_success "TLP reloaded successfully."
+    if systemctl enable --now tlp.service tlp-pd.service; then
+         log_success "Services (tlp.service, tlp-pd.service) enabled and active."
     else
-        # Fallback check: try to restart if reload fails (service might be stopped)
-        log_warn "Reload failed (service might be inactive). Attempting restart..."
-        if systemctl enable --now tlp; then
-             log_success "TLP enabled and started successfully."
-        else
-             log_error "Failed to start TLP."
-             exit 1
-        fi
+         log_error "Failed to enable or start TLP services."
+         exit 1
     fi
+
+    log_info "Restarting TLP service to apply the new configuration..."
+    if systemctl restart tlp.service; then
+        log_success "TLP service restarted successfully."
+    else
+        log_error "Failed to restart TLP service."
+        exit 1
+    fi
+    
+    log_success "TLP configuration pipeline completed successfully."
 }
 
 # Run Main
