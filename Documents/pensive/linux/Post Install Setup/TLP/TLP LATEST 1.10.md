@@ -470,8 +470,12 @@ SOUND_POWER_SAVE_CONTROLLER=Y
 #command to output the currenly set option : 
 #~ ❯ cat /sys/module/pcie_aspm/parameters/policy
 #[default] performance powersave powersupersave
+#Your BIOS FADT says ASPM is unsupported. With pcie_aspm=force, the kernel forces it on anyway. When TLP pushes the link into the deeper powersupersave state, the BIOS can't handle it, deadlocks the ACPI global lock, NVMe I/O stalls, filesystem goes readonly, full freeze.
+#The fix: set PCIE_ASPM_ON_AC=powersupersave so there's no ASPM policy change when switching profiles.
+# CAUSION!!! KEEPING THE VALUES DISCIMILAR, RESULTS IN THE SYSTEM FREEZING AND GOING INTO READ ONLY MODE, HAPPNED 20-30 TIMES SO FAR ON MY ASUS TUF F15!!! DONT CHANGE THIS!!!
 
-PCIE_ASPM_ON_AC=powersave
+
+PCIE_ASPM_ON_AC=powersupersave
 PCIE_ASPM_ON_BAT=powersupersave
 PCIE_ASPM_ON_SAV=powersupersave
 
