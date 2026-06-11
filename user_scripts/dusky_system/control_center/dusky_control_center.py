@@ -149,6 +149,8 @@ class ItemType(StrEnum):
     DIRECTORY_GENERATOR = "directory_generator"
     FILE_GENERATOR = "file_generator"
     ASYNC_SELECTOR = "async_selector"
+    FLAG_GROUP = "flag_group"
+
 
 class SectionType(StrEnum):
     """Valid section types."""
@@ -174,7 +176,8 @@ class ItemProperties(TypedDict, total=False):
     step: float
     default: float
     debounce: bool
-    options: list[str]
+    options: list[Any]
+    exclusive: bool
     options_map: dict[str, str]
     placeholder: str
     path: str
@@ -1701,6 +1704,8 @@ class DuskyControlCenter(Adw.Application):
                     row = self._build_warning_banner(props)
                 case ItemType.ASYNC_SELECTOR:
                     row = rows.AsyncSelectorRow(props, item.get("on_action"), ctx)
+                case ItemType.FLAG_GROUP:
+                    row = rows.FlagGroupRow(props, item.get("on_action"), ctx)
                 case _:
                     log.warning("Unknown item type '%s', defaulting to button", item_type)
                     row = rows.ButtonRow(props, item.get("on_press"), ctx)

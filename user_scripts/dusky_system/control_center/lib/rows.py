@@ -263,7 +263,8 @@ class RowProperties(TypedDict, total=False):
     step: float
     default: float
     debounce: bool
-    options: list[str]
+    options: list[Any]
+    exclusive: bool
     options_map: dict[str, str]
     options_command: str
     placeholder: str
@@ -2078,6 +2079,8 @@ class ExpanderRow(DynamicIconMixin, Adw.ExpanderRow):
                     return NavigationRow(props, item.get("layout"), self.context)
                 case "expander":
                     return ExpanderRow(props, item.get("items"), self.context)
+                case "flag_group":
+                    return FlagGroupRow(props, item.get("on_action"), self.context)
                 case _:
                     log.warning("Unknown item type '%s' in expander, skipping", item_type)
                     return None
@@ -2093,6 +2096,146 @@ class ExpanderRow(DynamicIconMixin, Adw.ExpanderRow):
         sources = self._state.mark_destroyed_and_get_sources()
         _batch_source_remove(*sources)
 
+
+class FlagGroupRow(DynamicIconMixin, Adw.PreferencesRow):
+    __gtype_name__ = "DuskyFlagGroupRow"
+
+    def __init__(
+        self,
+        properties: RowProperties,
+        on_action: ActionConfig | None = None,
+        context: RowContext | None = None,
+    ) -> None:
+        super().__init__()
+        self.add_css_class("action-row")
+
+        self._state = WidgetState()
+        self.properties = properties
+        self.on_action: ActionConfig = on_action or {}
+        self.context: RowContext = context or {}
+        self.toast_overlay: Adw.ToastOverlay | None = self.context.get("toast_overlay")
+
+        self.exclusive = bool(properties.get("exclusive", False))
+        self.options = properties.get("options", [])
+
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        main_box.set_margin_top(12)
+        main_box.set_margin_bottom(12)
+        main_box.set_margin_start(12)
+        main_box.set_margin_end(12)
+
+        top_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        icon_config = properties.get("icon", DEFAULT_ICON)
+        self.icon_widget = self._create_icon_widget(icon_config)
+        self.icon_widget.set_valign(Gtk.Align.CENTER)
+        top_box.append(self.icon_widget)
+
+        text_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        text_box.set_valign(Gtk.Align.CENTER)
+        text_box.set_hexpand(True)
+
+        title_str = str(properties.get("title", "Unnamed"))
+        title_label = Gtk.Label(xalign=0)
+        title_label.set_markup(f"<b>{GLib.markup_escape_text(title_str)}</b>")
+        title_label.set_wrap(True)
+        text_box.append(title_label)
+
+        if sub_str := properties.get("description", ""):
+            sub_label = Gtk.Label(label=sub_str, xalign=0)
+            sub_label.add_css_class("dim-label")
+            sub_label.set_wrap(True)
+            text_box.append(sub_label)
+
+        top_box.append(text_box)
+
+        btn_text = str(properties.get("button_text", "Execute"))
+        self.action_btn = Gtk.Button(label=btn_text)
+        self.action_btn.set_valign(Gtk.Align.CENTER)
+        self.action_btn.connect("clicked", self._on_action_clicked)
+
+        btn_style = str(properties.get("style", "default")).lower()
+        if btn_style == "destructive":
+            self.action_btn.add_css_class("destructive-action")
+        elif btn_style == "suggested":
+            self.action_btn.add_css_class("suggested-action")
+        else:
+            self.action_btn.add_css_class("default-action")
+
+        top_box.append(self.action_btn)
+        main_box.append(top_box)
+
+        flow = Gtk.FlowBox()
+        flow.set_selection_mode(Gtk.SelectionMode.NONE)
+        flow.set_max_children_per_line(4)
+        flow.set_row_spacing(8)
+        flow.set_column_spacing(16)
+
+        self.check_buttons: list[Gtk.CheckButton] = []
+        first_btn: Gtk.CheckButton | None = None
+
+        for opt in self.options:
+            if isinstance(opt, dict):
+                opt_id = str(opt.get("id", ""))
+                opt_label = str(opt.get("label", opt_id))
+            else:
+                opt_id = str(opt)
+                opt_label = str(opt)
+
+            chk = Gtk.CheckButton(label=opt_label)
+            # Store ID directly on the widget for fast retrieval
+            chk._flag_id = opt_id
+
+            if self.exclusive:
+                if first_btn is None:
+                    first_btn = chk
+                else:
+                    chk.set_group(first_btn)
+
+            self.check_buttons.append(chk)
+            flow.append(chk)
+
+        main_box.append(flow)
+        self.set_child(main_box)
+
+        if _is_dynamic_icon(icon_config) and isinstance(icon_config, dict):
+            self._start_icon_update_loop(icon_config)
+
+    def _create_icon_widget(self, icon: object) -> Gtk.Image:
+        if isinstance(icon, dict) and icon.get("type") == "file":
+            if path := icon.get("path"):
+                p = _expand_path(str(path))
+                if p.exists():
+                    img = Gtk.Image.new_from_file(str(p))
+                    img.add_css_class("action-row-prefix-icon")
+                    return img
+
+        icon_name = _resolve_static_icon_name(icon)
+        img = Gtk.Image.new_from_icon_name(icon_name)
+        img.add_css_class("action-row-prefix-icon")
+        return img
+
+    def _on_action_clicked(self, _btn: Gtk.Button) -> None:
+        active_flags = [chk._flag_id for chk in self.check_buttons if chk.get_active()]
+        flags_str = " ".join(active_flags)
+
+        if not isinstance(self.on_action, dict):
+            return
+
+        if self.on_action.get("type") == "exec" and (cmd := self.on_action.get("command")):
+            final_cmd = str(cmd).replace("{flags}", flags_str)
+            is_term = bool(self.on_action.get("terminal", False))
+            title = str(self.properties.get("title", "Flag Action"))
+
+            success = utility.execute_command(final_cmd, title, is_term)
+            msg = f"{'▶ Executed' if success else '✖ Failed'}: {title}"
+            utility.toast(self.toast_overlay, msg, 2 if success else 4)
+        elif self.on_action.get("type") == "redirect":
+            _perform_redirect(self.on_action, self.context)
+
+    def do_unroot(self) -> None:
+        sources = self._state.mark_destroyed_and_get_sources()
+        _batch_source_remove(*sources)
+        Adw.PreferencesRow.do_unroot(self)
 
 
 class AsyncSelectorRow(DynamicIconMixin, Adw.PreferencesRow):
