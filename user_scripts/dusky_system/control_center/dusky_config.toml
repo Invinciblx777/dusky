@@ -3513,3 +3513,20 @@ icon = "memory-symbolic"
 [pages.layout.items.value]
 type = "system"
 key = "memory_total"
+
+#Example TOML Configuration
+#[[pages.layout.items]]
+#type = "flag_group"
+#[pages.layout.items.properties]
+#title = "Pacman Operation"
+#description = "Select the transaction flags (Mutually Exclusive)"
+#exclusive = true # true = radio buttons (only one), false = checkboxes (multiple)
+#options = [
+#    { id = "-Syu", label = "System Upgrade" },
+#    { id = "-Scc", label = "Clear Cache" },
+#    { id = "-Rns", label = "Remove Package" }
+#]
+#[pages.layout.items.on_action]
+#type = "exec"
+#command = "sudo pacman {flags}"
+#terminal = true
