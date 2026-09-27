@@ -416,6 +416,10 @@ def _fetch_active_services(scope: str) -> set:
     return {line.split()[0] for line in res.stdout.splitlines() if line.strip()}
 
 
+def _unit_sort_key(unit: str) -> tuple[str, str]:
+    return unit.casefold(), unit
+
+
 def DEFERRED_LOAD() -> tuple[list[int], dict[int, list[ConfigItem]], dict[str, str]]:
     """
     Populates tabs 2-6 and 8, and refreshes Core from the same inventory.
@@ -439,7 +443,7 @@ def DEFERRED_LOAD() -> tuple[list[int], dict[int, list[ConfigItem]], dict[str, s
         ("user", active_user_raw, installed_user_srv, enabled_user, user_states),
         ("system", active_sys_raw, installed_sys_srv, enabled_sys, sys_states),
     ):
-        instances = sorted(unit for unit in active if "@" in unit and "@." not in unit)
+        instances = sorted((unit for unit in active if "@" in unit and "@." not in unit), key=_unit_sort_key)
         for unit, unit_state in SystemdEngine.list_unit_files(scope, instances).items():
             installed.add(unit)
             states[unit] = unit_state
@@ -460,7 +464,7 @@ def DEFERRED_LOAD() -> tuple[list[int], dict[int, list[ConfigItem]], dict[str, s
     used_sys = CORE_SYSTEM_DEFS.keys() & installed_sys
 
     # --- TAB 2: ACTIVE SERVICES ---
-    for unit in sorted(active_user):
+    for unit in sorted(active_user, key=_unit_sort_key):
         if "@." in unit or user_states[unit] not in MANAGEABLE_STATES:
             continue
         new_schema[2].append(
@@ -475,7 +479,7 @@ def DEFERRED_LOAD() -> tuple[list[int], dict[int, list[ConfigItem]], dict[str, s
             )
         )
 
-    for unit in sorted(active_sys):
+    for unit in sorted(active_sys, key=_unit_sort_key):
         if "@." in unit or sys_states[unit] not in MANAGEABLE_STATES:
             continue
         new_schema[2].append(
@@ -491,7 +495,7 @@ def DEFERRED_LOAD() -> tuple[list[int], dict[int, list[ConfigItem]], dict[str, s
         )
 
     # --- TAB 3: ENABLED SERVICES ---
-    for unit in sorted(enabled_user):
+    for unit in sorted(enabled_user, key=_unit_sort_key):
         if "@." in unit:
             continue
         new_schema[3].append(
@@ -506,7 +510,7 @@ def DEFERRED_LOAD() -> tuple[list[int], dict[int, list[ConfigItem]], dict[str, s
             )
         )
 
-    for unit in sorted(enabled_sys):
+    for unit in sorted(enabled_sys, key=_unit_sort_key):
         if "@." in unit:
             continue
         new_schema[3].append(
@@ -522,7 +526,7 @@ def DEFERRED_LOAD() -> tuple[list[int], dict[int, list[ConfigItem]], dict[str, s
         )
 
     # --- TAB 4: TIMERS ---
-    for unit in sorted(timers_user):
+    for unit in sorted(timers_user, key=_unit_sort_key):
         if "@." in unit or user_states[unit] not in MANAGEABLE_STATES:
             continue
         new_schema[4].append(
@@ -538,7 +542,7 @@ def DEFERRED_LOAD() -> tuple[list[int], dict[int, list[ConfigItem]], dict[str, s
         )
         used_user.add(unit)
 
-    for unit in sorted(timers_sys):
+    for unit in sorted(timers_sys, key=_unit_sort_key):
         if "@." in unit or sys_states[unit] not in MANAGEABLE_STATES:
             continue
         new_schema[4].append(
@@ -555,7 +559,7 @@ def DEFERRED_LOAD() -> tuple[list[int], dict[int, list[ConfigItem]], dict[str, s
         used_sys.add(unit)
 
     # --- TAB 5: ALL USER ---
-    for unit in sorted(installed_user - used_user):
+    for unit in sorted(installed_user - used_user, key=_unit_sort_key):
         if "@." in unit or not unit.endswith(".service") or user_states[unit] not in MANAGEABLE_STATES:
             continue
         new_schema[5].append(
@@ -571,7 +575,7 @@ def DEFERRED_LOAD() -> tuple[list[int], dict[int, list[ConfigItem]], dict[str, s
         )
 
     # --- TAB 6: ALL SYSTEM ---
-    for unit in sorted(installed_sys - used_sys):
+    for unit in sorted(installed_sys - used_sys, key=_unit_sort_key):
         if "@." in unit or not unit.endswith(".service") or sys_states[unit] not in MANAGEABLE_STATES:
             continue
         new_schema[6].append(
@@ -590,8 +594,8 @@ def DEFERRED_LOAD() -> tuple[list[int], dict[int, list[ConfigItem]], dict[str, s
     for state in sorted({value for states in (user_states, sys_states) for value in states.values()} - MANAGEABLE_STATES):
         for scope, states in (("user", user_states), ("system", sys_states)):
             for unit in sorted(
-                name for name, value in states.items()
-                if value == state and "@." not in name
+                (name for name, value in states.items() if value == state and "@." not in name),
+                key=_unit_sort_key,
             ):
                 new_schema[8].append(
                     ConfigItem(
