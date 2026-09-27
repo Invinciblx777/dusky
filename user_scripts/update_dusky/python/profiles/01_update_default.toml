@@ -146,6 +146,7 @@ tasks = [
     # "S | 380_nvidia_open_source.sh",
     "U | once | 383_configure_hyprland_gpu.py --auto",
     # "S | 385_waydroid_setup.sh",
+    "U | once:forever | clipboard_upgrade.py",
     "U | once | 390_clipboard_persistance.py --ram --quiet",
     # "S | once | 395_intel_media_sdk_check.sh",
     # "U | 405_spicetify_matugen_setup.sh",
