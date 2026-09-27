@@ -30,6 +30,10 @@ TAB_NOTICES = {
     2: {
         "level": "info",
         "message": "These services are running. Switches show startup enablement; a running service may have its switch off.",
+    },
+    8: {
+        "level": "info",
+        "message": "Read-only units, grouped by systemd state. **Static:** no ordinary enable switch. **Generated:** made automatically. **Transient:** created at runtime. Press **?** for details about the selected unit's state.",
     }
 }
 
@@ -43,9 +47,22 @@ TABS = [
     "All User",
     "All System",
     "Presets",
+    "Read Only",
 ]
 
 SCHEMA = {i: [] for i in range(len(TABS))}
+
+READ_ONLY_STATE_HELP = {
+    "static": "No ordinary enable switch; another unit or activation mechanism can start it.",
+    "generated": "Created automatically by a systemd generator; it cannot be enabled directly.",
+    "transient": "Created at runtime through systemd's API; it cannot be enabled directly.",
+    "alias": "Another name for a different unit; manage the original unit instead.",
+    "masked": "Blocked from starting until the mask is removed.",
+    "masked-runtime": "Blocked from starting for this boot until the runtime mask is removed.",
+    "linked": "Made available through a symlink to a unit file outside the usual search path.",
+    "linked-runtime": "Made available through a temporary symlink to an external unit file.",
+    "bad": "Systemd found an invalid unit file or could not determine its state.",
+}
 
 # --- DETAILED EXTENDED HELP DICTIONARIES ---
 CORE_USER_DEFS = {
@@ -309,7 +326,11 @@ def _append_core_sections(tab_idx, definitions, installed, scope, sections, rows
         rows = SCHEMA[tab_idx]
     assigned = set()
     for section_idx, (title, units) in enumerate((*sections, ("Other", tuple(definitions)))):
-        members = [unit for unit in units if unit in definitions and unit in installed and unit not in assigned]
+        members = [
+            unit for unit in units
+            if unit in definitions and unit in installed
+            and installed[unit] in MANAGEABLE_STATES and unit not in assigned
+        ]
         if not members:
             continue
         folder_key = f"__core_{scope}_{section_idx}"
@@ -328,12 +349,11 @@ def _append_core_sections(tab_idx, definitions, installed, scope, sections, rows
             label, help_text = definitions[unit]
             rows.append(
                 ConfigItem(
-                    label=label if installed[unit] in MANAGEABLE_STATES else f"{label} [{installed[unit]}]",
+                    label=label,
                     key=unit,
                     scope=scope,
                     type_="bool",
                     default=False,
-                    read_only=installed[unit] not in MANAGEABLE_STATES,
                     parent_ref=folder_key,
                     extended_help=(
                         f"**Unit:** `{unit}`\n**Scope:** {scope.title()}\n"
@@ -353,6 +373,9 @@ _append_core_sections(1, CORE_SYSTEM_DEFS, _core_installed_sys, "system", CORE_S
 # Empty – populated at runtime by User Presets via ENABLE_USER_PRESETS /
 # USER_PRESETS_TAB="Presets" -> Reset to Defaults / Save as Preset / Import.
 # No static presets needed; AI services (dusky_llm/stt) now live in Core User.
+
+# --- TAB 8: READ ONLY ---
+# Populated by discovery from non-manageable service and timer states.
 
 
 # =============================================================================
@@ -395,7 +418,7 @@ def _fetch_active_services(scope: str) -> set:
 
 def DEFERRED_LOAD() -> tuple[list[int], dict[int, list[ConfigItem]], dict[str, str]]:
     """
-    Populates tabs 2-6 and refreshes the Core tabs from the same inventory.
+    Populates tabs 2-6 and 8, and refreshes Core from the same inventory.
     Runs full scans after the initial UI render and returns replacement rows.
     Returns populated tab indices, new rows, and the collected unit states.
     Called by the TUI after its initial render of tabs 0-1.
@@ -428,7 +451,7 @@ def DEFERRED_LOAD() -> tuple[list[int], dict[int, list[ConfigItem]], dict[str, s
 
     active_user = active_user_raw.intersection(installed_user_srv)
     active_sys = active_sys_raw.intersection(installed_sys_srv)
-    new_schema = {i: [] for i in range(7)}
+    new_schema = {i: [] for i in (*range(7), 8)}
     _append_core_sections(0, CORE_USER_DEFS, user_states, "user", CORE_USER_SECTIONS, new_schema[0])
     _append_core_sections(1, CORE_SYSTEM_DEFS, sys_states, "system", CORE_SYSTEM_SECTIONS, new_schema[1])
 
@@ -438,32 +461,30 @@ def DEFERRED_LOAD() -> tuple[list[int], dict[int, list[ConfigItem]], dict[str, s
 
     # --- TAB 2: ACTIVE SERVICES ---
     for unit in sorted(active_user):
-        if "@." in unit:
+        if "@." in unit or user_states[unit] not in MANAGEABLE_STATES:
             continue
         new_schema[2].append(
             ConfigItem(
-                label=unit if user_states[unit] in MANAGEABLE_STATES else f"{unit} [{user_states[unit]}]",
+                label=unit,
                 key=unit,
                 scope="user",
                 type_="bool",
                 default=False,
-                read_only=user_states[unit] not in MANAGEABLE_STATES,
                 group="User Services",
                 extended_help=f"**Unit:** `{unit}`\n**Scope:** User\n\nCurrently active user-level service.",
             )
         )
 
     for unit in sorted(active_sys):
-        if "@." in unit:
+        if "@." in unit or sys_states[unit] not in MANAGEABLE_STATES:
             continue
         new_schema[2].append(
             ConfigItem(
-                label=unit if sys_states[unit] in MANAGEABLE_STATES else f"{unit} [{sys_states[unit]}]",
+                label=unit,
                 key=unit,
                 scope="system",
                 type_="bool",
                 default=False,
-                read_only=sys_states[unit] not in MANAGEABLE_STATES,
                 group="System Services",
                 extended_help=f"**Unit:** `{unit}`\n**Scope:** System\n\nCurrently active system-level service.",
             )
@@ -475,12 +496,11 @@ def DEFERRED_LOAD() -> tuple[list[int], dict[int, list[ConfigItem]], dict[str, s
             continue
         new_schema[3].append(
             ConfigItem(
-                label=unit if user_states[unit] in MANAGEABLE_STATES else f"{unit} [{user_states[unit]}]",
+                label=unit,
                 key=unit,
                 scope="user",
                 type_="bool",
                 default=False,
-                read_only=user_states[unit] not in MANAGEABLE_STATES,
                 group="User Services",
                 extended_help=f"**Unit:** `{unit}`\n**Scope:** User\n\nEnabled to start automatically with the user manager.",
             )
@@ -491,12 +511,11 @@ def DEFERRED_LOAD() -> tuple[list[int], dict[int, list[ConfigItem]], dict[str, s
             continue
         new_schema[3].append(
             ConfigItem(
-                label=unit if sys_states[unit] in MANAGEABLE_STATES else f"{unit} [{sys_states[unit]}]",
+                label=unit,
                 key=unit,
                 scope="system",
                 type_="bool",
                 default=False,
-                read_only=sys_states[unit] not in MANAGEABLE_STATES,
                 group="System Services",
                 extended_help=f"**Unit:** `{unit}`\n**Scope:** System\n\nEnabled to start automatically on boot.",
             )
@@ -504,16 +523,15 @@ def DEFERRED_LOAD() -> tuple[list[int], dict[int, list[ConfigItem]], dict[str, s
 
     # --- TAB 4: TIMERS ---
     for unit in sorted(timers_user):
-        if "@." in unit:
+        if "@." in unit or user_states[unit] not in MANAGEABLE_STATES:
             continue
         new_schema[4].append(
             ConfigItem(
-                label=unit if user_states[unit] in MANAGEABLE_STATES else f"{unit} [{user_states[unit]}]",
+                label=unit,
                 key=unit,
                 scope="user",
                 type_="bool",
                 default=False,
-                read_only=user_states[unit] not in MANAGEABLE_STATES,
                 group="User Timers",
                 extended_help=f"**Unit:** `{unit}`\n**Scope:** User\n\nSystemd timer unit (Cron alternative).",
             )
@@ -521,16 +539,15 @@ def DEFERRED_LOAD() -> tuple[list[int], dict[int, list[ConfigItem]], dict[str, s
         used_user.add(unit)
 
     for unit in sorted(timers_sys):
-        if "@." in unit:
+        if "@." in unit or sys_states[unit] not in MANAGEABLE_STATES:
             continue
         new_schema[4].append(
             ConfigItem(
-                label=unit if sys_states[unit] in MANAGEABLE_STATES else f"{unit} [{sys_states[unit]}]",
+                label=unit,
                 key=unit,
                 scope="system",
                 type_="bool",
                 default=False,
-                read_only=sys_states[unit] not in MANAGEABLE_STATES,
                 group="System Timers",
                 extended_help=f"**Unit:** `{unit}`\n**Scope:** System\n\nSystemd timer unit (Cron alternative).",
             )
@@ -539,16 +556,15 @@ def DEFERRED_LOAD() -> tuple[list[int], dict[int, list[ConfigItem]], dict[str, s
 
     # --- TAB 5: ALL USER ---
     for unit in sorted(installed_user - used_user):
-        if "@." in unit or not unit.endswith(".service"):
+        if "@." in unit or not unit.endswith(".service") or user_states[unit] not in MANAGEABLE_STATES:
             continue
         new_schema[5].append(
             ConfigItem(
-                label=unit if user_states[unit] in MANAGEABLE_STATES else f"{unit} [{user_states[unit]}]",
+                label=unit,
                 key=unit,
                 scope="user",
                 type_="bool",
                 default=False,
-                read_only=user_states[unit] not in MANAGEABLE_STATES,
                 group=unit[0].upper(),
                 extended_help=f"**Unit:** `{unit}`\n**Scope:** User\n\nAuto-discovered service.",
             )
@@ -556,21 +572,44 @@ def DEFERRED_LOAD() -> tuple[list[int], dict[int, list[ConfigItem]], dict[str, s
 
     # --- TAB 6: ALL SYSTEM ---
     for unit in sorted(installed_sys - used_sys):
-        if "@." in unit or not unit.endswith(".service"):
+        if "@." in unit or not unit.endswith(".service") or sys_states[unit] not in MANAGEABLE_STATES:
             continue
         new_schema[6].append(
             ConfigItem(
-                label=unit if sys_states[unit] in MANAGEABLE_STATES else f"{unit} [{sys_states[unit]}]",
+                label=unit,
                 key=unit,
                 scope="system",
                 type_="bool",
                 default=False,
-                read_only=sys_states[unit] not in MANAGEABLE_STATES,
                 group=unit[0].upper(),
                 extended_help=f"**Unit:** `{unit}`\n**Scope:** System\n\nAuto-discovered service.",
             )
         )
 
+    # --- TAB 8: READ-ONLY UNIT FILE STATES ---
+    for state in sorted({value for states in (user_states, sys_states) for value in states.values()} - MANAGEABLE_STATES):
+        for scope, states in (("user", user_states), ("system", sys_states)):
+            for unit in sorted(
+                name for name, value in states.items()
+                if value == state and "@." not in name
+            ):
+                new_schema[8].append(
+                    ConfigItem(
+                        label=f"{scope.title()}: {unit}",
+                        key=unit,
+                        scope=scope,
+                        type_="bool",
+                        default=False,
+                        read_only=True,
+                        group=state.title(),
+                        extended_help=(
+                            f"**Unit:** `{unit}`\n**Scope:** {scope.title()}\n"
+                            f"**Systemd state:** `{state}`\n\n"
+                            f"{READ_ONLY_STATE_HELP.get(state, 'Systemd reports this unit-file state; inspect the unit for details.')}"
+                        ),
+                    )
+                )
+
     state = {f"user/{unit}": "true" if value in ENABLED_STATES else "false" for unit, value in user_states.items()}
     state.update({f"system/{unit}": "true" if value in ENABLED_STATES else "false" for unit, value in sys_states.items()})
-    return list(range(7)), new_schema, state
+    return list(new_schema), new_schema, state
