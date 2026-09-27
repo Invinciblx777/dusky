@@ -1569,21 +1569,19 @@ impl WallpaperSelectorApp {
         .style(move |_theme, status| {
             let is_active = motion_profile.is_enabled();
             button::Style {
-                background: Some(Background::Color(if is_active {
-                    Color { a: 0.22, ..accent }
-                } else if status == button::Status::Hovered {
-                    Color::from_rgba8(255, 255, 255, 0.12)
+                background: Some(Background::Color(if status == button::Status::Hovered {
+                    Color::from_rgba8(30, 34, 46, 0.96)
                 } else {
-                    Color::from_rgba8(20, 22, 30, 0.90)
+                    Color::from_rgba8(20, 22, 30, 0.94)
                 })),
-                text_color: if is_active {
-                    accent
-                } else {
-                    Color::from_rgb8(210, 215, 235)
-                },
+                text_color: Color::from_rgb8(240, 243, 255),
                 border: Border {
                     radius: 14.0.into(),
-                    color: Color::from_rgba8(255, 255, 255, 0.08),
+                    color: if is_active {
+                        Color { a: 0.75, ..accent }
+                    } else {
+                        Color::from_rgba8(255, 255, 255, 0.08)
+                    },
                     width: 1.0,
                 },
                 ..button::Style::default()
