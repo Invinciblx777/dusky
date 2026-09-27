@@ -174,8 +174,7 @@ class WidgetTests(unittest.TestCase):
         row = rows.SelectionRow({'options': ['Old'], 'options_command': 'unused'})
         row._options_fetch_running = True
         row._options_fetch_pending = True
-        result = subprocess.CompletedProcess([], 0, stdout='New\n')
-        with patch.object(rows.subprocess, 'run', return_value=result), patch.object(rows, '_submit_task_safe', return_value=True):
+        with patch.object(rows, '_run_shell_async', side_effect=lambda _cmd, _timeout, callback: GLib.idle_add(callback, 'New\n')):
             row._fetch_options_async(row._options_fetch_generation)
             drain_until(lambda: row._options_fetch_generation == 1)
         self.assertEqual(row.options_list, ['New'])
@@ -229,6 +228,22 @@ class WidgetTests(unittest.TestCase):
                 widget._on_card_unmap(widget)
             handle.cancel.assert_not_called()
 
+    def test_removing_service_row_does_not_cancel_transaction(self):
+        from unittest.mock import Mock
+        row = rows.ServiceToggleRow({'service': 'example'})
+        group = cc.Adw.PreferencesGroup()
+        group.add(row)
+        window = cc.Adw.Window(content=group)
+        with patch.object(services, 'check_unit_status_async', return_value=None):
+            window.present()
+            drain_until(row.get_mapped)
+            handle = Mock()
+            row._toggle_handle = handle
+            group.remove(row)
+            self.assertTrue(row._state.is_destroyed)
+            handle.cancel.assert_not_called()
+        window.destroy()
+
 
 class ApplicationTests(unittest.TestCase):
     @classmethod
@@ -264,6 +279,35 @@ class ApplicationTests(unittest.TestCase):
         with patch.object(self.app, '_do_load_config', return_value=({'pages': []}, 'Invalid TOML')), patch.object(self.app, '_run_in_background', side_effect=lambda task, callback: callback(task(), None)):
             self.app._reload_app_async()
         self.assertIs(self.app._state.config, config)
+
+    def test_css_read_failure_preserves_working_theme(self):
+        config, provider, css = self.app._state.config, self.app._css_provider, self.app._state.css_content
+        def complete(task, callback):
+            try:
+                callback(task(), None)
+            except OSError as error:
+                callback(None, error)
+        with patch.object(self.app, '_do_load_css', side_effect=PermissionError('fixture denied')), patch.object(self.app, '_run_in_background', side_effect=complete), patch.object(cc.log, 'error'):
+            self.app._reload_app_async()
+        self.assertIs(self.app._state.config, config)
+        self.assertIs(self.app._css_provider, provider)
+        self.assertEqual(self.app._state.css_content, css)
+
+    def test_reload_restores_page_by_id(self):
+        original = self.app._state.config
+        self.app._sidebar_list.select_row(self.app._sidebar_list.get_row_at_index(2))
+        page_id = original['pages'][2]['id']
+        changed = dict(original)
+        changed['pages'] = list(original['pages'])
+        changed['pages'][1], changed['pages'][2] = changed['pages'][2], changed['pages'][1]
+        try:
+            with patch.object(self.app, '_do_load_config', return_value=(changed, None)), patch.object(self.app, '_run_in_background', side_effect=lambda task, callback: callback(task(), None)):
+                self.app._reload_app_async()
+            selected = self.app._sidebar_list.get_selected_row().get_index()
+            self.assertEqual(self.app._state.config['pages'][selected]['id'], page_id)
+        finally:
+            self.app._state.config = original
+            self.app._clear_and_rebuild_ui(2)
 
     def test_search_clear_returns_to_page(self):
         page = self.app._stack.get_visible_child_name()
@@ -328,7 +372,10 @@ class CommandTests(unittest.TestCase):
                 drain_until(lambda: self.process_stopped(pid))
             finally:
                 if not self.process_stopped(pid):
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
                 proc.communicate(timeout=3)
 
     def test_shell_expansion_preserves_quotes(self):
