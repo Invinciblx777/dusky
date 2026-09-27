@@ -240,7 +240,8 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
             self.wifi_switch.set_valign(Gtk.Align.CENTER)
             self.wifi_switch.set_can_focus(False)
             _add_css_class(self.wifi_switch, 'compact-switch')
-            self.wifi_switch.connect('state-set', self._on_wifi_state_set)
+            # Keep GTK's default state-set handler in charge of both visuals.
+            self.wifi_switch.connect('notify::active', self._on_wifi_active_changed)
             self.wifi_box.pack_start(self.wifi_switch, False, False, 0)
             self.power_container.pack_start(self.wifi_box, False, False, 0)
             spacer_wbt = Gtk.Box()
@@ -254,7 +255,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
             self.bt_switch.set_valign(Gtk.Align.CENTER)
             self.bt_switch.set_can_focus(False)
             _add_css_class(self.bt_switch, 'compact-switch')
-            self.bt_switch.connect('state-set', self._on_bt_state_set)
+            self.bt_switch.connect('notify::active', self._on_bt_active_changed)
             self.bt_box.pack_start(self.bt_switch, False, False, 0)
             self.power_container.pack_start(self.bt_box, False, False, 0)
             expand_spacer = Gtk.Box()
@@ -515,20 +516,20 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
                 self.bt_icon.set_from_icon_name('bluetooth-active-symbolic' if bt_on else 'bluetooth-disabled-symbolic', Gtk.IconSize.BUTTON)
                 self._set_radio_switch(self.bt_switch, bt_on)
 
-    def _on_wifi_state_set(self, switch: Gtk.Switch, state: bool) -> bool:
+    def _on_wifi_active_changed(self, switch: Gtk.Switch, _property: Any) -> None:
         if self._updating_radios:
-            return True
+            return
         if self._wifi_pending or self._wifi_confirmed is None:
-            GLib.idle_add(self._set_radio_switch, switch, self._wifi_confirmed or False, priority=GLib.PRIORITY_HIGH)
-            return True
+            self._set_radio_switch(switch, self._wifi_confirmed or False)
+            return
+        state = switch.get_active()
+        if state == self._wifi_confirmed:
+            return
         self._radio_revision += 1
         self._wifi_pending = True
-        # Let GTK finish the click before restoring the confirmed position.
-        GLib.idle_add(self._set_radio_switch, switch, self._wifi_confirmed, priority=GLib.PRIORITY_HIGH)
         switch.set_sensitive(False)
         switch.set_tooltip_text('Setting Wi-Fi…')
         start_thread('wifi-toggle', self._set_wifi_worker, state, self._wifi_confirmed)
-        return True
 
     def _set_wifi_worker(self, state: bool, prior: bool) -> None:
         val = 'true' if state else 'false'
@@ -538,19 +539,20 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         observation = run_command(['busctl', 'get-property', 'org.freedesktop.NetworkManager', '/org/freedesktop/NetworkManager', 'org.freedesktop.NetworkManager', 'WirelessEnabled'], timeout=1.0, capture_stdout=True)
         GLib.idle_add(self._finish_radio_change, 'wifi', self._read_busctl_bool(observation), prior)
 
-    def _on_bt_state_set(self, switch: Gtk.Switch, state: bool) -> bool:
+    def _on_bt_active_changed(self, switch: Gtk.Switch, _property: Any) -> None:
         if self._updating_radios:
-            return True
+            return
         if self._bt_pending or self._bt_adapter is None or self._bt_confirmed is None:
-            GLib.idle_add(self._set_radio_switch, switch, self._bt_confirmed or False, priority=GLib.PRIORITY_HIGH)
-            return True
+            self._set_radio_switch(switch, self._bt_confirmed or False)
+            return
+        state = switch.get_active()
+        if state == self._bt_confirmed:
+            return
         self._radio_revision += 1
         self._bt_pending = True
-        GLib.idle_add(self._set_radio_switch, switch, self._bt_confirmed, priority=GLib.PRIORITY_HIGH)
         switch.set_sensitive(False)
         switch.set_tooltip_text('Setting Bluetooth…')
         start_thread('bluetooth-toggle', self._set_bt_worker, self._bt_adapter, state, self._bt_confirmed)
-        return True
 
     def _set_bt_worker(self, adapter: str, state: bool, prior: bool) -> None:
         adapter_path = f'/org/bluez/{adapter}'
