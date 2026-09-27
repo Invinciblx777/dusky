@@ -890,6 +890,14 @@ impl WallpaperSelectorApp {
                             }
                         }
                         "g" => {
+                            if modifiers.shift() {
+                                self.last_g_press = None;
+                                if !self.filtered_indices.is_empty() {
+                                    return self.select_wallpaper(self.filtered_indices.len() - 1);
+                                } else {
+                                    return Task::none();
+                                }
+                            }
                             if let Some(last) = self.last_g_press {
                                 if last.elapsed().as_millis() < 500 {
                                     self.last_g_press = None;
