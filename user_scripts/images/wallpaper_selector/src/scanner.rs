@@ -7,12 +7,13 @@ use walkdir::WalkDir;
 pub struct WallpaperItem {
     pub path: PathBuf,
     pub relative: String,
+    pub search_key: String,
     pub name: String,
     pub thumb_path: PathBuf,
     pub is_favorite: bool,
     pub is_active: bool,
     pub mtime: std::time::SystemTime,
-    pub color_bucket: u8,
+    pub color_bucket: Option<u8>,
 }
 
 pub fn is_supported_image(path: &Path) -> bool {
@@ -27,53 +28,42 @@ pub fn is_supported_image(path: &Path) -> bool {
 }
 
 pub fn natural_cmp(a: &str, b: &str) -> Ordering {
-    let mut a_chars = a.chars().peekable();
-    let mut b_chars = b.chars().peekable();
-
-    loop {
-        match (a_chars.peek(), b_chars.peek()) {
-            (None, None) => return Ordering::Equal,
-            (None, Some(_)) => return Ordering::Less,
-            (Some(_), None) => return Ordering::Greater,
-            (Some(ca), Some(cb)) => {
-                if ca.is_ascii_digit() && cb.is_ascii_digit() {
-                    let mut num_a: u64 = 0;
-                    while let Some(d) = a_chars.peek() {
-                        if let Some(digit) = d.to_digit(10) {
-                            num_a = num_a.saturating_mul(10).saturating_add(digit as u64);
-                            a_chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-
-                    let mut num_b: u64 = 0;
-                    while let Some(d) = b_chars.peek() {
-                        if let Some(digit) = d.to_digit(10) {
-                            num_b = num_b.saturating_mul(10).saturating_add(digit as u64);
-                            b_chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-
-                    match num_a.cmp(&num_b) {
-                        Ordering::Equal => continue,
-                        non_eq => return non_eq,
-                    }
-                } else {
-                    let ca_lower = ca.to_lowercase().next().unwrap_or(*ca);
-                    let cb_lower = cb.to_lowercase().next().unwrap_or(*cb);
-                    match ca_lower.cmp(&cb_lower) {
-                        Ordering::Equal => {
-                            a_chars.next();
-                            b_chars.next();
-                        }
-                        non_eq => return non_eq,
-                    }
-                }
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    let (mut ai, mut bi) = (0, 0);
+    while ai < ab.len() && bi < bb.len() {
+        if ab[ai].is_ascii_digit() && bb[bi].is_ascii_digit() {
+            let (a_start, b_start) = (ai, bi);
+            while ai < ab.len() && ab[ai].is_ascii_digit() {
+                ai += 1;
             }
+            while bi < bb.len() && bb[bi].is_ascii_digit() {
+                bi += 1;
+            }
+            let a_digits = a[a_start..ai].trim_start_matches('0');
+            let b_digits = b[b_start..bi].trim_start_matches('0');
+            let order = a_digits
+                .len()
+                .cmp(&b_digits.len())
+                .then_with(|| a_digits.cmp(b_digits));
+            if order != Ordering::Equal {
+                return order;
+            }
+        } else {
+            let ca = a[ai..].chars().next().unwrap();
+            let cb = b[bi..].chars().next().unwrap();
+            let order = ca.to_lowercase().next().cmp(&cb.to_lowercase().next());
+            if order != Ordering::Equal {
+                return order;
+            }
+            ai += ca.len_utf8();
+            bi += cb.len_utf8();
         }
+    }
+    match (ai == ab.len(), bi == bb.len()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => unreachable!(),
     }
 }
 
@@ -82,20 +72,27 @@ pub fn scan_wallpapers(
     thumb_dir: &Path,
     favorites: &HashSet<String>,
     active_id: Option<&str>,
-) -> Vec<WallpaperItem> {
-    if !wallpapers_dir.exists() {
-        return Vec::new();
+) -> Result<Vec<WallpaperItem>, String> {
+    match wallpapers_dir.try_exists() {
+        Ok(false) => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "Could not access {}: {error}",
+                wallpapers_dir.display()
+            ));
+        }
+        Ok(true) => {}
     }
 
     let mut items = Vec::new();
+    let active_canonical = active_id
+        .filter(|id| Path::new(id).is_absolute())
+        .and_then(|id| Path::new(id).canonicalize().ok());
 
-    for entry in WalkDir::new(wallpapers_dir)
-        .follow_links(true)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
+    for entry in WalkDir::new(wallpapers_dir).follow_links(true) {
+        let entry = entry.map_err(|error| format!("Could not scan wallpapers: {error}"))?;
         let path = entry.path();
-        if path.is_file() && is_supported_image(path) {
+        if entry.file_type().is_file() && is_supported_image(path) {
             let relative = path
                 .strip_prefix(wallpapers_dir)
                 .map(|p| p.to_string_lossy().to_string())
@@ -106,36 +103,47 @@ pub fn scan_wallpapers(
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| relative.clone());
 
-            let is_fav = favorites.contains(&relative) || favorites.contains(&name);
+            let is_fav = favorites.contains(&relative);
 
             let is_act = active_id.is_some_and(|id| {
                 id == relative
-                    || id == name
-                    || path.to_string_lossy().ends_with(id)
-                    || id.ends_with(&relative)
-                    || id.ends_with(&name)
+                    || Path::new(id) == path
+                    || active_canonical.as_ref().is_some_and(|active| {
+                        path.canonicalize()
+                            .is_ok_and(|resolved| &resolved == active)
+                    })
             });
 
-            let thumb_path = crate::cache::thumb_path_for(&relative, thumb_dir);
+            let thumb_path = crate::cache::thumb_path_for(&relative, path, thumb_dir);
             let mtime = entry
                 .metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                .map_err(|error| {
+                    format!("Could not read metadata for {}: {error}", path.display())
+                })?
+                .modified()
+                .map_err(|error| {
+                    format!(
+                        "Could not read modification time for {}: {error}",
+                        path.display()
+                    )
+                })?;
 
             items.push(WallpaperItem {
                 path: path.to_path_buf(),
+                search_key: relative.to_lowercase(),
                 relative,
                 name,
                 thumb_path,
                 is_favorite: is_fav,
                 is_active: is_act,
                 mtime,
-                color_bucket: 12,
+                color_bucket: None,
             });
         }
     }
 
-    items.sort_by(|a, b| natural_cmp(&a.relative, &b.relative));
-    items
+    items.sort_by(|a, b| {
+        natural_cmp(&a.relative, &b.relative).then_with(|| a.relative.cmp(&b.relative))
+    });
+    Ok(items)
 }

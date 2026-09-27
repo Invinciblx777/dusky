@@ -11,8 +11,10 @@ pub fn apply_wallpaper(
     }
 
     if theme_ctl_path.exists() {
-        let mut cmd = Command::new(theme_ctl_path);
-        cmd.arg("set");
+        let mut cmd = Command::new("timeout");
+        cmd.args(["-k", "2s", "120s"])
+            .arg(theme_ctl_path)
+            .arg("set");
         if !regen {
             cmd.arg("--no-regen");
         }
@@ -26,10 +28,10 @@ pub fn apply_wallpaper(
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!("theme_ctl.sh failed: {stderr}"));
         }
-    } else {
-        // Fallback directly to awww img
-        let mut cmd = Command::new("awww");
-        cmd.arg("img").arg(image_path);
+    } else if !regen {
+        // Wallpaper-only mode can still work without the theme controller.
+        let mut cmd = Command::new("timeout");
+        cmd.args(["-k", "2s", "15s", "awww", "img"]).arg(image_path);
         let output = cmd
             .output()
             .map_err(|e| format!("Failed to run awww: {e}"))?;
@@ -38,6 +40,11 @@ pub fn apply_wallpaper(
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!("awww img failed: {stderr}"));
         }
+    } else {
+        return Err(format!(
+            "Theme controller is missing: {}",
+            theme_ctl_path.display()
+        ));
     }
 
     Ok(())

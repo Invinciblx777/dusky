@@ -1,11 +1,11 @@
 pkgname=dusky-wallpaper-selector
-pkgver=1.0.0
+pkgver=1.1.0
 pkgrel=1
 pkgdesc='Dusky Rust wallpaper selector for Hyprland'
 arch=('x86_64')
 license=('custom')
 depends=('glibc' 'gcc-libs' 'wayland' 'libxkbcommon' 'vulkan-icd-loader')
-makedepends=('cargo')
+makedepends=('cargo' 'python')
 source=()
 
 build() {
@@ -21,4 +21,32 @@ package() {
   local target_dir="${CARGO_TARGET_DIR:-$srcdir/project/target}"
   install -Dm755 "$target_dir/x86_64-unknown-linux-gnu/release/wallpaper_selector" \
     "$pkgdir/usr/bin/dusky-wallpaper-selector"
+  install -d "$pkgdir/usr/share/dusky-wallpaper-selector"
+  python - "$srcdir/project" > "$pkgdir/usr/share/dusky-wallpaper-selector/source.sha256" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+project = Path(sys.argv[1])
+files = [project / "Cargo.toml", project / "Cargo.lock"]
+for relative in (
+    "build.rs", "rust-toolchain", "rust-toolchain.toml",
+    ".cargo/config", ".cargo/config.toml",
+):
+    path = project / relative
+    if path.is_file():
+        files.append(path)
+src = project / "src"
+if src.is_dir():
+    files.extend(sorted(path for path in src.rglob("*") if path.is_file()))
+
+# Keep these inputs in sync with source_digest() in 151_wallpaper_selector_setup.py.
+digest = hashlib.sha256()
+digest.update(b"native-v3-frozen-sparse\0")
+for path in files:
+    digest.update(str(path.relative_to(project)).encode())
+    digest.update(b"\0")
+    digest.update(hashlib.sha256(path.read_bytes()).digest())
+print(digest.hexdigest())
+PY
 }

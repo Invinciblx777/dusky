@@ -4,13 +4,14 @@ use iced::keyboard::key::Named;
 use iced::widget::scrollable::AbsoluteOffset;
 use iced::widget::{
     Float, Space, Stack, button, column, container, image, mouse_area, row, scrollable, text,
-    text_input,
+    text_input, tooltip,
 };
 use iced::{
     Background, Border, Color, ContentFit, Element, Event, Length, Padding, Shadow, Subscription,
     Task, Vector,
 };
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use crate::config::{Config, MotionProfile, Preferences, ViewLayout};
 use crate::scanner::WallpaperItem;
@@ -21,7 +22,12 @@ pub enum Message {
     SearchChanged(String),
     FocusSearch,
     SearchSubmitted,
+    SearchTab,
+    SearchEscape,
+    SearchFocusChanged(bool),
+    CheckSearchFocus,
     YankPath(bool),
+    ClipboardWritten(Result<String, String>),
     NextFavorite,
     PrevFavorite,
     ToggleFavoritesView(bool),
@@ -29,7 +35,9 @@ pub enum Message {
     CycleSortMode,
     CycleMotionProfile,
     ToggleViewLayout,
-    GridScroll(f32),
+    GridScroll(f32, f32),
+    WindowOpened(iced::window::Id),
+    WindowResized(iced::Size),
     SelectWallpaper(usize),
     ApplyWallpaper(usize, bool),
     WallpaperApplied(Result<String, String>),
@@ -39,9 +47,16 @@ pub enum Message {
     JumpWallpapers(isize),
     ApplyRandom,
     RefreshList,
-    RefreshFinished(usize, usize, usize),
-    #[allow(dead_code)]
-    ToggleAnimation,
+    LibraryLoaded(LibrarySnapshot),
+    ThumbnailsReady(
+        u64,
+        Vec<(
+            PathBuf,
+            crate::cache::ThumbStatus,
+            Option<u8>,
+            Option<Vec<u8>>,
+        )>,
+    ),
     AnimationFrame(iced::time::Instant),
     EventOccurred(Event),
     Close,
@@ -51,6 +66,117 @@ const SLICE_WIDTH: f32 = 120.0;
 const EXPANDED_WIDTH: f32 = 540.0;
 const CARD_HEIGHT: f32 = 337.5;
 const CARD_GAP: f32 = 10.0;
+
+fn unfocus_search() -> Task<Message> {
+    iced::advanced::widget::operate(iced::advanced::widget::operation::focusable::unfocus())
+}
+
+#[derive(Debug, Clone)]
+pub struct LibrarySnapshot {
+    wallpapers: Vec<WallpaperItem>,
+    favorites: HashSet<String>,
+    active: Option<String>,
+    theme: AppTheme,
+    generated: usize,
+    failed: usize,
+    refreshed: bool,
+    ready: HashSet<PathBuf>,
+    color_cache: std::collections::HashMap<String, u8>,
+    colors_dirty: bool,
+    error: Option<String>,
+    warning: Option<String>,
+}
+
+fn load_library(config: Config, refreshed: bool) -> LibrarySnapshot {
+    let favorites = match crate::favorites::load_favorites(&config.fav_file) {
+        Ok(favorites) => favorites,
+        Err(error) => {
+            return LibrarySnapshot {
+                wallpapers: Vec::new(),
+                favorites: HashSet::new(),
+                active: None,
+                theme: AppTheme::load(),
+                generated: 0,
+                failed: 0,
+                refreshed,
+                ready: HashSet::new(),
+                color_cache: std::collections::HashMap::new(),
+                colors_dirty: false,
+                error: Some(format!("Could not read favorites: {error}")),
+                warning: None,
+            };
+        }
+    };
+    let active = crate::favorites::read_active_wallpaper(&config.theme_dir);
+    let mut wallpapers = match crate::scanner::scan_wallpapers(
+        &config.wallpaper_dir,
+        &config.thumb_dir,
+        &favorites,
+        active.as_deref(),
+    ) {
+        Ok(items) => items,
+        Err(error) => {
+            return LibrarySnapshot {
+                wallpapers: Vec::new(),
+                favorites,
+                active,
+                theme: AppTheme::load(),
+                generated: 0,
+                failed: 0,
+                refreshed,
+                ready: HashSet::new(),
+                color_cache: std::collections::HashMap::new(),
+                colors_dirty: false,
+                error: Some(error),
+                warning: None,
+            };
+        }
+    };
+    let (generated, failed, prune_error) = if refreshed {
+        let stats = crate::cache::batch_generate_thumbs(&wallpapers, false);
+        let prune_error = crate::cache::prune_thumbnails(&wallpapers, &config.thumb_dir)
+            .err()
+            .map(|error| format!("Could not prune thumbnails: {error}"));
+        (stats.generated, stats.failed, prune_error)
+    } else {
+        (0, 0, None)
+    };
+    let (colors, color_cache, saved) =
+        crate::color::ensure_color_cache(&wallpapers, &config.colors_file);
+    let colors_dirty = saved.is_err();
+    let color_error = saved
+        .err()
+        .map(|error| format!("Could not save wallpaper colors: {error}"));
+    for item in &mut wallpapers {
+        if let Some(&bucket) = colors.get(&item.relative) {
+            item.color_bucket = Some(bucket);
+        }
+    }
+    let ready = if refreshed {
+        // Reload visible image bytes after a refresh, even if the path is unchanged.
+        HashSet::new()
+    } else {
+        wallpapers
+            .iter()
+            .filter(|item| crate::cache::is_thumb_valid(&item.path, &item.thumb_path))
+            .map(|item| item.thumb_path.clone())
+            .collect()
+    };
+    LibrarySnapshot {
+        wallpapers,
+        favorites,
+        active,
+        theme: AppTheme::load(),
+        generated,
+        failed,
+        refreshed,
+        ready,
+        color_cache,
+        colors_dirty,
+        error: None,
+        warning: color_error.or(prune_error),
+    }
+}
 
 struct CarouselAnimation {
     target: f32,
@@ -74,7 +200,8 @@ impl CarouselAnimation {
         }
         while remaining > 0.0 {
             let step = remaining.min(1.0 / 240.0);
-            let accel = -omega * omega * (*position - self.target) - 2.0 * zeta * omega * self.velocity;
+            let accel =
+                -omega * omega * (*position - self.target) - 2.0 * zeta * omega * self.velocity;
             self.velocity += accel * step;
             *position += self.velocity * step;
             remaining -= step;
@@ -110,43 +237,49 @@ pub struct WallpaperSelectorApp {
     refreshing: bool,
     error_message: Option<String>,
     refresh_status: Option<String>,
-    animate_carousel: bool,
     animation: Option<CarouselAnimation>,
     visual_position: f32,
     grid_scroll_offset: f32,
-    grid_scroll_target: f32,
-    grid_animation: Option<CarouselAnimation>,
+    grid_viewport_height: f32,
+    window_width: f32,
+    wheel_pixels: f32,
+    ready_thumbs: HashSet<PathBuf>,
+    failed_thumbs: HashSet<PathBuf>,
+    thumb_handles: std::collections::HashMap<PathBuf, image::Handle>,
+    color_cache: std::collections::HashMap<String, u8>,
+    colors_dirty: bool,
+    color_prefetch_cursor: usize,
+    prefetch_running: bool,
+    library_generation: u64,
     launch_instant: iced::time::Instant,
 }
 
 impl WallpaperSelectorApp {
+    fn grid_columns(&self) -> usize {
+        (((self.window_width - 32.0 + 14.0) / 264.0).floor() as usize).max(1)
+    }
+
+    fn grid_card_width(&self) -> f32 {
+        (self.window_width - 32.0).clamp(80.0, 250.0)
+    }
+
+    fn thumbnail_handle(&self, item: &WallpaperItem) -> image::Handle {
+        self.thumb_handles
+            .get(&item.thumb_path)
+            .cloned()
+            .unwrap_or_else(|| image::Handle::from_path(item.thumb_path.clone()))
+    }
+
     pub fn new(config: Config) -> (Self, Task<Message>) {
         let preferences = Preferences::load(&config.preferences_file);
-        let theme = AppTheme::load();
-        let favorites = crate::favorites::load_favorites(&config.fav_file);
-        let active_wallpaper = crate::favorites::read_active_wallpaper(&config.theme_dir);
-
-        let mut all_wallpapers = crate::scanner::scan_wallpapers(
-            &config.wallpaper_dir,
-            &config.thumb_dir,
-            &favorites,
-            active_wallpaper.as_deref(),
-        );
-
-        let colors = crate::color::ensure_color_cache(&all_wallpapers, &config.colors_file);
-        for item in &mut all_wallpapers {
-            if let Some(&b) = colors.get(&item.relative) {
-                item.color_bucket = b;
-            }
-        }
-
-        let mut app = Self {
+        let loader_config = config.clone();
+        let app = Self {
             config,
-            theme,
-            all_wallpapers,
+            theme: AppTheme::default(),
+            all_wallpapers: Vec::new(),
             filtered_indices: Vec::new(),
-            favorites,
-            active_wallpaper,
+            favorites: HashSet::new(),
+            active_wallpaper: None,
             search_query: String::new(),
             search_focused: false,
             last_g_press: None,
@@ -155,75 +288,129 @@ impl WallpaperSelectorApp {
             sort_mode: preferences.sort_mode,
             motion_profile: preferences.motion_profile,
             view_layout: preferences.view_layout,
-            random_seed: 42,
+            random_seed: fastrand::u64(..),
             selected_index: None,
             applying: false,
-            refreshing: false,
+            refreshing: true,
             error_message: None,
-            refresh_status: None,
-            animate_carousel: preferences.motion_profile.is_enabled(),
+            refresh_status: Some("Loading library…".to_owned()),
             animation: None,
             visual_position: 0.0,
             grid_scroll_offset: 0.0,
-            grid_scroll_target: 0.0,
-            grid_animation: None,
+            grid_viewport_height: 520.0,
+            window_width: 1280.0,
+            wheel_pixels: 0.0,
+            ready_thumbs: HashSet::new(),
+            failed_thumbs: HashSet::new(),
+            thumb_handles: std::collections::HashMap::new(),
+            color_cache: std::collections::HashMap::new(),
+            colors_dirty: false,
+            color_prefetch_cursor: 0,
+            prefetch_running: false,
+            library_generation: 0,
             launch_instant: iced::time::Instant::now(),
         };
 
-        app.refilter();
-
-        // Auto-select the active wallpaper if present
-        if let Some(ref active) = app.active_wallpaper {
-            for (idx, &item_idx) in app.filtered_indices.iter().enumerate() {
-                if let Some(item) = app.all_wallpapers.get(item_idx) {
-                    if item.is_active || item.name == *active || item.relative == *active {
-                        app.selected_index = Some(idx);
-                        break;
-                    }
-                }
-            }
-        }
-
-        if app.selected_index.is_none() && !app.filtered_indices.is_empty() {
-            app.selected_index = Some(0);
-        }
-
-        app.visual_position = app.selected_index.unwrap_or(0) as f32;
-
-        app.prefetch_around_selected();
-
-        (app, Task::none())
+        (
+            app,
+            Task::perform(
+                async move { load_library(loader_config, false) },
+                Message::LibraryLoaded,
+            ),
+        )
     }
 
-    fn prefetch_around_selected(&self) {
-        if self.refreshing {
-            return;
+    fn prefetch_around_selected(&mut self) -> Task<Message> {
+        if self.refreshing || self.prefetch_running {
+            return Task::none();
         }
+        let mut indices = Vec::new();
         if let Some(sel) = self.selected_index {
             let count = self.filtered_indices.len();
-            if count == 0 {
-                return;
+            if count > 0 {
+                indices.extend(sel.saturating_sub(6)..=(sel + 6).min(count - 1));
             }
-            let start = sel.saturating_sub(6);
-            let end = (sel + 6).min(count.saturating_sub(1));
-            let mut missing = Vec::new();
-            for i in start..=end {
-                if let Some(&item_idx) = self.filtered_indices.get(i) {
-                    if let Some(item) = self.all_wallpapers.get(item_idx) {
-                        if !item.thumb_path.exists() {
-                            missing.push((item.path.clone(), item.thumb_path.clone()));
-                        }
+        }
+        if self.view_layout == ViewLayout::Grid {
+            let columns = self.grid_columns();
+            let first_row = (self.grid_scroll_offset / 154.0).floor().max(0.0) as usize;
+            let visible_rows = (self.grid_viewport_height / 154.0).ceil() as usize + 2;
+            let first = first_row.saturating_sub(1) * columns;
+            let last = ((first_row + visible_rows) * columns).min(self.filtered_indices.len());
+            indices.extend(first..last);
+        }
+        let mut seen = HashSet::new();
+        let mut missing = Vec::new();
+        for index in indices {
+            let Some(item) = self
+                .filtered_indices
+                .get(index)
+                .and_then(|&index| self.all_wallpapers.get(index))
+            else {
+                continue;
+            };
+            if !self.ready_thumbs.contains(&item.thumb_path)
+                && !self.failed_thumbs.contains(&item.thumb_path)
+                && seen.insert(item.thumb_path.clone())
+            {
+                missing.push((item.path.clone(), item.thumb_path.clone()));
+                if missing.len() == 8 {
+                    break;
+                }
+            }
+        }
+        if self.selected_color.is_some() {
+            while missing.len() < 8 && self.color_prefetch_cursor < self.all_wallpapers.len() {
+                let item = &self.all_wallpapers[self.color_prefetch_cursor];
+                self.color_prefetch_cursor += 1;
+                if item.color_bucket.is_none()
+                    && (!self.show_only_favorites || item.is_favorite)
+                    && !self.failed_thumbs.contains(&item.thumb_path)
+                    && seen.insert(item.thumb_path.clone())
+                {
+                    missing.push((item.path.clone(), item.thumb_path.clone()));
+                }
+            }
+        }
+        if missing.is_empty() {
+            if self.colors_dirty {
+                match crate::color::save_color_cache(&self.config.colors_file, &self.color_cache) {
+                    Ok(()) => self.colors_dirty = false,
+                    Err(error) => {
+                        self.error_message =
+                            Some(format!("Could not save wallpaper colors: {error}"))
                     }
                 }
             }
-            if !missing.is_empty() {
-                std::thread::spawn(move || {
-                    for (src, dst) in missing {
-                        crate::cache::generate_thumb(&src, &dst);
-                    }
-                });
-            }
+            return Task::none();
         }
+        self.prefetch_running = true;
+        let generation = self.library_generation;
+        Task::perform(
+            async move {
+                let results: Vec<_> = missing
+                    .into_iter()
+                    .map(|(source, thumb)| {
+                        let mut status = crate::cache::generate_thumb(&source, &thumb);
+                        let color = if status == crate::cache::ThumbStatus::Failed {
+                            None
+                        } else {
+                            crate::color::extract_color_from_file(&thumb)
+                        };
+                        if status != crate::cache::ThumbStatus::Failed && color.is_none() {
+                            let _ = std::fs::remove_file(&thumb);
+                            status = crate::cache::ThumbStatus::Failed;
+                        }
+                        let bytes = (status != crate::cache::ThumbStatus::Failed)
+                            .then(|| std::fs::read(&thumb).ok())
+                            .flatten();
+                        (thumb, status, color, bytes)
+                    })
+                    .collect();
+                (generation, results)
+            },
+            |(generation, results)| Message::ThumbnailsReady(generation, results),
+        )
     }
 
     fn refilter(&mut self) {
@@ -246,15 +433,14 @@ impl WallpaperSelectorApp {
                     return false;
                 }
                 if let Some(color_bucket) = selected_color {
-                    if item.color_bucket != color_bucket {
+                    if item.color_bucket != Some(color_bucket) {
                         return false;
                     }
                 }
                 if query.is_empty() {
                     return true;
                 }
-                item.name.to_lowercase().contains(&query)
-                    || item.relative.to_lowercase().contains(&query)
+                item.search_key.contains(&query)
             })
             .map(|(idx, _)| idx)
             .collect();
@@ -263,10 +449,15 @@ impl WallpaperSelectorApp {
         match self.sort_mode {
             crate::config::SortMode::Name => {
                 filtered.sort_by(|&a, &b| {
-                    self.all_wallpapers[a]
-                        .name
-                        .to_lowercase()
-                        .cmp(&self.all_wallpapers[b].name.to_lowercase())
+                    crate::scanner::natural_cmp(
+                        &self.all_wallpapers[a].relative,
+                        &self.all_wallpapers[b].relative,
+                    )
+                    .then_with(|| {
+                        self.all_wallpapers[a]
+                            .relative
+                            .cmp(&self.all_wallpapers[b].relative)
+                    })
                 });
             }
             crate::config::SortMode::Newest => {
@@ -277,26 +468,18 @@ impl WallpaperSelectorApp {
                 });
             }
             crate::config::SortMode::Random => {
-                let mut seed = self.random_seed;
-                for i in (1..filtered.len()).rev() {
-                    seed ^= seed << 13;
-                    seed ^= seed >> 7;
-                    seed ^= seed << 17;
-                    let j = (seed as usize) % (i + 1);
-                    filtered.swap(i, j);
-                }
+                fastrand::Rng::with_seed(self.random_seed).shuffle(&mut filtered);
             }
         }
 
         self.filtered_indices = filtered;
 
         // Retain the previously selected wallpaper if present in the new set
-        if let Some(ref rel) = prev_selected_relative {
-            self.selected_index = self
-                .filtered_indices
+        self.selected_index = prev_selected_relative.and_then(|rel| {
+            self.filtered_indices
                 .iter()
-                .position(|&item_idx| self.all_wallpapers[item_idx].relative == *rel);
-        }
+                .position(|&item_idx| self.all_wallpapers[item_idx].relative == rel)
+        });
 
         if self.selected_index.is_none() && !self.filtered_indices.is_empty() {
             self.selected_index = Some(0);
@@ -305,9 +488,6 @@ impl WallpaperSelectorApp {
         self.animation = None;
         self.visual_position = self.selected_index.unwrap_or(0) as f32;
         self.grid_scroll_offset = 0.0;
-        self.grid_scroll_target = 0.0;
-        self.grid_animation = None;
-        self.prefetch_around_selected();
     }
 
     fn select_wallpaper(&mut self, next: usize) -> Task<Message> {
@@ -315,7 +495,7 @@ impl WallpaperSelectorApp {
             return Task::none();
         }
         self.selected_index = Some(next);
-        if self.motion_profile.is_enabled() {
+        if self.view_layout == ViewLayout::Carousel && self.motion_profile.is_enabled() {
             if let Some(animation) = &mut self.animation {
                 animation.target = next as f32;
                 animation.profile = self.motion_profile;
@@ -332,13 +512,11 @@ impl WallpaperSelectorApp {
             self.visual_position = next as f32;
         }
 
-        self.prefetch_around_selected();
-
         if self.view_layout == ViewLayout::Grid {
-            let row = next / 5;
+            let row = next / self.grid_columns();
             let row_top = row as f32 * 154.0;
             let row_bottom = row_top + 154.0;
-            let visible_height = 700.0;
+            let visible_height = self.grid_viewport_height;
             if row_top < self.grid_scroll_offset {
                 return iced::widget::operation::scroll_to(
                     iced::widget::Id::new("grid_scroll"),
@@ -363,10 +541,73 @@ impl WallpaperSelectorApp {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let reset_scroll = matches!(
+            &message,
+            Message::LibraryLoaded(..)
+                | Message::SearchChanged(..)
+                | Message::SearchEscape
+                | Message::ToggleFavoritesView(..)
+                | Message::ToggleColorFilter(..)
+                | Message::CycleSortMode
+                | Message::ToggleFavorite(..)
+        );
+        let prefetch = matches!(
+            &message,
+            Message::LibraryLoaded(..)
+                | Message::ThumbnailsReady(..)
+                | Message::SelectWallpaper(..)
+                | Message::NextWallpaper
+                | Message::PrevWallpaper
+                | Message::JumpWallpapers(..)
+                | Message::GridScroll(..)
+                | Message::WindowResized(..)
+                | Message::SearchChanged(..)
+                | Message::SearchEscape
+                | Message::ToggleFavoritesView(..)
+                | Message::ToggleColorFilter(..)
+                | Message::CycleSortMode
+                | Message::ToggleViewLayout
+                | Message::ToggleFavorite(..)
+        );
+        let task = self.update_inner(message);
+        if prefetch {
+            let scroll_target = if reset_scroll && self.view_layout == ViewLayout::Grid {
+                let row = self.selected_index.unwrap_or(0) / self.grid_columns();
+                let target = (row as f32 * 154.0 + 77.0 - self.grid_viewport_height * 0.5).max(0.0);
+                self.grid_scroll_offset = target;
+                Some(target)
+            } else {
+                None
+            };
+            let prefetch_task = self.prefetch_around_selected();
+            if let Some(target) = scroll_target {
+                Task::batch([
+                    task,
+                    prefetch_task,
+                    iced::widget::operation::scroll_to(
+                        iced::widget::Id::new("grid_scroll"),
+                        AbsoluteOffset {
+                            x: None,
+                            y: Some(target),
+                        },
+                    ),
+                ])
+            } else {
+                Task::batch([task, prefetch_task])
+            }
+        } else {
+            task
+        }
+    }
+
+    fn update_inner(&mut self, message: Message) -> Task<Message> {
         if !matches!(
             &message,
             Message::RefreshList
-                | Message::RefreshFinished(..)
+                | Message::LibraryLoaded(..)
+                | Message::ThumbnailsReady(..)
+                | Message::AnimationFrame(..)
+                | Message::WindowResized(..)
                 | Message::YankPath(_)
                 | Message::EventOccurred(_)
         ) {
@@ -385,7 +626,32 @@ impl WallpaperSelectorApp {
             }
             Message::SearchSubmitted => {
                 self.search_focused = false;
-                iced::widget::operation::focus(iced::widget::Id::new("grid_scroll"))
+                unfocus_search()
+            }
+            Message::SearchTab => {
+                if self.search_focused {
+                    self.search_focused = false;
+                    unfocus_search()
+                } else {
+                    Task::none()
+                }
+            }
+            Message::SearchEscape => {
+                if !self.search_focused {
+                    return Task::none();
+                }
+                self.search_focused = false;
+                self.search_query.clear();
+                self.refilter();
+                unfocus_search()
+            }
+            Message::SearchFocusChanged(focused) => {
+                self.search_focused = focused;
+                Task::none()
+            }
+            Message::CheckSearchFocus => {
+                iced::widget::operation::is_focused(iced::widget::Id::new("search_input"))
+                    .map(Message::SearchFocusChanged)
             }
             Message::YankPath(filename_only) => {
                 if let Some(sel) = self.selected_index {
@@ -396,12 +662,33 @@ impl WallpaperSelectorApp {
                             } else {
                                 item.path.to_string_lossy().to_string()
                             };
-                            self.refresh_status = Some(format!("Yanked: {}", text_to_copy));
-                            let _ = std::process::Command::new("wl-copy")
-                                .arg(&text_to_copy)
-                                .spawn();
-                            return iced::clipboard::write(text_to_copy);
+                            return Task::perform(
+                                async move {
+                                    let output = std::process::Command::new("wl-copy")
+                                        .arg("--")
+                                        .arg(&text_to_copy)
+                                        .output()
+                                        .map_err(|error| error.to_string())?;
+                                    if output.status.success() {
+                                        Ok(text_to_copy)
+                                    } else {
+                                        Err(String::from_utf8_lossy(&output.stderr)
+                                            .trim()
+                                            .to_owned())
+                                    }
+                                },
+                                Message::ClipboardWritten,
+                            );
                         }
+                    }
+                }
+                Task::none()
+            }
+            Message::ClipboardWritten(result) => {
+                match result {
+                    Ok(text) => self.refresh_status = Some(format!("Yanked: {text}")),
+                    Err(error) => {
+                        self.error_message = Some(format!("Could not copy path: {error}"))
                     }
                 }
                 Task::none()
@@ -439,6 +726,7 @@ impl WallpaperSelectorApp {
             Message::ToggleFavoritesView(favs_only) => {
                 self.search_focused = false;
                 self.show_only_favorites = favs_only;
+                self.color_prefetch_cursor = 0;
                 self.refilter();
                 Task::none()
             }
@@ -474,12 +762,7 @@ impl WallpaperSelectorApp {
             }
             Message::ApplyRandom => {
                 if !self.filtered_indices.is_empty() {
-                    use std::time::SystemTime;
-                    let seed = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as usize)
-                        .unwrap_or(42);
-                    let random_idx = seed % self.filtered_indices.len();
+                    let random_idx = fastrand::usize(..self.filtered_indices.len());
                     return self.update(Message::ApplyWallpaper(random_idx, true));
                 }
                 Task::none()
@@ -523,6 +806,7 @@ impl WallpaperSelectorApp {
                 }
             }
             Message::ToggleFavorite(filtered_idx) => {
+                self.color_prefetch_cursor = 0;
                 if let Some(&item_idx) = self.filtered_indices.get(filtered_idx) {
                     if let Some(item) = self.all_wallpapers.get(item_idx) {
                         let lock_path = self
@@ -533,14 +817,12 @@ impl WallpaperSelectorApp {
                             &self.config.fav_file,
                             &lock_path,
                             &item.relative,
-                            &item.name,
                         ) {
                             Ok(favorites) => {
                                 self.favorites = favorites;
                                 for wallpaper in &mut self.all_wallpapers {
                                     wallpaper.is_favorite =
-                                        self.favorites.contains(&wallpaper.relative)
-                                            || self.favorites.contains(&wallpaper.name);
+                                        self.favorites.contains(&wallpaper.relative);
                                 }
                                 self.error_message = None;
                             }
@@ -560,66 +842,128 @@ impl WallpaperSelectorApp {
                 if self.refreshing {
                     return Task::none();
                 }
+                self.library_generation = self.library_generation.wrapping_add(1);
+                self.prefetch_running = false;
+                self.color_prefetch_cursor = 0;
+                self.refreshing = true;
+                self.refresh_status = Some("Refreshing library…".to_owned());
+                let config = self.config.clone();
+                Task::perform(
+                    async move { load_library(config, true) },
+                    Message::LibraryLoaded,
+                )
+            }
+            Message::LibraryLoaded(snapshot) => {
+                if let Some(error) = snapshot.error {
+                    self.refreshing = false;
+                    self.error_message = Some(error);
+                    self.refresh_status = None;
+                    return Task::none();
+                }
+                self.library_generation = self.library_generation.wrapping_add(1);
+                self.prefetch_running = false;
+                self.color_prefetch_cursor = 0;
                 let selected = self.selected_index.and_then(|index| {
                     self.filtered_indices
                         .get(index)
                         .and_then(|&item| self.all_wallpapers.get(item))
                         .map(|item| item.relative.clone())
                 });
-                self.refreshing = true;
-                self.refresh_status = Some("Refreshing library…".to_owned());
-                self.theme = AppTheme::load();
-                self.favorites = crate::favorites::load_favorites(&self.config.fav_file);
-                self.active_wallpaper =
-                    crate::favorites::read_active_wallpaper(&self.config.theme_dir);
-                self.all_wallpapers = crate::scanner::scan_wallpapers(
-                    &self.config.wallpaper_dir,
-                    &self.config.thumb_dir,
-                    &self.favorites,
-                    self.active_wallpaper.as_deref(),
-                );
-                let colors = crate::color::ensure_color_cache(&self.all_wallpapers, &self.config.colors_file);
-                for item in &mut self.all_wallpapers {
-                    if let Some(&b) = colors.get(&item.relative) {
-                        item.color_bucket = b;
-                    }
-                }
+                self.theme = snapshot.theme;
+                self.ready_thumbs = snapshot.ready;
+                self.color_cache = snapshot.color_cache;
+                self.colors_dirty = snapshot.colors_dirty;
+                self.failed_thumbs.clear();
+                self.thumb_handles
+                    .retain(|path, _| self.ready_thumbs.contains(path));
+                self.favorites = snapshot.favorites;
+                self.active_wallpaper = snapshot.active;
+                self.all_wallpapers = snapshot.wallpapers;
+                self.selected_index = None;
+                self.filtered_indices.clear();
                 self.refilter();
-                if let Some(selected) = selected {
-                    if let Some(index) = self
-                        .filtered_indices
-                        .iter()
-                        .position(|&item| self.all_wallpapers[item].relative == selected)
-                    {
-                        self.selected_index = Some(index);
-                    }
+                if let Some(index) = self
+                    .filtered_indices
+                    .iter()
+                    .position(|&item| {
+                        selected.as_deref() == Some(self.all_wallpapers[item].relative.as_str())
+                    })
+                    .or_else(|| {
+                        self.filtered_indices
+                            .iter()
+                            .position(|&item| self.all_wallpapers[item].is_active)
+                    })
+                {
+                    self.selected_index = Some(index);
                 }
                 self.visual_position = self.selected_index.unwrap_or(0) as f32;
-                self.prefetch_around_selected();
-                let wallpapers = self.all_wallpapers.clone();
-                let total = wallpapers.len();
-                Task::perform(
-                    async move {
-                        let stats = crate::cache::batch_generate_thumbs(&wallpapers, false);
-                        (total, stats.generated, stats.failed)
-                    },
-                    |(total, generated, failed)| Message::RefreshFinished(total, generated, failed),
-                )
-            }
-            Message::RefreshFinished(total, generated, failed) => {
                 self.refreshing = false;
-                if failed > 0 {
-                    self.error_message =
-                        Some(format!("Could not update {failed} wallpaper previews"));
-                } else {
-                    self.error_message = None;
-                    self.refresh_status = Some(format!(
-                        "Library refreshed: {total} wallpapers, {generated} previews updated"
+                if snapshot.failed > 0 {
+                    self.error_message = Some(format!(
+                        "Could not update {} wallpaper previews",
+                        snapshot.failed
                     ));
+                } else {
+                    self.error_message = snapshot.warning;
+                    self.refresh_status = Some(if snapshot.refreshed {
+                        format!(
+                            "Library refreshed: {} wallpapers, {} previews updated",
+                            self.all_wallpapers.len(),
+                            snapshot.generated
+                        )
+                    } else {
+                        format!("{} wallpapers loaded", self.all_wallpapers.len())
+                    });
+                }
+                Task::none()
+            }
+            Message::ThumbnailsReady(generation, results) => {
+                if generation != self.library_generation || self.refreshing {
+                    return Task::none();
+                }
+                self.prefetch_running = false;
+                let mut filter_changed = false;
+                for (path, status, color, bytes) in results {
+                    if status == crate::cache::ThumbStatus::Failed {
+                        self.failed_thumbs.insert(path);
+                        continue;
+                    }
+                    self.ready_thumbs.insert(path.clone());
+                    if let Some(bytes) = bytes {
+                        self.thumb_handles
+                            .insert(path.clone(), image::Handle::from_bytes(bytes));
+                    }
+                    if let Some(bucket) = color {
+                        if let Some(name) = path.file_name() {
+                            if self
+                                .color_cache
+                                .insert(name.to_string_lossy().into_owned(), bucket)
+                                != Some(bucket)
+                            {
+                                self.colors_dirty = true;
+                            }
+                        }
+                        for item in &mut self.all_wallpapers {
+                            if item.thumb_path == path {
+                                if item.color_bucket.is_none()
+                                    && self.selected_color == Some(bucket)
+                                {
+                                    filter_changed = true;
+                                }
+                                item.color_bucket = Some(bucket);
+                            }
+                        }
+                    }
+                }
+                if filter_changed {
+                    let scroll = self.grid_scroll_offset;
+                    self.refilter();
+                    self.grid_scroll_offset = scroll;
                 }
                 Task::none()
             }
             Message::ToggleColorFilter(bucket) => {
+                self.color_prefetch_cursor = 0;
                 if self.selected_color == Some(bucket) {
                     self.selected_color = None;
                 } else {
@@ -631,34 +975,33 @@ impl WallpaperSelectorApp {
             Message::CycleSortMode => {
                 self.sort_mode = self.sort_mode.next();
                 if self.sort_mode == crate::config::SortMode::Random {
-                    use std::time::SystemTime;
-                    self.random_seed = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(42);
+                    self.random_seed = fastrand::u64(..);
                 }
                 let preferences = Preferences {
-                    animate_carousel: self.animate_carousel,
                     sort_mode: self.sort_mode,
                     motion_profile: self.motion_profile,
                     view_layout: self.view_layout,
                 };
-                let _ = preferences.save(&self.config.preferences_file);
+                if let Err(error) = preferences.save(&self.config.preferences_file) {
+                    self.error_message =
+                        Some(format!("Could not save selector preferences: {error}"));
+                }
                 self.refilter();
                 Task::none()
             }
             Message::CycleMotionProfile => {
                 let next_profile = self.motion_profile.next();
                 let preferences = Preferences {
-                    animate_carousel: next_profile.is_enabled(),
                     sort_mode: self.sort_mode,
                     motion_profile: next_profile,
                     view_layout: self.view_layout,
                 };
-                let _ = preferences.save(&self.config.preferences_file);
+                if let Err(error) = preferences.save(&self.config.preferences_file) {
+                    self.error_message =
+                        Some(format!("Could not save selector preferences: {error}"));
+                }
                 self.motion_profile = next_profile;
-                self.animate_carousel = next_profile.is_enabled();
-                if !self.animate_carousel {
+                if !next_profile.is_enabled() {
                     self.animation = None;
                     self.visual_position = self.selected_index.unwrap_or(0) as f32;
                 } else if let Some(animation) = &mut self.animation {
@@ -669,16 +1012,18 @@ impl WallpaperSelectorApp {
             Message::ToggleViewLayout => {
                 let next_layout = self.view_layout.toggle();
                 let preferences = Preferences {
-                    animate_carousel: self.animate_carousel,
                     sort_mode: self.sort_mode,
                     motion_profile: self.motion_profile,
                     view_layout: next_layout,
                 };
-                let _ = preferences.save(&self.config.preferences_file);
+                if let Err(error) = preferences.save(&self.config.preferences_file) {
+                    self.error_message =
+                        Some(format!("Could not save selector preferences: {error}"));
+                }
                 self.view_layout = next_layout;
                 if next_layout == ViewLayout::Grid {
                     if let Some(sel) = self.selected_index {
-                        let row = sel / 5;
+                        let row = sel / self.grid_columns();
                         let target = (row as f32 * 154.0 - 154.0).max(0.0);
                         return iced::widget::operation::scroll_to(
                             iced::widget::Id::new("grid_scroll"),
@@ -691,11 +1036,30 @@ impl WallpaperSelectorApp {
                 }
                 Task::none()
             }
-            Message::GridScroll(y) => {
+            Message::GridScroll(y, height) => {
                 self.grid_scroll_offset = y;
+                self.grid_viewport_height = height;
                 Task::none()
             }
-            Message::ToggleAnimation => self.update(Message::CycleMotionProfile),
+            Message::WindowOpened(id) => iced::window::size(id).map(Message::WindowResized),
+            Message::WindowResized(size) => {
+                self.window_width = size.width;
+                if self.view_layout == ViewLayout::Grid {
+                    let row = self.selected_index.unwrap_or(0) / self.grid_columns();
+                    let target =
+                        (row as f32 * 154.0 + 77.0 - self.grid_viewport_height * 0.5).max(0.0);
+                    self.grid_scroll_offset = target;
+                    iced::widget::operation::scroll_to(
+                        iced::widget::Id::new("grid_scroll"),
+                        AbsoluteOffset {
+                            x: None,
+                            y: Some(target),
+                        },
+                    )
+                } else {
+                    Task::none()
+                }
+            }
             Message::AnimationFrame(at) => {
                 if let Some(animation) = &mut self.animation {
                     if !animation.tick(&mut self.visual_position, at) {
@@ -719,10 +1083,12 @@ impl WallpaperSelectorApp {
                             }
                         }
                         iced::mouse::ScrollDelta::Pixels { x, y } => {
-                            if y < 0.0 || x > 0.0 {
-                                return self.update(Message::NextWallpaper);
-                            } else if y > 0.0 || x < 0.0 {
-                                return self.update(Message::PrevWallpaper);
+                            let movement = if x.abs() > y.abs() { x } else { -y };
+                            self.wheel_pixels += movement;
+                            let steps = (self.wheel_pixels / 80.0).trunc() as isize;
+                            if steps != 0 {
+                                self.wheel_pixels -= steps as f32 * 80.0;
+                                return self.update(Message::JumpWallpapers(steps));
                             }
                         }
                     }
@@ -731,6 +1097,7 @@ impl WallpaperSelectorApp {
             }
             Message::EventOccurred(Event::Keyboard(iced::keyboard::Event::KeyPressed {
                 key,
+                modified_key,
                 modifiers,
                 ..
             })) => {
@@ -743,28 +1110,33 @@ impl WallpaperSelectorApp {
                                 self.search_query.clear();
                                 self.refilter();
                             }
-                            return iced::widget::operation::focus(iced::widget::Id::new("grid_scroll"));
+                            return unfocus_search();
                         }
                         Key::Named(Named::Enter) => {
                             self.search_focused = false;
-                            return iced::widget::operation::focus(iced::widget::Id::new("grid_scroll"));
+                            return unfocus_search();
                         }
                         Key::Named(Named::ArrowDown) => {
                             if self.view_layout == ViewLayout::Grid {
-                                return self.update(Message::JumpWallpapers(5));
+                                return self
+                                    .update(Message::JumpWallpapers(self.grid_columns() as isize));
                             } else {
                                 return self.update(Message::NextWallpaper);
                             }
                         }
                         Key::Named(Named::ArrowUp) => {
                             if self.view_layout == ViewLayout::Grid {
-                                return self.update(Message::JumpWallpapers(-5));
+                                return self.update(Message::JumpWallpapers(
+                                    -(self.grid_columns() as isize),
+                                ));
                             } else {
                                 return self.update(Message::PrevWallpaper);
                             }
                         }
                         Key::Named(Named::ArrowLeft) => return self.update(Message::PrevWallpaper),
-                        Key::Named(Named::ArrowRight) => return self.update(Message::NextWallpaper),
+                        Key::Named(Named::ArrowRight) => {
+                            return self.update(Message::NextWallpaper);
+                        }
                         _ => return Task::none(),
                     }
                 }
@@ -795,7 +1167,7 @@ impl WallpaperSelectorApp {
                     }
                 }
 
-                match key {
+                match modified_key {
                     Key::Named(Named::Escape) => {
                         self.last_g_press = None;
                         if !self.search_query.is_empty() {
@@ -831,7 +1203,7 @@ impl WallpaperSelectorApp {
                     Key::Named(Named::ArrowUp) => {
                         self.last_g_press = None;
                         if self.view_layout == ViewLayout::Grid {
-                            self.update(Message::JumpWallpapers(-5))
+                            self.update(Message::JumpWallpapers(-(self.grid_columns() as isize)))
                         } else {
                             Task::none()
                         }
@@ -839,7 +1211,7 @@ impl WallpaperSelectorApp {
                     Key::Named(Named::ArrowDown) => {
                         self.last_g_press = None;
                         if self.view_layout == ViewLayout::Grid {
-                            self.update(Message::JumpWallpapers(5))
+                            self.update(Message::JumpWallpapers(self.grid_columns() as isize))
                         } else {
                             Task::none()
                         }
@@ -876,7 +1248,7 @@ impl WallpaperSelectorApp {
                         "j" => {
                             self.last_g_press = None;
                             if self.view_layout == ViewLayout::Grid {
-                                self.update(Message::JumpWallpapers(5))
+                                self.update(Message::JumpWallpapers(self.grid_columns() as isize))
                             } else {
                                 self.update(Message::NextWallpaper)
                             }
@@ -884,7 +1256,9 @@ impl WallpaperSelectorApp {
                         "k" => {
                             self.last_g_press = None;
                             if self.view_layout == ViewLayout::Grid {
-                                self.update(Message::JumpWallpapers(-5))
+                                self.update(Message::JumpWallpapers(
+                                    -(self.grid_columns() as isize),
+                                ))
                             } else {
                                 self.update(Message::PrevWallpaper)
                             }
@@ -919,7 +1293,8 @@ impl WallpaperSelectorApp {
                             self.last_g_press = None;
                             if let Some(sel) = self.selected_index {
                                 if self.view_layout == ViewLayout::Grid {
-                                    let row_start = (sel / 5) * 5;
+                                    let columns = self.grid_columns();
+                                    let row_start = (sel / columns) * columns;
                                     self.select_wallpaper(row_start)
                                 } else {
                                     self.select_wallpaper(0)
@@ -932,11 +1307,14 @@ impl WallpaperSelectorApp {
                             self.last_g_press = None;
                             if let Some(sel) = self.selected_index {
                                 if self.view_layout == ViewLayout::Grid {
-                                    let row_end = ((sel / 5) * 5 + 4)
+                                    let columns = self.grid_columns();
+                                    let row_end = ((sel / columns) * columns + columns - 1)
                                         .min(self.filtered_indices.len().saturating_sub(1));
                                     self.select_wallpaper(row_end)
                                 } else {
-                                    self.select_wallpaper(self.filtered_indices.len().saturating_sub(1))
+                                    self.select_wallpaper(
+                                        self.filtered_indices.len().saturating_sub(1),
+                                    )
                                 }
                             } else {
                                 Task::none()
@@ -1030,7 +1408,7 @@ impl WallpaperSelectorApp {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
-        if self.launch_instant.elapsed().as_secs_f32() < 0.015 {
+        if self.motion_profile.is_enabled() && self.launch_instant.elapsed().as_secs_f32() < 0.015 {
             return container(Space::new())
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -1373,32 +1751,40 @@ impl WallpaperSelectorApp {
         for bucket in 0..crate::color::COLOR_BUCKET_COUNT as u8 {
             let is_selected = self.selected_color == Some(bucket);
             let col = crate::color::swatch_color(bucket, is_selected);
-            let btn = button(Space::new().width(Length::Fixed(11.0)).height(Length::Fixed(11.0)))
-                .padding(2)
-                .on_press(Message::ToggleColorFilter(bucket))
-                .style(move |_theme, status| {
-                    let is_hovered = status == button::Status::Hovered;
-                    button::Style {
-                        background: Some(Background::Color(if is_hovered {
-                            crate::color::swatch_color(bucket, true)
+            let btn = button(
+                Space::new()
+                    .width(Length::Fixed(11.0))
+                    .height(Length::Fixed(11.0)),
+            )
+            .padding(2)
+            .on_press(Message::ToggleColorFilter(bucket))
+            .style(move |_theme, status| {
+                let is_hovered = status == button::Status::Hovered;
+                button::Style {
+                    background: Some(Background::Color(if is_hovered {
+                        crate::color::swatch_color(bucket, true)
+                    } else {
+                        col
+                    })),
+                    border: Border {
+                        radius: 8.0.into(),
+                        color: if is_selected {
+                            Color::WHITE
+                        } else if is_hovered {
+                            Color::from_rgba8(255, 255, 255, 0.7)
                         } else {
-                            col
-                        })),
-                        border: Border {
-                            radius: 8.0.into(),
-                            color: if is_selected {
-                                Color::WHITE
-                            } else if is_hovered {
-                                Color::from_rgba8(255, 255, 255, 0.7)
-                            } else {
-                                Color::from_rgba8(0, 0, 0, 0.4)
-                            },
-                            width: if is_selected { 2.0 } else { 1.0 },
+                            Color::from_rgba8(0, 0, 0, 0.4)
                         },
-                        ..button::Style::default()
-                    }
-                });
-            swatches_row = swatches_row.push(btn);
+                        width: if is_selected { 2.0 } else { 1.0 },
+                    },
+                    ..button::Style::default()
+                }
+            });
+            swatches_row = swatches_row.push(tooltip(
+                btn,
+                crate::color::swatch_name(bucket),
+                iced::widget::tooltip::Position::Bottom,
+            ));
         }
 
         if let Some(active_bucket) = self.selected_color {
@@ -1440,27 +1826,36 @@ impl WallpaperSelectorApp {
             });
 
         // Bottom capsule (Sort & Random on far left, Colors & Search in middle, Counter on right)
-        let bottom_capsule = row![
-            sort_btn,
-            random_btn,
-            color_pill,
-            search_input,
-            counter_pill,
-        ]
-        .spacing(8)
-        .align_y(Vertical::Center);
+        let bottom_capsule = row![sort_btn, random_btn, color_pill, search_input, counter_pill,]
+            .spacing(8)
+            .align_y(Vertical::Center);
 
         // Center Content (Carousel or Grid)
         let main_content = if self.filtered_indices.is_empty() {
+            let indexing_colors = self.selected_color.is_some()
+                && self.prefetch_running
+                && self.color_prefetch_cursor < self.all_wallpapers.len();
             container(
                 column![
-                    text("No wallpapers found")
-                        .size(20)
-                        .color(Color::from_rgb8(160, 165, 185)),
+                    text(if self.refreshing {
+                        "Loading wallpapers…"
+                    } else if indexing_colors {
+                        "Indexing wallpaper colors…"
+                    } else {
+                        "No wallpapers found"
+                    })
+                    .size(20)
+                    .color(Color::from_rgb8(160, 165, 185)),
                     Space::new().height(6),
-                    text("Try clearing the search or switching view tabs.")
-                        .size(13)
-                        .color(Color::from_rgb8(104, 109, 126)),
+                    text(if self.refreshing {
+                        "Scanning the wallpaper library."
+                    } else if indexing_colors {
+                        "Matching wallpapers will appear as previews are indexed."
+                    } else {
+                        "Try clearing search, favorites, or the color filter."
+                    })
+                    .size(13)
+                    .color(Color::from_rgb8(104, 109, 126)),
                 ]
                 .align_x(Horizontal::Center)
                 .spacing(4),
@@ -1607,19 +2002,21 @@ impl WallpaperSelectorApp {
             return container(Space::new()).into();
         }
 
-        let chunk_size = 5;
+        let chunk_size = self.grid_columns();
+        let card_width = self.grid_card_width();
         let row_height = 154.0_f32;
         let total_rows = (total_items + chunk_size - 1) / chunk_size;
 
         let scroll = self.grid_scroll_offset;
         let start_row = (scroll / row_height).floor().max(0.0) as usize;
         let start_row = start_row.saturating_sub(1);
-        let end_row = (start_row + 9).min(total_rows);
+        let end_row = (start_row + (self.grid_viewport_height / row_height).ceil() as usize + 2)
+            .min(total_rows);
 
         let top_spacer = start_row as f32 * row_height;
         let bottom_spacer = (total_rows - end_row) as f32 * row_height;
 
-        let mut grid_col = column![].spacing(14).align_x(Horizontal::Center);
+        let mut grid_col = column![].spacing(0).align_x(Horizontal::Center);
 
         if top_spacer > 0.0 {
             grid_col = grid_col.push(Space::new().height(Length::Fixed(top_spacer)));
@@ -1636,28 +2033,31 @@ impl WallpaperSelectorApp {
                 let is_selected = self.selected_index == Some(filtered_idx);
 
                 let card_radius = 10.0;
-                let img_layer: Element<'_, Message> = if item.thumb_path.exists() {
-                    image(item.thumb_path.clone())
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .content_fit(ContentFit::Cover)
-                        .border_radius(card_radius)
-                        .opacity(entrance)
-                        .into()
-                } else {
-                    container(Space::new())
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .style(move |_| container::Style {
-                            background: Some(Background::Color(Color::from_rgba8(18, 20, 28, entrance))),
-                            border: Border {
-                                radius: card_radius.into(),
-                                ..Border::default()
-                            },
-                            ..container::Style::default()
-                        })
-                        .into()
-                };
+                let img_layer: Element<'_, Message> =
+                    if self.ready_thumbs.contains(&item.thumb_path) {
+                        image(self.thumbnail_handle(item))
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .content_fit(ContentFit::Cover)
+                            .border_radius(card_radius)
+                            .opacity(entrance)
+                            .into()
+                    } else {
+                        container(Space::new())
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .style(move |_| container::Style {
+                                background: Some(Background::Color(Color::from_rgba8(
+                                    18, 20, 28, entrance,
+                                ))),
+                                border: Border {
+                                    radius: card_radius.into(),
+                                    ..Border::default()
+                                },
+                                ..container::Style::default()
+                            })
+                            .into()
+                    };
 
                 let name = item
                     .path
@@ -1683,7 +2083,9 @@ impl WallpaperSelectorApp {
                         )
                         .padding([1, 5])
                         .style(|_| container::Style {
-                            background: Some(Background::Color(Color::from_rgba8(16, 185, 129, 0.25))),
+                            background: Some(Background::Color(Color::from_rgba8(
+                                16, 185, 129, 0.25,
+                            ))),
                             border: Border {
                                 color: Color::from_rgba8(52, 211, 153, 0.6),
                                 width: 1.0,
@@ -1695,41 +2097,43 @@ impl WallpaperSelectorApp {
                 }
 
                 if item.is_favorite {
-                    badge_row = badge_row.push(
-                        text("♥")
-                            .size(12)
-                            .color(Color::from_rgb8(243, 139, 168)),
-                    );
+                    badge_row =
+                        badge_row.push(text("♥").size(12).color(Color::from_rgb8(243, 139, 168)));
                 }
 
-                let bottom_badge = container(badge_row)
-                    .padding([4, 8])
-                    .style(|_| container::Style {
-                        background: Some(Background::Color(Color::from_rgba8(10, 12, 18, 0.75))),
-                        border: Border {
-                            radius: 8.0.into(),
-                            ..Border::default()
-                        },
-                        ..container::Style::default()
-                    });
+                let bottom_badge =
+                    container(badge_row)
+                        .padding([4, 8])
+                        .style(|_| container::Style {
+                            background: Some(Background::Color(Color::from_rgba8(
+                                10, 12, 18, 0.75,
+                            ))),
+                            border: Border {
+                                radius: 8.0.into(),
+                                ..Border::default()
+                            },
+                            ..container::Style::default()
+                        });
 
-                let overlay_col = column![
-                    Space::new().height(Length::Fill),
-                    bottom_badge,
-                ]
-                .padding(6);
+                let overlay_col =
+                    column![Space::new().height(Length::Fill), bottom_badge,].padding(6);
 
                 let card_stack = Stack::new().push(img_layer).push(overlay_col).clip(true);
 
                 let card_container = container(card_stack)
-                    .width(Length::Fixed(250.0))
+                    .width(Length::Fixed(card_width))
                     .height(Length::Fixed(140.0))
                     .style(move |_| container::Style {
-                        background: Some(Background::Color(Color::from_rgba8(15, 17, 24, entrance))),
+                        background: Some(Background::Color(Color::from_rgba8(
+                            15, 17, 24, entrance,
+                        ))),
                         border: Border {
                             radius: card_radius.into(),
                             color: if is_selected {
-                                Color { a: entrance, ..accent }
+                                Color {
+                                    a: entrance,
+                                    ..accent
+                                }
                             } else {
                                 Color::from_rgba8(255, 255, 255, 0.08 * entrance)
                             },
@@ -1737,7 +2141,10 @@ impl WallpaperSelectorApp {
                         },
                         shadow: Shadow {
                             color: if is_selected {
-                                Color { a: 0.35 * entrance, ..accent }
+                                Color {
+                                    a: 0.35 * entrance,
+                                    ..accent
+                                }
                             } else {
                                 Color::TRANSPARENT
                             },
@@ -1778,7 +2185,10 @@ impl WallpaperSelectorApp {
                 row_cards = row_cards.push(card_area);
             }
 
-            let row_container = container(row_cards).width(Length::Fixed(1306.0));
+            let row_width = chunk_size as f32 * card_width + (chunk_size - 1) as f32 * 14.0;
+            let row_container = container(row_cards)
+                .width(Length::Fixed(row_width))
+                .height(Length::Fixed(row_height));
             grid_col = grid_col.push(row_container);
         }
 
@@ -1792,7 +2202,7 @@ impl WallpaperSelectorApp {
 
         scrollable(centered_grid)
             .id(iced::widget::Id::new("grid_scroll"))
-            .on_scroll(|vp| Message::GridScroll(vp.absolute_offset().y))
+            .on_scroll(|vp| Message::GridScroll(vp.absolute_offset().y, vp.bounds().height))
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
@@ -1849,8 +2259,8 @@ impl WallpaperSelectorApp {
         }) * entrance;
 
         // Image layer (reads thumbnail from disk; NEVER generates synchronously)
-        let img_layer: Element<'_, Message> = if item.thumb_path.exists() {
-            image(item.thumb_path.clone())
+        let img_layer: Element<'_, Message> = if self.ready_thumbs.contains(&item.thumb_path) {
+            image(self.thumbnail_handle(item))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .content_fit(ContentFit::Cover)
@@ -2049,6 +2459,9 @@ impl WallpaperSelectorApp {
     }
 
     fn entrance_progress(&self) -> f32 {
+        if !self.motion_profile.is_enabled() {
+            return 1.0;
+        }
         let elapsed = self.launch_instant.elapsed().as_secs_f32();
         if elapsed < 0.015 {
             0.0
@@ -2058,10 +2471,42 @@ impl WallpaperSelectorApp {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        let events = iced::event::listen().map(Message::EventOccurred);
+        let events = iced::event::listen_with(|event, status, _| match (status, &event) {
+            (
+                iced::event::Status::Captured,
+                Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: Key::Named(Named::Escape),
+                    ..
+                }),
+            ) => Some(Message::SearchEscape),
+            (_, Event::Mouse(iced::mouse::Event::ButtonPressed(_))) => {
+                Some(Message::CheckSearchFocus)
+            }
+            (
+                _,
+                Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: Key::Named(Named::Tab),
+                    ..
+                }),
+            ) => Some(Message::SearchTab),
+            (
+                iced::event::Status::Captured,
+                Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: Key::Named(Named::ArrowUp | Named::ArrowDown),
+                    ..
+                }),
+            ) => Some(Message::EventOccurred(event)),
+            (iced::event::Status::Ignored, _) => Some(Message::EventOccurred(event)),
+            _ => None,
+        });
+        let events = Subscription::batch([
+            events,
+            iced::window::open_events().map(Message::WindowOpened),
+            iced::window::resize_events().map(|(_, size)| Message::WindowResized(size)),
+        ]);
         let animating = self.animation.is_some()
-            || self.grid_animation.is_some()
-            || self.launch_instant.elapsed().as_secs_f32() < 0.08;
+            || (self.motion_profile.is_enabled()
+                && self.launch_instant.elapsed().as_secs_f32() < 0.08);
         if animating {
             Subscription::batch([events, iced::window::frames().map(Message::AnimationFrame)])
         } else {

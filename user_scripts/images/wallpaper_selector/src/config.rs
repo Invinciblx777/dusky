@@ -96,7 +96,6 @@ impl ViewLayout {
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct Preferences {
-    pub animate_carousel: bool,
     pub sort_mode: SortMode,
     pub motion_profile: MotionProfile,
     pub view_layout: ViewLayout,
@@ -105,7 +104,6 @@ pub struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            animate_carousel: true,
             sort_mode: SortMode::Name,
             motion_profile: MotionProfile::Smooth,
             view_layout: ViewLayout::Carousel,
@@ -115,14 +113,10 @@ impl Default for Preferences {
 
 impl Preferences {
     pub fn load(path: &std::path::Path) -> Self {
-        let mut prefs: Self = fs::read(path)
+        fs::read(path)
             .ok()
             .and_then(|data| serde_json::from_slice(&data).ok())
-            .unwrap_or_default();
-        if !prefs.animate_carousel && prefs.motion_profile.is_enabled() {
-            prefs.motion_profile = MotionProfile::Off;
-        }
-        prefs
+            .unwrap_or_default()
     }
 
     pub fn save(&self, path: &std::path::Path) -> io::Result<()> {

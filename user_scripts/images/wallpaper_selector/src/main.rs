@@ -25,16 +25,28 @@ fn print_help() {
     println!("  --help, -h       Show this help message");
 }
 
-fn cycle_favorite(direction_next: bool, config: &Config) {
-    let favorites_set = favorites::load_favorites(&config.fav_file);
+fn cycle_favorite(direction_next: bool, config: &Config) -> bool {
+    let favorites_set = match favorites::load_favorites(&config.fav_file) {
+        Ok(favorites) => favorites,
+        Err(error) => {
+            eprintln!("Could not read favorites: {error}");
+            return false;
+        }
+    };
     let active_id = favorites::read_active_wallpaper(&config.theme_dir);
 
-    let all = scanner::scan_wallpapers(
+    let all = match scanner::scan_wallpapers(
         &config.wallpaper_dir,
         &config.thumb_dir,
         &favorites_set,
         active_id.as_deref(),
-    );
+    ) {
+        Ok(items) => items,
+        Err(error) => {
+            eprintln!("{error}");
+            return false;
+        }
+    };
 
     let fav_items: Vec<_> = all.into_iter().filter(|w| w.is_favorite).collect();
 
@@ -48,60 +60,75 @@ fn cycle_favorite(direction_next: bool, config: &Config) {
                 "No favorite wallpapers found.",
             ])
             .spawn();
-        return;
+        return false;
     }
 
-    let current_index = active_id
-        .as_ref()
-        .and_then(|id| {
-            fav_items.iter().position(|w| {
-                w.relative == *id || w.name == *id || w.path.to_string_lossy().ends_with(id)
-            })
-        })
-        .unwrap_or(0);
+    let current_index = fav_items.iter().position(|item| item.is_active);
 
     let next_index = if direction_next {
-        (current_index + 1) % fav_items.len()
+        current_index.map_or(0, |index| (index + 1) % fav_items.len())
     } else {
-        (current_index + fav_items.len() - 1) % fav_items.len()
+        current_index.map_or(fav_items.len() - 1, |index| {
+            (index + fav_items.len() - 1) % fav_items.len()
+        })
     };
 
     let target = &fav_items[next_index];
-    if let Err(e) = apply::apply_wallpaper(&target.path, &config.theme_ctl, true) {
-        eprintln!("Failed to apply wallpaper: {e}");
-    }
+    apply::apply_wallpaper(&target.path, &config.theme_ctl, true)
+        .map_err(|e| eprintln!("Failed to apply wallpaper: {e}"))
+        .is_ok()
 }
 
-fn apply_random(config: &Config) {
-    let favorites_set = favorites::load_favorites(&config.fav_file);
-    let all = scanner::scan_wallpapers(
+fn apply_random(config: &Config) -> bool {
+    let favorites_set = match favorites::load_favorites(&config.fav_file) {
+        Ok(favorites) => favorites,
+        Err(error) => {
+            eprintln!("Could not read favorites: {error}");
+            return false;
+        }
+    };
+    let all = match scanner::scan_wallpapers(
         &config.wallpaper_dir,
         &config.thumb_dir,
         &favorites_set,
         None,
-    );
+    ) {
+        Ok(items) => items,
+        Err(error) => {
+            eprintln!("{error}");
+            return false;
+        }
+    };
 
     if all.is_empty() {
         eprintln!("No wallpapers found in {}", config.wallpaper_dir.display());
-        return;
+        return false;
     }
 
-    use std::time::SystemTime;
-    let seed = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as usize)
-        .unwrap_or(42);
-    let choice = &all[seed % all.len()];
+    let choice = &all[fastrand::usize(..all.len())];
 
-    if let Err(e) = apply::apply_wallpaper(&choice.path, &config.theme_ctl, true) {
-        eprintln!("Failed to apply wallpaper: {e}");
-    }
+    apply::apply_wallpaper(&choice.path, &config.theme_ctl, true)
+        .map_err(|e| eprintln!("Failed to apply wallpaper: {e}"))
+        .is_ok()
 }
 
 fn build_cache(config: &Config, force: bool) -> bool {
     println!("Scanning {}...", config.wallpaper_dir.display());
-    let favs = favorites::load_favorites(&config.fav_file);
-    let all = scanner::scan_wallpapers(&config.wallpaper_dir, &config.thumb_dir, &favs, None);
+    let favs = match favorites::load_favorites(&config.fav_file) {
+        Ok(favorites) => favorites,
+        Err(error) => {
+            eprintln!("Could not read favorites: {error}");
+            return false;
+        }
+    };
+    let all = match scanner::scan_wallpapers(&config.wallpaper_dir, &config.thumb_dir, &favs, None)
+    {
+        Ok(items) => items,
+        Err(error) => {
+            eprintln!("{error}");
+            return false;
+        }
+    };
     println!("Checking {} wallpapers...", all.len());
     let stats = cache::batch_generate_thumbs(&all, force);
     println!(
@@ -116,18 +143,27 @@ fn build_cache(config: &Config, force: bool) -> bool {
         );
         false
     } else {
-        match cache::remove_previous_jpegs(&all, &config.thumb_dir) {
-            Ok(removed) if removed > 0 => println!("Removed {removed} previous JPEG thumbnails"),
-            Err(error) => eprintln!("Could not remove previous thumbnails: {error}"),
-            _ => {}
-        }
-        match cache::remove_legacy_pngs(&config.thumb_dir) {
-            Ok(removed) if removed > 0 => println!("Removed {removed} legacy PNG thumbnails"),
-            Err(error) => eprintln!("Could not remove legacy thumbnails: {error}"),
+        match cache::prune_thumbnails(&all, &config.thumb_dir) {
+            Ok(removed) if removed > 0 => println!("Removed {removed} obsolete thumbnails"),
+            Err(error) => {
+                eprintln!("Could not prune obsolete thumbnails: {error}");
+                return false;
+            }
             _ => {}
         }
         println!("Indexing wallpaper colors...");
-        let colors = color::ensure_color_cache(&all, &config.colors_file);
+        let (colors, _, saved) = color::ensure_color_cache(&all, &config.colors_file);
+        if let Err(error) = saved {
+            eprintln!("Could not save wallpaper color index: {error}");
+            return false;
+        }
+        if colors.len() != all.len() {
+            eprintln!(
+                "Could not index colors for {} wallpapers",
+                all.len() - colors.len()
+            );
+            return false;
+        }
         println!("Color index ready: {} wallpapers indexed", colors.len());
         println!("Cache generation complete!");
         true
@@ -135,39 +171,22 @@ fn build_cache(config: &Config, force: bool) -> bool {
 }
 
 struct SingleInstanceGuard {
-    sock_path: std::path::PathBuf,
-    _listener: std::os::unix::net::UnixListener,
+    _lock: std::fs::File,
 }
 
 impl SingleInstanceGuard {
-    pub fn acquire() -> Option<Self> {
+    pub fn acquire() -> Result<Option<Self>, String> {
         let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let sock_path = runtime_dir.join("dusky_wallpaper_selector.sock");
-
-        if sock_path.exists() {
-            if std::os::unix::net::UnixStream::connect(&sock_path).is_ok() {
-                // An active instance is already running
-                return None;
-            }
-            // Stale socket from dead instance
-            let _ = std::fs::remove_file(&sock_path);
+            .ok_or("XDG_RUNTIME_DIR is not set")?;
+        let path = runtime_dir.join("dusky_wallpaper_selector.lock");
+        let file = std::fs::File::create(&path)
+            .map_err(|e| format!("Could not open {}: {e}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _lock: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(error) => Err(format!("Could not lock {}: {error}", path.display())),
         }
-
-        match std::os::unix::net::UnixListener::bind(&sock_path) {
-            Ok(listener) => Some(Self {
-                sock_path,
-                _listener: listener,
-            }),
-            Err(_) => None,
-        }
-    }
-}
-
-impl Drop for SingleInstanceGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.sock_path);
     }
 }
 
@@ -297,7 +316,7 @@ fn detect_primary_gpu_vendor() -> Option<(String, String)> {
 
 fn optimize_gpu_environment() {
     // 1. If user explicitly provided driver files, don't override
-    if env::var_os("VK_DRIVER_FILES").is_some() || env::var_os("VK_ICD_FILENAMES").is_some() {
+    if env::var_os("VK_DRIVER_FILES").is_some() {
         return;
     }
 
@@ -359,7 +378,6 @@ fn optimize_gpu_environment() {
         if std::path::Path::new(candidate).exists() {
             unsafe {
                 env::set_var("VK_DRIVER_FILES", candidate);
-                env::set_var("VK_ICD_FILENAMES", candidate);
             }
             break;
         }
@@ -367,7 +385,6 @@ fn optimize_gpu_environment() {
 }
 
 fn main() -> iced::Result {
-    optimize_gpu_environment();
     let config = Config::load();
     let args: Vec<String> = env::args().collect();
 
@@ -388,17 +405,23 @@ fn main() -> iced::Result {
     }
 
     if option == Some("--next-fav") {
-        cycle_favorite(true, &config);
+        if !cycle_favorite(true, &config) {
+            std::process::exit(1);
+        }
         return Ok(());
     }
 
     if option == Some("--prev-fav") {
-        cycle_favorite(false, &config);
+        if !cycle_favorite(false, &config) {
+            std::process::exit(1);
+        }
         return Ok(());
     }
 
     if option == Some("--random") {
-        apply_random(&config);
+        if !apply_random(&config) {
+            std::process::exit(1);
+        }
         return Ok(());
     }
 
@@ -418,15 +441,20 @@ fn main() -> iced::Result {
 
     // Single-instance guard prevents duplicate instances and CPU thrashing
     let _guard = match SingleInstanceGuard::acquire() {
-        Some(g) => g,
-        None => {
+        Ok(Some(g)) => g,
+        Ok(None) => {
             if let Err(error) = reveal_existing_window() {
                 eprintln!("Could not show the running wallpaper selector: {error}");
             }
             return Ok(());
         }
+        Err(error) => {
+            eprintln!("Could not start wallpaper selector: {error}");
+            std::process::exit(1);
+        }
     };
 
+    optimize_gpu_environment();
     // Launch GUI in transparent overlay mode (matching skwd-wall overlay)
     let window_settings = iced::window::Settings {
         decorations: false,

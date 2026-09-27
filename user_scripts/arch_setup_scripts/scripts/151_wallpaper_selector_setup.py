@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
-"""Use the ISO package when installed; otherwise build for this CPU."""
+"""Use a current ISO package or build the selector for this CPU."""
 
 import argparse
 import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import signal
-import stat
 import subprocess
 import sys
 import tempfile
-import threading
 import time
+import tomllib
 from pathlib import Path
 
 
 GIB = 1024 ** 3
 TARGET = "x86_64-unknown-linux-gnu"
 SYSTEM_BINARY = Path("/usr/bin/dusky-wallpaper-selector")
+SYSTEM_SOURCE_DIGEST = Path("/usr/share/dusky-wallpaper-selector/source.sha256")
 
 
 def env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 3600) -> int:
@@ -33,14 +34,9 @@ def env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 3600) -
     return max(minimum, min(value, maximum))
 
 
-BUILD_RECIPE = "native-v2-frozen-sparse"
-FETCH_INACTIVITY_TIMEOUT_S = env_int(
-    "DUSKY_WALLPAPER_FETCH_INACTIVITY_TIMEOUT",
-    env_int("DUSKY_WALLPAPER_FETCH_TIMEOUT", 20, minimum=5, maximum=300),
-    minimum=5,
-    maximum=300,
-)
-BUILD_TIMEOUT_S = env_int("DUSKY_WALLPAPER_BUILD_TIMEOUT", 600, maximum=1800)
+BUILD_RECIPE = "native-v3-frozen-sparse"
+FETCH_TIMEOUT_S = env_int("DUSKY_WALLPAPER_FETCH_TIMEOUT", 120, maximum=1800)
+BUILD_TIMEOUT_S = env_int("DUSKY_WALLPAPER_BUILD_TIMEOUT", 7200, maximum=7200)
 CACHE_TIMEOUT_S = env_int("DUSKY_WALLPAPER_CACHE_TIMEOUT", 120, maximum=900)
 
 
@@ -94,7 +90,12 @@ def binary_runs(binary: Path) -> bool:
         if header[:7] != b"\x7fELF\x02\x01\x01" or header[18:20] != b"\x3e\x00":
             return False
         result = subprocess.run(
-            [str(binary), "--help"], capture_output=True, text=True, timeout=10, check=False
+            [str(binary), "--help"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
         )
         return result.returncode == 0 and "wallpaper_selector" in result.stdout
     except (OSError, subprocess.TimeoutExpired):
@@ -103,32 +104,31 @@ def binary_runs(binary: Path) -> bool:
 
 def get_project_version(project: Path) -> str:
     cargo_toml = project / "Cargo.toml"
-    if not cargo_toml.is_file():
-        return "1.0.0"
-    for line in cargo_toml.read_text().splitlines():
-        line = line.strip()
-        if line.startswith("version"):
-            parts = line.split("=", 1)
-            if len(parts) == 2:
-                return parts[1].strip().strip('"').strip("'")
-    return "1.0.0"
+    with cargo_toml.open("rb") as stream:
+        return tomllib.load(stream)["package"]["version"]
 
 
-def parse_version(v: str | None) -> tuple[int, ...]:
+def parse_version(v: str | None) -> tuple:
     if not v:
-        return (-1,)
-    cleaned = v.lstrip("vV").strip()
-    parts = []
-    for part in cleaned.split("."):
-        digits = "".join(ch for ch in part if ch.isdigit())
-        parts.append(int(digits) if digits else 0)
-    return tuple(parts) if parts else (-1,)
+        return (-1, -1, -1, ())
+    match = re.fullmatch(r"[vV]?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?", v.strip())
+    if not match:
+        return (-1, -1, -1, ())
+    prerelease = match.group(4)
+    suffix = (0, tuple((0, int(part)) if part.isdigit() else (1, part)
+                       for part in prerelease.split("."))) if prerelease else (1, ())
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)), suffix)
 
 
 def binary_version(binary: Path) -> str | None:
     try:
         result = subprocess.run(
-            [str(binary), "--version"], capture_output=True, text=True, timeout=10, check=False
+            [str(binary), "--version"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
         )
         if result.returncode == 0:
             for token in result.stdout.strip().split():
@@ -155,6 +155,8 @@ def native_binary_valid(project: Path, binary: Path, manifest_path: Path, expect
         if not b_ver or parse_version(b_ver) != parse_version(expected_version):
             return False
         manifest = json.loads(manifest_path.read_text())
+        if not isinstance(manifest, dict):
+            return False
         return (
             manifest.get("version") == expected_version
             and manifest.get("target") == TARGET
@@ -168,6 +170,13 @@ def native_binary_valid(project: Path, binary: Path, manifest_path: Path, expect
         return False
 
 
+def packaged_source_matches(project: Path) -> bool:
+    try:
+        return SYSTEM_SOURCE_DIGEST.read_text().strip() == source_digest(project)
+    except OSError:
+        return False
+
+
 def memory_bytes() -> tuple[int, int]:
     values = {}
     for line in Path("/proc/meminfo").read_text().splitlines():
@@ -175,19 +184,20 @@ def memory_bytes() -> tuple[int, int]:
         if key in ("MemTotal", "MemAvailable"):
             values[key] = int(value.strip().split()[0]) * 1024
     total, available = values["MemTotal"], values["MemAvailable"]
-    # Respect container or systemd cgroup limits when the setup is run inside one.
-    for limit_path, current_path in (
-        (Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory.current")),
-        (Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"), Path("/sys/fs/cgroup/memory/memory.usage_in_bytes")),
-    ):
+    cgroup = next((line.partition("::")[2] for line in Path("/proc/self/cgroup").read_text().splitlines()
+                   if line.startswith("0::")), "/")
+    root = Path("/sys/fs/cgroup")
+    group = root / cgroup.lstrip("/")
+    for directory in (group, *group.parents):
+        if not directory.is_relative_to(root):
+            break
         try:
-            limit = int(limit_path.read_text().strip())
-            current = int(current_path.read_text().strip())
+            limit = int((directory / "memory.max").read_text().strip())
+            current = int((directory / "memory.current").read_text().strip())
         except (OSError, ValueError):
             continue
         total = min(total, limit)
         available = min(available, max(0, limit - current))
-        break
     return total, available
 
 
@@ -209,17 +219,19 @@ def filesystem_type(path: Path) -> str | None:
 
 def build_base() -> tuple[Path, bool]:
     try:
-        total, available = memory_bytes()
+        _, available = memory_bytes()
     except (OSError, KeyError, ValueError):
-        total = available = 0
-    if total >= 8 * GIB and available >= 8 * GIB:
-        for path in (Path("/mnt/zram1"), Path("/tmp")):
+        available = 0
+    if available >= 6 * GIB:
+        for path in (Path("/tmp"), Path("/dev/shm")):
             if not path.is_dir() or not os.access(path, os.W_OK):
                 continue
             if filesystem_type(path) not in ("tmpfs", "ramfs"):
                 continue
             stat_res = os.statvfs(path)
-            if stat_res.f_bavail * stat_res.f_frsize >= 8 * GIB:
+            if stat_res.f_flag & os.ST_NOEXEC:
+                continue
+            if stat_res.f_bavail * stat_res.f_frsize >= 3 * GIB:
                 log("INFO", f"Building in memory at {path}")
                 return path, True
     log("INFO", "Building on disk; temporary build files will be removed")
@@ -252,6 +264,7 @@ def terminate_process_group(process: subprocess.Popen, *, grace_seconds: float =
 
     deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline and process_group_exists(pgid):
+        process.poll()
         time.sleep(0.05)
 
     if process_group_exists(pgid):
@@ -280,6 +293,7 @@ def run_bounded(
             command,
             cwd=cwd,
             env=env,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE if capture_output else None,
             stderr=subprocess.PIPE if capture_output else None,
             text=True,
@@ -320,120 +334,6 @@ def run_bounded(
         raise
 
 
-def get_pgid_io(target_pgid: int) -> int:
-    """Return total bytes read/written across all processes in the process group."""
-    total = 0
-    try:
-        entries = os.listdir("/proc")
-    except OSError:
-        return 0
-    for entry in entries:
-        if not entry.isdigit():
-            continue
-        try:
-            pid = int(entry)
-            if os.getpgid(pid) == target_pgid:
-                with open(f"/proc/{pid}/io", "r") as stream:
-                    for line in stream:
-                        if line.startswith(("rchar:", "wchar:")):
-                            total += int(line.split()[1])
-        except (OSError, ProcessLookupError, PermissionError):
-            continue
-    return total
-
-
-def run_with_inactivity_timeout(
-    command: list[str],
-    *,
-    inactivity_timeout: float,
-    cwd: Path | None = None,
-    env: dict[str, str] | None = None,
-    progress_callback=None,
-) -> tuple[int, str, str, bool]:
-    """Run process with an intelligent inactivity timeout: aborts only if no network/disk IO occurs for inactivity_timeout seconds."""
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            errors="replace",
-            start_new_session=True,
-        )
-    except OSError as error:
-        return 127, "", f"Could not start {command[0]!r}: {error}", False
-
-    pgid = process.pid
-    stdout_lines: list[str] = []
-    stderr_lines: list[str] = []
-    last_activity = [time.monotonic()]
-    lock = threading.Lock()
-
-    def stream_reader(stream, accumulator):
-        try:
-            for line in iter(stream.readline, ""):
-                with lock:
-                    accumulator.append(line)
-                    last_activity[0] = time.monotonic()
-        except Exception:
-            pass
-
-    t_err = threading.Thread(target=stream_reader, args=(process.stderr, stderr_lines), daemon=True)
-    t_out = threading.Thread(target=stream_reader, args=(process.stdout, stdout_lines), daemon=True)
-    t_err.start()
-    t_out.start()
-
-    initial_io = get_pgid_io(pgid)
-    last_io = initial_io
-    last_progress_log = time.monotonic()
-    timed_out = False
-
-    while process.poll() is None:
-        time.sleep(0.5)
-        current_io = get_pgid_io(pgid)
-        now = time.monotonic()
-
-        if current_io > last_io:
-            last_io = current_io
-            with lock:
-                last_activity[0] = now
-
-            if progress_callback and (now - last_progress_log >= 10.0):
-                transferred = current_io - initial_io
-                if transferred > 50 * 1024:
-                    progress_callback(transferred)
-                    last_progress_log = now
-
-        with lock:
-            idle_seconds = now - last_activity[0]
-
-        if idle_seconds >= inactivity_timeout:
-            timed_out = True
-            terminate_process_group(process)
-            break
-
-    try:
-        process.wait(timeout=2)
-    except (subprocess.TimeoutExpired, OSError):
-        pass
-
-    t_err.join(timeout=1.0)
-    t_out.join(timeout=1.0)
-
-    with lock:
-        stdout = "".join(stdout_lines)
-        stderr = "".join(stderr_lines)
-
-    return (
-        process.returncode if process.returncode is not None else -signal.SIGKILL,
-        stdout,
-        stderr,
-        timed_out,
-    )
-
-
 def get_cargo_home(build_dir: Path) -> Path:
     """Return a writable CARGO_HOME, creating a fallback in build_dir only if needed."""
     existing = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo"))
@@ -448,7 +348,7 @@ def get_cargo_home(build_dir: Path) -> Path:
 
     cargo_home = build_dir / "cargo-home"
     cargo_home.mkdir(parents=True, exist_ok=True)
-    for filename in ("config.toml", "config", "credentials.toml", "credentials"):
+    for filename in ("config.toml", "credentials.toml"):
         source = existing / filename
         if source.is_file():
             try:
@@ -459,17 +359,19 @@ def get_cargo_home(build_dir: Path) -> Path:
 
 
 def fetch_dependencies(cargo: str, project: Path, env: dict[str, str]) -> bool:
-    """Fast preflight: verify dependencies are cached offline or fetch them with an intelligent inactivity timeout."""
+    """Use cached dependencies when available, otherwise fetch with a deadline."""
     # 1. Fast check if all dependencies are already cached offline
     offline_cmd = [cargo, "fetch", "--locked", "--offline", "--target", TARGET]
-    rc, _, _, _ = run_bounded(offline_cmd, cwd=project, env=env, timeout=10, capture_output=True)
+    rc, _, _, _ = run_bounded(offline_cmd, cwd=project, env=env, timeout=30, capture_output=True)
     if rc == 0:
         return True
 
-    # 2. Not cached locally; fetch from crates.io with intelligent inactivity timeout
-    log("INFO", f"Missing dependencies; fetching from crates.io (idle timeout: {FETCH_INACTIVITY_TIMEOUT_S}s)...")
+    if env.get("CARGO_NET_OFFLINE", "").lower() in {"true", "1"}:
+        log("WARN", "Cargo dependencies are not cached and CARGO_NET_OFFLINE is enabled")
+        return False
+
+    log("INFO", f"Missing dependencies; fetching from crates.io (timeout: {FETCH_TIMEOUT_S}s)...")
     fetch_env = env.copy()
-    fetch_env["CARGO_NET_OFFLINE"] = "false"
     fetch_env["CARGO_HTTP_TIMEOUT"] = "30"
     fetch_env["CARGO_NET_RETRY"] = "2"
     fetch_env["CARGO_REGISTRIES_CRATES_IO_PROTOCOL"] = "sparse"
@@ -477,19 +379,15 @@ def fetch_dependencies(cargo: str, project: Path, env: dict[str, str]) -> bool:
 
     fetch_cmd = [cargo, "fetch", "--locked", "--target", TARGET]
 
-    def on_progress(bytes_fetched: int) -> None:
-        mb = bytes_fetched / (1024 * 1024)
-        log("INFO", f"Downloading dependencies... ({mb:.1f} MB received)")
-
-    rc, _, stderr, timed_out = run_with_inactivity_timeout(
+    rc, _, stderr, timed_out = run_bounded(
         fetch_cmd,
         cwd=project,
         env=fetch_env,
-        inactivity_timeout=float(FETCH_INACTIVITY_TIMEOUT_S),
-        progress_callback=on_progress,
+        timeout=FETCH_TIMEOUT_S,
+        capture_output=True,
     )
     if timed_out:
-        log("WARN", f"Cargo dependency fetch stalled for {FETCH_INACTIVITY_TIMEOUT_S}s with no data received; crates.io unreachable or offline")
+        log("WARN", f"Cargo dependency fetch exceeded {FETCH_TIMEOUT_S}s")
         return False
     if rc != 0:
         log("WARN", f"Cargo dependency fetch failed (exit {rc}):\n{stderr[-1000:].strip()}")
@@ -500,6 +398,8 @@ def fetch_dependencies(cargo: str, project: Path, env: dict[str, str]) -> bool:
 def link_system_binary(system_binary: Path, binary: Path) -> bool:
     temporary_binary = binary.with_name(f".{binary.name}.{os.getpid()}.tmp")
     try:
+        if binary.is_symlink() and binary.readlink() == system_binary:
+            return True
         temporary_binary.symlink_to(system_binary)
         os.replace(temporary_binary, binary)
         return True
@@ -516,7 +416,7 @@ def build_native(project: Path, binary: Path, manifest_path: Path, version: str)
         log("WARN", "Cargo is not installed; skipping native compilation")
         return False
 
-    base, _ = build_base()
+    base, ram_build = build_base()
     with tempfile.TemporaryDirectory(prefix="dusky-wall-build-", dir=base) as temp:
         temp_dir = Path(temp)
         target_dir = temp_dir / "target"
@@ -534,6 +434,12 @@ def build_native(project: Path, binary: Path, manifest_path: Path, version: str)
         env["CFLAGS"] = "-march=native -mtune=native -O2"
         env["CXXFLAGS"] = env["CFLAGS"]
         env["CPPFLAGS"] = ""
+        try:
+            _, available = memory_bytes()
+        except (OSError, KeyError, ValueError):
+            available = 2 * GIB
+        compiler_budget = max(0, available - 2 * GIB) if ram_build else available
+        jobs = min(os.cpu_count() or 1, max(1, compiler_budget // (2 * GIB)))
 
         # Preflight: ensure dependencies are available before starting compilation
         if not fetch_dependencies(cargo, project, env):
@@ -544,7 +450,7 @@ def build_native(project: Path, binary: Path, manifest_path: Path, version: str)
         build_env["RUSTUP_AUTO_INSTALL"] = "0"
 
         log("INFO", f"Compiling native release binary for this CPU (v{version})")
-        command = [cargo, "build", "--release", "--frozen", "--target", TARGET]
+        command = [cargo, "build", "--release", "--frozen", "--target", TARGET, "--jobs", str(jobs)]
         returncode, _, stderr, timed_out = run_bounded(
             command,
             cwd=project,
@@ -592,12 +498,17 @@ def build_native(project: Path, binary: Path, manifest_path: Path, version: str)
 def main(argv: list[str] | None = None) -> int:
     home = Path.home()
     project = home / "user_scripts/images/wallpaper_selector"
-    project_ver = get_project_version(project)
+    source_available = (project / "Cargo.toml").is_file()
+    try:
+        project_ver = get_project_version(project) if source_available else None
+    except (OSError, KeyError, tomllib.TOMLDecodeError) as error:
+        log("WARN", f"Could not read selector package version; skipping setup: {error}")
+        return 0
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--version", "-v", action="version",
-        version=f"wallpaper_selector_setup {project_ver}",
+        version=f"wallpaper_selector_setup {project_ver or 'package-only'}",
         help="Show version information and exit",
     )
     cache_group = parser.add_mutually_exclusive_group()
@@ -614,8 +525,6 @@ def main(argv: list[str] | None = None) -> int:
     install_dir = home / ".local/share/dusky/wallpaper_selector"
     binary = install_dir / "wallpaper_selector"
     manifest_path = install_dir / "binary_manifest.json"
-    legacy_binary = project / "wallpaper_selector"
-    legacy_manifest = project / "binary_manifest.json"
     local_bin = home / ".local/bin/wallpaper_selector"
     thumb_dir = home / ".cache/dusky_images/wallpaper_selector_rust/thumbs"
     settings_dir = home / ".config/dusky/settings/dusky_theme"
@@ -623,82 +532,77 @@ def main(argv: list[str] | None = None) -> int:
     if platform.machine() != "x86_64":
         log("WARN", "This selector package targets x86-64 only; skipping setup")
         return 0
-    if not (project / "Cargo.toml").is_file():
-        log("WARN", f"Selector source is missing from {project}; skipping setup")
+    try:
+        for directory in (thumb_dir, settings_dir, install_dir, local_bin.parent):
+            directory.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        log("WARN", f"Could not prepare selector directories; skipping setup: {error}")
         return 0
-
-    for directory in (thumb_dir, settings_dir, install_dir, local_bin.parent):
-        directory.mkdir(parents=True, exist_ok=True)
 
     system_ok = binary_runs(SYSTEM_BINARY)
     system_ver = binary_version(SYSTEM_BINARY) if system_ok else None
 
     selected = False
+    package_newer = bool(
+        system_ver and project_ver and parse_version(system_ver) > parse_version(project_ver)
+    )
 
-    # 1. Use system package binary if it's already installed and at least as new as source
-    if system_ver and parse_version(system_ver) >= parse_version(project_ver):
+    # Keep a verified native build when the generic ISO package also exists.
+    if (
+        not package_newer
+        and project_ver is not None
+        and native_binary_valid(project, binary, manifest_path, project_ver)
+    ):
+        log("OK", f"Using verified native build for this CPU (v{project_ver})")
+        selected = True
+
+    if (
+        not selected
+        and system_ver
+        and (
+            project_ver is None
+            or package_newer
+            or (
+                parse_version(system_ver) == parse_version(project_ver)
+                and packaged_source_matches(project)
+            )
+        )
+    ):
         log("OK", f"Using ISO package binary at {SYSTEM_BINARY} (v{system_ver})")
         if link_system_binary(SYSTEM_BINARY, binary):
             manifest_path.unlink(missing_ok=True)
             selected = True
 
-    # 2. Use existing verified native build if source, CPU, version, and hashes match
-    if not selected and native_binary_valid(project, binary, manifest_path, project_ver):
-        log("OK", f"Using verified native build for this CPU (v{project_ver})")
-        selected = True
-
-    # 3. Migrate verified native build from project dir if found
-    if not selected and native_binary_valid(project, legacy_binary, legacy_manifest, project_ver):
-        temporary_binary = binary.with_name(f".{binary.name}.{os.getpid()}.tmp")
-        temporary_manifest = manifest_path.with_name(f".{manifest_path.name}.{os.getpid()}.tmp")
-        try:
-            shutil.copy2(legacy_binary, temporary_binary)
-            shutil.copy2(legacy_manifest, temporary_manifest)
-            os.replace(temporary_binary, binary)
-            os.replace(temporary_manifest, manifest_path)
-            log("OK", f"Moved verified native build out of the Git checkout (v{project_ver})")
-            selected = True
-        except OSError as error:
-            log("WARN", f"Could not migrate the verified native build: {error}")
-        finally:
-            temporary_binary.unlink(missing_ok=True)
-            temporary_manifest.unlink(missing_ok=True)
-
-    # 4. Attempt native compilation
-    if not selected:
+    # Compile when the installed ISO package does not match the current source.
+    if not selected and project_ver is not None:
         if system_ok:
-            log("INFO", f"System binary at {SYSTEM_BINARY} is outdated (v{system_ver or 'legacy'} < v{project_ver}); attempting native build")
-        built_ok = build_native(project, binary, manifest_path, project_ver)
+            log("INFO", f"System binary at {SYSTEM_BINARY} does not match the source; attempting native build")
+        try:
+            built_ok = build_native(project, binary, manifest_path, project_ver)
+        except OSError as error:
+            log("WARN", f"Could not complete native build; using an available package if possible: {error}")
+            built_ok = False
         if built_ok:
             log("OK", f"Installed newly built native binary (v{project_ver})")
             selected = True
 
-    # 5. Fallback if build was unavailable or failed
-    if not selected:
-        current_local_ok = binary_runs(binary)
-        current_local_ver = binary_version(binary) if current_local_ok else None
-
-        if system_ok:
-            log("WARN", f"Native build unavailable; attempting packaged binary v{system_ver or 'unknown'}")
-            if link_system_binary(SYSTEM_BINARY, binary):
-                manifest_path.unlink(missing_ok=True)
-                selected = True
-            else:
-                log("WARN", "Could not link packaged fallback binary")
-
-        if not selected and current_local_ok:
-            log("WARN", f"Native build unavailable; keeping previously installed binary v{current_local_ver or 'unknown'}")
+    # A working ISO package remains usable if source or native compilation fails.
+    if not selected and system_ok:
+        log("WARN", f"Using ISO package binary (v{system_ver or 'unknown'}) because no current native build is available")
+        if link_system_binary(SYSTEM_BINARY, binary):
+            manifest_path.unlink(missing_ok=True)
             selected = True
 
-        if not selected:
-            log("WARN", "Wallpaper selector binary build skipped or failed, and no fallback binary is available; continuing setup")
-            return 0
+    if not selected:
+        log("WARN", "No runnable packaged or native selector binary is available; skipping setup")
+        return 0
 
     if binary_runs(binary):
         temporary_link = local_bin.with_name(f".{local_bin.name}.{os.getpid()}.tmp")
         try:
-            temporary_link.symlink_to(binary)
-            os.replace(temporary_link, local_bin)
+            if not (local_bin.is_symlink() and local_bin.readlink() == binary):
+                temporary_link.symlink_to(binary)
+                os.replace(temporary_link, local_bin)
         except OSError as error:
             temporary_link.unlink(missing_ok=True)
             log("WARN", f"Could not create launcher symlink: {error}")
@@ -706,9 +610,6 @@ def main(argv: list[str] | None = None) -> int:
     else:
         log("WARN", "No runnable wallpaper selector binary available; skipping launcher symlink")
         return 0
-
-    for legacy_file in (legacy_binary, legacy_manifest):
-        legacy_file.unlink(missing_ok=True)
 
     cache_mode = "--rebuild-cache" if args.rebuild_cache else "--build-cache"
     log("INFO", "Regenerating all previews" if args.rebuild_cache else "Generating missing or stale previews")
@@ -718,14 +619,18 @@ def main(argv: list[str] | None = None) -> int:
         capture_output=False,
     )
     if timed_out:
-        log("WARN", f"Thumbnail generation exceeded {CACHE_TIMEOUT_S}s and was terminated; continuing setup")
+        log("WARN", f"Thumbnail generation exceeded {CACHE_TIMEOUT_S}s and was terminated; continuing update")
         return 0
     if returncode != 0:
-        log("WARN", f"Thumbnail generation failed (exit {returncode}); continuing setup")
+        log("WARN", f"Thumbnail generation failed (exit {returncode}); continuing update")
         return 0
     log("OK", "Wallpaper selector setup complete")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as error:
+        log("WARN", f"Wallpaper selector setup failed; continuing update: {error}")
+        sys.exit(0)

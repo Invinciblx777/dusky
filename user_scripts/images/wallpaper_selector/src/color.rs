@@ -135,32 +135,71 @@ pub fn save_color_cache(path: &Path, cache: &HashMap<String, u8>) -> io::Result<
 pub fn ensure_color_cache(
     wallpapers: &[crate::scanner::WallpaperItem],
     colors_file: &Path,
-) -> HashMap<String, u8> {
+) -> (HashMap<String, u8>, HashMap<String, u8>, io::Result<()>) {
     let mut cache = load_color_cache(colors_file);
+    let active_keys: std::collections::HashSet<_> = wallpapers
+        .iter()
+        .filter_map(|item| {
+            item.thumb_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .collect();
+    let old_count = cache.len();
+    cache.retain(|key, _| active_keys.contains(key));
     let missing: Vec<_> = wallpapers
         .iter()
-        .filter(|w| !cache.contains_key(&w.relative))
+        .filter(|w| {
+            w.thumb_path
+                .file_name()
+                .is_some_and(|name| !cache.contains_key(name.to_string_lossy().as_ref()))
+                && crate::cache::is_thumb_valid(&w.path, &w.thumb_path)
+        })
         .collect();
 
     if !missing.is_empty() {
-        let newly_computed: Vec<(String, u8)> = missing
+        let newly_computed: Vec<(String, Option<u8>)> = missing
             .par_iter()
             .map(|item| {
-                let target_path = if item.thumb_path.exists() {
-                    &item.thumb_path
-                } else {
-                    &item.path
-                };
-                let bucket = extract_color_from_file(target_path).unwrap_or(12);
-                (item.relative.clone(), bucket)
+                let key = item
+                    .thumb_path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                let mut color = extract_color_from_file(&item.thumb_path);
+                if color.is_none() {
+                    let _ = fs::remove_file(&item.thumb_path);
+                    if crate::cache::generate_thumb(&item.path, &item.thumb_path)
+                        != crate::cache::ThumbStatus::Failed
+                    {
+                        color = extract_color_from_file(&item.thumb_path);
+                    }
+                }
+                (key, color)
             })
             .collect();
 
         for (rel, bucket) in newly_computed {
-            cache.insert(rel, bucket);
+            if let Some(bucket) = bucket {
+                cache.insert(rel, bucket);
+            }
         }
-        let _ = save_color_cache(colors_file, &cache);
     }
+    let saved = if old_count != cache.len() || !missing.is_empty() {
+        save_color_cache(colors_file, &cache)
+    } else {
+        Ok(())
+    };
 
-    cache
+    let colors = wallpapers
+        .iter()
+        .filter_map(|item| {
+            let key = item.thumb_path.file_name()?.to_string_lossy();
+            cache
+                .get(key.as_ref())
+                .map(|&bucket| (item.relative.clone(), bucket))
+        })
+        .collect();
+    (colors, cache, saved)
 }
