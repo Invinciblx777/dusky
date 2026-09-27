@@ -128,6 +128,7 @@ class ConfigItem:
     target_file_override: str | None = None
     engine_type_override: str | None = None
     force_interactive: bool | None = None
+    read_only: bool = False
 
     _ratio_cache: float | None = field(default=None, repr=False, compare=False)
 

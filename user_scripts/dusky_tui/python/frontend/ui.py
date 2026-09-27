@@ -1361,6 +1361,7 @@ class ShortcutsInfoScreen(ModalScreen[None]):
             ("r", "Reset highlighted item to default"),
             ("R", "Reset entire page to defaults"),
         ]
+        bindings_info.insert(2, ("f5", "Refresh current TUI state"))
 
         for keys, desc in bindings_info:
             txt = Text()
@@ -2162,6 +2163,7 @@ Tooltip {
         Binding("D", "delete_user_preset", "Delete Preset", priority=False),
         Binding("u", "undo", "Undo", priority=False),
         Binding("ctrl+r", "redo", "Redo", priority=True),
+        Binding("f5", "refresh_state", "Refresh", priority=True, show=False),
         Binding("r", "reset_item", "Reset Item", priority=False),
         Binding("R", "reset_all", "Reset Page", priority=True),
         Binding("?", "toggle_help", "Help", priority=False),
@@ -2197,12 +2199,14 @@ Tooltip {
         global_popup: Any | None = None,
         tab_notices: dict[int, dict | list[dict]] | None = None,
         deferred_load=None,
+        hide_missing_items: bool = False,
         custom_views: dict[int | str, Any] | None = None,
         **kwargs
     ):
         super().__init__(**kwargs)
 
         self.deferred_load = deferred_load
+        self.hide_missing_items = hide_missing_items
         self.custom_views = custom_views or {}
         self.engine_pool = engine_pool
         self.default_engine_key = default_engine_key
@@ -2674,7 +2678,7 @@ Tooltip {
 
                 self._items_by_engine.setdefault(ekey, []).append((t_idx, i_idx, item))
 
-                if item.type_ not in ("action", "preset", "menu"):
+                if item.type_ not in ("action", "preset", "menu") and not item.read_only:
                     self._configurable_items.append((t_idx, i_idx, item))
 
                 if item.type_ == "preset":
@@ -2914,7 +2918,9 @@ Tooltip {
         val_str = str(item.value)
 
         # Tail rendering.
-        if item.type_ in ("action", "preset", "menu"):
+        if item.read_only:
+            txt.append("Read only", style=self.theme_colors["muted"])
+        elif item.type_ in ("action", "preset", "menu"):
             if item.type_ == "preset":
                 if is_active_preset:
                     txt.append("󰄬 Active", style=f"bold {self.theme_colors['success']}")
@@ -3391,7 +3397,7 @@ Tooltip {
                 item.exists_in_target = True
                 new_val = item.deserialize(raw)
             else:
-                item.exists_in_target = (item.default != "nil")
+                item.exists_in_target = not self.hide_missing_items and item.default != "nil"
                 new_val = item.value
 
             if not item._initial_loaded:
@@ -3443,10 +3449,12 @@ Tooltip {
 
         if self._boot_complete and self.deferred_load and not self._deferred_started:
             self._deferred_started = True
+            self._inventory_refreshing = True
             self._run_deferred_load()
 
     @work(exclusive=True, group="deferred-tabs", exit_on_error=False)
-    async def _run_deferred_load(self) -> None:
+    async def _run_deferred_load(self, *, manual_refresh: bool = False) -> None:
+        self._inventory_refreshing = True
         try:
             writes_before = dict(self._write_generation)
             result = await asyncio.to_thread(self.deferred_load)
@@ -3462,19 +3470,123 @@ Tooltip {
                 # A schema can return the state collected during discovery.
                 # Re-read it if an edit happened while discovery was running.
                 use_prefetched = default_state is not None and self._write_generation == writes_before
+                def load_one(key, engine):
+                    if use_prefetched and key == self.default_engine_key:
+                        return default_state
+                    if key == self.default_engine_key and new_items and hasattr(engine, "load_state_for_units"):
+                        discovered = [item for rows in new_items.values() for item in rows if item.type_ not in ("menu", "action", "preset")]
+                        return engine.load_state_for_units(
+                            [item.key for item in discovered if item.scope == "user"],
+                            [item.key for item in discovered if item.scope == "system"],
+                        )
+                    return engine.load_state()
                 def load_states():
                     return {
-                        key: default_state if use_prefetched and key == self.default_engine_key else engine.load_state()
+                        key: load_one(key, engine)
                         for key, engine in self.engine_pool.items()
                     }
                 states = await self._run_save_io(load_states)
                 if use_prefetched and self._write_generation != writes_before:
+                    use_prefetched = False
                     states[self.default_engine_key] = await self._run_save_io(
-                        self.engine_pool[self.default_engine_key].load_state
+                        load_one, self.default_engine_key, self.engine_pool[self.default_engine_key]
                     )
             self._apply_deferred_tabs(updated_tabs, states, new_items)
+            if manual_refresh:
+                self._apply_refreshed_states(states)
+                self._refresh_custom_views()
+                self.notify_status("Refreshed current TUI state.")
         except Exception:
             LOGGER.exception("Deferred tab loading failed")
+            self.notify_status("Deferred discovery failed; existing rows were kept.", level="error")
+        finally:
+            self._inventory_refreshing = False
+
+    def action_refresh_state(self) -> None:
+        if not self._boot_complete or getattr(self, "_inventory_refreshing", False):
+            return
+        self._inventory_refreshing = True
+        if self.deferred_load:
+            self._run_deferred_load(manual_refresh=True)
+        else:
+            self._run_state_refresh()
+
+    @work(exclusive=True, group="manual-state-refresh", exit_on_error=False)
+    async def _run_state_refresh(self) -> None:
+        try:
+            async with self._save_lock:
+                states, errors = await self._run_save_io(
+                    self._load_engines_batch_sync, set(self.engine_pool)
+                )
+            for key, error in errors.items():
+                self.notify_status(f"Failed to refresh {key}: {error}", level="error")
+            self._apply_refreshed_states(states)
+            self._refresh_custom_views()
+            if states and not errors:
+                self.notify_status("Refreshed current TUI state.")
+        except Exception:
+            LOGGER.exception("State refresh failed")
+            self.notify_status("State refresh failed; existing values were kept.", level="error")
+        finally:
+            self._inventory_refreshing = False
+
+    def _apply_refreshed_states(self, states: dict) -> None:
+        self._states.update(states)
+        self._loaded_engines.update(states)
+        for key in states:
+            self._failed_engines.pop(key, None)
+
+        for tab_idx in self.tabs:
+            if tab_idx not in self._tab_data_ready and self._engines_for_tab(tab_idx).issubset(self._loaded_engines):
+                self._apply_states_to_tab(tab_idx, self._states)
+
+        changed_keys = set()
+        for engine_key, refs in self._items_by_engine.items():
+            if engine_key not in states:
+                continue
+            state = states[engine_key]
+            for tab_idx, item_idx, item in refs:
+                if item.type_ in ("action", "preset", "menu") or not item._initial_loaded:
+                    continue
+                uid = self._uid_engine_key(item)
+                if self._has_pending_save_for_key(uid):
+                    continue
+                raw = self._lookup_state(state, item)
+                if raw is not None:
+                    value = item.deserialize(raw)
+                    exists = True
+                else:
+                    exists = not self.hide_missing_items and item.default != "nil"
+                    value = item.default if exists else item.value
+                if item.serialize(item.value) != item.serialize(value) or item.exists_in_target != exists:
+                    item.value = clone_value(value)
+                    item.exists_in_target = exists
+                    self._on_item_value_changed(item)
+                    changed_keys.add(uid)
+                self._committed[(tab_idx, item_idx)] = clone_value(value)
+
+        for uid in changed_keys:
+            self._bump_write_generation(uid)
+        if states:
+            self._refresh_all_ui()
+            self._refresh_presets_ui()
+
+    def _refresh_custom_views(self) -> None:
+        for tab_idx, name in self.tabs.items():
+            if tab_idx not in self.custom_views and name not in self.custom_views:
+                continue
+            container = self.query_one(f"#tab-{tab_idx}")
+            for view in container.children:
+                if isinstance(view, NoticeBox):
+                    continue
+                try:
+                    if callable(update := getattr(view, "update_content", None)):
+                        update()
+                    else:
+                        view.refresh()
+                except Exception:
+                    LOGGER.exception("Unable to refresh custom view in tab %s", tab_idx)
+                    self.notify_status(f"Could not refresh custom view in {name}.", level="error")
 
     @work(exclusive=True, group="engine-boot", exit_on_error=False)
     async def run_deferred_boot(self, *, initial_tab: int | None = 0) -> None:
@@ -3624,20 +3736,34 @@ Tooltip {
                 pass
 
         items = self.schema.get(tab_idx, [])
+        # Schemas opt in to hiding missing settings. Other TUIs often show
+        # settings whose config file has no entry yet.
+        visible = {
+            idx for idx, item in enumerate(items)
+            if item.type_ in ("menu", "action", "preset")
+            or not self.hide_missing_items
+            or item.exists_in_target
+        }
+        for idx, item in enumerate(items):
+            if item.type_ == "menu" and self.hide_missing_items and not any(
+                child.parent_ref in (item.uid, item.key) and child_idx in visible
+                for child_idx, child in enumerate(items)
+            ):
+                visible.discard(idx)
         options = []
         current_group = None
         first_item_id = None
 
-        parents = {itm.uid: idx for idx, itm in enumerate(items) if itm.is_parent or itm.type_ == "menu"}
+        parents = {itm.uid: idx for idx, itm in enumerate(items) if idx in visible and (itm.is_parent or itm.type_ == "menu")}
         for idx, itm in enumerate(items):
-            if itm.is_parent or itm.type_ == "menu":
+            if idx in visible and (itm.is_parent or itm.type_ == "menu"):
                 parents.setdefault(itm.key, idx)
         children_map = defaultdict(list)
         root_items = []
         parent_indices = {
             idx: parents[itm.parent_ref]
             for idx, itm in enumerate(items)
-            if itm.parent_ref in parents and parents[itm.parent_ref] != idx
+            if idx in visible and itm.parent_ref in parents and parents[itm.parent_ref] != idx
         }
         # Break malformed cycles so every tree has a visible root.
         checked = set()
@@ -3652,6 +3778,8 @@ Tooltip {
                 current = parent_indices[current]
             checked.update(chain)
         for orig_idx, itm in enumerate(items):
+            if orig_idx not in visible:
+                continue
             if orig_idx in parent_indices:
                 children_map[parent_indices[orig_idx]].append((orig_idx, itm))
             else:
@@ -3778,12 +3906,14 @@ Tooltip {
                         continue
                     old_idx, old_item = matches.popleft()
                     remapped[(tab_idx, old_idx)] = (tab_idx, new_idx)
-                    if old_item._initial_loaded:
+                    refreshes_inventory = self.hide_missing_items
+                    keep_value = not refreshes_inventory or (tab_idx, old_idx) in self.pending_commits
+                    if old_item._initial_loaded and keep_value and not new_item.read_only:
                         new_item.value = clone_value(old_item.value)
                         new_item.initial_value = clone_value(old_item.initial_value)
                         new_item.exists_in_target = old_item.exists_in_target
                         new_item._initial_loaded = True
-                        new_item.expanded = old_item.expanded
+                    new_item.expanded = old_item.expanded
                 self.schema[tab_idx] = new_items[tab_idx]
 
         if replaced_tabs:
@@ -3791,7 +3921,11 @@ Tooltip {
                 return remapped.get(ref) if ref[0] in replaced_tabs else ref
 
             self._committed = {new_ref: value for ref, value in self._committed.items() if (new_ref := remap(ref)) is not None}
-            self.pending_commits = {new_ref for ref in self.pending_commits if (new_ref := remap(ref)) is not None}
+            self.pending_commits = {
+                new_ref for ref in self.pending_commits
+                if (new_ref := remap(ref)) is not None
+                and not self.schema[new_ref[0]][new_ref[1]].read_only
+            }
             for history in (self.undo_stack, self.redo_stack):
                 transactions = [
                     [(*new_ref, old, new) for ti, ii, old, new in transaction if (new_ref := remap((ti, ii))) is not None]
@@ -3826,7 +3960,7 @@ Tooltip {
                     item.exists_in_target = True
                     item.value = item.deserialize(raw)
                 else:
-                    item.exists_in_target = (item.default != "nil")
+                    item.exists_in_target = not self.hide_missing_items and item.default != "nil"
 
                 if not item._initial_loaded:
                     item.initial_value = clone_value(item.value)
@@ -4767,6 +4901,24 @@ Tooltip {
         self._bump_write_generation(self._uid_engine_key(item))
         self._refresh_presets_ui()
 
+    def _apply_observed_systemd_state(self, item: ConfigItem, actual: str, expected: str) -> None:
+        """Reconcile every view of one unit after an uncertain systemctl write."""
+        uid = self._get_item_uid(item)
+        engine_key = self._get_item_engine_info(item)
+        for tab_idx, item_idx, other in self._items_by_uid.get(uid, ()):
+            if self._get_item_engine_info(other) != engine_key:
+                continue
+            observed = other.deserialize(actual)
+            self._committed[(tab_idx, item_idx)] = clone_value(observed)
+            if other.serialize(other.value) == expected:
+                other.value = observed
+            other.exists_in_target = True
+            self._sync_pending(tab_idx, item_idx, other)
+            self._on_item_value_changed(other)
+            self._refresh_single_ui(tab_idx, item_idx, other)
+        self._bump_write_generation(self._uid_engine_key(item))
+        self._refresh_presets_ui()
+
     # =========================================================================
     # TRANSACTION APPLICATION
     # =========================================================================
@@ -4934,6 +5086,12 @@ Tooltip {
         batch_mode: bool = False,
         record_undo: bool = True
     ) -> None:
+        if item.read_only:
+            self.notify_status(f"{item.label} cannot be enabled or disabled directly.", level="warning")
+            return
+        if not item.exists_in_target and self.hide_missing_items:
+            self.notify_status(f"{item.label} is no longer available. Press F5 to refresh.", level="warning")
+            return
         if not self.require_boot_complete():
             return
         if item.confirm_message and not is_undo and not batch_mode:
@@ -4962,6 +5120,8 @@ Tooltip {
         batch_mode: bool = False,
         record_undo: bool = True
     ) -> bool:
+        if item.read_only:
+            return False
         old_val = clone_value(item.value)
         self._schema_dirty_counter += 1
 
@@ -5163,15 +5323,19 @@ Tooltip {
                 return
 
             self._active_save_count += 1
+            write_result = None
             try:
                 try:
-                    success, msg, _ = await self._run_save_io(
-                        engine.write_value,
-                        item.key,
-                        item.scope,
-                        val_str,
-                        item_type=item.type_
-                    )
+                    if hasattr(engine, "write_value_result"):
+                        write_result = await self._run_save_io(
+                            engine.write_value_result, item.key, item.scope, val_str
+                        )
+                        success, msg = write_result.ok, write_result.message
+                    else:
+                        success, msg, _ = await self._run_save_io(
+                            engine.write_value, item.key, item.scope, val_str,
+                            item_type=item.type_
+                        )
                 except Exception as e:
                     success, msg = False, f"Engine Error: {e}"
             finally:
@@ -5212,6 +5376,20 @@ Tooltip {
                 self.set_timer(0.15, reset_trigger)
 
             self.notify_status(f"Updated {item.label}", level="success")
+            self._maybe_finish_quit()
+            return
+
+        if write_result is not None and "AUTH_REQUIRED" not in msg:
+            if self._write_generation.get(uek) != generation or item.serialize(item.value) != val_str:
+                return
+            if write_result.actual is not None:
+                self._apply_observed_systemd_state(item, write_result.actual, val_str)
+                self.notify_status(f"Error: {msg}; current enablement was refreshed.", level="error")
+            else:
+                for ti, ii, _, _ in transaction:
+                    self._sync_pending(ti, ii, self.schema[ti][ii])
+                self.notify_status(f"Error: {msg}; current enablement is unknown.", level="error")
+            self._save_failure_pending = True
             self._maybe_finish_quit()
             return
 
@@ -5399,6 +5577,42 @@ Tooltip {
                 # Duplicate views must not execute a trigger multiple times.
                 changes = list({(b[0][0], b[0][1]): b[0] for b in batch}.values())
 
+                if trigger_key is None and hasattr(engine, "write_batch_results"):
+                    self._active_save_count += 1
+                    try:
+                        results = await self._run_save_io(engine.write_batch_results, changes)
+                    except Exception as exc:
+                        results = {}
+                        error_msgs.append(f"Engine Error: {exc}")
+                        final_success = False
+                    finally:
+                        self._active_save_count -= 1
+
+                    reconciled = set()
+                    for change, key, frozen_str, frozen_val, itm in batch:
+                        identity = (change[0], change[1])
+                        result = results.get(identity)
+                        if result is None:
+                            continue  # Unknown outcome remains pending; never repeat it blindly.
+                        if result.ok:
+                            if mark_success(key, frozen_str, frozen_val, itm):
+                                success_count += 1
+                                self._bump_write_generation(self._uid_engine_key(itm))
+                            continue
+                        final_success = False
+                        if result.message == "AUTH_REQUIRED":
+                            auth_required = True
+                            continue
+                        if identity not in reconciled and result.actual is not None:
+                            self._apply_observed_systemd_state(itm, result.actual, frozen_str)
+                            reconciled.add(identity)
+                        if result.actual == frozen_str:
+                            success_count += 1
+                        error_msgs.append(result.message)
+                    if auth_required:
+                        break
+                    continue
+
                 self._active_save_count += 1
                 try:
                     if trigger_key is not None:
@@ -5510,6 +5724,8 @@ Tooltip {
                 return
 
         if auth_required:
+            self._refresh_all_ui()
+            self._refresh_presets_ui()
             if isinstance(self.screen, PasswordScreen):
                 self.notify_status("Another authorization is already in progress.", level="warning")
                 self._save_failure_pending = True
@@ -5973,6 +6189,8 @@ Tooltip {
             return
 
         tab_idx, item_idx, item = parsed
+        if item.read_only:
+            return
 
         if item.is_parent or item.type_ == "menu":
             items_in_tab = self.schema.get(tab_idx, [])
@@ -6009,7 +6227,9 @@ Tooltip {
 
             # 2. Reset all descendant child items if modified
             for i_idx, itm in enumerate(items_in_tab):
-                if (itm.key in child_keys or self._get_item_uid(itm) in child_uids) and itm.type_ not in ("menu", "action", "preset"):
+                if (itm.key in child_keys or self._get_item_uid(itm) in child_uids) and itm.type_ not in ("menu", "action", "preset") and not itm.read_only and (
+                    itm.exists_in_target or not self.hide_missing_items
+                ):
                     if str(itm.value) != str(itm.default):
                         transaction.append((tab_idx, i_idx, itm.value, itm.default))
 
@@ -6041,7 +6261,8 @@ Tooltip {
             items = self.schema.get(tab_idx, [])
             configurable_items = [
                 (idx, item) for idx, item in enumerate(items)
-                if item.type_ not in ("action", "menu", "preset")
+                if item.type_ not in ("action", "menu", "preset") and not item.read_only
+                and (item.exists_in_target or not self.hide_missing_items)
             ]
 
             has_changes = any(

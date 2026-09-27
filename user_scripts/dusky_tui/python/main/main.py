@@ -464,6 +464,7 @@ EXAMPLES:
         GLOBAL_POPUP = getattr(schema_module, "GLOBAL_POPUP", None)
         TAB_NOTICES = getattr(schema_module, "TAB_NOTICES", None)
         DEFERRED_LOAD = getattr(schema_module, "DEFERRED_LOAD", None)
+        HIDE_MISSING_ITEMS = getattr(schema_module, "HIDE_MISSING_ITEMS", False)
         REQUIRE_ROOT = getattr(schema_module, "REQUIRE_ROOT", False)
         CUSTOM_VIEWS = getattr(schema_module, "CUSTOM_VIEWS", None)
 
@@ -753,6 +754,8 @@ EXAMPLES:
                     print(f"### `{item.key}`")
                     print(f"- **Type:** `{item.type_}`")
                     print(f"- **Default:** `{item.default}`")
+                    if item.read_only:
+                        print("- **Read only:** yes")
 
                     if item.extended_help:
                         print(f"\n> {item.extended_help.replace('**', '')}\n")
@@ -870,7 +873,7 @@ EXAMPLES:
         if args.default:
             logger.info("Initiating Full Headless Default Restoration")
 
-            unique_items = (item for items in SCHEMA.values() for item in items if item.type_ not in ("action", "preset", "menu"))
+            unique_items = (item for items in SCHEMA.values() for item in items if item.type_ not in ("action", "preset", "menu") and not item.read_only)
             changes_by_engine = {}
 
             for item in unique_items:
@@ -895,6 +898,15 @@ EXAMPLES:
             for ekey, indexed_changes in changes_by_engine.items():
                 changes = list(indexed_changes.values())
                 engine_pool[ekey].load_state()
+                if hasattr(engine_pool[ekey], "write_batch_results"):
+                    results = engine_pool[ekey].write_batch_results(changes)
+                    failures = [result.message for result in results.values() if not result.ok]
+                    if failures:
+                        all_success = False
+                        print(f"[-] {ekey[0]} reset: {len(results) - len(failures)} applied; {len(failures)} failed. First error: {failures[0]}")
+                    else:
+                        print(f"[*] Restoration Complete for {ekey[0]} backend. Reset {len(results)} items successfully.")
+                    continue
                 success, msg, _ = engine_pool[ekey].write_batch(changes)
 
                 if success:
@@ -938,6 +950,7 @@ EXAMPLES:
         global_popup=GLOBAL_POPUP,
         tab_notices=TAB_NOTICES,
         deferred_load=DEFERRED_LOAD,
+        hide_missing_items=HIDE_MISSING_ITEMS,
         custom_views=CUSTOM_VIEWS
     )
 
