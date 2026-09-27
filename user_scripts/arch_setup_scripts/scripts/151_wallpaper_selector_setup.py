@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -33,7 +34,12 @@ def env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 3600) -
 
 
 BUILD_RECIPE = "native-v2-frozen-sparse"
-FETCH_TIMEOUT_S = env_int("DUSKY_WALLPAPER_FETCH_TIMEOUT", 15, maximum=120)
+FETCH_INACTIVITY_TIMEOUT_S = env_int(
+    "DUSKY_WALLPAPER_FETCH_INACTIVITY_TIMEOUT",
+    env_int("DUSKY_WALLPAPER_FETCH_TIMEOUT", 20, minimum=5, maximum=300),
+    minimum=5,
+    maximum=300,
+)
 BUILD_TIMEOUT_S = env_int("DUSKY_WALLPAPER_BUILD_TIMEOUT", 600, maximum=1800)
 CACHE_TIMEOUT_S = env_int("DUSKY_WALLPAPER_CACHE_TIMEOUT", 120, maximum=900)
 
@@ -314,6 +320,120 @@ def run_bounded(
         raise
 
 
+def get_pgid_io(target_pgid: int) -> int:
+    """Return total bytes read/written across all processes in the process group."""
+    total = 0
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return 0
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            pid = int(entry)
+            if os.getpgid(pid) == target_pgid:
+                with open(f"/proc/{pid}/io", "r") as stream:
+                    for line in stream:
+                        if line.startswith(("rchar:", "wchar:")):
+                            total += int(line.split()[1])
+        except (OSError, ProcessLookupError, PermissionError):
+            continue
+    return total
+
+
+def run_with_inactivity_timeout(
+    command: list[str],
+    *,
+    inactivity_timeout: float,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    progress_callback=None,
+) -> tuple[int, str, str, bool]:
+    """Run process with an intelligent inactivity timeout: aborts only if no network/disk IO occurs for inactivity_timeout seconds."""
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            start_new_session=True,
+        )
+    except OSError as error:
+        return 127, "", f"Could not start {command[0]!r}: {error}", False
+
+    pgid = process.pid
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    last_activity = [time.monotonic()]
+    lock = threading.Lock()
+
+    def stream_reader(stream, accumulator):
+        try:
+            for line in iter(stream.readline, ""):
+                with lock:
+                    accumulator.append(line)
+                    last_activity[0] = time.monotonic()
+        except Exception:
+            pass
+
+    t_err = threading.Thread(target=stream_reader, args=(process.stderr, stderr_lines), daemon=True)
+    t_out = threading.Thread(target=stream_reader, args=(process.stdout, stdout_lines), daemon=True)
+    t_err.start()
+    t_out.start()
+
+    initial_io = get_pgid_io(pgid)
+    last_io = initial_io
+    last_progress_log = time.monotonic()
+    timed_out = False
+
+    while process.poll() is None:
+        time.sleep(0.5)
+        current_io = get_pgid_io(pgid)
+        now = time.monotonic()
+
+        if current_io > last_io:
+            last_io = current_io
+            with lock:
+                last_activity[0] = now
+
+            if progress_callback and (now - last_progress_log >= 10.0):
+                transferred = current_io - initial_io
+                if transferred > 50 * 1024:
+                    progress_callback(transferred)
+                    last_progress_log = now
+
+        with lock:
+            idle_seconds = now - last_activity[0]
+
+        if idle_seconds >= inactivity_timeout:
+            timed_out = True
+            terminate_process_group(process)
+            break
+
+    try:
+        process.wait(timeout=2)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+    t_err.join(timeout=1.0)
+    t_out.join(timeout=1.0)
+
+    with lock:
+        stdout = "".join(stdout_lines)
+        stderr = "".join(stderr_lines)
+
+    return (
+        process.returncode if process.returncode is not None else -signal.SIGKILL,
+        stdout,
+        stderr,
+        timed_out,
+    )
+
+
 def get_cargo_home(build_dir: Path) -> Path:
     """Return a writable CARGO_HOME, creating a fallback in build_dir only if needed."""
     existing = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo"))
@@ -339,32 +459,37 @@ def get_cargo_home(build_dir: Path) -> Path:
 
 
 def fetch_dependencies(cargo: str, project: Path, env: dict[str, str]) -> bool:
-    """Fast preflight: verify dependencies are cached offline or fetch them with a strict timeout."""
+    """Fast preflight: verify dependencies are cached offline or fetch them with an intelligent inactivity timeout."""
     # 1. Fast check if all dependencies are already cached offline
     offline_cmd = [cargo, "fetch", "--locked", "--offline", "--target", TARGET]
     rc, _, _, _ = run_bounded(offline_cmd, cwd=project, env=env, timeout=10, capture_output=True)
     if rc == 0:
         return True
 
-    # 2. Not cached locally; fetch from crates.io with strict network timeouts
-    log("INFO", "Missing dependencies; fetching from crates.io (fast preflight)...")
+    # 2. Not cached locally; fetch from crates.io with intelligent inactivity timeout
+    log("INFO", f"Missing dependencies; fetching from crates.io (idle timeout: {FETCH_INACTIVITY_TIMEOUT_S}s)...")
     fetch_env = env.copy()
     fetch_env["CARGO_NET_OFFLINE"] = "false"
-    fetch_env["CARGO_HTTP_TIMEOUT"] = "7"
-    fetch_env["CARGO_NET_RETRY"] = "1"
+    fetch_env["CARGO_HTTP_TIMEOUT"] = "30"
+    fetch_env["CARGO_NET_RETRY"] = "2"
     fetch_env["CARGO_REGISTRIES_CRATES_IO_PROTOCOL"] = "sparse"
     fetch_env["RUSTUP_AUTO_INSTALL"] = "0"
 
     fetch_cmd = [cargo, "fetch", "--locked", "--target", TARGET]
-    rc, _, stderr, timed_out = run_bounded(
+
+    def on_progress(bytes_fetched: int) -> None:
+        mb = bytes_fetched / (1024 * 1024)
+        log("INFO", f"Downloading dependencies... ({mb:.1f} MB received)")
+
+    rc, _, stderr, timed_out = run_with_inactivity_timeout(
         fetch_cmd,
         cwd=project,
         env=fetch_env,
-        timeout=FETCH_TIMEOUT_S,
-        capture_output=True,
+        inactivity_timeout=float(FETCH_INACTIVITY_TIMEOUT_S),
+        progress_callback=on_progress,
     )
     if timed_out:
-        log("WARN", f"Cargo dependency fetch timed out after {FETCH_TIMEOUT_S}s (crates.io unreachable)")
+        log("WARN", f"Cargo dependency fetch stalled for {FETCH_INACTIVITY_TIMEOUT_S}s with no data received; crates.io unreachable or offline")
         return False
     if rc != 0:
         log("WARN", f"Cargo dependency fetch failed (exit {rc}):\n{stderr[-1000:].strip()}")
