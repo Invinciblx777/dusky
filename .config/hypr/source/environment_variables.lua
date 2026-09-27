@@ -90,24 +90,28 @@ hl_env("VISUAL", "nvim")
 hl_env("LIBVIRT_DEFAULT_URI", "qemu:///system")
 
 -- 9. Clipboard persistence - dynamic path from toggler
--- Reads ~/.config/dusky/settings/cliphist_db_env written by 390_clipboard_persistance.py.
+-- Reads $XDG_CONFIG_HOME/dusky/settings/cliphist_db_env (default: ~/.config).
 -- Populates Hyprland's session environment so apps launched via keybinds inherit it.
--- Systemd user units load the same file via EnvironmentFile= for daemon supervision.
+-- The daemon and new interactive shells independently refresh from the same file.
 do
-  local f = io.open(home.. "/.config/dusky/settings/cliphist_db_env", "r")
+  local config_home = getenv("XDG_CONFIG_HOME")
+  if not config_home or config_home == "" then config_home = home .. "/.config" end
+  local cache_home = getenv("XDG_CACHE_HOME")
+  if not cache_home or cache_home == "" then cache_home = home .. "/.cache" end
+  local path = cache_home .. "/cliphist/db"
+  local f = io.open(config_home .. "/dusky/settings/cliphist_db_env", "r")
   if f then
-    local content = f:read("*a")
-    f:close()
-    local path = content:match('CLIPHIST_DB_PATH%s*=%s*"([^"]+)"')
-              or content:match("CLIPHIST_DB_PATH%s*=%s*'([^']+)'")
-              or content:match('CLIPHIST_DB_PATH%s*=%s*([^%s\n]+)')
-    if path and path ~= "" then
-      path = path:gsub("^%s+", ""):gsub("%s+$", "")
-      hl_env("CLIPHIST_DB_PATH", path)
+    for line in f:lines() do
+      local assignment = line:gsub("^%s*", ""):gsub("^export%s+", "")
+      local value = assignment:match("^CLIPHIST_DB_PATH%s*=%s*(.*)$")
+      if value then
+        value = value:match('^"([^"]*)"')
+             or value:match("^'([^']*)'")
+             or value:match("^[^%s]*")
+        if value:match("^/.") then path = value end
+      end
     end
-  else
-    -- Fallback for first boot when toggler hasn't run yet
-    local cache_home = getenv("XDG_CACHE_HOME") or (home.. "/.cache")
-    hl_env("CLIPHIST_DB_PATH", cache_home.. "/cliphist/db")
+    f:close()
   end
+  hl_env("CLIPHIST_DB_PATH", path)
 end

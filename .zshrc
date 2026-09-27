@@ -59,11 +59,29 @@ export VISUAL='nvim'
 
 # Compilation Optimization: Moved to ~/.config/pacman/makepkg.conf
 
-# Clipboard DB path: load active mode from settings
-if [[ -f "$HOME/.config/dusky/settings/cliphist_db_env" ]]; then
-  source "$HOME/.config/dusky/settings/cliphist_db_env"
-  export CLIPHIST_DB_PATH
-fi
+# Clipboard DB path: refresh new shells, including those in an existing terminal.
+# Read the toggler's file as literal data, using the daemon's path/fallback rules.
+() {
+  emulate -L zsh
+  local env_file="${XDG_CONFIG_HOME:-$HOME/.config}/dusky/settings/cliphist_db_env"
+  local line val MATCH MBEGIN MEND
+  local -a match mbegin mend
+  local assignment='^[[:space:]]*(export[[:space:]]+)?CLIPHIST_DB_PATH[[:space:]]*=[[:space:]]*(.*)$'
+  local double_quote='^"([^"]*)"' single_quote="^'([^']*)'"
+  export CLIPHIST_DB_PATH="${XDG_CACHE_HOME:-$HOME/.cache}/cliphist/db"
+  if [[ -f $env_file && ! -L $env_file && -r $env_file ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+      [[ $line =~ $assignment ]] || continue
+      val=$match[2]
+      if [[ $val =~ $double_quote || $val =~ $single_quote ]]; then
+        val=$match[1]
+      else
+        val=${val%%[[:space:]]*}
+      fi
+      [[ $val == /?* ]] && CLIPHIST_DB_PATH=$val
+    done < "$env_file"
+  fi
+}
 
 # Configure PATH - enabled for npm global bins (fixes gemini-cli)
 # Deduped PATH - ensures npm global bins without duplication (Hyprland also sets PATH via systemd)
