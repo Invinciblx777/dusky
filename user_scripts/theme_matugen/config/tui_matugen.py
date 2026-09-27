@@ -717,7 +717,7 @@ def DEFERRED_LOAD() -> tuple[list[int], dict[int, list[ConfigItem]]]:
                 type_="action",
                 default=":",
                 group="Auto-Discovered",
-                extended_help="**Auto-Discovered Templates**\n\nNo undiscovered `[templates.*]` blocks were found. All templates in `config.toml` are already covered by the static tabs. New templates you add to `config.toml` will appear here after a TUI restart."
+                extended_help="**Auto-Discovered Templates**\n\nNo undiscovered `[templates.*]` blocks were found. All templates in `config.toml` are already covered by the static tabs. Press F5 after adding templates to refresh this tab."
             )
         ]
         for it in placeholder:
@@ -738,7 +738,6 @@ def DEFERRED_LOAD() -> tuple[list[int], dict[int, list[ConfigItem]]]:
             extended_help=f"**Auto-Discovered Template: {key}**\n\nFound `[templates.{key}]` block in `config.toml` that is not covered by static tabs. Toggle to comment/uncomment the block."
         )
         disc_items.append(item)
-        REGISTERED_KEYS.add(key)
 
     # Return tuple form per MASTER_SCHEMA: indices + new_items dict
     return [4], {4: disc_items}
