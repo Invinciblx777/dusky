@@ -105,11 +105,11 @@ hl.bind(
     { description = "Matugen Theme Config" }
 )
 
-hl.bind(
-    "CTRL + SPACE",
-    hl.dsp.exec_cmd(dusky_scripts .. "images/wallpaper_selector.py"),
-    { description = "Rofi Wallpaper Selector" }
-)
+-- hl.bind(
+--     "CTRL + SPACE",
+--     hl.dsp.exec_cmd(dusky_scripts .. "images/wallpaper_selector.py"),
+--     { description = "Rofi Wallpaper Selector" }
+-- )
 
 hl.bind(
     "SUPER + SPACE",
@@ -160,11 +160,14 @@ cond_bind(
     { description = "Audio Mixer" }
 )
 
-cond_bind(
-    "ALT + 4",
-    hl.dsp.exec_cmd(HOME .. "/.local/bin/wallpaper_selector"),
-    { description = "Dusky Wallpaper Selector" }
-)
+-- alt + 4 and ctrl space to open rust wallpaper selector
+for _, key in ipairs({ "ALT + 4", "CTRL + SPACE" }) do
+    cond_bind(
+        key,
+        hl.dsp.exec_cmd(HOME .. "/.local/bin/wallpaper_selector"),
+        { description = "Dusky Wallpaper Selector" }
+    )
+end
 
 hl.bind(
     "SUPER + apostrophe",
