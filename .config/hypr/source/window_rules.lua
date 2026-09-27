@@ -1529,10 +1529,10 @@ hl.window_rule({
     move = {0, 0},
     border_size = 0,
     rounding = 0,
+    pin = true,
     no_dim = true,
     workspace = "unset",
-    focus_on_activate = true,
-    stay_focused = true
+    focus_on_activate = true
 })
 
 
