@@ -470,7 +470,7 @@ def render_network_dashboard_view(app):
     t_conn.add_column(style="dim", justify="right")
     t_conn.add_column(style="bold white", justify="left")
     t_conn.add_row("Connection:", f"{conn_icon} {conn_type} ({ssid})")
-    t_conn.add_row("SSID:", ssid)
+    t_conn.add_row("SSID:" if is_wifi else "Source:", ssid)
     t_conn.add_row("IP:", ip)
     t_conn.add_row("Gateway:", gw)
     t_conn.add_row("Iface:", iface_str)
@@ -505,102 +505,15 @@ def render_network_dashboard_view(app):
     return grid
 
 
-# ============================================================================
-#  Devices Dashboard (Tab 3) — nmcli device status filtered view
-# ============================================================================
-def render_devices_dashboard_view(app):
-    from rich.panel import Panel
-    from rich.table import Table
-    from rich.text import Text
-    from python.engines.network_manager import NetworkManagerEngine
-
-    devices = []
-    details_map = {}
-    eng = getattr(NetworkManagerEngine, "_instance", None)
-    if not eng and app and hasattr(app, "engine_pool"):
-        for e in list(app.engine_pool.values()):
-            if isinstance(e, NetworkManagerEngine):
-                eng = e
-                break
-    if eng:
-        devices = list(getattr(eng, "_devices_cache", []))
-        details_map = dict(getattr(eng, "_device_details", {}))
-        if not devices:
-            try:
-                devices = eng._get_nmcli_devices()
-                details_map = eng._get_device_details_map()
-            except Exception:
-                pass
-
-    if not devices:
-        t = Table(show_header=False, box=None, padding=(0, 1))
-        t.add_column(justify="center")
-        t.add_row(Text("No devices found", style="dim italic"))
-        return Panel(t, title="[bold cyan] DEVICES [/bold cyan]", border_style="cyan")
-
-    # Main device table
-    tbl = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 1), expand=True)
-    tbl.add_column("Device", style="bold white", no_wrap=True)
-    tbl.add_column("Type", style="dim", no_wrap=True)
-    tbl.add_column("State", justify="left")
-    tbl.add_column("Connection", style="white", overflow="fold")
-    tbl.add_column("IP / Details", style="dim", overflow="fold")
-
-    for d in devices:
-        dev = d.get("device", "")
-        dtype = d.get("type", "")
-        state = d.get("state", "")
-        conn = d.get("connection", "") or "--"
-        det = details_map.get(dev, {})
-        ip = det.get("IP4.ADDRESS[1]", "") or det.get("IP4.ADDRESS", "") or d.get("ip", "")
-        if not ip:
-            ip = det.get("IP4.GATEWAY", "") or ""
-            if ip:
-                ip = f"gw {ip}"
-            else:
-                # fallback to hwaddr for identification
-                hw = det.get("GENERAL.HWADDR", "")
-                ip = hw if hw and hw != "(unknown)" else "--"
-
-        # Icons & colors by state
-        if "connected" in state.lower():
-            state_txt = Text(state, style="bold green")
-            icon = "●"
-        elif "disconnected" in state.lower():
-            state_txt = Text(state, style="yellow")
-            icon = "○"
-        elif "unavailable" in state.lower():
-            state_txt = Text(state, style="dim")
-            icon = "◯"
-        else:
-            state_txt = Text(state, style="dim")
-            icon = "·"
-
-        dev_txt = Text(f"{icon} {dev}", style="bold white")
-        tbl.add_row(dev_txt, dtype, state_txt, conn, ip)
-
-    panel = Panel(tbl, title="[bold cyan] 󰈀 DEVICES — nmcli device status [/bold cyan]", border_style="cyan", expand=True)
-
-    # Optional detail grid for selected/connected devices
-    # Add summary footer
-    footer = Text(f"{len(devices)} devices • filtered view • see list below for details", style="dim italic")
-    from rich.console import Group
-    return Group(panel, footer)
-
-
 CUSTOM_VIEWS = {
     2: {
         "view": render_network_dashboard_view,
         "interval": 1.0
-    },
-    3: {
-        "view": render_devices_dashboard_view,
-        "interval": 2.0
     }
 }
 
 # ============================================================================
-#  Tab 3 (index 3): Devices — details populated by engine
+#  Tab 3 (index 3): Devices and internet source — populated by engine
 # ============================================================================
 SCHEMA[3].extend([
     ConfigItem(
@@ -678,6 +591,16 @@ SCHEMA[4].extend([
 # ============================================================================
 SCHEMA[5].extend([
     ConfigItem(
+        label="Adapter: Auto",
+        key="hotspot_device",
+        scope="hotspot",
+        type_="cycle",
+        default="Auto",
+        options=["Auto"],
+        group="Config",
+        extended_help="Auto prefers an idle Wi-Fi adapter. Using a connected adapter replaces its Wi-Fi connection."
+    ),
+    ConfigItem(
         label="SSID",
         key="hotspot_ssid",
         scope="hotspot",
@@ -693,7 +616,7 @@ SCHEMA[5].extend([
         type_="string",
         default="",
         group="Config",
-        extended_help="Min 8 chars; empty = open."
+        extended_help="8–63 ASCII characters; blank generates and saves a password when started."
     ),
     ConfigItem(
         label="Start 2.4 GHz",
@@ -703,7 +626,7 @@ SCHEMA[5].extend([
         default=False,
         options=["trigger"],
         group="Actions",
-        extended_help="Start 2.4 GHz hotspot."
+        extended_help="Start a local Wi-Fi network, even without internet. A connected adapter will leave its Wi-Fi network."
     ),
     ConfigItem(
         label="Start 5 GHz",
@@ -713,7 +636,7 @@ SCHEMA[5].extend([
         default=False,
         options=["trigger"],
         group="Actions",
-        extended_help="Start 5 GHz hotspot."
+        extended_help="Start a local Wi-Fi network, even without internet. A connected adapter will leave its Wi-Fi network."
     ),
     ConfigItem(
         label="Stop",
@@ -750,6 +673,15 @@ SCHEMA[5].extend([
         type_="action",
         default=":",
         group="Status"
+    ),
+    ConfigItem(
+        label="Laptop IP: N/A",
+        key="hotspot_address_info",
+        scope="hotspot",
+        type_="action",
+        default=":",
+        group="Status",
+        extended_help="Use this address from the connected phone for SSH, FTP, or other local services."
     )
 ])
 

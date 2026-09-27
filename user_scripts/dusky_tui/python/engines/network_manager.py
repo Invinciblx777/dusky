@@ -4,10 +4,12 @@ import time
 import math
 import json
 import re
+import secrets
 import shutil
 import logging
 import subprocess
 import threading
+import tempfile
 import select
 import termios
 import tty
@@ -19,6 +21,10 @@ from typing import Any
 from python.frontend.core_types import BaseEngine, ConfigItem
 
 logger = logging.getLogger("dusky_network_engine")
+HOTSPOT_PROFILE = "Dusky Hotspot"
+ROUTE_CHOICE_FILE = Path.home() / ".config/dusky/settings/network/internet_source.json"
+HOTSPOT_PREVIOUS_FILE = Path.home() / ".config/dusky/settings/network/hotspot_previous.json"
+PREFERRED_ROUTE_METRIC = 1
 
 # =============================================================================
 #  NMCLI OUTPUT PARSER & DECODERS
@@ -743,9 +749,17 @@ class NetworkManagerEngine(BaseEngine):
         self.shutdown_event = threading.Event()
         self.rescan_event = threading.Event()
 
-        # In-memory hotspot config
+        # Hotspot fields are loaded from the saved NetworkManager profile when available.
         self._hotspot_ssid = "MyHotspot"
         self._hotspot_password = ""
+        self._hotspot_device = "Auto"
+        self._hotspot_devices_cache: list[dict[str, str]] = []
+        self._uplinks_cache: list[dict[str, str]] = []
+        self._last_uplink_refresh = 0.0
+        saved_hotspot = self._hotspot_profile()
+        if saved_hotspot:
+            self._hotspot_ssid = saved_hotspot["ssid"]
+            self._hotspot_password = saved_hotspot["password"]
 
         # Live state tracking
         self._tp_state: dict[str, Any] = {}
@@ -789,6 +803,9 @@ class NetworkManagerEngine(BaseEngine):
         self.app = app
         if not self._cached_scans:
             self._cached_scans = self._get_scanned_wifi()
+        self._uplinks_cache = self._active_uplinks()
+        self._hotspot_devices_cache = self._hotspot_devices()
+        self._last_uplink_refresh = time.time()
         self._rebuild_schema()
         self.rescan_event.set()
 
@@ -812,9 +829,11 @@ class NetworkManagerEngine(BaseEngine):
         # Hotspot config
         state["hotspot/hotspot_ssid"] = self._hotspot_ssid
         state["hotspot/hotspot_password"] = self._hotspot_password
+        state["hotspot/hotspot_device"] = self._hotspot_device
 
         active = self._get_active_wifi_connection()
-        state["hotspot/hotspot_status_info"] = "Active" if active and active.get("mode") == "ap" else "Inactive"
+        hotspot = self._hotspot_profile(active_only=True)
+        state["hotspot/hotspot_status_info"] = "Active" if hotspot else "Inactive"
 
         # Active Wi-Fi band state
         if active:
@@ -861,7 +880,8 @@ class NetworkManagerEngine(BaseEngine):
         return state
 
     def write_value(self, target_key: str, target_scope: str, new_value: str, item_type: str = "string") -> tuple[bool, str, str]:
-        logger.info(f"write_value: key={target_key}, scope={target_scope}, val={new_value}")
+        logger.info("write_value: key=%s, scope=%s, val=%s", target_key, target_scope,
+                    "[hidden]" if target_key == "hotspot_password" else new_value)
 
         # ---- Rescan button ----
         if target_key == "rescan":
@@ -895,6 +915,9 @@ class NetworkManagerEngine(BaseEngine):
         if target_scope == "hotspot":
             return self._handle_hotspot(target_key, new_value)
 
+        if target_scope == "route":
+            return self._handle_route_choice(target_key)
+
         # ---- Network actions ----
         if target_scope == "network":
             return self._handle_network_action(target_key, new_value)
@@ -921,48 +944,427 @@ class NetworkManagerEngine(BaseEngine):
     #  ACTION HANDLERS
     # =========================================================================
 
+    def _active_uplinks(self) -> list[dict[str, str]]:
+        """Active physical links users may explicitly choose for default routing."""
+        result = []
+        route_devices: dict[int, set[str]] = {}
+        for family in (4, 6):
+            try:
+                routes = json.loads(self._run_cmd(["ip", "-j", f"-{family}", "route", "show", "default"]))
+                route_devices[family] = {route["dev"] for route in routes if isinstance(route, dict) and "dev" in route}
+            except (TypeError, ValueError):
+                route_devices[family] = set()
+        rows = self._run_cmd(["nmcli", "-t", "-f", "NAME,UUID,TYPE,DEVICE", "connection", "show", "--active"])
+        for line in rows.splitlines():
+            parts = _split_nmcli_line(line)
+            if len(parts) < 4 or not parts[3] or parts[3] == "--" or parts[2] in {"tun", "vpn", "wireguard", "loopback", "dummy"}:
+                continue
+            name, uuid, kind, device = parts[:4]
+            props = self._run_cmd([
+                "nmcli", "-g", "ipv4.method,ipv4.never-default,ipv6.method,ipv6.never-default",
+                "connection", "show", "uuid", uuid,
+            ]).splitlines()
+            gateways = self._run_cmd([
+                "nmcli", "-g", "IP4.GATEWAY,IP6.GATEWAY", "device", "show", device,
+            ]).splitlines()
+            if len(props) < 4 or len(gateways) < 2 or "shared" in (props[0], props[2]):
+                continue
+            if (kind in {"bridge", "bond", "team"} and all(gateway in {"", "--"} for gateway in gateways[:2])
+                    and device not in route_devices[4] | route_devices[6]):
+                continue
+            if props[0] in {"disabled", "ignore"} and props[2] in {"disabled", "ignore"}:
+                continue
+            gateway_v4 = gateways[0] if gateways[0] not in {"", "--"} else "on-link" if device in route_devices[4] else ""
+            gateway_v6 = gateways[1] if gateways[1] not in {"", "--"} else "on-link" if device in route_devices[6] else ""
+            display_name = name
+            if name.startswith("Wired connection "):
+                properties = self._run_cmd(["udevadm", "info", "-q", "property", "-p", f"/sys/class/net/{device}"])
+                model = next((line.partition("=")[2].replace("_", " ") for line in properties.splitlines()
+                              if line.startswith("ID_MODEL=") and line.partition("=")[2]), "")
+                if model:
+                    display_name = model
+            result.append({"name": name, "display_name": display_name, "uuid": uuid, "type": kind, "device": device,
+                           "ipv4_gateway": gateway_v4, "ipv6_gateway": gateway_v6,
+                           "ipv4_method": props[0], "ipv6_method": props[2],
+                           "ipv4_never_default": props[1], "ipv6_never_default": props[3]})
+        return result
+
+    def _default_route(self, family: int) -> str:
+        output = self._run_cmd(["ip", "-j", f"-{family}", "route", "show", "default"])
+        try:
+            routes = json.loads(output)
+            if not isinstance(routes, list) or not routes:
+                return "none"
+            route = min(routes, key=lambda item: item.get("metric", 0))
+            return f"{route.get('dev', '?')} via {route.get('gateway', 'on-link')}"
+        except (ValueError, TypeError):
+            return "none"
+
+    @staticmethod
+    def _route_choice() -> dict[str, Any]:
+        try:
+            choice = json.loads(ROUTE_CHOICE_FILE.read_text())
+            return choice if isinstance(choice, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    @staticmethod
+    def _save_route_choice(choice: dict[str, Any]) -> None:
+        ROUTE_CHOICE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if not choice:
+            ROUTE_CHOICE_FILE.unlink(missing_ok=True)
+            return
+        with tempfile.TemporaryDirectory(dir=ROUTE_CHOICE_FILE.parent) as directory:
+            replacement = Path(directory) / ROUTE_CHOICE_FILE.name
+            replacement.write_text(json.dumps(choice, indent=2) + "\n")
+            replacement.replace(ROUTE_CHOICE_FILE)
+
+    @staticmethod
+    def _profile_route_settings(uuid: str) -> tuple[str, str, str, str] | None:
+        result = subprocess.run(
+            ["nmcli", "-g", "ipv4.route-metric,ipv6.route-metric,ipv4.never-default,ipv6.never-default",
+             "connection", "show", "uuid", uuid],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10,
+        )
+        values = result.stdout.splitlines()
+        return tuple(values[:4]) if result.returncode == 0 and len(values) >= 4 else None
+
+    @staticmethod
+    def _set_profile_route_settings(uuid: str, settings: tuple[str, str, str, str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["nmcli", "connection", "modify", "uuid", uuid,
+             "ipv4.route-metric", settings[0], "ipv6.route-metric", settings[1],
+             "ipv4.never-default", settings[2], "ipv6.never-default", settings[3]],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10,
+        )
+
+    def _active_device_for_uuid(self, uuid: str) -> str:
+        rows = self._run_cmd(["nmcli", "-t", "-f", "UUID,DEVICE", "connection", "show", "--active"])
+        for line in rows.splitlines():
+            parts = _split_nmcli_line(line)
+            if len(parts) >= 2 and parts[0] == uuid:
+                return parts[1]
+        return ""
+
+    @staticmethod
+    def _reapply_device(device: str) -> subprocess.CompletedProcess[str] | None:
+        if not device or device == "--":
+            return None
+        return subprocess.run(
+            ["nmcli", "device", "reapply", device],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=15,
+        )
+
+    def _change_route_settings(self, uuid: str, settings: tuple[str, str, str, str]) -> str:
+        changed = self._set_profile_route_settings(uuid, settings)
+        if changed.returncode:
+            return changed.stderr.strip() or "NetworkManager rejected the profile change."
+        applied = self._reapply_device(self._active_device_for_uuid(uuid))
+        if applied is not None and applied.returncode:
+            return applied.stderr.strip() or "NetworkManager could not apply the change live."
+        return ""
+
+    def _restore_route_choice(self, choice: dict[str, Any]) -> str:
+        originals = choice.get("original_settings", {})
+        if not isinstance(originals, dict):
+            return ""
+        problems = []
+        for uuid, values in originals.items():
+            if not isinstance(uuid, str) or not isinstance(values, list) or len(values) != 4:
+                continue
+            original = tuple(str(value) for value in values)
+            current = self._profile_route_settings(uuid)
+            expected = ((str(PREFERRED_ROUTE_METRIC), str(PREFERRED_ROUTE_METRIC), "no", "no")
+                        if uuid == choice.get("uuid") else (original[0], original[1], "yes", "yes"))
+            if current is None:
+                problems.append(f"{uuid}: profile unavailable")
+            elif current not in {expected, original}:
+                problems.append(f"{uuid}: changed outside this menu; left alone")
+            elif current != original:
+                issue = self._change_route_settings(uuid, original)
+                if issue:
+                    problems.append(f"{uuid}: {issue}")
+        return "; ".join(problems)
+
+    def _handle_route_choice(self, key: str) -> tuple[bool, str, str]:
+        previous = self._route_choice()
+        if key == "automatic":
+            issue = self._restore_route_choice(previous)
+            if issue:
+                return False, issue, issue
+            try:
+                self._save_route_choice({})
+            except OSError as exc:
+                return False, f"Could not clear route preference: {exc}", ""
+            self.rescan_event.set()
+            return True, "Previous route settings restored.", ""
+
+        if not key.startswith("use__"):
+            return False, "Unknown internet source.", ""
+        uuid = key[5:]
+        active_uplinks = self._active_uplinks()
+        candidate = next((item for item in active_uplinks if item["uuid"] == uuid), None)
+        if not candidate:
+            return False, "This connection is not an active selectable link.", ""
+        preferred = (str(PREFERRED_ROUTE_METRIC), str(PREFERRED_ROUTE_METRIC), "no", "no")
+        prior_originals = previous.get("original_settings", {})
+        originals = dict(prior_originals) if isinstance(prior_originals, dict) else {}
+        current_settings = {}
+        desired_settings = {}
+        for link in active_uplinks:
+            link_uuid = link["uuid"]
+            current = self._profile_route_settings(link_uuid)
+            if current is None:
+                return False, f"Could not read route settings for {link['name']}.", ""
+            current_settings[link_uuid] = current
+            saved_original = originals.get(link_uuid)
+            if not isinstance(saved_original, list) or len(saved_original) != 4:
+                originals[link_uuid] = list(current)
+            else:
+                old_original = tuple(str(value) for value in saved_original)
+                old_expected = (preferred if link_uuid == previous.get("uuid") else
+                                (old_original[0], old_original[1], "yes", "yes"))
+                if current not in {old_original, old_expected}:
+                    originals[link_uuid] = list(current)
+            original = tuple(str(value) for value in originals[link_uuid])
+            desired_settings[link_uuid] = (preferred if link_uuid == uuid else
+                                           (original[0], original[1], "yes", "yes"))
+        if previous.get("uuid") == uuid and all(current_settings[item] == desired_settings[item] for item in current_settings):
+            return True, f"{candidate['name']} is already preferred.", ""
+        try:
+            self._save_route_choice({"uuid": uuid, "original_settings": originals})
+        except OSError as exc:
+            return False, f"Could not save route preference: {exc}", ""
+        changed_uuids = []
+        for link in [candidate] + [item for item in active_uplinks if item["uuid"] != uuid]:
+            link_uuid = link["uuid"]
+            if current_settings[link_uuid] == desired_settings[link_uuid]:
+                continue
+            changed_uuids.append(link_uuid)
+            issue = self._change_route_settings(link_uuid, desired_settings[link_uuid])
+            if issue:
+                rollback_issues = [self._change_route_settings(item, current_settings[item]) for item in reversed(changed_uuids)]
+                if any(rollback_issues):
+                    issue += "; rollback incomplete; original settings remain in the saved preference file"
+                else:
+                    try:
+                        self._save_route_choice(previous)
+                    except OSError:
+                        issue += "; could not restore the previous saved preference"
+                return False, f"Could not set {link['name']} as the source: {issue}", issue
+        self._uplinks_cache = self._active_uplinks()
+        self.rescan_event.set()
+        current_v4 = self._default_route(4)
+        current_v6 = self._default_route(6)
+        if candidate["ipv4_method"] not in {"disabled", "ignore"} and not current_v4.startswith(f"{candidate['device']} via "):
+            return True, f"Preferred {candidate['name']}, but IPv4 still uses {current_v4}; this link may have no gateway or another route may override it.", ""
+        if candidate["ipv6_method"] not in {"disabled", "ignore"} and not current_v6.startswith(f"{candidate['device']} via "):
+            return True, f"Preferred {candidate['name']}, but IPv6 still uses {current_v6}; this link may have no gateway or another route may override it.", ""
+        return True, f"Preferred internet source: {candidate['name']} ({candidate['device']}).", ""
+
+    def _hotspot_profile(self, active_only: bool = False) -> dict[str, str] | None:
+        rows = self._run_cmd(["nmcli", "-t", "-f", "NAME,UUID,TYPE,DEVICE", "connection", "show", "--active"] if active_only else
+                             ["nmcli", "-t", "-f", "NAME,UUID,TYPE", "connection", "show"])
+        for line in rows.splitlines():
+            fields = _split_nmcli_line(line)
+            if len(fields) < 3 or fields[0] != HOTSPOT_PROFILE or fields[2] != "802-11-wireless":
+                continue
+            uuid = fields[1]
+            mode = self._run_cmd(["nmcli", "-g", "802-11-wireless.mode", "connection", "show", "uuid", uuid]).strip()
+            if mode != "ap":
+                continue
+            if active_only:
+                return {"uuid": uuid, "ssid": "", "password": "", "device": fields[3] if len(fields) > 3 else ""}
+            ssid = self._run_cmd(["nmcli", "-g", "802-11-wireless.ssid", "connection", "show", "uuid", uuid]).strip()
+            password = self._run_cmd(["nmcli", "--show-secrets", "-g", "802-11-wireless-security.psk", "connection", "show", "uuid", uuid]).strip()
+            return {"uuid": uuid, "ssid": ssid, "password": password, "device": ""}
+        return None
+
+    def _hotspot_devices(self) -> list[dict[str, str]]:
+        devices = []
+        for line in self._run_cmd(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device", "status"]).splitlines():
+            fields = _split_nmcli_line(line)
+            if len(fields) < 4 or fields[1] != "wifi":
+                continue
+            device = fields[0]
+            features = self._run_cmd(["nmcli", "-g", "WIFI-PROPERTIES.AP,WIFI-PROPERTIES.2GHZ,WIFI-PROPERTIES.5GHZ", "device", "show", device]).splitlines()
+            if len(features) >= 3 and features[0] == "yes":
+                devices.append({"device": device, "state": fields[2], "connection": fields[3],
+                                "2.4": features[1], "5": features[2]})
+        return devices
+
+    @staticmethod
+    def _remember_hotspot_previous(device: str, uuid: str) -> None:
+        HOTSPOT_PREVIOUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if not uuid:
+            HOTSPOT_PREVIOUS_FILE.unlink(missing_ok=True)
+            return
+        with tempfile.TemporaryDirectory(dir=HOTSPOT_PREVIOUS_FILE.parent) as directory:
+            replacement = Path(directory) / HOTSPOT_PREVIOUS_FILE.name
+            replacement.write_text(json.dumps({"device": device, "uuid": uuid}) + "\n")
+            replacement.replace(HOTSPOT_PREVIOUS_FILE)
+
+    @staticmethod
+    def _hotspot_previous() -> dict[str, str]:
+        try:
+            data = json.loads(HOTSPOT_PREVIOUS_FILE.read_text())
+            return data if isinstance(data, dict) and isinstance(data.get("device"), str) and isinstance(data.get("uuid"), str) else {}
+        except (OSError, ValueError):
+            return {}
+
+    @staticmethod
+    def _prepare_hotspot_firewall(device: str) -> str:
+        """Allow NetworkManager's hotspot DHCP/DNS when UFW is active."""
+        ufw = shutil.which("ufw")
+        if not ufw or subprocess.run(
+            ["systemctl", "is-active", "--quiet", "ufw"],
+            capture_output=True, stdin=subprocess.DEVNULL, timeout=5,
+        ).returncode:
+            return ""
+        try:
+            rules = Path("/etc/ufw/user.rules").read_text()
+            if all(f"-A ufw-user-input -i {device} -p {proto} --dport {port} -j ACCEPT" in rules
+                   for port, proto in ((67, "udp"), (53, "udp"), (53, "tcp"))):
+                return ""
+        except OSError:
+            pass
+        pkexec = shutil.which("pkexec")
+        if not pkexec:
+            return "UFW is active; install polkit or allow hotspot DHCP/DNS on this Wi-Fi adapter."
+        program = (
+            "import subprocess, sys\n"
+            "device, ufw = sys.argv[1:3]\n"
+            "for port, protocol, purpose in ((67, 'udp', 'DHCP'), (53, 'udp', 'DNS'), (53, 'tcp', 'DNS')):\n"
+            "    command = [ufw, 'allow', 'in', 'on', device, 'to', 'any', 'port', str(port), "
+            "'proto', protocol, 'comment', 'Dusky hotspot ' + purpose]\n"
+            "    result = subprocess.run(command, capture_output=True, text=True)\n"
+            "    if result.returncode:\n"
+            "        sys.stderr.write(result.stderr or result.stdout)\n"
+            "        sys.exit(result.returncode)\n"
+        )
+        try:
+            result = subprocess.run([pkexec, "/usr/bin/python3", "-c", program, device, ufw],
+                                    capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return f"Could not prepare UFW for the hotspot: {exc}"
+        if result.returncode:
+            return f"Could not prepare UFW for the hotspot: {result.stderr.strip()}"
+        return ""
+
     def _handle_hotspot(self, key: str, value: str) -> tuple[bool, str, str]:
         if key == "hotspot_ssid":
+            if not value or len(value.encode("utf-8")) > 32:
+                return False, "SSID must be 1–32 bytes.", ""
             self._hotspot_ssid = value
             return True, "Hotspot SSID updated.", ""
 
         if key == "hotspot_password":
-            if value and len(value) < 8:
-                return False, "Password must be at least 8 characters.", ""
+            if value and (len(value) < 8 or len(value) > 63 or not value.isascii()):
+                return False, "Password must be 8–63 ASCII characters; blank generates one.", ""
             self._hotspot_password = value
             return True, "Hotspot password updated.", ""
 
+        if key == "hotspot_device":
+            if value != "Auto" and value not in [item["device"] for item in self._hotspot_devices()]:
+                return False, "This Wi-Fi adapter cannot host a hotspot.", ""
+            self._hotspot_device = value
+            return True, f"Hotspot adapter: {value}.", ""
+
         if key in ("start_hotspot_24", "start_hotspot_5"):
             band = "bg" if key == "start_hotspot_24" else "a"
-            wifi_dev = self._get_wifi_device()
-            if not wifi_dev:
-                return False, "No WiFi device found.", ""
-
-            cmd = ["nmcli", "device", "wifi", "hotspot", "ifname", wifi_dev,
-                   "ssid", self._hotspot_ssid, "band", band]
-            if self._hotspot_password:
-                cmd.extend(["password", self._hotspot_password])
-
-            res = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=15)
-            if res.returncode == 0:
-                self.rescan_event.set()
-                return True, "Hotspot started!", res.stdout
-            return False, f"Failed: {res.stderr.strip()}", res.stderr
+            if not shutil.which("dnsmasq"):
+                return False, "Install dnsmasq; NetworkManager needs it for hotspot DHCP.", ""
+            if self._run_cmd(["nmcli", "radio", "wifi"]).strip() != "enabled":
+                enabled = subprocess.run(["nmcli", "radio", "wifi", "on"], capture_output=True, text=True,
+                                         stdin=subprocess.DEVNULL, timeout=10)
+                if enabled.returncode:
+                    return False, f"Could not enable Wi-Fi: {enabled.stderr.strip()}", enabled.stderr
+            candidates = [item for item in self._hotspot_devices() if item["2.4" if band == "bg" else "5"] == "yes"]
+            if self._hotspot_device != "Auto":
+                candidates = [item for item in candidates if item["device"] == self._hotspot_device]
+            else:
+                candidates.sort(key=lambda item: item["state"].startswith("connected"))
+            if not candidates:
+                return False, "No available Wi-Fi adapter supports this hotspot band.", ""
+            device = candidates[0]["device"]
+            firewall_issue = self._prepare_hotspot_firewall(device)
+            if firewall_issue:
+                return False, firewall_issue, ""
+            active = self._hotspot_profile(active_only=True)
+            if active and active["device"] != device:
+                return False, "Stop the active hotspot before moving it to another adapter.", ""
+            previous_uuid = ""
+            if not active:
+                rows = self._run_cmd(["nmcli", "-t", "-f", "UUID,DEVICE", "connection", "show", "--active"])
+                for line in rows.splitlines():
+                    fields = _split_nmcli_line(line)
+                    if len(fields) > 1 and fields[1] == device:
+                        previous_uuid = fields[0]
+                        break
+            password = self._hotspot_password or secrets.token_urlsafe(12)
+            existing = self._hotspot_profile()
+            if active and existing and existing["uuid"] == active["uuid"]:
+                old_band = self._run_cmd(["nmcli", "-g", "802-11-wireless.band", "connection", "show", "uuid", active["uuid"]]).strip()
+                if (existing["ssid"], existing["password"], old_band) == (self._hotspot_ssid, password, band):
+                    return True, f"Hotspot is already active on {device}.", ""
+            if existing:
+                cmd = ["nmcli", "connection", "modify", "uuid", existing["uuid"]]
+            else:
+                cmd = ["nmcli", "connection", "add", "type", "wifi", "ifname", "*",
+                       "con-name", HOTSPOT_PROFILE]
+            cmd += ["802-11-wireless.mode", "ap", "802-11-wireless.ssid", self._hotspot_ssid,
+                    "802-11-wireless.band", band, "802-11-wireless-security.key-mgmt", "wpa-psk",
+                    "802-11-wireless-security.psk", password, "ipv4.method", "shared",
+                    "ipv6.method", "disabled", "connection.autoconnect", "no"]
+            changed = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=15)
+            if changed.returncode:
+                return False, f"Could not save hotspot: {changed.stderr.strip()}", changed.stderr
+            profile = self._hotspot_profile()
+            if not profile:
+                return False, "Hotspot profile was saved but cannot be found.", ""
+            activated = subprocess.run(["nmcli", "connection", "up", "uuid", profile["uuid"], "ifname", device],
+                                       capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30)
+            if activated.returncode:
+                if previous_uuid:
+                    subprocess.run(["nmcli", "connection", "up", "uuid", previous_uuid, "ifname", device],
+                                   capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30)
+                return False, f"Could not start hotspot: {activated.stderr.strip()}", activated.stderr
+            self._hotspot_password = password
+            try:
+                if previous_uuid:
+                    self._remember_hotspot_previous(device, previous_uuid)
+                elif not active:
+                    self._remember_hotspot_previous("", "")
+            except OSError as exc:
+                return True, f"Hotspot active, but previous Wi-Fi could not be remembered: {exc}", ""
+            self.rescan_event.set()
+            address = self._run_cmd(["nmcli", "-g", "IP4.ADDRESS", "device", "show", device]).strip()
+            return True, f"Hotspot active on {device}; laptop address {address or 'pending DHCP setup'}. Internet is optional.", ""
 
         if key == "stop_hotspot":
-            wifi_dev = self._get_wifi_device()
-            if not wifi_dev:
-                return False, "No WiFi device.", ""
+            profile = self._hotspot_profile(active_only=True)
+            if not profile:
+                return True, "Hotspot is already stopped.", ""
             res = subprocess.run(
-                ["nmcli", "device", "disconnect", wifi_dev],
+                ["nmcli", "connection", "down", "uuid", profile["uuid"]],
                 capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10
             )
             if res.returncode == 0:
                 self.rescan_event.set()
-                return True, "Hotspot stopped.", ""
+                previous = self._hotspot_previous()
+                if previous.get("device") == profile["device"] and previous.get("uuid"):
+                    restored = subprocess.run(
+                        ["nmcli", "connection", "up", "uuid", previous["uuid"], "ifname", profile["device"]],
+                        capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30)
+                    if restored.returncode:
+                        return True, f"Hotspot stopped; previous Wi-Fi did not reconnect: {restored.stderr.strip()}", ""
+                self._remember_hotspot_previous("", "")
+                return True, "Hotspot stopped; previous Wi-Fi restored if available.", ""
             return False, f"Failed: {res.stderr.strip()}", res.stderr
 
         if key == "qr_hotspot":
+            if not self._hotspot_password:
+                return False, "Start the hotspot to generate and save a password first.", ""
             return self._trigger_qr_viewer(self._hotspot_ssid, self._hotspot_password, "WPA2", False)
 
         return True, "OK", ""
@@ -1263,33 +1665,35 @@ class NetworkManagerEngine(BaseEngine):
     def _enrich_network_status(self, verb: dict[str, str], active_wifi: dict[str, Any] | None) -> dict[str, Any]:
         enriched = dict(verb)
 
-        # 1. Physical connection type & SSID & interface resolution
-        if active_wifi:
-            enriched["type"] = "wifi"
-            enriched["ssid"] = active_wifi.get("ssid", "")
-            iface = active_wifi.get("device", "")
-            if iface:
-                enriched["iface"] = iface
-                enriched["phy_iface"] = iface
-
-        if not enriched.get("iface"):
-            # Fallback to default route interface
-            try:
-                route_out = self._run_cmd(["ip", "-o", "route", "show", "default"])
-                m_dev = re.search(r"dev (\S+)", route_out)
-                if m_dev:
-                    enriched["iface"] = m_dev.group(1)
-            except Exception:
-                pass
-
-        iface = enriched.get("iface", "")
+        # Keep the displayed profile, address, and gateway on the same route.
+        route = None
+        try:
+            routes = json.loads(self._run_cmd(["ip", "-j", "-4", "route", "show", "default"]))
+            if routes:
+                route = min(routes, key=lambda item: item.get("metric", 0))
+        except (TypeError, ValueError):
+            pass
+        preferred = self._route_choice().get("uuid") if not route else None
+        preferred_link = next((item for item in self._uplinks_cache if item.get("uuid") == preferred), {})
+        iface = route.get("dev", "") if route else preferred_link.get("device", "") or (active_wifi or {}).get("device", "")
         if iface:
-            if not enriched.get("phy_iface"):
-                enriched["phy_iface"] = iface
+            if enriched.get("iface") != iface:
+                for field in ("ip", "prefix", "freq", "bitrate", "rx_bytes", "tx_bytes"):
+                    enriched.pop(field, None)
+            enriched["iface"] = iface
+            enriched["phy_iface"] = iface
+            enriched["gateway"] = route.get("gateway", "on-link") if route else "N/A"
             if Path(f"/sys/class/net/{iface}/wireless").exists() or Path(f"/sys/class/net/{iface}/phy80211").exists():
                 enriched["type"] = "wifi"
-            elif not enriched.get("type"):
+            else:
                 enriched["type"] = "ethernet"
+            device = next((item for item in self._devices_cache if item.get("device") == iface), {})
+            profile_name = device.get("connection", "")
+            if active_wifi and active_wifi.get("device") == iface:
+                enriched["ssid"] = active_wifi.get("ssid", "")
+            else:
+                source = next((item for item in self._uplinks_cache if item.get("device") == iface), {})
+                enriched["ssid"] = source.get("display_name") or (profile_name if profile_name and profile_name != "--" else iface)
 
         # 2. IP address & prefix fallback
         if iface and (not enriched.get("ip") or enriched.get("ip") == "N/A"):
@@ -1302,17 +1706,7 @@ class NetworkManagerEngine(BaseEngine):
             except Exception:
                 pass
 
-        # 3. Default Gateway fallback if missing or empty
-        if not enriched.get("gateway") or enriched.get("gateway") == "N/A":
-            try:
-                route_out = self._run_cmd(["ip", "-o", "route", "show", "default"])
-                match = re.search(r"default via ([\d.]+)", route_out)
-                if match:
-                    enriched["gateway"] = match.group(1)
-            except Exception:
-                pass
-
-        # 4. Rx & Tx bytes fallback for live throughput calculation
+        # 3. Rx & Tx bytes fallback for live throughput calculation
         if iface and (not enriched.get("rx_bytes") or not enriched.get("tx_bytes")):
             rx_p = Path(f"/sys/class/net/{iface}/statistics/rx_bytes")
             tx_p = Path(f"/sys/class/net/{iface}/statistics/tx_bytes")
@@ -1323,7 +1717,7 @@ class NetworkManagerEngine(BaseEngine):
                 try: enriched["tx_bytes"] = tx_p.read_text().strip()
                 except Exception: pass
 
-        # 5. Wi-Fi details fallback if missing
+        # 4. Wi-Fi details fallback if missing
         phy_iface = enriched.get("phy_iface", iface)
         if enriched.get("type") == "wifi" and phy_iface:
             if not enriched.get("freq") or not enriched.get("ssid"):
@@ -1347,10 +1741,10 @@ class NetworkManagerEngine(BaseEngine):
                 except Exception:
                     pass
 
-        # 6. Concurrent dual ping for router gateway and 1.1.1.1
+        # 5. Concurrent dual ping for router gateway and 1.1.1.1
         gw = enriched.get("gateway")
         ping_targets: list[tuple[str, str]] = []
-        if gw and "router_ping_ms" not in enriched:
+        if gw and gw not in {"N/A", "on-link"} and "router_ping_ms" not in enriched:
             ping_targets.append(("router_ping_ms", gw))
         if "internet_ping_ms" not in enriched:
             ping_targets.append(("internet_ping_ms", "1.1.1.1"))
@@ -1414,6 +1808,10 @@ class NetworkManagerEngine(BaseEngine):
                     self._device_details = self._get_device_details_map()
                 except Exception:
                     pass
+                if now - self._last_uplink_refresh >= 10:
+                    self._uplinks_cache = self._active_uplinks()
+                    self._hotspot_devices_cache = self._hotspot_devices()
+                    self._last_uplink_refresh = now
 
                 should_scan = self.rescan_event.is_set() or (now - last_scan_time > 25.0)
 
@@ -2198,6 +2596,36 @@ class NetworkManagerEngine(BaseEngine):
                     dev_collapsed.add(uid)
 
         t_devices = []
+        choice = self._route_choice()
+        default_v4 = self._default_route(4)
+        default_v6 = self._default_route(6)
+        current_device = default_v4.split(" via ", 1)[0]
+        t_devices.append(self._make_item(
+            label=f"IPv4 default: {default_v4}", key="default_ipv4", scope="route_info",
+            type_="action", default=":", group="Internet Source"))
+        t_devices.append(self._make_item(
+            label=f"IPv6 default: {default_v6}", key="default_ipv6", scope="route_info",
+            type_="action", default=":", group="Internet Source"))
+        t_devices.append(self._make_item(
+            label="● System priorities" if not choice else "○ System priorities", key="automatic", scope="route",
+            type_="bool", default=False, options=["trigger"], group="Internet Source",
+            extended_help="Restore the selected profile's previous route metrics and local-only setting."))
+        for uplink in self._uplinks_cache:
+            selected = choice.get("uuid") == uplink["uuid"]
+            note = " • current IPv4" if uplink["device"] == current_device else ""
+            if uplink["ipv4_never_default"] == "yes":
+                note += " • local-only"
+            elif not uplink["ipv4_gateway"]:
+                note += " • no gateway shown"
+            t_devices.append(self._make_item(
+                label=f"{'●' if selected else '○'} {uplink['display_name']} ({uplink['device']}){note}",
+                key=f"use__{uplink['uuid']}", scope="route", type_="bool", default=False,
+                options=["trigger"], group="Internet Source",
+                extended_help="Make this active link the preferred default route. This can override a local-only profile. VPN routing and DNS settings are separate."))
+        if not self._uplinks_cache:
+            t_devices.append(self._make_item(
+                label="No active selectable connections", key="no_uplinks", scope="route_info",
+                type_="action", default=":", group="Internet Source"))
         # Show each device as parent menu
         for d in self._devices_cache:
             dev_name = d.get("device", "")
@@ -2254,7 +2682,7 @@ class NetworkManagerEngine(BaseEngine):
             t_devices.append(self._make_item(label=f"State: {state}", key=f"state__{dev_name}", scope="clipboard", type_="bool", default=False, options=["copy"], parent_ref=parent_uid))
             t_devices.append(self._make_item(label=f"Conn: {conn}", key=f"conn__{dev_name}", scope="clipboard", type_="bool", default=False, options=["copy"], parent_ref=parent_uid))
 
-        if not t_devices:
+        if not self._devices_cache:
             t_devices.append(self._make_item(label="No Devices", key="no_devices", scope="devices", type_="action", default=":", group="Devices"))
 
         self.app.schema[devices_idx] = t_devices
@@ -2263,7 +2691,7 @@ class NetworkManagerEngine(BaseEngine):
         verb = self._verbose_info
         iface_name = verb.get("iface", "")
         conn_type = verb.get("type", "disconnected" if not iface_name else "ethernet")
-        ssid_label = verb.get("ssid", active["ssid"] if active else "None")
+        ssid_label = verb.get("ssid", "None")
         ip_label = verb.get("ip", "N/A")
         prefix_label = verb.get("prefix", "")
         if ip_label != "N/A" and prefix_label:
@@ -2289,13 +2717,16 @@ class NetworkManagerEngine(BaseEngine):
         internet_ping_str = format_ping_latency(self._ping_state.get("internet_ping_latency"))
         packet_loss_str = format_packet_loss(self._ping_state.get("internet_ping_packet_loss", 0))
 
-        if active and active.get("mode") == "ap":
+        hotspot = self._hotspot_profile(active_only=True)
+        if hotspot:
             status_text = "Active"
-            clients = self._get_hotspot_clients(active.get("device"))
+            clients = self._get_hotspot_clients(hotspot["device"])
             clients_text = f"{clients} connected"
+            address = self._run_cmd(["nmcli", "-g", "IP4.ADDRESS", "device", "show", hotspot["device"]]).strip() or "pending"
         else:
             status_text = "Inactive"
             clients_text = "N/A"
+            address = "N/A"
 
         # Update all tabs agnostic of exact tab index
         for tab_items in self.app.schema.values():
@@ -2321,7 +2752,7 @@ class NetworkManagerEngine(BaseEngine):
                 elif item.key == "status_type":
                     item.label = f"Connection: {conn_status_label}"
                 elif item.key == "status_ssid":
-                    item.label = f"SSID: {ssid_label}"
+                    item.label = f"{'SSID' if conn_type == 'wifi' else 'Source'}: {ssid_label}"
                 elif item.key == "status_ip":
                     item.label = f"IP: {ip_label}"
                 elif item.key == "status_gateway":
@@ -2356,6 +2787,15 @@ class NetworkManagerEngine(BaseEngine):
                     item.label = f"Status: {status_text}"
                 elif item.key == "hotspot_clients_info":
                     item.label = f"Clients: {clients_text}"
+                elif item.key == "hotspot_address_info":
+                    item.label = f"Laptop IP: {address}"
+                elif item.key == "hotspot_device":
+                    options = ["Auto"] + [candidate["device"] for candidate in self._hotspot_devices_cache]
+                    item.options = options
+                    if self._hotspot_device not in options:
+                        self._hotspot_device = "Auto"
+                    item.value = self._hotspot_device
+                    item.label = f"Adapter: {self._hotspot_device}"
                 elif item.key == "hotspot_ssid":
                     item.value = self._hotspot_ssid
                 elif item.key == "hotspot_password":
