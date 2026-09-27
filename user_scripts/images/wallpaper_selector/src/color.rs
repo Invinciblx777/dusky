@@ -24,6 +24,7 @@ pub fn swatch_color(bucket: u8, bright: bool) -> Color {
     }
 }
 
+#[allow(dead_code)]
 pub fn swatch_name(bucket: u8) -> &'static str {
     match bucket {
         0 => "Red",

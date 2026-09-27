@@ -19,6 +19,11 @@ use crate::theme::AppTheme;
 #[derive(Debug, Clone)]
 pub enum Message {
     SearchChanged(String),
+    FocusSearch,
+    SearchSubmitted,
+    YankPath(bool),
+    NextFavorite,
+    PrevFavorite,
     ToggleFavoritesView(bool),
     ToggleColorFilter(u8),
     CycleSortMode,
@@ -35,6 +40,7 @@ pub enum Message {
     ApplyRandom,
     RefreshList,
     RefreshFinished(usize, usize, usize),
+    #[allow(dead_code)]
     ToggleAnimation,
     AnimationFrame(iced::time::Instant),
     EventOccurred(Event),
@@ -91,6 +97,8 @@ pub struct WallpaperSelectorApp {
     favorites: HashSet<String>,
     active_wallpaper: Option<String>,
     search_query: String,
+    search_focused: bool,
+    last_g_press: Option<iced::time::Instant>,
     show_only_favorites: bool,
     selected_color: Option<u8>,
     sort_mode: crate::config::SortMode,
@@ -140,6 +148,8 @@ impl WallpaperSelectorApp {
             favorites,
             active_wallpaper,
             search_query: String::new(),
+            search_focused: false,
+            last_g_press: None,
             show_only_favorites: false,
             selected_color: None,
             sort_mode: preferences.sort_mode,
@@ -355,22 +365,85 @@ impl WallpaperSelectorApp {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         if !matches!(
             &message,
-            Message::RefreshList | Message::RefreshFinished(..) | Message::EventOccurred(_)
+            Message::RefreshList
+                | Message::RefreshFinished(..)
+                | Message::YankPath(_)
+                | Message::EventOccurred(_)
         ) {
             self.refresh_status = None;
         }
         match message {
             Message::SearchChanged(query) => {
+                self.search_focused = true;
                 self.search_query = query;
                 self.refilter();
                 Task::none()
             }
+            Message::FocusSearch => {
+                self.search_focused = true;
+                iced::widget::operation::focus(iced::widget::Id::new("search_input"))
+            }
+            Message::SearchSubmitted => {
+                self.search_focused = false;
+                iced::widget::operation::focus(iced::widget::Id::new("grid_scroll"))
+            }
+            Message::YankPath(filename_only) => {
+                if let Some(sel) = self.selected_index {
+                    if let Some(&item_idx) = self.filtered_indices.get(sel) {
+                        if let Some(item) = self.all_wallpapers.get(item_idx) {
+                            let text_to_copy = if filename_only {
+                                item.name.clone()
+                            } else {
+                                item.path.to_string_lossy().to_string()
+                            };
+                            self.refresh_status = Some(format!("Yanked: {}", text_to_copy));
+                            let _ = std::process::Command::new("wl-copy")
+                                .arg(&text_to_copy)
+                                .spawn();
+                            return iced::clipboard::write(text_to_copy);
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::NextFavorite => {
+                if let Some(curr) = self.selected_index {
+                    let count = self.filtered_indices.len();
+                    if count > 0 {
+                        for offset in 1..count {
+                            let next_idx = (curr + offset) % count;
+                            let item_idx = self.filtered_indices[next_idx];
+                            if self.all_wallpapers[item_idx].is_favorite {
+                                return self.select_wallpaper(next_idx);
+                            }
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::PrevFavorite => {
+                if let Some(curr) = self.selected_index {
+                    let count = self.filtered_indices.len();
+                    if count > 0 {
+                        for offset in 1..count {
+                            let prev_idx = (curr + count - offset) % count;
+                            let item_idx = self.filtered_indices[prev_idx];
+                            if self.all_wallpapers[item_idx].is_favorite {
+                                return self.select_wallpaper(prev_idx);
+                            }
+                        }
+                    }
+                }
+                Task::none()
+            }
             Message::ToggleFavoritesView(favs_only) => {
+                self.search_focused = false;
                 self.show_only_favorites = favs_only;
                 self.refilter();
                 Task::none()
             }
             Message::SelectWallpaper(filtered_idx) => {
+                self.search_focused = false;
                 self.select_wallpaper(filtered_idx)
             }
             Message::NextWallpaper => {
@@ -658,77 +731,292 @@ impl WallpaperSelectorApp {
             }
             Message::EventOccurred(Event::Keyboard(iced::keyboard::Event::KeyPressed {
                 key,
-                modifiers: _,
+                modifiers,
                 ..
-            })) => match key {
-                Key::Named(Named::Escape) => {
-                    if !self.search_query.is_empty() {
-                        self.search_query.clear();
-                        self.refilter();
+            })) => {
+                // If search is focused, handle only Escape, Enter, and Up/Down navigation.
+                if self.search_focused {
+                    match key {
+                        Key::Named(Named::Escape) => {
+                            self.search_focused = false;
+                            if !self.search_query.is_empty() {
+                                self.search_query.clear();
+                                self.refilter();
+                            }
+                            return iced::widget::operation::focus(iced::widget::Id::new("grid_scroll"));
+                        }
+                        Key::Named(Named::Enter) => {
+                            self.search_focused = false;
+                            return iced::widget::operation::focus(iced::widget::Id::new("grid_scroll"));
+                        }
+                        Key::Named(Named::ArrowDown) => {
+                            if self.view_layout == ViewLayout::Grid {
+                                return self.update(Message::JumpWallpapers(5));
+                            } else {
+                                return self.update(Message::NextWallpaper);
+                            }
+                        }
+                        Key::Named(Named::ArrowUp) => {
+                            if self.view_layout == ViewLayout::Grid {
+                                return self.update(Message::JumpWallpapers(-5));
+                            } else {
+                                return self.update(Message::PrevWallpaper);
+                            }
+                        }
+                        Key::Named(Named::ArrowLeft) => return self.update(Message::PrevWallpaper),
+                        Key::Named(Named::ArrowRight) => return self.update(Message::NextWallpaper),
+                        _ => return Task::none(),
+                    }
+                }
+
+                // Normal Mode Keybindings:
+                if modifiers.control() {
+                    match key {
+                        Key::Character(ref c) if c == "d" || c == "D" => {
+                            self.last_g_press = None;
+                            return self.update(Message::JumpWallpapers(15));
+                        }
+                        Key::Character(ref c) if c == "u" || c == "U" => {
+                            self.last_g_press = None;
+                            return self.update(Message::JumpWallpapers(-15));
+                        }
+                        Key::Character(ref c) if c == "f" || c == "F" => {
+                            self.last_g_press = None;
+                            return self.update(Message::JumpWallpapers(25));
+                        }
+                        Key::Character(ref c) if c == "b" || c == "B" => {
+                            self.last_g_press = None;
+                            return self.update(Message::JumpWallpapers(-25));
+                        }
+                        Key::Character(ref c) if c == "c" || c == "C" => {
+                            return iced::exit();
+                        }
+                        _ => return Task::none(),
+                    }
+                }
+
+                match key {
+                    Key::Named(Named::Escape) => {
+                        self.last_g_press = None;
+                        if !self.search_query.is_empty() {
+                            self.search_query.clear();
+                            self.refilter();
+                            Task::none()
+                        } else {
+                            iced::exit()
+                        }
+                    }
+                    Key::Named(Named::Enter) => {
+                        self.last_g_press = None;
+                        if let Some(sel) = self.selected_index {
+                            return self.update(Message::ApplyWallpaper(sel, true));
+                        }
                         Task::none()
-                    } else {
-                        iced::exit()
                     }
-                }
-                Key::Named(Named::Enter) => {
-                    if let Some(sel) = self.selected_index {
-                        return self.update(Message::ApplyWallpaper(sel, true));
+                    Key::Named(Named::Space) => {
+                        self.last_g_press = None;
+                        if let Some(sel) = self.selected_index {
+                            return self.update(Message::ApplyWallpaper(sel, false));
+                        }
+                        Task::none()
                     }
-                    Task::none()
-                }
-                Key::Named(Named::ArrowRight) => self.update(Message::NextWallpaper),
-                Key::Named(Named::ArrowLeft) => self.update(Message::PrevWallpaper),
-                Key::Named(Named::ArrowUp) => {
-                    if self.view_layout == ViewLayout::Grid {
-                        self.update(Message::JumpWallpapers(-5))
-                    } else {
+                    Key::Named(Named::ArrowRight) => {
+                        self.last_g_press = None;
+                        self.update(Message::NextWallpaper)
+                    }
+                    Key::Named(Named::ArrowLeft) => {
+                        self.last_g_press = None;
+                        self.update(Message::PrevWallpaper)
+                    }
+                    Key::Named(Named::ArrowUp) => {
+                        self.last_g_press = None;
+                        if self.view_layout == ViewLayout::Grid {
+                            self.update(Message::JumpWallpapers(-5))
+                        } else {
+                            Task::none()
+                        }
+                    }
+                    Key::Named(Named::ArrowDown) => {
+                        self.last_g_press = None;
+                        if self.view_layout == ViewLayout::Grid {
+                            self.update(Message::JumpWallpapers(5))
+                        } else {
+                            Task::none()
+                        }
+                    }
+                    Key::Named(Named::PageDown) => {
+                        self.last_g_press = None;
+                        self.update(Message::JumpWallpapers(25))
+                    }
+                    Key::Named(Named::PageUp) => {
+                        self.last_g_press = None;
+                        self.update(Message::JumpWallpapers(-25))
+                    }
+                    Key::Named(Named::Home) => {
+                        self.last_g_press = None;
+                        self.select_wallpaper(0)
+                    }
+                    Key::Named(Named::End) => {
+                        self.last_g_press = None;
+                        if !self.filtered_indices.is_empty() {
+                            self.select_wallpaper(self.filtered_indices.len() - 1)
+                        } else {
+                            Task::none()
+                        }
+                    }
+                    Key::Character(ref c) => match c.as_str() {
+                        "h" => {
+                            self.last_g_press = None;
+                            self.update(Message::PrevWallpaper)
+                        }
+                        "l" => {
+                            self.last_g_press = None;
+                            self.update(Message::NextWallpaper)
+                        }
+                        "j" => {
+                            self.last_g_press = None;
+                            if self.view_layout == ViewLayout::Grid {
+                                self.update(Message::JumpWallpapers(5))
+                            } else {
+                                self.update(Message::NextWallpaper)
+                            }
+                        }
+                        "k" => {
+                            self.last_g_press = None;
+                            if self.view_layout == ViewLayout::Grid {
+                                self.update(Message::JumpWallpapers(-5))
+                            } else {
+                                self.update(Message::PrevWallpaper)
+                            }
+                        }
+                        "g" => {
+                            if let Some(last) = self.last_g_press {
+                                if last.elapsed().as_millis() < 500 {
+                                    self.last_g_press = None;
+                                    return self.select_wallpaper(0);
+                                }
+                            }
+                            self.last_g_press = Some(iced::time::Instant::now());
+                            Task::none()
+                        }
+                        "G" => {
+                            self.last_g_press = None;
+                            if !self.filtered_indices.is_empty() {
+                                self.select_wallpaper(self.filtered_indices.len() - 1)
+                            } else {
+                                Task::none()
+                            }
+                        }
+                        "0" | "^" => {
+                            self.last_g_press = None;
+                            if let Some(sel) = self.selected_index {
+                                if self.view_layout == ViewLayout::Grid {
+                                    let row_start = (sel / 5) * 5;
+                                    self.select_wallpaper(row_start)
+                                } else {
+                                    self.select_wallpaper(0)
+                                }
+                            } else {
+                                Task::none()
+                            }
+                        }
+                        "$" => {
+                            self.last_g_press = None;
+                            if let Some(sel) = self.selected_index {
+                                if self.view_layout == ViewLayout::Grid {
+                                    let row_end = ((sel / 5) * 5 + 4)
+                                        .min(self.filtered_indices.len().saturating_sub(1));
+                                    self.select_wallpaper(row_end)
+                                } else {
+                                    self.select_wallpaper(self.filtered_indices.len().saturating_sub(1))
+                                }
+                            } else {
+                                Task::none()
+                            }
+                        }
+                        "/" => {
+                            self.last_g_press = None;
+                            self.update(Message::FocusSearch)
+                        }
+                        "n" => {
+                            self.last_g_press = None;
+                            self.update(Message::NextFavorite)
+                        }
+                        "N" => {
+                            self.last_g_press = None;
+                            self.update(Message::PrevFavorite)
+                        }
+                        "o" => {
+                            self.last_g_press = None;
+                            if let Some(sel) = self.selected_index {
+                                self.update(Message::ApplyWallpaper(sel, true))
+                            } else {
+                                Task::none()
+                            }
+                        }
+                        "O" => {
+                            self.last_g_press = None;
+                            if let Some(sel) = self.selected_index {
+                                self.update(Message::ApplyWallpaper(sel, false))
+                            } else {
+                                Task::none()
+                            }
+                        }
+                        "f" | "m" => {
+                            self.last_g_press = None;
+                            if let Some(sel) = self.selected_index {
+                                self.update(Message::ToggleFavorite(sel))
+                            } else {
+                                Task::none()
+                            }
+                        }
+                        "p" | "P" => {
+                            self.last_g_press = None;
+                            self.update(Message::ToggleFavoritesView(!self.show_only_favorites))
+                        }
+                        "y" => {
+                            self.last_g_press = None;
+                            self.update(Message::YankPath(false))
+                        }
+                        "Y" => {
+                            self.last_g_press = None;
+                            self.update(Message::YankPath(true))
+                        }
+                        "v" | "V" => {
+                            self.last_g_press = None;
+                            self.update(Message::ToggleViewLayout)
+                        }
+                        "s" | "S" => {
+                            self.last_g_press = None;
+                            self.update(Message::CycleSortMode)
+                        }
+                        "r" | "R" => {
+                            self.last_g_press = None;
+                            self.update(Message::ApplyRandom)
+                        }
+                        "c" | "C" => {
+                            self.last_g_press = None;
+                            if self.selected_color.is_some() {
+                                self.selected_color = None;
+                                self.refilter();
+                            }
+                            Task::none()
+                        }
+                        "q" | "Q" => {
+                            self.last_g_press = None;
+                            iced::exit()
+                        }
+                        _ => {
+                            self.last_g_press = None;
+                            Task::none()
+                        }
+                    },
+                    _ => {
+                        self.last_g_press = None;
                         Task::none()
                     }
                 }
-                Key::Named(Named::ArrowDown) => {
-                    if self.view_layout == ViewLayout::Grid {
-                        self.update(Message::JumpWallpapers(5))
-                    } else {
-                        Task::none()
-                    }
-                }
-                Key::Named(Named::PageDown) => self.update(Message::JumpWallpapers(5)),
-                Key::Named(Named::PageUp) => self.update(Message::JumpWallpapers(-5)),
-                Key::Named(Named::Home) => self.select_wallpaper(0),
-                Key::Named(Named::End) => {
-                    if !self.filtered_indices.is_empty() {
-                        self.select_wallpaper(self.filtered_indices.len() - 1)
-                    } else {
-                        Task::none()
-                    }
-                }
-                Key::Character(ref c) if (c == "f" || c == "F") && self.search_query.is_empty() => {
-                    if let Some(sel) = self.selected_index {
-                        return self.update(Message::ToggleFavorite(sel));
-                    }
-                    Task::none()
-                }
-                Key::Character(ref c) if (c == "r" || c == "R") && self.search_query.is_empty() => {
-                    self.update(Message::ApplyRandom)
-                }
-                Key::Character(ref c) if (c == "s" || c == "S") && self.search_query.is_empty() => {
-                    self.update(Message::CycleSortMode)
-                }
-                Key::Character(ref c) if (c == "m" || c == "M") && self.search_query.is_empty() => {
-                    self.update(Message::CycleMotionProfile)
-                }
-                Key::Character(ref c) if (c == "g" || c == "G") && self.search_query.is_empty() => {
-                    self.update(Message::ToggleViewLayout)
-                }
-                Key::Character(ref c) if (c == "c" || c == "C") && self.search_query.is_empty() => {
-                    if self.selected_color.is_some() {
-                        self.selected_color = None;
-                        self.refilter();
-                    }
-                    Task::none()
-                }
-                _ => Task::none(),
-            },
+            }
             Message::EventOccurred(_) => Task::none(),
         }
     }
@@ -832,11 +1120,13 @@ impl WallpaperSelectorApp {
             });
 
         // Search capsule
-        let search_input = text_input("dusky wallpapers", &self.search_query)
+        let search_input = text_input("dusky wallpapers  /", &self.search_query)
+            .id(iced::widget::Id::new("search_input"))
             .on_input(Message::SearchChanged)
+            .on_submit(Message::SearchSubmitted)
             .padding([6, 10])
             .size(12)
-            .width(Length::Fixed(120.0))
+            .width(Length::Fixed(140.0))
             .style(move |_theme, status| {
                 let is_focused = matches!(status, text_input::Status::Focused { .. });
                 text_input::Style {
@@ -1186,8 +1476,10 @@ impl WallpaperSelectorApp {
             "Applying wallpaper…"
         } else if let Some(status) = &self.refresh_status {
             status.as_str()
+        } else if self.search_focused {
+            "Search Mode  •  Type to filter  •  Enter: Focus Grid  •  Esc: Normal Mode (Clear)"
         } else {
-            "← / →: Navigate  •  G: Grid / Slices  •  M: Motion  •  S: Sort  •  C: Clear color  •  Click: Apply  •  Esc: Close"
+            "hjkl / ←↓↑→: Nav  •  Enter/o: Apply  •  Space/O: Fast  •  f: Fav  •  /: Search  •  y/Y: Yank  •  v: View  •  q: Quit"
         })
         .size(11)
         .color(if self.error_message.is_some() {
