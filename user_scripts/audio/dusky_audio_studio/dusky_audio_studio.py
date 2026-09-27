@@ -1816,7 +1816,7 @@ def stop_daemon(restore_defaults: bool = True, cfg: AudioConfig | None = None) -
 # -----------------------------------------------------------------------------
 #   GTK3 Interface & Reactive Studio Studio
 # -----------------------------------------------------------------------------
-def run_gtk_app() -> None:
+def run_gtk_app(*, open_only: bool = False) -> None:
     if GUI_PID_FILE.exists():
         try:
             with open(GUI_PID_FILE, "r", encoding="utf-8") as f:
@@ -1845,6 +1845,9 @@ def run_gtk_app() -> None:
         pass
 
     cfg = load_config()
+    if open_only:
+        # Opening settings must reflect the running DSP without starting it.
+        cfg.enabled = bool(get_daemon_pid())
 
     provider = Gtk.CssProvider()
     provider.load_from_data(DUSKY_CSS.encode("utf-8"))
@@ -1970,7 +1973,7 @@ def run_gtk_app() -> None:
             footer_lbl.get_style_context().add_class("footer-info")
             main_vbox.pack_end(footer_lbl, False, False, 0)
 
-            if self.cfg.enabled:
+            if self.cfg.enabled and not open_only:
                 start_daemon(self.cfg)
 
             # Start 30 Hz Telemetry Polling Timer
@@ -3396,8 +3399,8 @@ def main() -> None:
     args = sys.argv[1:]
     cfg = load_config()
 
-    if not args or args[0] in ("--gui", "-g"):
-        run_gtk_app()
+    if not args or args[0] in ("--gui", "-g", "--gui-only"):
+        run_gtk_app(open_only=bool(args and args[0] == "--gui-only"))
         return
 
     match args[0].lower():

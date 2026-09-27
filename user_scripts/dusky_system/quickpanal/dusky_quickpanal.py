@@ -28,7 +28,7 @@ try:
 except (ImportError, ValueError) as exc:
     raise SystemExit(f'Failed to load GTK3 PyGObject libraries: {exc}') from exc
 from dusky_backend import (
-    APP_ID, HOME, execute_cmd, run_command, fetch_json_output, _reclaim_idle_memory,
+    APP_ID, HOME, execute_cmd, run_command, fetch_json_output, atomic_write_text, _reclaim_idle_memory,
     LatestValueWorker, RefreshPool, HyprsunsetController, LOG, start_thread, gi_object_c_pointer,
     HAS_VOLUME, HAS_BRIGHTNESS, HAS_LOCAL_BRIGHTNESS, HAS_SUNSET, DDC_MANAGER,
     get_volume, apply_volume, get_brightness, apply_local_brightness, 
@@ -54,16 +54,11 @@ except (OSError, AttributeError, ImportError):
     LIBGRAB = None
 CONFIG_DIR: Final[Path] = Path(HOME) / '.config' / 'dusky' / 'quickpanal'
 CONFIG_FILE: Final[Path] = CONFIG_DIR / 'config.toml'
-DEFAULT_TOML_CONFIG: Final[str] = '[layout]\nshow_weather = true\nshow_metrics = true\nshow_quick_toggles = true\nshow_power_profiles = true\nshow_sliders = true\nshow_notifications = true\nshow_media = false\n\n[[toggles]]\nid = "wifi"\nicon = "network-wireless-symbolic"\nlabel = "Wi-Fi"\ntooltip = "Wi-Fi\\nLMB: Network Manager"\non_left = "foot --app-id=dusky_tui python ~/user_scripts/dusky_tui/python/main/main.py ~/user_scripts/network_manager/tui_dusky_network.py"\n\n[[toggles]]\nid = "idle"\nicon = "timer-symbolic"\nlabel = "Hypridle"\ntooltip = "Hypridle\\nLMB: Toggle | RMB: Lock Screen"\non_left = "~/user_scripts/waybar/toggle_hypridle.sh"\non_right = "~/user_scripts/hyprlock/lock.sh"\n\n[[toggles]]\nid = "blur"\nicon = "preferences-desktop-appearance-symbolic"\nlabel = "Visuals"\ntooltip = "Visuals\\nLMB: Toggle Blur/Shadow"\non_left = "~/user_scripts/hypr/hypr_blur_opacity_shadow_toggle.sh toggle"\n\n[[toggles]]\nid = "updates"\nicon = "folder-download-symbolic"\nlabel = "Updates"\ntooltip = "Updates\\nLMB: System Update | RMB: Dusky Update"\non_left = "dusky-run kitty --class system_update.sh --hold sh -c \'~/user_scripts/update_dusky/system_update.sh --all\'"\non_right = "dusky-run kitty --class update_dusky.py --hold sh -c \'~/user_scripts/update_dusky/python/update_dusky_supervisor.py\'"\n\n[[toggles]]\nid = "audio"\nicon = "audio-input-microphone-symbolic"\nlabel = "Voice DSP"\ntooltip = "Voice DSP & Noise Cancellation\\nLMB: Open Studio | RMB: Toggle ON/OFF"\non_left = "python3 ~/user_scripts/audio/dusky_audio_studio/dusky_audio_studio.py"\non_right = "python3 ~/user_scripts/audio/dusky_audio_studio/dusky_audio_studio.py --toggle"\n'
+DEFAULT_TOML_CONFIG: Final[str] = '[layout]\nshow_weather = true\nshow_metrics = true\nshow_quick_toggles = true\nshow_power_profiles = true\nshow_sliders = true\nshow_notifications = true\nshow_media = false\n\n[[toggles]]\nid = "wifi"\nicon = "network-wireless-symbolic"\nlabel = "Wi-Fi"\ntooltip = "Wi-Fi\\nLMB: Network Manager"\non_left = "foot --app-id=dusky_tui python ~/user_scripts/dusky_tui/python/main/main.py ~/user_scripts/network_manager/tui_dusky_network.py"\n\n[[toggles]]\nid = "idle"\nicon = "timer-symbolic"\nlabel = "Hypridle"\ntooltip = "Hypridle\\nLMB: Toggle | RMB: Lock Screen"\non_left = "~/user_scripts/waybar/toggle_hypridle.sh"\non_right = "~/user_scripts/hyprlock/lock.sh"\n\n[[toggles]]\nid = "blur"\nicon = "preferences-desktop-appearance-symbolic"\nlabel = "Visuals"\ntooltip = "Visuals\\nLMB: Toggle Blur/Shadow"\non_left = "~/user_scripts/hypr/hypr_blur_opacity_shadow_toggle.sh toggle"\n\n[[toggles]]\nid = "updates"\nicon = "folder-download-symbolic"\nlabel = "Updates"\ntooltip = "Updates\\nLMB: System Update | RMB: Dusky Update"\non_left = "dusky-run kitty --class system_update.sh --hold sh -c \'~/user_scripts/update_dusky/system_update.sh --all\'"\non_right = "dusky-run kitty --class update_dusky.py --hold sh -c \'~/user_scripts/update_dusky/python/update_dusky_supervisor.py\'"\n\n[[toggles]]\nid = "audio"\nicon = "audio-input-microphone-symbolic"\nlabel = "Voice DSP"\ntooltip = "Voice DSP & Noise Cancellation\\nLMB: Open Studio | RMB: Toggle ON/OFF"\non_left = "python3 ~/user_scripts/audio/dusky_audio_studio/dusky_audio_studio.py --gui-only"\non_right = "python3 ~/user_scripts/audio/dusky_audio_studio/dusky_audio_studio.py --toggle"\n'
 
 def load_or_create_config() -> dict[str, Any]:
-    if not CONFIG_FILE.exists():
-        try:
-            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            CONFIG_FILE.write_text(DEFAULT_TOML_CONFIG, encoding='utf-8')
-        except OSError as e:
-            LOG.error(f'Could not create default config directory/file: {e}')
-            return tomllib.loads(DEFAULT_TOML_CONFIG)
+    if not CONFIG_FILE.exists() and not atomic_write_text(CONFIG_FILE, DEFAULT_TOML_CONFIG):
+        return tomllib.loads(DEFAULT_TOML_CONFIG)
     try:
         with CONFIG_FILE.open('rb') as f:
             config = tomllib.load(f)
@@ -125,8 +120,12 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         self._wifi_pending = False
         self._bt_pending = False
         self._bt_adapter: str | None = None
+        self._radio_revision = 0
+        self._wifi_confirmed: bool | None = None
+        self._bt_confirmed: bool | None = None
         self._power_pending_revision = 0
         self._power_pending_profile: str | None = None
+        self._power_confirmed_profile: str | None = None
         self._powertop_pending = False
         self.set_default_size(320, -1)
         self.set_size_request(320, -1)
@@ -267,9 +266,9 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
             sep.set_margin_bottom(4)
             self.power_container.pack_start(sep, False, False, 0)
             self.power_cmds = {
-                'Balanced': f'{HOME}/user_scripts/battery/tlp/tlp_mode_toggle.sh balanced',
-                'Performance': f'{HOME}/user_scripts/battery/tlp/tlp_mode_toggle.sh performance',
-                'Power Saver': f'{HOME}/user_scripts/battery/tlp/tlp_mode_toggle.sh power-saver'
+                'Balanced': [f'{HOME}/user_scripts/battery/tlp/tlp_mode_toggle.sh', 'balanced'],
+                'Performance': [f'{HOME}/user_scripts/battery/tlp/tlp_mode_toggle.sh', 'performance'],
+                'Power Saver': [f'{HOME}/user_scripts/battery/tlp/tlp_mode_toggle.sh', 'power-saver'],
             }
             self.power_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
             self.btn_save = Gtk.RadioButton()
@@ -354,14 +353,12 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         if not self.dynamic_toggles.get('audio') or not self._visible:
             return
         pid_file = Path(HOME) / '.config' / 'dusky' / 'settings' / 'dusky_studio' / 'daemon.pid'
-        if not pid_file.exists():
-            pid_file = Path(HOME) / '.config' / 'dusky_audio_studio' / 'daemon.pid'
         is_active = False
         if pid_file.exists():
             try:
                 pid = int(pid_file.read_text().strip())
-                os.kill(pid, 0)
-                is_active = True
+                if pid > 0:
+                    is_active = b'dusky_audio_studio' in Path(f'/proc/{pid}/cmdline').read_bytes()
             except (ValueError, OSError):
                 is_active = False
         GLib.idle_add(self._apply_audio, is_active)
@@ -470,75 +467,119 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
     def _fetch_net_bt_state(self) -> None:
         if not hasattr(self, 'wifi_switch') or not self._visible:
             return
+        revision = self._radio_revision
         try:
             wifi_r = run_command(['busctl', 'get-property', 'org.freedesktop.NetworkManager', '/org/freedesktop/NetworkManager', 'org.freedesktop.NetworkManager', 'WirelessEnabled'], timeout=0.8, capture_stdout=True)
-            wifi_on = ('true' in wifi_r.stdout) if wifi_r is not None and wifi_r.returncode == 0 else None
+            wifi_on = self._read_busctl_bool(wifi_r)
             adapters = sorted(p.name for p in Path('/sys/class/bluetooth').glob('hci*') if p.name[3:].isdigit())
             adapter = self._bt_adapter if self._bt_adapter in adapters else next(iter(adapters), None)
             bt_r = run_command(['busctl', 'get-property', 'org.bluez', f'/org/bluez/{adapter}', 'org.bluez.Adapter1', 'Powered'], timeout=0.8, capture_stdout=True) if adapter else None
-            bt_powered = bt_r is not None and bt_r.returncode == 0 and ('true' in bt_r.stdout)
-            bt_on = bt_powered
-            GLib.idle_add(self._apply_net_bt_state, wifi_on, bt_on, adapter if bt_r is not None and bt_r.returncode == 0 else None)
-        except Exception:
-            pass
+            bt_on = self._read_busctl_bool(bt_r)
+            GLib.idle_add(self._apply_net_bt_state, wifi_on, bt_on, adapter, revision)
+        except Exception as exc:
+            LOG.warning('Failed to read radio state: %s', exc)
 
-    def _apply_net_bt_state(self, wifi_on: bool | None, bt_on: bool, adapter: str | None) -> None:
-        self._bt_adapter = adapter
+    @staticmethod
+    def _read_busctl_bool(result: Any) -> bool | None:
+        if result is None or result.returncode != 0:
+            return None
+        parts = result.stdout.strip().split()
+        if len(parts) == 2 and parts[0] == 'b' and parts[1] in ('true', 'false'):
+            return parts[1] == 'true'
+        return None
+
+    def _set_radio_switch(self, switch: Gtk.Switch, state: bool) -> None:
         self._updating_radios = True
         try:
-            if not self._wifi_pending:
-                self.wifi_switch.set_sensitive(wifi_on is not None)
-                icon = 'network-wireless-symbolic' if wifi_on else 'network-wireless-disconnected-symbolic'
-                self.wifi_icon.set_from_icon_name(icon, Gtk.IconSize.BUTTON)
-                self.wifi_switch.set_active(bool(wifi_on))
-            if not self._bt_pending:
-                self.bt_switch.set_sensitive(adapter is not None)
-                icon = 'bluetooth-active-symbolic' if bt_on else 'bluetooth-disabled-symbolic'
-                self.bt_icon.set_from_icon_name(icon, Gtk.IconSize.BUTTON)
-                self.bt_switch.set_active(bt_on)
+            switch.set_active(state)
+            switch.set_state(state)
         finally:
             self._updating_radios = False
+
+    def _apply_net_bt_state(self, wifi_on: bool | None, bt_on: bool | None, adapter: str | None, revision: int) -> None:
+        if revision != self._radio_revision:
+            return
+        self._bt_adapter = adapter
+        if not self._wifi_pending:
+            self._wifi_confirmed = wifi_on
+            self.wifi_switch.set_sensitive(wifi_on is not None)
+            self.wifi_switch.set_tooltip_text('Wi-Fi status unavailable' if wifi_on is None else 'Wi-Fi on' if wifi_on else 'Wi-Fi off')
+            if wifi_on is not None:
+                self.wifi_icon.set_from_icon_name('network-wireless-symbolic' if wifi_on else 'network-wireless-disconnected-symbolic', Gtk.IconSize.BUTTON)
+                self._set_radio_switch(self.wifi_switch, wifi_on)
+        if not self._bt_pending:
+            self._bt_confirmed = bt_on
+            self.bt_switch.set_sensitive(bt_on is not None)
+            self.bt_switch.set_tooltip_text('Bluetooth status unavailable' if bt_on is None else 'Bluetooth on' if bt_on else 'Bluetooth off')
+            if bt_on is not None:
+                self.bt_icon.set_from_icon_name('bluetooth-active-symbolic' if bt_on else 'bluetooth-disabled-symbolic', Gtk.IconSize.BUTTON)
+                self._set_radio_switch(self.bt_switch, bt_on)
 
     def _on_wifi_state_set(self, switch: Gtk.Switch, state: bool) -> bool:
         if self._updating_radios:
             return False
-        val = 'true' if state else 'false'
-        execute_cmd(f'busctl set-property org.freedesktop.NetworkManager /org/freedesktop/NetworkManager org.freedesktop.NetworkManager WirelessEnabled b {val}')
-        icon = 'network-wireless-symbolic' if state else 'network-wireless-disconnected-symbolic'
-        self.wifi_icon.set_from_icon_name(icon, Gtk.IconSize.BUTTON)
+        if self._wifi_pending or self._wifi_confirmed is None:
+            self._set_radio_switch(switch, self._wifi_confirmed or False)
+            return True
+        self._radio_revision += 1
         self._wifi_pending = True
         switch.set_sensitive(False)
-        GLib.timeout_add(800, self._clear_wifi_pending)
+        switch.set_tooltip_text('Setting Wi-Fi…')
+        start_thread('wifi-toggle', self._set_wifi_worker, state, self._wifi_confirmed)
         return False
 
-    def _clear_wifi_pending(self) -> bool:
-        self._wifi_pending = False
-        self.wifi_switch.set_sensitive(True)
-        if self._visible and self.pool:
-            self.pool.submit(self._fetch_net_bt_state)
-        return GLib.SOURCE_REMOVE
+    def _set_wifi_worker(self, state: bool, prior: bool) -> None:
+        val = 'true' if state else 'false'
+        result = run_command(['busctl', 'set-property', 'org.freedesktop.NetworkManager', '/org/freedesktop/NetworkManager', 'org.freedesktop.NetworkManager', 'WirelessEnabled', 'b', val], timeout=2.0)
+        if result is None or result.returncode != 0:
+            LOG.warning('Could not set Wi-Fi to %s', val)
+        observation = run_command(['busctl', 'get-property', 'org.freedesktop.NetworkManager', '/org/freedesktop/NetworkManager', 'org.freedesktop.NetworkManager', 'WirelessEnabled'], timeout=1.0, capture_stdout=True)
+        GLib.idle_add(self._finish_radio_change, 'wifi', self._read_busctl_bool(observation), prior)
 
     def _on_bt_state_set(self, switch: Gtk.Switch, state: bool) -> bool:
         if self._updating_radios:
             return False
-        if self._bt_adapter is None:
+        if self._bt_pending or self._bt_adapter is None or self._bt_confirmed is None:
+            self._set_radio_switch(switch, self._bt_confirmed or False)
             return True
-        adapter_path = f'/org/bluez/{self._bt_adapter}'
-        if state:
-            execute_cmd(f"sudo -n /usr/bin/rfkill unblock bluetooth; busctl set-property org.bluez {adapter_path} org.bluez.Adapter1 Powered b true")
-            icon = "bluetooth-active-symbolic"
-        else:
-            execute_cmd(f"busctl set-property org.bluez {adapter_path} org.bluez.Adapter1 Powered b false")
-            icon = "bluetooth-disabled-symbolic"
-        self.bt_icon.set_from_icon_name(icon, Gtk.IconSize.BUTTON)
+        self._radio_revision += 1
         self._bt_pending = True
         switch.set_sensitive(False)
-        GLib.timeout_add(800, self._clear_bt_pending)
+        switch.set_tooltip_text('Setting Bluetooth…')
+        start_thread('bluetooth-toggle', self._set_bt_worker, self._bt_adapter, state, self._bt_confirmed)
         return False
 
-    def _clear_bt_pending(self) -> bool:
-        self._bt_pending = False
-        self.bt_switch.set_sensitive(True)
+    def _set_bt_worker(self, adapter: str, state: bool, prior: bool) -> None:
+        adapter_path = f'/org/bluez/{adapter}'
+        if state:
+            unblock = run_command(['/usr/bin/sudo', '-n', '/usr/bin/rfkill', 'unblock', 'bluetooth'], timeout=2.0)
+            if unblock is None or unblock.returncode != 0:
+                LOG.warning('Could not unblock Bluetooth rfkill before enabling adapter')
+        val = 'true' if state else 'false'
+        result = run_command(['busctl', 'set-property', 'org.bluez', adapter_path, 'org.bluez.Adapter1', 'Powered', 'b', val], timeout=2.0)
+        if result is None or result.returncode != 0:
+            LOG.warning('Could not set Bluetooth adapter %s to %s', adapter, val)
+        observation = run_command(['busctl', 'get-property', 'org.bluez', adapter_path, 'org.bluez.Adapter1', 'Powered'], timeout=1.0, capture_stdout=True)
+        GLib.idle_add(self._finish_radio_change, 'bluetooth', self._read_busctl_bool(observation), prior)
+
+    def _finish_radio_change(self, radio: str, observed: bool | None, prior: bool) -> bool:
+        if radio == 'wifi':
+            self._wifi_pending = False
+            self._wifi_confirmed = observed
+            switch, icon = self.wifi_switch, self.wifi_icon
+            names = ('network-wireless-symbolic', 'network-wireless-disconnected-symbolic')
+        else:
+            self._bt_pending = False
+            self._bt_confirmed = observed
+            switch, icon = self.bt_switch, self.bt_icon
+            names = ('bluetooth-active-symbolic', 'bluetooth-disabled-symbolic')
+        if observed is not None:
+            self._set_radio_switch(switch, observed)
+            icon.set_from_icon_name(names[0] if observed else names[1], Gtk.IconSize.BUTTON)
+        else:
+            self._set_radio_switch(switch, prior)
+        switch.set_sensitive(observed is not None)
+        switch.set_tooltip_text(f'{radio.capitalize()} status unavailable' if observed is None else f'{radio.capitalize()} {"on" if observed else "off"}')
         if self._visible and self.pool:
             self.pool.submit(self._fetch_net_bt_state)
         return GLib.SOURCE_REMOVE
@@ -573,6 +614,10 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
             return GLib.SOURCE_REMOVE
         mapping = {'balanced': self.btn_bal, 'performance': self.btn_perf, 'power-saver': self.btn_save}
         target_btn = mapping.get(profile)
+        if target_btn is None:
+            return GLib.SOURCE_REMOVE
+        self._power_confirmed_profile = profile
+        self._clear_power_error()
         if target_btn and (not target_btn.get_active()):
             LOG.info(f'Applying power profile: {profile}')
             self._updating_power = True
@@ -582,6 +627,15 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
             self._updating_power = False
         return GLib.SOURCE_REMOVE
 
+    def _clear_power_error(self) -> None:
+        for btn, tooltip in (
+            (self.btn_save, 'Power Saver\nRMB: Powertop auto-tune now'),
+            (self.btn_bal, 'Balanced'),
+            (self.btn_perf, 'Performance'),
+        ):
+            btn.set_inconsistent(False)
+            btn.set_tooltip_text(tooltip)
+
     def _on_power_toggled(self, button: Gtk.RadioButton, profile_name: str) -> None:
         if not button.get_active() or self._updating_power:
             return
@@ -590,18 +644,23 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
             self._power_pending_revision += 1
             current_rev = self._power_pending_revision
             self._power_pending_profile = profile_key
+            self._clear_power_error()
             for btn in (self.btn_save, self.btn_bal, self.btn_perf):
                 _remove_css_class(btn, 'applying')
                 btn.set_sensitive(False)
             _add_css_class(button, 'applying')
             start_thread('power-profile', self._run_power_cmd_worker, cmd, current_rev)
 
-    def _run_power_cmd_worker(self, cmd: str, revision: int) -> None:
+    def _run_power_cmd_worker(self, cmd: list[str], revision: int) -> None:
+        succeeded = False
         try:
-            run_command(['/usr/bin/bash', '-c', cmd], timeout=4.0)
+            result = run_command(cmd, timeout=4.0)
+            succeeded = result is not None and result.returncode == 0
+            if not succeeded:
+                LOG.error('Failed to apply power profile: command did not complete successfully')
         except Exception as e:
             LOG.error(f'Failed to apply power profile: {e}')
-        GLib.idle_add(self._power_cmd_finished, revision)
+        GLib.idle_add(self._power_cmd_finished, revision, succeeded)
 
     def _on_power_save_button_press(self, button: Gtk.RadioButton, event: Gdk.EventButton) -> bool:
         if event.button != 3:
@@ -632,13 +691,25 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         if self._power_pending_profile is None:
             _remove_css_class(self.btn_save, 'applying')
 
-    def _power_cmd_finished(self, revision: int) -> bool:
+    def _power_cmd_finished(self, revision: int, succeeded: bool) -> bool:
         if revision != self._power_pending_revision:
             return GLib.SOURCE_REMOVE
+        requested_profile = self._power_pending_profile
         self._power_pending_profile = None
         for btn in (self.btn_save, self.btn_bal, self.btn_perf):
             _remove_css_class(btn, 'applying')
             btn.set_sensitive(True)
+        if not succeeded and self._power_confirmed_profile is not None:
+            mapping = {'balanced': self.btn_bal, 'performance': self.btn_perf, 'power-saver': self.btn_save}
+            self._updating_power = True
+            try:
+                mapping[self._power_confirmed_profile].set_active(True)
+            finally:
+                self._updating_power = False
+        elif not succeeded and requested_profile is not None:
+            mapping = {'balanced': self.btn_bal, 'performance': self.btn_perf, 'power-saver': self.btn_save}
+            mapping[requested_profile].set_inconsistent(True)
+            mapping[requested_profile].set_tooltip_text('Could not apply profile; current state is unknown')
         if self._visible and self.pool:
             self.pool.submit(self._fetch_power_profile)
         return GLib.SOURCE_REMOVE

@@ -120,7 +120,9 @@ class MetricPill(Gtk.EventBox):
         self.add(self._box)
         self.show_all()
 
-    def _on_clicked(self, *args: Any) -> bool:
+    def _on_clicked(self, _widget: Gtk.Widget, event: Gdk.EventButton) -> bool:
+        if event.button != 1:
+            return False
         if self._on_click_cmd:
             if callable(self.on_execute):
                 self.on_execute(self._on_click_cmd)

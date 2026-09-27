@@ -15,6 +15,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -166,18 +167,37 @@ def run_command(
     env = COMMAND_ENV if extra_env is None else {**COMMAND_ENV, **extra_env}
     cmd_list = [os.fspath(a) for a in args]
     try:
-        return subprocess.run(
+        with subprocess.Popen(
             cmd_list,
-            capture_output=capture_stdout,
+            stdout=subprocess.PIPE if capture_stdout else None,
+            stderr=subprocess.PIPE if capture_stdout else None,
             text=True,
-            timeout=timeout,
-            check=False,
             env=env,
-            close_fds=True
-        )
-    except subprocess.TimeoutExpired:
-        LOG.warning("Command '%s' timed out after %.2fs", cmd_list[0], timeout)
-        return None
+            close_fds=True,
+            start_new_session=True,
+        ) as proc:
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                LOG.warning("Command '%s' timed out after %.2fs", cmd_list[0], timeout)
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError as exc:
+                    if not isinstance(exc, ProcessLookupError):
+                        LOG.warning("Could not stop process group for '%s': %s", cmd_list[0], exc)
+                    if proc.poll() is None:
+                        proc.kill()
+                try:
+                    proc.communicate(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    # A descendant that created another session may still hold
+                    # the captured pipes; do not let it defeat this timeout.
+                    for stream in (proc.stdout, proc.stderr):
+                        if stream is not None:
+                            stream.close()
+                    proc.wait()
+                return None
+            return subprocess.CompletedProcess(cmd_list, proc.returncode, stdout, stderr)
     except FileNotFoundError:
         LOG.warning("Command '%s' not found on PATH", cmd_list[0])
         return None
@@ -540,19 +560,19 @@ def fetch_notifications() -> list[NotificationData]:
                 nid = int(item.get("id", -1))
                 if nid < 0 or str(nid) in blacklist:
                     continue
-                app = item.get("app-name", item.get("app_name", ""))
+                app = item.get("app_name") or item.get("app-name") or ""
                 if is_app_ignored(app, ignored_apps):
                     continue
-                summary = item.get("summary", "")
+                summary = item.get("summary") or ""
                 if not summary:
                     continue
                 combined[nid] = NotificationData(
                     id=nid,
                     app_name=app,
                     summary=summary,
-                    body=item.get("body", ""),
+                    body=item.get("body") or "",
                     source=src,
-                    desktop_entry=item.get("desktop-entry", "")
+                    desktop_entry=item.get("desktop_entry") or item.get("desktop-entry") or ""
                 )
             except Exception:
                 pass
