@@ -11,6 +11,27 @@ use config::Config;
 use std::env;
 use ui::WallpaperSelectorApp;
 
+// Bound background task threads instead of creating one for every CPU.
+struct BackgroundExecutor(iced::futures::executor::ThreadPool);
+
+impl iced::executor::Executor for BackgroundExecutor {
+    fn new() -> Result<Self, iced::futures::io::Error> {
+        iced::futures::executor::ThreadPool::builder()
+            .pool_size(2)
+            .name_prefix("wallpaper-worker")
+            .create()
+            .map(Self)
+    }
+
+    fn spawn(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        self.0.spawn_ok(future);
+    }
+
+    fn block_on<T>(&self, future: impl std::future::Future<Output = T>) -> T {
+        iced::futures::executor::block_on(future)
+    }
+}
+
 fn print_help() {
     println!("Dusky Wallpaper Selector (Rust/Iced)");
     println!("Usage: wallpaper_selector [OPTIONS]\n");
@@ -315,6 +336,11 @@ fn detect_primary_gpu_vendor() -> Option<(String, String)> {
 }
 
 fn optimize_gpu_environment() {
+    // Avoid initializing unused graphics backends on this Vulkan/Wayland target.
+    // An explicit user override still takes precedence.
+    if env::var_os("WGPU_BACKEND").is_none() {
+        unsafe { env::set_var("WGPU_BACKEND", "vulkan") };
+    }
     // 1. If user explicitly provided driver files, don't override
     if env::var_os("VK_DRIVER_FILES").is_some() {
         return;
@@ -472,6 +498,7 @@ fn main() -> iced::Result {
         WallpaperSelectorApp::update,
         WallpaperSelectorApp::view,
     )
+    .executor::<BackgroundExecutor>()
     .window(window_settings)
     .subscription(WallpaperSelectorApp::subscription)
     .theme(theme)

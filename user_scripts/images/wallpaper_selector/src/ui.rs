@@ -48,6 +48,7 @@ pub enum Message {
     ApplyRandom,
     RefreshList,
     LibraryLoaded(LibrarySnapshot),
+    ActiveWallpaperLoaded(u64, Option<String>, Option<String>),
     ThumbnailsReady(
         u64,
         Vec<(
@@ -107,7 +108,11 @@ fn load_library(config: Config, refreshed: bool) -> LibrarySnapshot {
             };
         }
     };
-    let active = crate::favorites::read_active_wallpaper(&config.theme_dir);
+    let active = if refreshed {
+        crate::favorites::read_active_wallpaper(&config.theme_dir)
+    } else {
+        crate::favorites::read_tracked_wallpaper(&config.theme_dir)
+    };
     let mut wallpapers = match crate::scanner::scan_wallpapers(
         &config.wallpaper_dir,
         &config.thumb_dir,
@@ -141,27 +146,35 @@ fn load_library(config: Config, refreshed: bool) -> LibrarySnapshot {
     } else {
         (0, 0, None)
     };
-    let (colors, color_cache, saved) =
-        crate::color::ensure_color_cache(&wallpapers, &config.colors_file);
-    let colors_dirty = saved.is_err();
+    let (mut color_cache, saved) = if refreshed {
+        let (_, cache, saved) = crate::color::ensure_color_cache(&wallpapers, &config.colors_file);
+        (cache, saved)
+    } else {
+        // Startup only reads cached results. Missing colors are computed by the
+        // bounded preview loader, after the window is usable.
+        (crate::color::load_color_cache(&config.colors_file), Ok(()))
+    };
+    let old_color_count = color_cache.len();
+    if !refreshed {
+        let wanted: HashSet<_> = wallpapers
+            .iter()
+            .filter_map(|item| item.thumb_path.file_name())
+            .collect();
+        color_cache.retain(|key, _| wanted.contains(std::ffi::OsStr::new(key)));
+    }
+    let colors_dirty = saved.is_err() || old_color_count != color_cache.len();
     let color_error = saved
         .err()
         .map(|error| format!("Could not save wallpaper colors: {error}"));
     for item in &mut wallpapers {
-        if let Some(&bucket) = colors.get(&item.relative) {
+        if let Some(&bucket) = item
+            .thumb_path
+            .file_name()
+            .and_then(|name| color_cache.get(name.to_string_lossy().as_ref()))
+        {
             item.color_bucket = Some(bucket);
         }
     }
-    let ready = if refreshed {
-        // Reload visible image bytes after a refresh, even if the path is unchanged.
-        HashSet::new()
-    } else {
-        wallpapers
-            .iter()
-            .filter(|item| crate::cache::is_thumb_valid(&item.path, &item.thumb_path))
-            .map(|item| item.thumb_path.clone())
-            .collect()
-    };
     LibrarySnapshot {
         wallpapers,
         favorites,
@@ -170,7 +183,7 @@ fn load_library(config: Config, refreshed: bool) -> LibrarySnapshot {
         generated,
         failed,
         refreshed,
-        ready,
+        ready: HashSet::new(),
         color_cache,
         colors_dirty,
         error: None,
@@ -328,7 +341,15 @@ impl WallpaperSelectorApp {
         if let Some(sel) = self.selected_index {
             let count = self.filtered_indices.len();
             if count > 0 {
-                indices.extend(sel.saturating_sub(6)..=(sel + 6).min(count - 1));
+                indices.push(sel);
+                for distance in 1..=6 {
+                    if sel + distance < count {
+                        indices.push(sel + distance);
+                    }
+                    if let Some(index) = sel.checked_sub(distance) {
+                        indices.push(index);
+                    }
+                }
             }
         }
         if self.view_layout == ViewLayout::Grid {
@@ -353,7 +374,11 @@ impl WallpaperSelectorApp {
                 && !self.failed_thumbs.contains(&item.thumb_path)
                 && seen.insert(item.thumb_path.clone())
             {
-                missing.push((item.path.clone(), item.thumb_path.clone()));
+                missing.push((
+                    item.path.clone(),
+                    item.thumb_path.clone(),
+                    item.color_bucket,
+                ));
                 if missing.len() == 8 {
                     break;
                 }
@@ -368,7 +393,11 @@ impl WallpaperSelectorApp {
                     && !self.failed_thumbs.contains(&item.thumb_path)
                     && seen.insert(item.thumb_path.clone())
                 {
-                    missing.push((item.path.clone(), item.thumb_path.clone()));
+                    missing.push((
+                        item.path.clone(),
+                        item.thumb_path.clone(),
+                        item.color_bucket,
+                    ));
                 }
             }
         }
@@ -390,12 +419,12 @@ impl WallpaperSelectorApp {
             async move {
                 let results: Vec<_> = missing
                     .into_iter()
-                    .map(|(source, thumb)| {
+                    .map(|(source, thumb, cached_color)| {
                         let mut status = crate::cache::generate_thumb(&source, &thumb);
                         let color = if status == crate::cache::ThumbStatus::Failed {
                             None
                         } else {
-                            crate::color::extract_color_from_file(&thumb)
+                            cached_color.or_else(|| crate::color::extract_color_from_file(&thumb))
                         };
                         if status != crate::cache::ThumbStatus::Failed && color.is_none() {
                             let _ = std::fs::remove_file(&thumb);
@@ -554,6 +583,7 @@ impl WallpaperSelectorApp {
         let prefetch = matches!(
             &message,
             Message::LibraryLoaded(..)
+                | Message::ActiveWallpaperLoaded(..)
                 | Message::ThumbnailsReady(..)
                 | Message::SelectWallpaper(..)
                 | Message::NextWallpaper
@@ -569,8 +599,11 @@ impl WallpaperSelectorApp {
                 | Message::ToggleViewLayout
                 | Message::ToggleFavorite(..)
         );
+        let previous_selection = self.selected_index;
         let task = self.update_inner(message);
-        if prefetch {
+        // Keyboard shortcuts can select directly instead of emitting a
+        // navigation message. Every selection change needs its previews.
+        if prefetch || self.selected_index != previous_selection {
             let scroll_target = if reset_scroll && self.view_layout == ViewLayout::Grid {
                 let row = self.selected_index.unwrap_or(0) / self.grid_columns();
                 let target = (row as f32 * 154.0 + 77.0 - self.grid_viewport_height * 0.5).max(0.0);
@@ -605,6 +638,7 @@ impl WallpaperSelectorApp {
             &message,
             Message::RefreshList
                 | Message::LibraryLoaded(..)
+                | Message::ActiveWallpaperLoaded(..)
                 | Message::ThumbnailsReady(..)
                 | Message::AnimationFrame(..)
                 | Message::WindowResized(..)
@@ -914,6 +948,77 @@ impl WallpaperSelectorApp {
                     } else {
                         format!("{} wallpapers loaded", self.all_wallpapers.len())
                     });
+                }
+                if snapshot.refreshed {
+                    Task::none()
+                } else {
+                    let generation = self.library_generation;
+                    let expected = self.active_wallpaper.clone();
+                    let theme_dir = self.config.theme_dir.clone();
+                    Task::perform(
+                        async move {
+                            // Batched Iced tasks share a stream poll. Waiting for
+                            // the subprocess here would also stall preview work.
+                            let (sender, receiver) = iced::futures::channel::oneshot::channel();
+                            let started = std::thread::Builder::new()
+                                .name("wallpaper-active".into())
+                                .spawn(move || {
+                                    let active =
+                                        crate::favorites::read_active_wallpaper(&theme_dir);
+                                    let _ = sender.send(active);
+                                });
+                            let active = if started.is_ok() {
+                                receiver.await.unwrap_or_else(|_| expected.clone())
+                            } else {
+                                expected.clone()
+                            };
+                            (generation, expected, active)
+                        },
+                        |(generation, expected, active)| {
+                            Message::ActiveWallpaperLoaded(generation, expected, active)
+                        },
+                    )
+                }
+            }
+            Message::ActiveWallpaperLoaded(generation, expected, active) => {
+                if generation != self.library_generation
+                    || self.active_wallpaper != expected
+                    || active == expected
+                    || self.applying
+                {
+                    return Task::none();
+                }
+                let follow_active = self
+                    .selected_index
+                    .and_then(|index| self.filtered_indices.get(index))
+                    .is_some_and(|&index| self.all_wallpapers[index].is_active)
+                    || (expected.is_none() && self.selected_index == Some(0));
+                let canonical = active.as_deref().and_then(|path| {
+                    let path = std::path::Path::new(path);
+                    path.is_absolute()
+                        .then(|| path.canonicalize().ok())
+                        .flatten()
+                });
+                for item in &mut self.all_wallpapers {
+                    item.is_active = active.as_deref().is_some_and(|id| {
+                        id == item.relative
+                            || std::path::Path::new(id) == item.path
+                            || canonical.as_ref().is_some_and(|path| {
+                                item.path
+                                    .canonicalize()
+                                    .is_ok_and(|resolved| &resolved == path)
+                            })
+                    });
+                }
+                self.active_wallpaper = active;
+                if follow_active {
+                    if let Some(index) = self
+                        .filtered_indices
+                        .iter()
+                        .position(|&index| self.all_wallpapers[index].is_active)
+                    {
+                        return self.select_wallpaper(index);
+                    }
                 }
                 Task::none()
             }

@@ -629,6 +629,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # Unwind runner and TemporaryDirectory cleanup on service/updater cancellation.
+    signal.signal(signal.SIGTERM, lambda signum, _frame: sys.exit(128 + signum))
     try:
         sys.exit(main())
     except Exception as error:
