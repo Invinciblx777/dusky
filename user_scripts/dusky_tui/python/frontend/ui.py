@@ -22,7 +22,7 @@ from textual import on, events, work
 from textual.message import Message
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, Horizontal
+from textual.containers import Vertical, Horizontal, VerticalScroll
 from textual.css.query import NoMatches
 from textual.geometry import Size
 from textual.widgets import Label, Input, Tabs, Tab, ContentSwitcher, OptionList, Markdown, Static
@@ -1974,8 +1974,10 @@ NoticeBox.-danger { border-left: solid $error; background: $error 10%; }
 NoticeBox.-success { border-left: solid $success; background: $success 10%; }
 
 .list-wrapper { height: 1fr; }
-.custom-view-with-options { height: 2fr; min-height: 6; }
-.custom-options { height: 1fr; min-height: 5; }
+.custom-view-scroll { height: 1fr; overflow-x: hidden; overflow-y: auto; scrollbar-size: 1 1; }
+.custom-rich-content { height: auto; overflow: hidden hidden; }
+.custom-view-with-options { height: 2fr; min-height: 3; }
+.custom-options { height: 1fr; min-height: 3; }
 
 ConfigOptionList {
     min-width: 20; width: 1fr; height: 1fr; scrollbar-size: 0 0;
@@ -2485,13 +2487,19 @@ Tooltip {
                                 elif isinstance(custom_view, Widget):
                                     yield custom_view
                                 else:
-                                    yield CustomRichTabWidget(
+                                    rich_widget = CustomRichTabWidget(
                                         renderable_or_factory=custom_view,
                                         app_ref=self,
                                         refresh_interval=refresh_interval,
-                                        classes="custom-view-with-options" if show_options else None,
+                                        classes="custom-rich-content",
                                         id=f"custom-view-{i}"
                                     )
+                                    rich_widget.can_focus = False
+                                    with VerticalScroll(
+                                        classes="custom-view-scroll custom-view-with-options" if show_options else "custom-view-scroll",
+                                        id=f"custom-scroll-{i}"
+                                    ):
+                                        yield rich_widget
                                 if show_options:
                                     with Horizontal(classes="list-wrapper custom-options"):
                                         yield ConfigOptionList(id=f"list-{i}")

@@ -8,7 +8,11 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from python.frontend.core_types import ConfigItem
-from python.frontend.ui import ConfigOptionList, ConfirmDialog, DuskyTUI
+from python.frontend.ui import ConfigOptionList, ConfirmDialog, CustomRichTabWidget, DuskyTUI
+from rich.console import Group
+from rich.panel import Panel
+from rich.table import Table
+from textual.containers import VerticalScroll
 from textual.widgets import Markdown, Tabs
 from textual.events import MouseScrollDown
 
@@ -21,6 +25,54 @@ class FakeEngine:
 
 
 class NetworkUiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dashboard_overflow_scrolls_without_moving_actions(self):
+        def dashboard():
+            grid = Table.grid(expand=True)
+            grid.add_column(ratio=1)
+            grid.add_column(ratio=1)
+            grid.add_row(
+                Panel("Connection\nSSID\nIP\nGateway\nInterface\nLink"),
+                Group(Panel("Down\nUp\nRX\nTX"), Panel("Router\nInternet\nLoss\nDNS\nWrapped DNS")),
+            )
+            return grid
+
+        key = ("fixture", "")
+        app = DuskyTUI(
+            engine_pool={key: FakeEngine()}, default_engine_key=key,
+            schema={0: [ConfigItem(label=f"Action {i}", key=f"action{i}", type_="bool", default=False)
+                        for i in range(8)]}, tabs=["Status"], enable_user_presets=False,
+            custom_views={0: {"view": dashboard, "show_options": True}},
+        )
+        async with app.run_test(size=(90, 24)) as pilot:
+            await pilot.pause()
+            viewport = app.query_one("#custom-scroll-0", VerticalScroll)
+            content = app.query_one(CustomRichTabWidget)
+            options = app.query_one(ConfigOptionList)
+            self.assertGreater(content.size.height, viewport.content_size.height)
+            self.assertGreater(viewport.max_scroll_y, 0)
+            action_region = options.region
+            content.post_message(MouseScrollDown(content, 2, 2, 0, 1, 0, False, False, False))
+            await pilot.pause(0.4)
+            self.assertGreater(viewport.scroll_y, 0)
+            self.assertEqual(options.region, action_region)
+            scroll = viewport.scroll_y
+            content.update_content()
+            await pilot.pause()
+            self.assertEqual(viewport.scroll_y, scroll)
+            await pilot.click("#custom-scroll-0", offset=(2, 2))
+            self.assertIs(app.focused, viewport)
+            await pilot.press("end")
+            await pilot.pause(0.4)
+            self.assertEqual(viewport.scroll_y, viewport.max_scroll_y)
+            await pilot.press("home")
+            await pilot.pause(0.4)
+            self.assertEqual(viewport.scroll_y, 0)
+            await pilot.resize_terminal(48, 16)
+            await pilot.pause()
+            self.assertGreater(viewport.max_scroll_y, 0)
+            self.assertGreater(options.size.height, 0)
+            self.assertLessEqual(options.region.bottom, app.query_one("#bottom-dock").region.y)
+
     async def test_refresh_keeps_mouse_scrolling_and_logical_selection(self):
         key = ("fixture", "")
         items = [
