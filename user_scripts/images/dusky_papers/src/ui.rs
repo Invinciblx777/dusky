@@ -58,7 +58,7 @@ pub enum Message {
             PathBuf,
             crate::cache::ThumbStatus,
             Option<u8>,
-            Option<Vec<u8>>,
+            Option<image::Handle>,
         )>,
     ),
     AnimationFrame(std::time::Instant),
@@ -363,6 +363,18 @@ impl DuskyPapersApp {
             let last = ((first_row + visible_rows) * columns).min(self.filtered_indices.len());
             indices.extend(first..last);
         }
+        // Keep decoded previews only for the viewport and its nearby items.
+        // Revisiting distant items reuses their existing disk previews.
+        let wanted: HashSet<_> = indices
+            .iter()
+            .filter_map(|&index| {
+                self.filtered_indices
+                    .get(index)
+                    .map(|&item| self.all_wallpapers[item].thumb_path.clone())
+            })
+            .collect();
+        self.thumb_handles.retain(|path, _| wanted.contains(path));
+        self.ready_thumbs.retain(|path| wanted.contains(path));
         let mut seen = HashSet::new();
         let mut missing = Vec::new();
         for index in indices {
@@ -433,10 +445,20 @@ impl DuskyPapersApp {
                             let _ = std::fs::remove_file(&thumb);
                             status = crate::cache::ThumbStatus::Failed;
                         }
-                        let bytes = (status != crate::cache::ThumbStatus::Failed)
-                            .then(|| std::fs::read(&thumb).ok())
-                            .flatten();
-                        (thumb, status, color, bytes)
+                        // Iced uploads these small RGBA previews synchronously;
+                        // decode on this worker to avoid relying on a later redraw.
+                        let handle = (status != crate::cache::ThumbStatus::Failed)
+                            .then(|| ::image::open(&thumb).ok())
+                            .flatten()
+                            .map(|decoded| {
+                                let rgba = decoded.into_rgba8();
+                                image::Handle::from_rgba(
+                                    rgba.width(),
+                                    rgba.height(),
+                                    rgba.into_raw(),
+                                )
+                            });
+                        (thumb, status, color, handle)
                     })
                     .collect();
                 (generation, results)
@@ -1029,15 +1051,16 @@ impl DuskyPapersApp {
                 }
                 self.prefetch_running = false;
                 let mut filter_changed = false;
-                for (path, status, color, bytes) in results {
+                for (path, status, color, handle) in results {
                     if status == crate::cache::ThumbStatus::Failed {
                         self.failed_thumbs.insert(path);
                         continue;
                     }
-                    self.ready_thumbs.insert(path.clone());
-                    if let Some(bytes) = bytes {
-                        self.thumb_handles
-                            .insert(path.clone(), image::Handle::from_bytes(bytes));
+                    if let Some(handle) = handle {
+                        self.ready_thumbs.insert(path.clone());
+                        self.thumb_handles.insert(path.clone(), handle);
+                    } else {
+                        self.failed_thumbs.insert(path.clone());
                     }
                     if let Some(bucket) = color {
                         if let Some(name) = path.file_name() {

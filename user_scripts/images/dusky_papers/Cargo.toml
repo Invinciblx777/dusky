@@ -6,19 +6,21 @@ authors = ["Dusk Linux"]
 description = "Dusky Papers: fast, lightweight wallpapers for Arch Linux / Hyprland"
 
 [dependencies]
-iced_core = "0.14"
-iced_futures = { version = "0.14", features = ["thread-pool"] }
-iced_runtime = "0.14"
-iced_renderer = { version = "0.14", features = ["wgpu"] }
-iced_widget = { version = "0.14", features = ["advanced", "image", "wgpu"] }
+iced_core = "0.14.0"
+iced_futures = { version = "0.14.0", features = ["thread-pool"] }
+iced_runtime = "0.14.0"
+iced_renderer = { version = "0.14.0", features = ["wgpu-bare"] }
+iced_widget = { version = "0.14.2", features = ["advanced", "image", "wgpu"] }
+# Enable Linux graphics backends explicitly; retain Vulkan and the Wayland GL override.
+wgpu = { version = "27.0.1", default-features = false, features = ["std", "wgsl", "vulkan", "gles", "parking_lot"] }
 iced_exwlshell = { version = "0.20.1", default-features = false }
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
-rayon = "1.10"
-fastrand = "2.5"
-sha2 = "0.10"
-walkdir = "2.5"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+rayon = "1.12.0"
+fastrand = "2.5.0"
+sha2 = "0.11.0"
+walkdir = "2.5.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 
 [profile.release]
 opt-level = 3
