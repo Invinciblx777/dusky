@@ -1,15 +1,18 @@
-use iced::alignment::{Horizontal, Vertical};
-use iced::keyboard::Key;
-use iced::keyboard::key::Named;
-use iced::widget::scrollable::AbsoluteOffset;
-use iced::widget::{
+use iced_core::alignment::{Horizontal, Vertical};
+use iced_core::keyboard::Key;
+use iced_core::keyboard::key::Named;
+use iced_core::{Background, Border, Color, ContentFit, Event, Length, Padding, Shadow, Vector};
+use iced_futures::Subscription;
+use iced_runtime::Task;
+use iced_widget::scrollable::AbsoluteOffset;
+use iced_widget::{
     Float, Space, Stack, button, column, container, image, mouse_area, row, scrollable, text,
     text_input, tooltip,
 };
-use iced::{
-    Background, Border, Color, ContentFit, Element, Event, Length, Padding, Shadow, Subscription,
-    Task, Vector,
-};
+
+type Element<'a, Message> =
+    iced_core::Element<'a, Message, iced_core::Theme, iced_renderer::Renderer>;
+
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -36,8 +39,8 @@ pub enum Message {
     CycleMotionProfile,
     ToggleViewLayout,
     GridScroll(f32, f32),
-    WindowOpened(iced::window::Id),
-    WindowResized(iced::Size),
+    WindowOpened(iced_core::window::Id),
+    WindowResized(iced_core::Size),
     SelectWallpaper(usize),
     ApplyWallpaper(usize, bool),
     WallpaperApplied(Result<String, String>),
@@ -58,7 +61,7 @@ pub enum Message {
             Option<Vec<u8>>,
         )>,
     ),
-    AnimationFrame(iced::time::Instant),
+    AnimationFrame(std::time::Instant),
     EventOccurred(Event),
     Close,
 }
@@ -69,7 +72,7 @@ const CARD_HEIGHT: f32 = 337.5;
 const CARD_GAP: f32 = 10.0;
 
 fn unfocus_search() -> Task<Message> {
-    iced::advanced::widget::operate(iced::advanced::widget::operation::focusable::unfocus())
+    iced_runtime::task::widget(iced_core::widget::operation::focusable::unfocus())
 }
 
 #[derive(Debug, Clone)]
@@ -194,12 +197,12 @@ fn load_library(config: Config, refreshed: bool) -> LibrarySnapshot {
 struct CarouselAnimation {
     target: f32,
     velocity: f32,
-    last_tick: iced::time::Instant,
+    last_tick: std::time::Instant,
     profile: MotionProfile,
 }
 
 impl CarouselAnimation {
-    fn tick(&mut self, position: &mut f32, now: iced::time::Instant) -> bool {
+    fn tick(&mut self, position: &mut f32, now: std::time::Instant) -> bool {
         let mut remaining = now
             .saturating_duration_since(self.last_tick)
             .as_secs_f32()
@@ -238,7 +241,7 @@ pub struct DuskyPapersApp {
     active_wallpaper: Option<String>,
     search_query: String,
     search_focused: bool,
-    last_g_press: Option<iced::time::Instant>,
+    last_g_press: Option<std::time::Instant>,
     show_only_favorites: bool,
     selected_color: Option<u8>,
     sort_mode: crate::config::SortMode,
@@ -264,7 +267,7 @@ pub struct DuskyPapersApp {
     color_prefetch_cursor: usize,
     prefetch_running: bool,
     library_generation: u64,
-    launch_instant: iced::time::Instant,
+    launch_instant: std::time::Instant,
 }
 
 impl DuskyPapersApp {
@@ -321,7 +324,7 @@ impl DuskyPapersApp {
             color_prefetch_cursor: 0,
             prefetch_running: false,
             library_generation: 0,
-            launch_instant: iced::time::Instant::now(),
+            launch_instant: std::time::Instant::now(),
         };
 
         (
@@ -532,7 +535,7 @@ impl DuskyPapersApp {
                 self.animation = Some(CarouselAnimation {
                     target: next as f32,
                     velocity: 0.0,
-                    last_tick: iced::time::Instant::now(),
+                    last_tick: std::time::Instant::now(),
                     profile: self.motion_profile,
                 });
             }
@@ -547,8 +550,8 @@ impl DuskyPapersApp {
             let row_bottom = row_top + 154.0;
             let visible_height = self.grid_viewport_height;
             if row_top < self.grid_scroll_offset {
-                return iced::widget::operation::scroll_to(
-                    iced::widget::Id::new("grid_scroll"),
+                return iced_runtime::widget::operation::scroll_to(
+                    iced_core::widget::Id::new("grid_scroll"),
                     AbsoluteOffset {
                         x: None,
                         y: Some(row_top),
@@ -556,8 +559,8 @@ impl DuskyPapersApp {
                 );
             } else if row_bottom > self.grid_scroll_offset + visible_height {
                 let target = (row_bottom - visible_height).max(0.0);
-                return iced::widget::operation::scroll_to(
-                    iced::widget::Id::new("grid_scroll"),
+                return iced_runtime::widget::operation::scroll_to(
+                    iced_core::widget::Id::new("grid_scroll"),
                     AbsoluteOffset {
                         x: None,
                         y: Some(target),
@@ -617,8 +620,8 @@ impl DuskyPapersApp {
                 Task::batch([
                     task,
                     prefetch_task,
-                    iced::widget::operation::scroll_to(
-                        iced::widget::Id::new("grid_scroll"),
+                    iced_runtime::widget::operation::scroll_to(
+                        iced_core::widget::Id::new("grid_scroll"),
                         AbsoluteOffset {
                             x: None,
                             y: Some(target),
@@ -656,7 +659,7 @@ impl DuskyPapersApp {
             }
             Message::FocusSearch => {
                 self.search_focused = true;
-                iced::widget::operation::focus(iced::widget::Id::new("search_input"))
+                iced_runtime::widget::operation::focus(iced_core::widget::Id::new("search_input"))
             }
             Message::SearchSubmitted => {
                 self.search_focused = false;
@@ -683,10 +686,10 @@ impl DuskyPapersApp {
                 self.search_focused = focused;
                 Task::none()
             }
-            Message::CheckSearchFocus => {
-                iced::widget::operation::is_focused(iced::widget::Id::new("search_input"))
-                    .map(Message::SearchFocusChanged)
-            }
+            Message::CheckSearchFocus => iced_runtime::widget::operation::is_focused(
+                iced_core::widget::Id::new("search_input"),
+            )
+            .map(Message::SearchFocusChanged),
             Message::YankPath(filename_only) => {
                 if let Some(sel) = self.selected_index {
                     if let Some(&item_idx) = self.filtered_indices.get(sel) {
@@ -956,7 +959,8 @@ impl DuskyPapersApp {
                         async move {
                             // Batched Iced tasks share a stream poll. Waiting for
                             // the subprocess here would also stall preview work.
-                            let (sender, receiver) = iced::futures::channel::oneshot::channel();
+                            let (sender, receiver) =
+                                iced_futures::futures::channel::oneshot::channel();
                             let started = std::thread::Builder::new()
                                 .name("wallpaper-active".into())
                                 .spawn(move || {
@@ -1127,8 +1131,8 @@ impl DuskyPapersApp {
                     if let Some(sel) = self.selected_index {
                         let row = sel / self.grid_columns();
                         let target = (row as f32 * 154.0 - 154.0).max(0.0);
-                        return iced::widget::operation::scroll_to(
-                            iced::widget::Id::new("grid_scroll"),
+                        return iced_runtime::widget::operation::scroll_to(
+                            iced_core::widget::Id::new("grid_scroll"),
                             AbsoluteOffset {
                                 x: None,
                                 y: Some(target),
@@ -1143,7 +1147,7 @@ impl DuskyPapersApp {
                 self.grid_viewport_height = height;
                 Task::none()
             }
-            Message::WindowOpened(id) => iced::window::size(id).map(Message::WindowResized),
+            Message::WindowOpened(id) => iced_runtime::window::size(id).map(Message::WindowResized),
             Message::WindowResized(size) => {
                 self.window_width = size.width;
                 if self.view_layout == ViewLayout::Grid {
@@ -1151,8 +1155,8 @@ impl DuskyPapersApp {
                     let target =
                         (row as f32 * 154.0 + 77.0 - self.grid_viewport_height * 0.5).max(0.0);
                     self.grid_scroll_offset = target;
-                    iced::widget::operation::scroll_to(
-                        iced::widget::Id::new("grid_scroll"),
+                    iced_runtime::widget::operation::scroll_to(
+                        iced_core::widget::Id::new("grid_scroll"),
                         AbsoluteOffset {
                             x: None,
                             y: Some(target),
@@ -1170,21 +1174,23 @@ impl DuskyPapersApp {
                 }
                 Task::none()
             }
-            Message::Close => iced::exit(),
-            Message::EventOccurred(Event::Mouse(iced::mouse::Event::WheelScrolled { delta })) => {
+            Message::Close => iced_runtime::exit(),
+            Message::EventOccurred(Event::Mouse(iced_core::mouse::Event::WheelScrolled {
+                delta,
+            })) => {
                 if self.view_layout == ViewLayout::Grid {
                     // Let scrollable handle wheel scrolling natively
                     Task::none()
                 } else {
                     match delta {
-                        iced::mouse::ScrollDelta::Lines { x, y } => {
+                        iced_core::mouse::ScrollDelta::Lines { x, y } => {
                             if y < 0.0 || x > 0.0 {
                                 return self.update(Message::NextWallpaper);
                             } else if y > 0.0 || x < 0.0 {
                                 return self.update(Message::PrevWallpaper);
                             }
                         }
-                        iced::mouse::ScrollDelta::Pixels { x, y } => {
+                        iced_core::mouse::ScrollDelta::Pixels { x, y } => {
                             let movement = if x.abs() > y.abs() { x } else { -y };
                             self.wheel_pixels += movement;
                             let steps = (self.wheel_pixels / 80.0).trunc() as isize;
@@ -1197,7 +1203,7 @@ impl DuskyPapersApp {
                     Task::none()
                 }
             }
-            Message::EventOccurred(Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            Message::EventOccurred(Event::Keyboard(iced_core::keyboard::Event::KeyPressed {
                 key,
                 modified_key,
                 modifiers,
@@ -1263,7 +1269,7 @@ impl DuskyPapersApp {
                             return self.update(Message::JumpWallpapers(-25));
                         }
                         Key::Character(ref c) if c == "c" || c == "C" => {
-                            return iced::exit();
+                            return iced_runtime::exit();
                         }
                         _ => return Task::none(),
                     }
@@ -1277,7 +1283,7 @@ impl DuskyPapersApp {
                             self.refilter();
                             Task::none()
                         } else {
-                            iced::exit()
+                            iced_runtime::exit()
                         }
                     }
                     Key::Named(Named::Enter) => {
@@ -1380,7 +1386,7 @@ impl DuskyPapersApp {
                                     return self.select_wallpaper(0);
                                 }
                             }
-                            self.last_g_press = Some(iced::time::Instant::now());
+                            self.last_g_press = Some(std::time::Instant::now());
                             Task::none()
                         }
                         "G" => {
@@ -1492,7 +1498,7 @@ impl DuskyPapersApp {
                         }
                         "q" | "Q" => {
                             self.last_g_press = None;
-                            iced::exit()
+                            iced_runtime::exit()
                         }
                         _ => {
                             self.last_g_press = None;
@@ -1609,7 +1615,7 @@ impl DuskyPapersApp {
 
         // Search capsule
         let search_input = text_input("Dusky Papers  /", &self.search_query)
-            .id(iced::widget::Id::new("search_input"))
+            .id(iced_core::widget::Id::new("search_input"))
             .on_input(Message::SearchChanged)
             .on_submit(Message::SearchSubmitted)
             .padding([6, 10])
@@ -1883,7 +1889,7 @@ impl DuskyPapersApp {
             swatches_row = swatches_row.push(tooltip(
                 btn,
                 crate::color::swatch_name(bucket),
-                iced::widget::tooltip::Position::Bottom,
+                iced_widget::tooltip::Position::Bottom,
             ));
         }
 
@@ -2248,7 +2254,7 @@ impl DuskyPapersApp {
                             } else {
                                 Color::TRANSPARENT
                             },
-                            offset: iced::Vector::ZERO,
+                            offset: iced_core::Vector::ZERO,
                             blur_radius: 12.0 * entrance,
                         },
                         ..container::Style::default()
@@ -2301,7 +2307,7 @@ impl DuskyPapersApp {
             .align_x(Horizontal::Center);
 
         scrollable(centered_grid)
-            .id(iced::widget::Id::new("grid_scroll"))
+            .id(iced_core::widget::Id::new("grid_scroll"))
             .on_scroll(|vp| Message::GridScroll(vp.absolute_offset().y, vp.bounds().height))
             .width(Length::Fill)
             .height(Length::Fill)
@@ -2510,7 +2516,7 @@ impl DuskyPapersApp {
                         a: 0.30 * emphasis * edge_fade,
                         ..accent
                     },
-                    offset: iced::Vector::ZERO,
+                    offset: iced_core::Vector::ZERO,
                     blur_radius: 16.0 * edge_fade,
                 },
                 ..container::Style::default()
@@ -2543,7 +2549,7 @@ impl DuskyPapersApp {
                         shadow: if is_hovered {
                             Shadow {
                                 color: Color { a: 0.35, ..accent },
-                                offset: iced::Vector::ZERO,
+                                offset: iced_core::Vector::ZERO,
                                 blur_radius: 12.0,
                             }
                         } else {
@@ -2571,44 +2577,47 @@ impl DuskyPapersApp {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        let events = iced::event::listen_with(|event, status, _| match (status, &event) {
+        let events = iced_futures::event::listen_with(|event, status, _| match (status, &event) {
             (
-                iced::event::Status::Captured,
-                Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                iced_core::event::Status::Captured,
+                Event::Keyboard(iced_core::keyboard::Event::KeyPressed {
                     key: Key::Named(Named::Escape),
                     ..
                 }),
             ) => Some(Message::SearchEscape),
-            (_, Event::Mouse(iced::mouse::Event::ButtonPressed(_))) => {
+            (_, Event::Mouse(iced_core::mouse::Event::ButtonPressed(_))) => {
                 Some(Message::CheckSearchFocus)
             }
             (
                 _,
-                Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                Event::Keyboard(iced_core::keyboard::Event::KeyPressed {
                     key: Key::Named(Named::Tab),
                     ..
                 }),
             ) => Some(Message::SearchTab),
             (
-                iced::event::Status::Captured,
-                Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                iced_core::event::Status::Captured,
+                Event::Keyboard(iced_core::keyboard::Event::KeyPressed {
                     key: Key::Named(Named::ArrowUp | Named::ArrowDown),
                     ..
                 }),
             ) => Some(Message::EventOccurred(event)),
-            (iced::event::Status::Ignored, _) => Some(Message::EventOccurred(event)),
+            (iced_core::event::Status::Ignored, _) => Some(Message::EventOccurred(event)),
             _ => None,
         });
         let events = Subscription::batch([
             events,
-            iced::window::open_events().map(Message::WindowOpened),
-            iced::window::resize_events().map(|(_, size)| Message::WindowResized(size)),
+            iced_runtime::window::open_events().map(Message::WindowOpened),
+            iced_runtime::window::resize_events().map(|(_, size)| Message::WindowResized(size)),
         ]);
         let animating = self.animation.is_some()
             || (self.motion_profile.is_enabled()
                 && self.launch_instant.elapsed().as_secs_f32() < 0.08);
         if animating {
-            Subscription::batch([events, iced::window::frames().map(Message::AnimationFrame)])
+            Subscription::batch([
+                events,
+                iced_runtime::window::frames().map(Message::AnimationFrame),
+            ])
         } else {
             events
         }

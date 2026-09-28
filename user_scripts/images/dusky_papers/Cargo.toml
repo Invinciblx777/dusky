@@ -6,7 +6,12 @@ authors = ["Dusk Linux"]
 description = "Dusky Papers: fast, lightweight wallpapers for Arch Linux / Hyprland"
 
 [dependencies]
-iced = { version = "0.14", default-features = false, features = ["advanced", "image-without-codecs", "wayland", "wgpu", "thread-pool"] }
+iced_core = "0.14"
+iced_futures = { version = "0.14", features = ["thread-pool"] }
+iced_runtime = "0.14"
+iced_renderer = { version = "0.14", features = ["wgpu"] }
+iced_widget = { version = "0.14", features = ["advanced", "image", "wgpu"] }
+iced_exwlshell = { version = "0.20.1", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 rayon = "1.10"
 fastrand = "2.5"
@@ -21,3 +26,8 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# The layer-shell crate enables window_clipboard defaults, including X11.
+# Keep its existing API with only the Wayland implementation.
+[patch.crates-io]
+window_clipboard = { path = "src/wayland_clipboard" }

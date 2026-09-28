@@ -1519,19 +1519,12 @@ hl.window_rule({
 })
 
 --- Dusky Papers ---
-hl.window_rule({
+hl.layer_rule({
     name = "dusky_papers",
-    match = {
-        class = "^(dusky-papers)$",
-    },
-    float = true,
-    fullscreen = true,
-    border_size = 0,
-    rounding = 0,
-    pin = true,
-    no_dim = true,
-    workspace = "unset",
-    focus_on_activate = true
+    match = { namespace = "dusky-papers" },
+    blur = true,
+    xray = false, -- Blur the windows underneath, rather than only the wallpaper.
+    ignore_alpha = 0.0
 })
 
 
