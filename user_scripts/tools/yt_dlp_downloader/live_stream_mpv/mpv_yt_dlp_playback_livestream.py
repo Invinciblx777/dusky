@@ -6,16 +6,12 @@ the growing file from tmpfs, giving you rewind + 2x on live streams.
 Video data never touches disk: startup aborts unless the record dir is tmpfs.
 
 Examples:
-  %(prog)s URL                                  # pick format + buffer, DVR play
+  %(prog)s URL                                  # live mode: full timeline + tmpfs record
   %(prog)s URL -F                                # list formats/codecs only
   %(prog)s URL -f 1 --speed 2                    # 2nd listed rendition at 2x
-  %(prog)s URL -f live-2750 --fullscreen         # 720p fullscreen DVR
-  %(prog)s URL --prefer-codec av1                # best av1/vp9/hevc/avc match
-  %(prog)s URL -f "bv*[vcodec^=av01]+ba/b"       # raw yt-dlp selector passthrough
-  %(prog)s URL --buffer full                     # large RAM window, easy scrub
+  %(prog)s URL --mode file --buffer full         # growing-file DVR (no server window)
+  %(prog)s URL --mode plain                      # play URL, no recording
   %(prog)s URL --cookies ~/cookies.txt            # login-walled / sensitive posts
-  %(prog)s URL --direct -f best                  # no DVR, plain mpv + yt-dlp
-  %(prog)s URL --record-only --keep               # timeshift buffer in tmpfs
   %(prog)s --set-global buffer=near speed=2       # persist global defaults
   %(prog)s --history                              # list past streams
   %(prog)s --replay 0                             # replay #0 with stored settings
@@ -41,10 +37,12 @@ import json
 import os
 import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 PROG = os.path.basename(sys.argv[0]) or "mpv_yt_dlp_playback_livestream.py"
@@ -98,6 +96,7 @@ GLOBAL_SPEC: dict[str, tuple[str, object]] = {
     "low_latency": ("bool", False),
     "keep": ("bool", False),
     "show_recorder": ("bool", False),
+    "mode": ("str", "live"),
 }
 
 
@@ -223,8 +222,17 @@ def save_history(entries: list[dict]) -> None:
 
 ENTRY_FIELDS = ("url", "title", "uploader", "live_status", "format", "buffer",
                 "speed", "prefer_codec", "fullscreen", "mute", "low_latency",
-                "cookies_used", "cookies", "cookies_from_browser",
+                "cookies_used", "cookies", "cookies_from_browser", "mode", "start",
                 "last_played", "plays")
+
+
+def parse_start(value: str) -> str:
+    """Validate an mpv --start value: seconds, MM:SS, HH:MM:SS, negatives from edge."""
+    import re
+    if re.fullmatch(r"-?(\d+:){0,2}\d+(\.\d+)?", value.strip()):
+        return value.strip()
+    raise SystemExit(f"ERROR: bad --start {value!r}. Use seconds (90), MM:SS (1:30), "
+                     f"HH:MM:SS, or negative from live edge (-1800).")
 
 
 def find_entry(spec: str) -> dict:
@@ -656,6 +664,66 @@ def join_threshold(fmts: list[dict], choice: str) -> int:
     return max(START_BYTES, min(int(tbr * 125 * 1.5), 2 * 1024 * 1024))
 
 
+# ---------- live time-travel (in-player seeks are clamped by ffmpeg HLS) ----------
+# Proven: relative/absolute/percent seeks are acked but don't move (deltas ==
+# elapsed playback). Only (re)opening at a position works. So travel keys quit
+# mpv with a code and the wrapper relaunches at base+delta (absolute --start,
+# verified exact to keyframe). Builtin defaults + your input.conf stay intact;
+# this fragment only adds four keys.
+
+TRAVEL_CONF = (
+    "# added by mpv_yt_dlp_playback_livestream.py (live mode time travel)\n"
+    "Ctrl+Left quit 91\n"    # back 60s
+    "Ctrl+Right quit 92\n"   # forward 60s (clamped at live edge)
+    "Shift+Left quit 93\n"   # back 10min
+    "Shift+Right quit 94\n"  # forward 10min (clamped at live edge)
+)
+TRAVEL_DELTAS = {91: -60, 92: 60, 93: -600, 94: 600}
+
+
+def _ipc_cmd(sock: str, command: list, timeout: float = 5.0) -> object:
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(timeout)
+    try:
+        s.connect(sock)
+        s.sendall((json.dumps({"command": command}) + "\n").encode())
+        out = b""
+        while b"\n" not in out:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            out += chunk
+        return json.loads(out.decode()).get("data")
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+class EdgeTracker(threading.Thread):
+    """Poll mpv IPC duration; the max seen approximates the live edge."""
+
+    def __init__(self, sock: str) -> None:
+        super().__init__(daemon=True)
+        self.sock = sock
+        self.edge: float | None = None
+        self._stop = threading.Event()
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                v = _ipc_cmd(self.sock, ["get_property", "duration"], timeout=4.0)
+                if isinstance(v, (int, float)) and v > 0:
+                    self.edge = v if self.edge is None else max(self.edge, v)
+            except (OSError, ValueError, socket.timeout):
+                pass
+            self._stop.wait(10.0)
+
+    def halt(self) -> None:
+        self._stop.set()
+
+
 # ---------- CLI ----------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -690,7 +758,11 @@ def build_parser() -> argparse.ArgumentParser:
                     action=argparse.BooleanOptionalAction,
                     help="also show the live recorder window (default: headless)")
     ap.add_argument("--record-only", action="store_true", help="record to tmpfs without launching the player")
-    ap.add_argument("--direct", action="store_true", help="no DVR: plain mpv + yt-dlp (no rewind buffer)")
+    ap.add_argument("--mode", default=None,
+                    help="live = play event URL directly with full server timeline + tmpfs record (default); "
+                         "file = two-process growing-file DVR (no server window needed); "
+                         "plain = play URL, no recording")
+    ap.add_argument("--direct", action="store_true", help="deprecated alias for --mode plain")
     ap.add_argument("--fullscreen", dest="fullscreen", default=None,
                     action=argparse.BooleanOptionalAction, help="start player fullscreen")
     ap.add_argument("--mute", dest="mute", default=None,
@@ -698,8 +770,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--low-latency", dest="low_latency", default=None,
                     action=argparse.BooleanOptionalAction, help="recorder uses mpv --profile=low-latency")
     ap.add_argument("--timeout", type=float, default=None, help="seconds to wait for recording to start (default: 30)")
+    ap.add_argument("--start", default=None,
+                    help="open at position: seconds (3600), MM:SS, HH:MM:SS, or negative seconds "
+                         "from live edge (-1800). In-player clicks cannot seek on live HLS "
+                         "(ffmpeg demuxer clamps to edge) — this is the time-travel knob.")
     ap.add_argument("--player-args", default="", help='extra player args, e.g. --player-args="--volume=80"')
-    ap.add_argument("--recorder-args", default="", help="extra recorder args, same quoting")
+    ap.add_argument("--recorder-args", default="", help="extra recorder args (file mode only)")
     ap.add_argument("--print-cmds", action="store_true", help="print mpv commands without running them")
     mg = ap.add_argument_group("config + history",
                                f"stored in {os.path.join(_cfg_dir())} (0600, video stays in tmpfs)")
@@ -718,7 +794,8 @@ def build_parser() -> argparse.ArgumentParser:
 OPT_ENV = {
     "format": "MPV_DVR_FORMAT", "prefer_codec": "MPV_DVR_CODEC", "buffer": "MPV_DVR_BUFFER",
     "speed": "MPV_DVR_SPEED", "tmpdir": "MPV_DVR_TMPDIR", "cookies": "MPV_DVR_COOKIES",
-    "cookies_from_browser": "MPV_DVR_COOKIES_FROM_BROWSER",
+    "cookies_from_browser": "MPV_DVR_COOKIES_FROM_BROWSER", "mode": "MPV_DVR_MODE",
+    "start": "MPV_DVR_START",
 }
 
 
@@ -857,6 +934,15 @@ def main() -> int:
     args.keep = _eff_bool(args.keep, entry, "keep", cfg, False)
     args.show_recorder = _eff_bool(args.show_recorder, entry, "show_recorder", cfg, False)
     args.allow_disk = _eff_bool(args.allow_disk, entry, "allow_disk", cfg, False)
+    mode = str(_eff(args.mode, entry, "mode", cfg, "live")).strip().lower()
+    if args.direct:
+        print("NOTE: --direct is deprecated, use --mode plain.", file=sys.stderr)
+        if args.mode is None and not entry.get("mode"):
+            mode = "plain"
+    if mode not in ("live", "file", "plain"):
+        raise SystemExit("ERROR: --mode must be live/file/plain")
+    start = _eff(args.start, entry, "start", cfg, None)
+    start_opt = [f"--start={parse_start(str(start))}"] if start not in (None, "") else []
     if not 0.1 <= args.speed <= 100:
         raise SystemExit("ERROR: --speed must be 0.1..100")
     if args.timeout <= 0 or args.min_free <= 0:
@@ -907,7 +993,9 @@ def main() -> int:
             "prefer_codec": args.prefer_codec or "", "fullscreen": args.fullscreen,
             "mute": args.mute, "low_latency": args.low_latency,
             "cookies_used": bool(cookie_src or browser), "cookies": cookie_src or "",
-            "cookies_from_browser": browser or "", "last_played": int(time.time()), "plays": 0,
+            "cookies_from_browser": browser or "", "mode": mode,
+            "start": start_opt[0].split("=", 1)[1] if start_opt else "",
+            "last_played": int(time.time()), "plays": 0,
         })
         print("Saved to history (#0). Replay with: --replay 0", file=sys.stderr)
 
@@ -915,10 +1003,10 @@ def main() -> int:
     extra_rec = shlex.split(args.recorder_args) if args.recorder_args else []
     std_flags = ["--no-save-position-on-quit", "--no-resume-playback"]
 
-    if args.direct:
+    if mode == "plain":
         cmd = ["mpv", f"--ytdl-format={choice}", f"--speed={args.speed}"]
         cmd += [f"--ytdl-raw-options={o}" for o in raw_opts]
-        cmd += std_flags + buf_flags
+        cmd += std_flags + buf_flags + start_opt
         if args.fullscreen:
             cmd.append("--fullscreen")
         if args.mute:
@@ -943,6 +1031,123 @@ def main() -> int:
     print(f"Recording to tmpfs: {rec_path}", file=sys.stderr)
 
     env = dict(os.environ, TMPDIR=tmpfs, XDG_CACHE_HOME=os.path.join(tmpfs, "cache"))
+    if mode == "live":
+        # One mpv on the event URL: full server timeline + tmpfs archive.
+        # In-player seeks are clamped by ffmpeg's HLS demuxer (proven), so
+        # travel keys quit mpv with a code and the wrapper relaunches at
+        # base+delta via absolute --start (proven exact). Plain arrows keep
+        # working for small in-buffer seeks; these keys jump far.
+        def _to_secs(v: str) -> int:
+            neg = v.startswith("-")
+            parts = [float(p) for p in v.lstrip("-").split(":")]
+            total = 0.0
+            for p in parts:
+                total = total * 60 + p
+            return int(-total if neg else total)
+
+        base_cmd = ["mpv", f"--ytdl-format={choice}", f"--speed={args.speed}"]
+        base_cmd += [f"--ytdl-raw-options={o}" for o in raw_opts]
+        base_cmd += std_flags + [f"--watch-later-dir={watch}"] + buf_flags
+        if args.fullscreen:
+            base_cmd.append("--fullscreen")
+        if args.mute:
+            base_cmd.append("--mute=yes")
+        if args.low_latency:
+            base_cmd.append("--profile=low-latency")
+        base_cmd += [f"--stream-record={rec_path}"] + extra_player
+        sock = os.path.join(tmpfs, "mpv-ipc.sock")
+        travel_conf = os.path.join(tmpfs, "travel.conf")
+        try:
+            with open(travel_conf, "w", encoding="utf-8") as f:
+                f.write(TRAVEL_CONF)
+            os.chmod(travel_conf, 0o600)
+        except OSError as e:
+            raise SystemExit(f"ERROR: cannot write travel keys to tmpfs: {e}")
+
+        if start_opt:
+            first_start: list[str] = list(start_opt)
+            base: int | None = None if start_opt[0].startswith("--start=-") else _to_secs(
+                start_opt[0].split("=", 1)[1])
+        else:
+            first_start = []
+            base = None
+        tracker = EdgeTracker(sock)
+        tracker.start()
+        final_base: int | None = base
+        print("Travel keys: Ctrl+Left/Right = ∓60s, Shift+Left/Right = ∓10min "
+              "(reopens at position; plain arrows = in-buffer seeks).",
+              file=sys.stderr)
+        if args.print_cmds:
+            print("+ " + " ".join(shlex.quote(c) for c in base_cmd + first_start + ["--", args.url]),
+                  file=sys.stderr)
+            _drop(staged_cookies)
+            tracker.halt()
+            try:
+                os.rmdir(watch)
+            except OSError:
+                pass
+            return 0
+        rc_live = 0
+        try:
+            open_start = first_start
+            while True:
+                try:
+                    os.unlink(sock)
+                except OSError:
+                    pass
+                cmd = list(base_cmd) + open_start + [
+                    f"--input-ipc-server={sock}", f"--input-conf={travel_conf}",
+                    "--", args.url]
+                print("+ " + " ".join(shlex.quote(c) for c in cmd), file=sys.stderr)
+                rc_live = subprocess.call(cmd, env=env)
+                if rc_live not in TRAVEL_DELTAS:
+                    break
+                cur = final_base if final_base is not None else tracker.edge
+                if cur is None:
+                    print("Edge unknown yet — reopening at live edge.", file=sys.stderr)
+                    open_start, final_base = [], None
+                    continue
+                target = int(cur) + TRAVEL_DELTAS[rc_live]
+                if tracker.edge is not None and target >= tracker.edge - 5:
+                    open_start, final_base = [], None
+                    print("Back at live edge.", file=sys.stderr)
+                else:
+                    target = max(0, target)
+                    open_start, final_base = [f"--start={target}"], target
+                    print(f"Jumping to {target // 3600}:{(target % 3600) // 60:02d}:{target % 60:02d}...",
+                          file=sys.stderr)
+            # Remember where playback ended so --replay resumes there.
+            try:
+                entries = load_history()
+                for e in entries:
+                    if e.get("url") == url:
+                        e["start"] = "" if final_base is None else str(final_base)
+                        e["last_played"] = int(time.time())
+                save_history(entries)
+            except OSError:
+                pass
+            return rc_live
+        except KeyboardInterrupt:
+            print("\nStopping...", file=sys.stderr)
+            return 130
+        finally:
+            tracker.halt()
+            _drop(staged_cookies)
+            try:
+                os.unlink(sock)
+            except OSError:
+                pass
+            try:
+                os.unlink(travel_conf)
+            except OSError:
+                pass
+            if not args.keep:
+                try:
+                    os.unlink(rec_path)
+                except OSError:
+                    pass
+            else:
+                print(f"Kept (tmpfs): {rec_path}", file=sys.stderr)
     rec_cmd = ["mpv", f"--ytdl-format={choice}", f"--stream-record={rec_path}"]
     rec_cmd += [f"--ytdl-raw-options={o}" for o in raw_opts]
     rec_cmd += std_flags + [f"--watch-later-dir={watch}"]
@@ -952,7 +1157,7 @@ def main() -> int:
         rec_cmd += ["--vo=null", "--ao=null"]
     rec_cmd += extra_rec + ["--", args.url]
 
-    play_cmd = ["mpv", f"--speed={args.speed}"] + std_flags + [f"--watch-later-dir={watch}"] + buf_flags
+    play_cmd = ["mpv", f"--speed={args.speed}"] + std_flags + [f"--watch-later-dir={watch}"] + buf_flags + start_opt
     if args.fullscreen:
         play_cmd.append("--fullscreen")
     if args.mute:
