@@ -53,7 +53,7 @@ from python.engines.ufw import UfwEngine, RuleRecord, COMMON_SERVICES
 ENGINE_TYPE = "ufw"
 TARGET_FILE = "/etc/default/ufw"
 REQUIRE_ROOT = True
-APP_TITLE = "Dusky Firewall Manager (UFW)"
+APP_TITLE = "Dusky Firewall"
 DEFAULT_MODE = "auto"
 THEME_FILE = "~/.config/matugen/generated/dusky_tui.json"
 ENABLE_USER_PRESETS = False
@@ -62,15 +62,20 @@ ENABLE_USER_PRESETS = False
 # 2. TABS DEFINITION
 # =============================================================================
 TABS = [
-    "Dashboard",
-    "Ports & Sockets",
+    "Status",
+    "Controls",
+    "Sockets",
+    "Ports",
     "Rules",
-    "Rule Builder",
-    "Domains & Web",
-    "NAT & Routing",
-    "Connections & Ban",
-    "App Profiles",
+    "Builder",
+    "Domains",
+    "Whitelist",
+    "Routing",
+    "Traffic",
+    "Bans",
+    "Profiles",
     "Presets",
+    "Audit",
     "Reports",
 ]
 
@@ -81,9 +86,10 @@ SCHEMA: dict[int, list[ConfigItem]] = {i: [] for i in range(len(TABS))}
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# TAB 0: DASHBOARD & QUICK CONTROLS
+# TAB 1: CONTROLS (Power, Panic Killswitch, Policies, Logging)
 # -----------------------------------------------------------------------------
-SCHEMA[0] = [
+# TAB 0: 'Status' is a full-height Rich live dashboard view (show_options=False)
+SCHEMA[1] = [
     ConfigItem(
         label="Firewall Active",
         key="firewall_enabled",
@@ -178,9 +184,10 @@ SCHEMA[0] = [
 ]
 
 # -----------------------------------------------------------------------------
-# TAB 1: PORTS & SOCKETS (Inspect, Open, Close, Common Services)
+# TAB 3: PORTS (Quick Port Tool, Diagnostic Prober, Common Services)
 # -----------------------------------------------------------------------------
-SCHEMA[1] = [
+# TAB 2: 'Sockets' is a full-height Rich live listening sockets view (show_options=False)
+SCHEMA[3] = [
     # Quick Port Open / Close
     ConfigItem(
         label="Target Port",
@@ -406,58 +413,10 @@ SCHEMA[1] = [
 ]
 
 # -----------------------------------------------------------------------------
-# TAB 2: RULES INVENTORY & MANAGEMENT
+# TAB 5: BUILDER (Interactive Rule Constructor & Rule Management)
 # -----------------------------------------------------------------------------
-SCHEMA[2] = [
-    ConfigItem(
-        label="Target Rule Number",
-        key="target_delete_num",
-        scope="builder",
-        type_="int",
-        default=1,
-        min_val=1,
-        max_val=500,
-        step=1,
-        group="Manage Rules",
-        extended_help="**Rule Number**\n\nEnter the index number of the rule to delete, as shown in the rules table above.",
-    ),
-    ConfigItem(
-        label="Delete Rule",
-        key="action_delete_rule",
-        scope="actions",
-        type_="bool",
-        default=False,
-        options=["trigger:Delete Rule"],
-        confirm_message="Delete the selected rule number from the active firewall?",
-        group="Manage Rules",
-        extended_help="**Delete Numbered Rule**\n\nPermanently removes the rule matching the specified index and reloads netfilter.",
-    ),
-    ConfigItem(
-        label="Reload Ruleset",
-        key="action_reload",
-        scope="actions",
-        type_="bool",
-        default=False,
-        options=["trigger:Reload"],
-        group="Manage Rules",
-        extended_help="**Synchronize Rules**\n\nReloads active netfilter rules.",
-    ),
-    ConfigItem(
-        label="Clear Domain Rules",
-        key="action_sync_domains",
-        scope="actions",
-        type_="bool",
-        default=False,
-        options=["trigger:Clean & Sync Domains"],
-        group="Manage Rules",
-        extended_help="**Scrub & Refresh Domain Rules**\n\nRemoves stale resolved domain IPs and injects fresh DNS records.",
-    ),
-]
-
-# -----------------------------------------------------------------------------
-# TAB 3: INTERACTIVE RULE BUILDER
-# -----------------------------------------------------------------------------
-SCHEMA[3] = [
+# TAB 4: 'Rules' is a full-height Rich live numbered rules view (show_options=False)
+SCHEMA[5] = [
     ConfigItem(
         label="Action",
         key="action",
@@ -587,12 +546,56 @@ SCHEMA[3] = [
         group="Placement & Execution",
         extended_help="**Commit Rule**\n\nExecutes the compiled UFW rule command and reloads netfilter.",
     ),
+    ConfigItem(
+        label="Target Rule Number",
+        key="target_delete_num",
+        scope="builder",
+        type_="int",
+        default=1,
+        min_val=1,
+        max_val=500,
+        step=1,
+        group="Manage Rules",
+        extended_help="**Rule Number**\n\nEnter the index number of the rule to delete, as shown in the 'Rules' tab.",
+    ),
+    ConfigItem(
+        label="Delete Rule",
+        key="action_delete_rule",
+        scope="actions",
+        type_="bool",
+        default=False,
+        options=["trigger:Delete Rule"],
+        confirm_message="Delete the selected rule number from the active firewall?",
+        group="Manage Rules",
+        extended_help="**Delete Numbered Rule**\n\nPermanently removes the rule matching the specified index and reloads netfilter.",
+    ),
+    ConfigItem(
+        label="Reload Ruleset",
+        key="action_reload",
+        scope="actions",
+        type_="bool",
+        default=False,
+        options=["trigger:Reload"],
+        group="Manage Rules",
+        extended_help="**Synchronize Rules**\n\nReloads active netfilter rules.",
+    ),
+    ConfigItem(
+        label="Clear Domain Rules",
+        key="action_sync_domains",
+        scope="actions",
+        type_="bool",
+        default=False,
+        options=["trigger:Clean & Sync Domains"],
+        group="Manage Rules",
+        extended_help="**Scrub & Refresh Domain Rules**\n\nRemoves stale resolved domain IPs and injects fresh DNS records.",
+    ),
 ]
 
 # -----------------------------------------------------------------------------
-# TAB 4: DOMAINS & EXCLUSIVE WEB FILTER
+# TAB 7: WHITELIST (Lockdown Mode, Domain Registry)
 # -----------------------------------------------------------------------------
-SCHEMA[4] = [
+# TAB 6: 'Domains' is a full-height Rich live registered domains view (show_options=False)
+SCHEMA[7] = [
     ConfigItem(
         label="Whitelist Mode (Lockdown)",
         key="whitelist_mode",
@@ -663,9 +666,9 @@ SCHEMA[4] = [
 ]
 
 # -----------------------------------------------------------------------------
-# TAB 5: NAT & ROUTING (Port Forwarding, Waydroid, Docker, Sysctl)
+# TAB 8: ROUTING (Port Forwarding DNAT, Sysctl, Containers)
 # -----------------------------------------------------------------------------
-SCHEMA[5] = [
+SCHEMA[8] = [
     # Port Forwarding
     ConfigItem(
         label="WAN External Port",
@@ -765,9 +768,10 @@ SCHEMA[5] = [
 ]
 
 # -----------------------------------------------------------------------------
-# TAB 6: ACTIVE CONNECTIONS & IP BANNING
+# TAB 10: BANS (IP Blacklisting, ICMP Stealth, Panic Killswitch)
 # -----------------------------------------------------------------------------
-SCHEMA[6] = [
+# TAB 9: 'Traffic' is a full-height Rich live active connections view (show_options=False)
+SCHEMA[10] = [
     ConfigItem(
         label="Target IP to Ban/Unban",
         key="ban_ip_target",
@@ -831,9 +835,9 @@ SCHEMA[6] = [
 ]
 
 # -----------------------------------------------------------------------------
-# TAB 7: APPLICATION PROFILES
+# TAB 11: PROFILES (UFW Application Profiles)
 # -----------------------------------------------------------------------------
-SCHEMA[7] = [
+SCHEMA[11] = [
     ConfigItem(
         label="Profile Name",
         key="target_app",
@@ -876,9 +880,9 @@ SCHEMA[7] = [
 ]
 
 # -----------------------------------------------------------------------------
-# TAB 8: PRESETS
+# TAB 12: PRESETS (System and Hardened Security Presets)
 # -----------------------------------------------------------------------------
-SCHEMA[8] = [
+SCHEMA[12] = [
     ConfigItem(
         label="Dusky Full Setup",
         key="action_preset_dusky_full",
@@ -956,9 +960,10 @@ SCHEMA[8] = [
 ]
 
 # -----------------------------------------------------------------------------
-# TAB 9: REPORTS & LOGS
+# TAB 13: AUDIT (Netfilter Diagnostic Reports Selector)
 # -----------------------------------------------------------------------------
-SCHEMA[9] = [
+# TAB 14: 'Reports' is a full-height Rich live netfilter diagnostic report view (show_options=False)
+SCHEMA[13] = [
     ConfigItem(
         label="Report Type",
         key="selected_report",
@@ -967,7 +972,7 @@ SCHEMA[9] = [
         default="listening",
         options=["listening", "added", "user-rules", "before-rules", "after-rules", "logging-rules", "raw"],
         group="Netfilter Reports",
-        extended_help="**Report Type**\n\n- `listening`: Open sockets and bound daemon rules\n- `added`: Rules as created on command line\n- `user-rules`: Raw /etc/ufw/user.rules table\n- `before-rules`: Early netfilter evaluation rules\n- `after-rules`: Trailing evaluation rules (Docker)\n- `raw`: Live kernel iptables packet counters",
+        extended_help="**Report Type**\n\n- `listening`: Open sockets and bound daemon rules\n- `added`: Rules as created on command line\n- `user-rules`: Raw /etc/ufw/user.rules table\n- `before-rules`: Early netfilter evaluation rules\n- `after-rules`: Trailing evaluation rules (Docker)\n- `raw`: Live kernel iptables packet counters\n\n*Note: View the full live report output under the 'Reports' tab.*",
     ),
     ConfigItem(
         label="Refresh Report",
@@ -977,7 +982,7 @@ SCHEMA[9] = [
         default=False,
         options=["trigger:Refresh"],
         group="Netfilter Reports",
-        extended_help="**Refresh Report**\n\nRe-reads live netfilter diagnostic report.",
+        extended_help="**Refresh Report**\n\nRe-reads live netfilter diagnostic report from the kernel.",
     ),
 ]
 
@@ -1218,10 +1223,11 @@ def render_reports_view(app: Any) -> Any:
 
     rep_name = "listening"
     if hasattr(app, "schema"):
-        for item in app.schema.get(9, []):
-            if item.key == "selected_report":
-                rep_name = item.value or "listening"
-                break
+        for tab_items in app.schema.values():
+            for item in tab_items:
+                if item.key == "selected_report":
+                    rep_name = item.value or "listening"
+                    break
 
     content = eng.get_report(rep_name)
     return Panel(
@@ -1239,32 +1245,32 @@ CUSTOM_VIEWS = {
     0: {
         "view": render_ufw_dashboard_view,
         "interval": 2.0,
-        "show_options": True,
-    },
-    1: {
-        "view": render_ports_view,
-        "interval": 2.0,
-        "show_options": True,
+        "show_options": False,
     },
     2: {
-        "view": render_rules_view,
+        "view": render_ports_view,
         "interval": 2.0,
-        "show_options": True,
+        "show_options": False,
     },
     4: {
-        "view": render_domains_view,
-        "interval": 3.0,
-        "show_options": True,
+        "view": render_rules_view,
+        "interval": 2.0,
+        "show_options": False,
     },
     6: {
-        "view": render_connections_view,
-        "interval": 2.0,
-        "show_options": True,
+        "view": render_domains_view,
+        "interval": 3.0,
+        "show_options": False,
     },
     9: {
+        "view": render_connections_view,
+        "interval": 2.0,
+        "show_options": False,
+    },
+    14: {
         "view": render_reports_view,
         "interval": 3.0,
-        "show_options": True,
+        "show_options": False,
     },
 }
 
