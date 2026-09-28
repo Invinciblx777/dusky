@@ -652,13 +652,17 @@ EXAMPLES:
             from python.engines.hyprlock import HyprlockEngine
             return HyprlockEngine(config_path=config_path)
 
+        elif e_type in ("ufw", "ufw_firewall"):
+            from python.engines.ufw import UfwEngine
+            return UfwEngine(config_path=config_path)
+
         else:
             print(f"[-] Fatal: Unknown ENGINE_TYPE '{e_type}' specified in schema '{schema_path.name}'.")
             print(
                 "[i] Supported engines are: 'lua', 'ini', 'bridged_ini', 'systemd', 'systemd_dns', 'systemd_power', 'hyprlang', "
                 "'trackpad', 'monitor', 'cmdline', 'systemd_boot', 'flatdotconfig', 'env', "
                 "'waybar', 'network', 'pkg_throttle', 'cpu_core', 'fstab', 'shell_fallback', 'json', "
-                "'dusky_sites', 'locale_gen', 'matugen', 'fontconfig', 'toml', 'kokoro', 'starship', 'hyprlock'"
+                "'dusky_sites', 'locale_gen', 'matugen', 'fontconfig', 'toml', 'kokoro', 'starship', 'hyprlock', 'ufw'"
             )
             sys.exit(1)
 
