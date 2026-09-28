@@ -170,11 +170,18 @@ def setup_logging(module_name: str, enable_logging: bool) -> logging.Logger:
         fh = logging.FileHandler(log_file)
         fh.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s"))
         logger.addHandler(fh)
+        handler = fh
 
         print(f"[*] Logging enabled: {log_file}")
 
     else:
-        logger.addHandler(logging.NullHandler())
+        handler = logging.NullHandler()
+        logger.addHandler(handler)
+
+    for name in ("dusky_network_engine", "python.frontend.ui"):
+        related = logging.getLogger(name)
+        related.setLevel(logging.DEBUG if enable_logging else logging.WARNING)
+        related.addHandler(handler)
 
     return logger
 
