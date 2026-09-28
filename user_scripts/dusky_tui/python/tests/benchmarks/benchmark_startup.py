@@ -294,6 +294,17 @@ def worker(args):
     mark('launcher_return_ms')
     if not app_box:
         raise RuntimeError('Launcher returned without running DuskyTUI')
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    process_cpu_ms = time.process_time() * 1000
+    # Fingerprint loaded framework sources after the measured launcher returns.
+    # Module paths expose accidental imports from a different checkout.
+    for name, module in tuple(sys.modules.items()):
+        if name.startswith(('python.frontend.', 'python.engines.')):
+            filename = getattr(module, '__file__', None)
+            if filename:
+                path = Path(filename).resolve()
+                if path.is_file():
+                    source_hashes[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
     import textual
     app = app_box[0]
     metrics = dict(marks)
@@ -301,8 +312,8 @@ def worker(args):
         selected = [s for s in spans if s['kind'] == kind and s['phase'] == 'startup']
         metrics[f'startup_{kind}_count'] = len(selected)
         metrics[f'startup_{kind}_inclusive_ms'] = sum(s['duration_ms'] for s in selected)
-    metrics['max_rss_kib'] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    metrics['process_cpu_ms'] = time.process_time() * 1000
+    metrics['max_rss_kib'] = usage.ru_maxrss
+    metrics['process_cpu_ms'] = process_cpu_ms
     output = dict(metrics=metrics, spans=spans, switches=switches, errors=failures,
                   environment=dict(python=sys.version, executable=sys.executable, textual=textual.__version__,
                     kernel=platform.release(), uid=os.geteuid(), home=str(Path.home()),
@@ -319,13 +330,9 @@ def worker(args):
 
 
 def main():
-    import pwd
-    launch_home = Path.home()
-    if os.geteuid() == 0 and os.environ.get('SUDO_USER'):
-        launch_home = Path(pwd.getpwnam(os.environ['SUDO_USER']).pw_dir)
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('schema', type=Path)
-    parser.add_argument('--launcher', type=Path, default=launch_home/'user_scripts/dusky_tui/python/main/main.py')
+    parser.add_argument('--launcher', type=Path, default=Path(__file__).resolve().parents[2]/'main/main.py')
     parser.add_argument('--runs', '-n', type=positive, default=5)
     parser.add_argument('--mode', choices=('headless','terminal'), default='headless')
     parser.add_argument('--width', type=positive, default=120)
