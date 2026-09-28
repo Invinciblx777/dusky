@@ -23,6 +23,7 @@ from textual.message import Message
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, Horizontal
+from textual.css.query import NoMatches
 from textual.geometry import Size
 from textual.widgets import Label, Input, Tabs, Tab, ContentSwitcher, OptionList, Markdown, Static
 from textual.widgets.option_list import Option, OptionDoesNotExist
@@ -1407,6 +1408,15 @@ class ConfigOptionList(OptionList):
     _last_click_x: int = 0
     _last_click_button: int = 1
 
+    def watch_highlighted(self, highlighted: int | None) -> None:
+        if getattr(self, "_restoring_options", False):
+            if highlighted is not None and not self.get_option_at_index(highlighted).disabled:
+                option = self.get_option_at_index(highlighted)
+                self._restored_option = option
+                self.post_message(self.OptionHighlighted(self, option, highlighted))
+            return
+        super().watch_highlighted(highlighted)
+
     def action_scroll_top(self) -> None:
         for i in range(self.option_count):
             if not self.get_option_at_index(i).disabled:
@@ -1964,6 +1974,8 @@ NoticeBox.-danger { border-left: solid $error; background: $error 10%; }
 NoticeBox.-success { border-left: solid $success; background: $success 10%; }
 
 .list-wrapper { height: 1fr; }
+.custom-view-with-options { height: 2fr; min-height: 6; }
+.custom-options { height: 1fr; min-height: 5; }
 
 ConfigOptionList {
     min-width: 20; width: 1fr; height: 1fr; scrollbar-size: 0 0;
@@ -2462,8 +2474,10 @@ Tooltip {
 
                             if custom_view is not None:
                                 refresh_interval = None
+                                show_options = False
                                 if isinstance(custom_view, dict) and "view" in custom_view:
                                     refresh_interval = custom_view.get("interval")
+                                    show_options = bool(custom_view.get("show_options", False))
                                     custom_view = custom_view["view"]
 
                                 if isinstance(custom_view, type) and issubclass(custom_view, Widget):
@@ -2475,8 +2489,14 @@ Tooltip {
                                         renderable_or_factory=custom_view,
                                         app_ref=self,
                                         refresh_interval=refresh_interval,
+                                        classes="custom-view-with-options" if show_options else None,
                                         id=f"custom-view-{i}"
                                     )
+                                if show_options:
+                                    with Horizontal(classes="list-wrapper custom-options"):
+                                        yield ConfigOptionList(id=f"list-{i}")
+                                        with Vertical(classes="indicator-column"):
+                                            yield ScrollIndicator("", id=f"indicator-{i}")
                             else:
                                 with Horizontal(classes="list-wrapper"):
                                     yield ConfigOptionList(id=f"list-{i}")
@@ -3728,6 +3748,7 @@ Tooltip {
             return
 
         scroll_y = ol.scroll_y
+        old_keys = getattr(ol, "_rendered_option_keys", {})
 
         if not maintain_highlight_id and ol.highlighted is not None:
             try:
@@ -3736,13 +3757,29 @@ Tooltip {
                 pass
 
         items = self.schema.get(tab_idx, [])
+        option_keys = {
+            f"item_{tab_idx}_{idx}": (item.scope, item.key, item.parent_ref)
+            for idx, item in enumerate(items)
+        }
+        selected_key = old_keys.get(maintain_highlight_id) if maintain_highlight_id else None
+        if selected_key is None and ol.highlighted is not None:
+            try:
+                selected_key = old_keys.get(ol.get_option_at_index(ol.highlighted).id)
+            except OptionDoesNotExist:
+                pass
         # Schemas opt in to hiding missing settings. Other TUIs often show
         # settings whose config file has no entry yet.
         visible = {
             idx for idx, item in enumerate(items)
-            if item.type_ in ("menu", "action", "preset")
-            or not self.hide_missing_items
-            or item.exists_in_target
+            if (
+                not isinstance(self.custom_views.get(tab_idx), dict)
+                or not self.custom_views[tab_idx].get("option_groups")
+                or item.group in self.custom_views[tab_idx]["option_groups"]
+            ) and (
+                item.type_ in ("menu", "action", "preset")
+                or not self.hide_missing_items
+                or item.exists_in_target
+            )
         }
         for idx, item in enumerate(items):
             if item.type_ == "menu" and self.hide_missing_items and not any(
@@ -3845,8 +3882,48 @@ Tooltip {
         while stack:
             traverse(*stack.pop())
 
-        ol.clear_options()
-        ol.add_options(options)
+        old_options = list(ol.options)
+        if selected_key is not None:
+            visible_ids = {option_keys[option.id]: option.id for option in options if not option.disabled}
+            maintain_highlight_id = visible_ids.get(selected_key)
+            if maintain_highlight_id is None and selected_key[2]:
+                parent = next((item for item in items if item.uid == selected_key[2] or item.key == selected_key[2]), None)
+                if parent is not None:
+                    maintain_highlight_id = visible_ids.get((parent.scope, parent.key, parent.parent_ref))
+            if maintain_highlight_id is None:
+                previous_index = ol.highlighted or 0
+                neighbors = sorted(enumerate(old_options), key=lambda pair: abs(pair[0] - previous_index))
+                maintain_highlight_id = next((visible_ids[old_keys[option.id]] for _, option in neighbors
+                                              if old_keys.get(option.id) in visible_ids), first_item_id)
+
+        same_structure = (
+            len(old_options) == len(options)
+            and all(old.id == new.id and old_keys.get(old.id) == option_keys.get(new.id)
+                    for old, new in zip(old_options, options))
+        )
+        if same_structure:
+            for index, (old, new) in enumerate(zip(old_options, options)):
+                if old.prompt != new.prompt:
+                    ol.replace_option_prompt_at_index(index, new.prompt)
+        else:
+            ol._restoring_options = True
+            try:
+                ol.clear_options()
+                ol.add_options(options)
+                if maintain_highlight_id:
+                    try:
+                        ol.highlighted = ol.get_option_index(maintain_highlight_id)
+                    except OptionDoesNotExist:
+                        ol.highlighted = ol.get_option_index(first_item_id) if first_item_id else None
+                elif first_item_id:
+                    ol.highlighted = ol.get_option_index(first_item_id)
+                ol.last_highlighted_id = (
+                    ol.get_option_at_index(ol.highlighted).id if ol.highlighted is not None else None
+                )
+                ol.scroll_y = scroll_y
+            finally:
+                ol._restoring_options = False
+
         positions = []
         count = 0
         for option in options:
@@ -3854,26 +3931,14 @@ Tooltip {
             positions.append(count)
         ol._selectable_positions = positions
 
-        if maintain_highlight_id:
-            try:
-                ol.highlighted = ol.get_option_index(maintain_highlight_id)
-            except OptionDoesNotExist:
-                ol.highlighted = ol.get_option_index(first_item_id) if first_item_id else None
-
-        elif first_item_id:
-            ol.last_highlighted_id = first_item_id
-            try:
-                ol.highlighted = ol.get_option_index(first_item_id)
-            except OptionDoesNotExist:
-                pass
-
-        ol.scroll_y = scroll_y
+        ol._rendered_option_keys = option_keys
 
         self._tab_populated.add(tab_idx)
         self._tab_dirty.discard(tab_idx)
 
         if tab_idx == self._current_tab_index():
             self._update_file_link()
+            self._update_current_help_panel()
 
         self.call_after_refresh(self._update_scroll_indicators)
 
@@ -3992,6 +4057,84 @@ Tooltip {
             if ol := self.current_option_list:
                 self._update_pagination(ol)
         self._queue_ready_tabs_for_warmup()
+
+    def _replace_dynamic_tabs(self, replacements: dict[int, list[ConfigItem]]) -> bool:
+        """Reconcile a live inventory without invalidating edits and callbacks."""
+        if self._save_tasks or self._save_timers or self._save_auth_pending or self._modal_active():
+            return False
+
+        remapped: dict[tuple[int, int], tuple[int, int]] = {}
+        observed: dict[tuple[int, int], Any] = {}
+        changed = False
+        for tab_idx, incoming in replacements.items():
+            existing = self.schema.get(tab_idx, [])
+            old_by_identity = defaultdict(deque)
+            for old_idx, item in enumerate(existing):
+                old_by_identity[(item.scope, item.key, item.parent_ref)].append((old_idx, item))
+
+            merged = []
+            for new_idx, fresh in enumerate(incoming):
+                matches = old_by_identity.get((fresh.scope, fresh.key, fresh.parent_ref))
+                if not matches:
+                    merged.append(fresh)
+                    changed = True
+                    continue
+                old_idx, item = matches.popleft()
+                remapped[(tab_idx, old_idx)] = (tab_idx, new_idx)
+                if old_idx != new_idx:
+                    changed = True
+                pending = (tab_idx, old_idx) in self.pending_commits
+                if not pending:
+                    item.value = clone_value(fresh.value)
+                    item.initial_value = clone_value(fresh.initial_value)
+                    item._initial_loaded = fresh._initial_loaded
+                    item.exists_in_target = fresh.exists_in_target
+                    observed[(tab_idx, new_idx)] = clone_value(fresh.value)
+                item.label = fresh.label
+                item.default = clone_value(fresh.default)
+                item.options = list(fresh.options)
+                item.hints = list(fresh.hints)
+                item.group = fresh.group
+                item.extended_help = fresh.extended_help
+                item.confirm_message = fresh.confirm_message
+                item.warning_msg = fresh.warning_msg
+                item.popup_message = fresh.popup_message
+                item.read_only = fresh.read_only
+                item.expanded = item.expanded if item.is_parent else fresh.expanded
+                merged.append(item)
+
+            if any(old_by_identity.values()):
+                changed = True
+            self.schema[tab_idx] = merged
+
+        replaced_tabs = set(replacements)
+
+        def remap(ref):
+            return remapped.get(ref) if ref[0] in replaced_tabs else ref
+
+        self._committed = {
+            new_ref: value for ref, value in self._committed.items()
+            if (new_ref := remap(ref)) is not None
+        }
+        self._committed.update(observed)
+        for tab_idx, incoming in replacements.items():
+            for idx, item in enumerate(self.schema[tab_idx]):
+                self._committed.setdefault((tab_idx, idx), clone_value(item.value))
+        self.pending_commits = {
+            new_ref for ref in self.pending_commits
+            if (new_ref := remap(ref)) is not None
+        }
+        for history in (self.undo_stack, self.redo_stack):
+            transactions = [
+                [(*new_ref, old, new) for ti, ii, old, new in transaction
+                 if (new_ref := remap((ti, ii))) is not None]
+                for transaction in history
+            ]
+            history.clear()
+            history.extend(transaction for transaction in transactions if transaction)
+        if changed:
+            self._schema_dirty_counter += 1
+        return True
 
     def _refresh_single_ui(self, tab_idx: int, item_idx: int, item: ConfigItem) -> None:
         if tab_idx not in self._tab_populated:
@@ -4554,6 +4697,7 @@ Tooltip {
             self._update_scroll_indicators()
             self.check_tab_overflow()
             self._update_file_link()
+            self._update_current_help_panel()
 
         except Exception:
             pass
@@ -4619,11 +4763,31 @@ Tooltip {
                 if item.warning_msg:
                     help_text += f"> **{_ICON_WARNING} WARNING:** {item.warning_msg}\n"
 
-                help_text += item.extended_help or f"**{item.label}**\nNo extended documentation available."
+                help_text += item.extended_help or f"**{_md_escape(item.label)}**\nNo extended documentation available."
 
-                md.update(help_text)
+                if getattr(md, "_dusky_help_text", None) != help_text:
+                    md.update(help_text)
+                    md._dusky_help_text = help_text
 
         except Exception:
+            pass
+
+    def _update_current_help_panel(self) -> None:
+        try:
+            if not self.query_one("#content-area").has_class("-show-help"):
+                return
+            ol = self.current_option_list
+            if ol and ol.highlighted is not None:
+                parsed = self._get_item_from_id(ol.get_option_at_index(ol.highlighted).id)
+                if parsed:
+                    self._update_help_panel(parsed[2])
+                    return
+            md = self.query_one("#help-markdown", Markdown)
+            neutral = "Select an item to view documentation."
+            if getattr(md, "_dusky_help_text", None) != neutral:
+                md.update(neutral)
+                md._dusky_help_text = neutral
+        except (NoMatches, OptionDoesNotExist):
             pass
 
     @on(OptionList.OptionHighlighted)
@@ -4631,6 +4795,19 @@ Tooltip {
         ol = event.option_list
 
         if not isinstance(ol, ConfigOptionList) or not event.option_id:
+            return
+
+        restored = getattr(ol, "_restored_option", None) is event.option
+        if restored:
+            ol._restored_option = None
+
+        try:
+            if (
+                ol is not self.current_option_list or ol.highlighted != event.option_index
+                or ol.get_option_at_index(event.option_index) is not event.option
+            ):
+                return
+        except OptionDoesNotExist:
             return
 
         parsed = self._get_item_from_id(event.option_id)
@@ -4667,12 +4844,12 @@ Tooltip {
 
                 ol.last_highlighted_id = event.option_id
 
-                if hasattr(ol, "scroll_to_highlight"):
-                    ol.scroll_to_highlight()
-                elif hasattr(ol, "scroll_to_option") and curr_idx is not None:
-                    ol.scroll_to_option(curr_idx)
-
-                self._ensure_header_visible(ol, curr_idx)
+                if not restored:
+                    if hasattr(ol, "scroll_to_highlight"):
+                        ol.scroll_to_highlight()
+                    elif hasattr(ol, "scroll_to_option") and curr_idx is not None:
+                        ol.scroll_to_option(curr_idx)
+                    self._ensure_header_visible(ol, curr_idx)
 
             except OptionDoesNotExist:
                 pass
@@ -5375,7 +5552,8 @@ Tooltip {
 
                 self.set_timer(0.15, reset_trigger)
 
-            self.notify_status(f"Updated {item.label}", level="success")
+            message = msg if self._get_item_engine_info(item)[0] == "network" and msg else f"Updated {item.label}"
+            self.notify_status(message, level="success")
             self._maybe_finish_quit()
             return
 
@@ -5893,12 +6071,7 @@ Tooltip {
         self.toggle_shortcut_active("help", content_area.has_class("-show-help"))
 
         if content_area.has_class("-show-help"):
-            ol = self.current_option_list
-
-            if ol and ol.last_highlighted_id:
-                parsed = self._get_item_from_id(ol.last_highlighted_id)
-                if parsed:
-                    self._update_help_panel(parsed[2])
+            self._update_current_help_panel()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if action == "clear_local_search":
@@ -6527,7 +6700,12 @@ Tooltip {
     def handle_selection(self, event: OptionList.OptionSelected) -> None:
         ol = event.option_list
 
-        if isinstance(ol, ConfigOptionList):
+        if isinstance(ol, ConfigOptionList) and ol is self.current_option_list:
+            try:
+                if ol.get_option_at_index(event.option_index) is not event.option:
+                    return
+            except OptionDoesNotExist:
+                return
             click_x = getattr(ol, "_last_click_x", 0)
             button = getattr(ol, "_last_click_button", 1)
             was_already_selected = getattr(ol, "_mouse_down_highlight", None) == event.option_index
@@ -7081,9 +7259,18 @@ Tooltip {
         if self._sudo_keepalive:
             self._sudo_keepalive.stop()
             self._sudo_keepalive = None
+        engines = (
+            dict.values(self.engine_pool) if isinstance(self.engine_pool, dict)
+            else self.engine_pool.values()
+        )
+        for engine in engines:
+            if callable(shutdown := getattr(engine, "shutdown", None)):
+                shutdown()
         await self._shutdown_background_actions()
 
     def execute_action(self, item: ConfigItem) -> None:
+        if item.read_only:
+            return
         if item.key == "__save_new_preset":
             self.action_save_preset()
             return
