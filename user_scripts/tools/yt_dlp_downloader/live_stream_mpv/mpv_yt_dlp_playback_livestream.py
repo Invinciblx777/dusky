@@ -412,24 +412,35 @@ def resolve_buffer(want: str | None, need_player: bool) -> str:
     return "near"
 
 
-def wait_for_file(path: str, proc: subprocess.Popen, timeout: float) -> bool:
+def wait_for_file(path: str, proc: subprocess.Popen, timeout: float, min_bytes: int = START_BYTES) -> bool:
     t0 = time.time()
     while time.time() - t0 < timeout:
         try:
-            if os.path.getsize(path) >= START_BYTES:
+            if os.path.getsize(path) >= min_bytes:
                 return True
         except OSError:
             pass
         if proc.poll() is not None:  # recorder died: fail fast
             try:
-                return os.path.getsize(path) >= START_BYTES
+                return os.path.getsize(path) >= min_bytes
             except OSError:
                 return False
         time.sleep(0.5)
     try:
-        return os.path.getsize(path) >= START_BYTES
+        return os.path.getsize(path) >= min_bytes
     except OSError:
         return False
+
+
+def join_threshold(fmts: list[dict], choice: str) -> int:
+    """Wait ~3s of stream data before the player joins a growing file.
+
+    Joining a .ts that only has a fragment of a segment is what causes the
+    brief 'PES packet size mismatch / Packet corrupt' burst on player start.
+    Scales with the chosen rendition's bitrate so 480p doesn't wait long.
+    """
+    tbr = next((f["tbr"] for f in fmts if f["id"] == choice), 0) or 0
+    return max(START_BYTES, min(int(tbr * 125 * 3), 32 * 1024 * 1024))
 
 
 # ---------- CLI ----------
@@ -579,7 +590,9 @@ def main() -> int:
 
     rec = subprocess.Popen(rec_cmd, env=env)
     try:
-        if not wait_for_file(rec_path, rec, args.timeout):
+        need = join_threshold(fmts, choice)
+        print(f"Waiting for ~{need // 1024}KB before player joins (cleaner start)...", file=sys.stderr)
+        if not wait_for_file(rec_path, rec, args.timeout, need):
             if rec.poll() is not None:
                 print("ERROR: recorder exited before producing data.", file=sys.stderr)
                 return 1
