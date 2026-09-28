@@ -1526,6 +1526,24 @@ class ScrollIndicator(Label):
 
         self.update(txt)
 
+    def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
+        try:
+            tab_idx = int(self.id.split("-")[1])
+            ol = self.app.query_one(f"#list-{tab_idx}", ConfigOptionList)
+            ol.scroll_down(animate=False)
+            event.stop()
+        except Exception:
+            pass
+
+    def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        try:
+            tab_idx = int(self.id.split("-")[1])
+            ol = self.app.query_one(f"#list-{tab_idx}", ConfigOptionList)
+            ol.scroll_up(animate=False)
+            event.stop()
+        except Exception:
+            pass
+
     def on_mouse_down(self, event: events.MouseDown) -> None:
         if self._max_scroll_y <= 0:
             return
@@ -1819,12 +1837,10 @@ class CustomRichTabWidget(Static):
     DEFAULT_CSS = """
     CustomRichTabWidget {
         width: 100%;
-        height: 100%;
+        height: auto;
         background: transparent;
         padding: 0 1;
-        overflow-x: auto;
-        overflow-y: auto;
-        scrollbar-size: 1 1;
+        overflow: hidden hidden;
     }
     """
 
@@ -1843,6 +1859,8 @@ class CustomRichTabWidget(Static):
         self._refresh_inflight = False
         self._factory_source = None
         self._factory_takes_app = False
+        self._last_rendered_repr: str | None = None
+        self._is_unmounted = False
 
     def on_mount(self) -> None:
         self.update_content()
@@ -1850,6 +1868,7 @@ class CustomRichTabWidget(Static):
             self._start_timer()
 
     def on_unmount(self) -> None:
+        self._is_unmounted = True
         self._stop_timer()
 
     def on_show(self) -> None:
@@ -1864,12 +1883,33 @@ class CustomRichTabWidget(Static):
             return
         interval = self.refresh_interval
         if interval is not None and interval > 0:
-            self._refresh_timer = self.set_interval(interval, self.update_content)
+            self._refresh_timer = self.set_interval(interval, self._timer_tick)
 
     def _stop_timer(self) -> None:
         if self._refresh_timer is not None:
             self._refresh_timer.stop()
             self._refresh_timer = None
+
+    def _timer_tick(self) -> None:
+        if self._refresh_inflight or self._is_unmounted:
+            return
+        import asyncio
+        asyncio.create_task(self._async_refresh())
+
+    async def _async_refresh(self) -> None:
+        if self._refresh_inflight or self._is_unmounted:
+            return
+        self._refresh_inflight = True
+        try:
+            import asyncio
+            res = await asyncio.to_thread(self._invoke_factory)
+            if res is not None and not self._is_unmounted:
+                self._apply_rendered_content(res)
+        except Exception as e:
+            if not self._is_unmounted:
+                self._apply_rendered_content(Text(f"Error rendering custom view: {e}", style="bold red"))
+        finally:
+            self._refresh_inflight = False
 
     def _invoke_factory(self) -> Any:
         factory = self.renderable_or_factory
@@ -1892,17 +1932,37 @@ class CustomRichTabWidget(Static):
         return factory(self.app_ref) if self._factory_takes_app else factory()
 
     def update_content(self) -> None:
-        if self._refresh_inflight:
+        if self._refresh_inflight or self._is_unmounted:
             return
         self._refresh_inflight = True
         try:
             res = self._invoke_factory()
-            if res is not None:
-                self.update(res)
+            if res is not None and not self._is_unmounted:
+                self._apply_rendered_content(res)
         except Exception as e:
-            self.update(Text(f"Error rendering custom view: {e}", style="bold red"))
+            if not self._is_unmounted:
+                self._apply_rendered_content(Text(f"Error rendering custom view: {e}", style="bold red"))
         finally:
             self._refresh_inflight = False
+
+    def _apply_rendered_content(self, res: Any) -> None:
+        if self._is_unmounted:
+            return
+
+        res_repr = repr(res)
+        if self._last_rendered_repr == res_repr:
+            return
+        self._last_rendered_repr = res_repr
+
+        parent = self.parent
+        saved_y = None
+        if isinstance(parent, VerticalScroll):
+            saved_y = parent.scroll_y
+
+        self.update(res)
+
+        if saved_y is not None and isinstance(parent, VerticalScroll) and saved_y > 0:
+            parent.scroll_to(y=saved_y, animate=False, immediate=True)
 
 
 class DuskyTUI(App):
@@ -1984,7 +2044,7 @@ ConfigOptionList {
     background: transparent; border: none;
 }
 ConfigOptionList > .option-list--option {
-    padding: 0 1; background: transparent; transition: background 150ms linear;
+    padding: 0 1; background: transparent;
 }
 ConfigOptionList > .option-list--option-hover { background: $primary 10%; }
 ConfigOptionList > .option-list--option-highlighted { background: $primary 20%; }
@@ -2218,6 +2278,9 @@ Tooltip {
         **kwargs
     ):
         super().__init__(**kwargs)
+
+        self.supports_smooth_scrolling = True
+        self.scroll_sensitivity_y = 2.0
 
         self.deferred_load = deferred_load
         self.hide_missing_items = hide_missing_items
@@ -4868,26 +4931,13 @@ Tooltip {
         if ol is None or curr_idx is None or ol.option_count == 0:
             return
 
-        has_selectable_above = False
-        for i in range(curr_idx):
-            try:
-                if not getattr(ol.get_option_at_index(i), "disabled", False):
-                    has_selectable_above = True
-                    break
-            except Exception:
-                pass
-
-        if not has_selectable_above:
-            ol.scroll_y = 0
-            return
-
-        if curr_idx > 0:
+        # Only adjust if the option is at the very top of the visible window
+        # and has an immediate disabled group header 1 row above it
+        if curr_idx > 0 and int(ol.scroll_y) == curr_idx:
             try:
                 prev_opt = ol.get_option_at_index(curr_idx - 1)
                 if getattr(prev_opt, "disabled", False):
-                    target_header_idx = curr_idx - 1
-                    if int(ol.scroll_y) > target_header_idx:
-                        ol.scroll_y = target_header_idx
+                    ol.scroll_y = curr_idx - 1
             except Exception:
                 pass
 

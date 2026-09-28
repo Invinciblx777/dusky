@@ -1050,13 +1050,17 @@ def render_ufw_dashboard_view(app: Any) -> Any:
 
     p_listen = Panel(t_listen, title="[bold yellow] 󰒋 LISTENING SOCKETS (PORTS) [/bold yellow]", border_style="yellow", expand=True)
 
-    grid = Table.grid(expand=True)
-    grid.add_column(ratio=1)
-    grid.add_column(ratio=1)
-    grid.add_row(p_power, p_policy)
-    grid.add_row(p_listen, None)
+    top_grid = Table.grid(expand=True)
+    top_grid.add_column(ratio=1)
+    top_grid.add_column(ratio=1)
+    top_grid.add_row(p_power, p_policy)
 
-    return grid
+    main_grid = Table.grid(expand=True)
+    main_grid.add_column()
+    main_grid.add_row(top_grid)
+    main_grid.add_row(p_listen)
+
+    return main_grid
 
 
 def render_ports_view(app: Any) -> Any:
