@@ -2807,7 +2807,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "wallpaper_selector"
+name = "dusky-papers"
 version = "1.1.0"
 dependencies = [
  "fastrand",

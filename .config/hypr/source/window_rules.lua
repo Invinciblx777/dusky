@@ -1518,11 +1518,11 @@ hl.window_rule({
     animation = "popin 60%",      -- scale in starting from 60% size
 })
 
---- Dusky Wallpaper Selector (Rust Transparent Overlay) ---
+--- Dusky Papers ---
 hl.window_rule({
-    name = "wallpaper_selector_rust",
+    name = "dusky_papers",
     match = {
-        class = "^(dusky-wallpaper-selector-rust)$",
+        class = "^(dusky-papers)$",
     },
     float = true,
     fullscreen = true,

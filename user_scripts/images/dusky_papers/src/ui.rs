@@ -229,7 +229,7 @@ impl CarouselAnimation {
     }
 }
 
-pub struct WallpaperSelectorApp {
+pub struct DuskyPapersApp {
     config: Config,
     theme: AppTheme,
     all_wallpapers: Vec<WallpaperItem>,
@@ -267,7 +267,7 @@ pub struct WallpaperSelectorApp {
     launch_instant: iced::time::Instant,
 }
 
-impl WallpaperSelectorApp {
+impl DuskyPapersApp {
     fn grid_columns(&self) -> usize {
         (((self.window_width - 32.0 + 14.0) / 264.0).floor() as usize).max(1)
     }
@@ -843,10 +843,7 @@ impl WallpaperSelectorApp {
                 self.color_prefetch_cursor = 0;
                 if let Some(&item_idx) = self.filtered_indices.get(filtered_idx) {
                     if let Some(item) = self.all_wallpapers.get(item_idx) {
-                        let lock_path = self
-                            .config
-                            .home
-                            .join(".cache/dusky_images/wallpaper_selector/favorites.lock");
+                        let lock_path = self.config.theme_dir.join("favorites.lock");
                         match crate::favorites::toggle_favorite(
                             &self.config.fav_file,
                             &lock_path,
@@ -1089,7 +1086,7 @@ impl WallpaperSelectorApp {
                 };
                 if let Err(error) = preferences.save(&self.config.preferences_file) {
                     self.error_message =
-                        Some(format!("Could not save selector preferences: {error}"));
+                        Some(format!("Could not save Dusky Papers preferences: {error}"));
                 }
                 self.refilter();
                 Task::none()
@@ -1103,7 +1100,7 @@ impl WallpaperSelectorApp {
                 };
                 if let Err(error) = preferences.save(&self.config.preferences_file) {
                     self.error_message =
-                        Some(format!("Could not save selector preferences: {error}"));
+                        Some(format!("Could not save Dusky Papers preferences: {error}"));
                 }
                 self.motion_profile = next_profile;
                 if !next_profile.is_enabled() {
@@ -1123,7 +1120,7 @@ impl WallpaperSelectorApp {
                 };
                 if let Err(error) = preferences.save(&self.config.preferences_file) {
                     self.error_message =
-                        Some(format!("Could not save selector preferences: {error}"));
+                        Some(format!("Could not save Dusky Papers preferences: {error}"));
                 }
                 self.view_layout = next_layout;
                 if next_layout == ViewLayout::Grid {
@@ -1611,7 +1608,7 @@ impl WallpaperSelectorApp {
             });
 
         // Search capsule
-        let search_input = text_input("dusky wallpapers  /", &self.search_query)
+        let search_input = text_input("Dusky Papers  /", &self.search_query)
             .id(iced::widget::Id::new("search_input"))
             .on_input(Message::SearchChanged)
             .on_submit(Message::SearchSubmitted)

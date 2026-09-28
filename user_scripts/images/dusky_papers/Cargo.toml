@@ -1,9 +1,9 @@
 [package]
-name = "wallpaper_selector"
+name = "dusky-papers"
 version = "1.1.0"
 edition = "2024"
 authors = ["Dusk Linux"]
-description = "Fast, lightweight GPU-accelerated wallpaper selector for Arch Linux / Hyprland"
+description = "Dusky Papers: fast, lightweight wallpapers for Arch Linux / Hyprland"
 
 [dependencies]
 iced = { version = "0.14", default-features = false, features = ["advanced", "image-without-codecs", "wayland", "wgpu", "thread-pool"] }

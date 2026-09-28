@@ -9,7 +9,7 @@ mod ui;
 
 use config::Config;
 use std::env;
-use ui::WallpaperSelectorApp;
+use ui::DuskyPapersApp;
 
 // Bound background task threads instead of creating one for every CPU.
 struct BackgroundExecutor(iced::futures::executor::ThreadPool);
@@ -33,8 +33,8 @@ impl iced::executor::Executor for BackgroundExecutor {
 }
 
 fn print_help() {
-    println!("Dusky Wallpaper Selector (Rust/Iced)");
-    println!("Usage: wallpaper_selector [OPTIONS]\n");
+    println!("Dusky Papers");
+    println!("Usage: dusky-papers [OPTIONS]\n");
     println!("Options:");
     println!("  --next-fav       Cycle to next favorite wallpaper and exit");
     println!("  --prev-fav       Cycle to previous favorite wallpaper and exit");
@@ -76,7 +76,7 @@ fn cycle_favorite(direction_next: bool, config: &Config) -> bool {
         let _ = std::process::Command::new("notify-send")
             .args([
                 "-a",
-                "dusky-wallpaper",
+                "dusky-papers",
                 "No Favorites",
                 "No favorite wallpapers found.",
             ])
@@ -200,7 +200,7 @@ impl SingleInstanceGuard {
         let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
             .map(std::path::PathBuf::from)
             .ok_or("XDG_RUNTIME_DIR is not set")?;
-        let path = runtime_dir.join("dusky_wallpaper_selector.lock");
+        let path = runtime_dir.join("dusky-papers.lock");
         let file = std::fs::File::create(&path)
             .map_err(|e| format!("Could not open {}: {e}", path.display()))?;
         match file.try_lock() {
@@ -232,9 +232,9 @@ fn reveal_existing_window() -> Result<(), String> {
         .and_then(|clients| {
             clients
                 .iter()
-                .find(|client| client["class"].as_str() == Some("dusky-wallpaper-selector-rust"))
+                .find(|client| client["class"].as_str() == Some("dusky-papers"))
         })
-        .ok_or("Could not find the running wallpaper selector window")?;
+        .ok_or("Could not find the running Dusky Papers window")?;
     let address = window["address"]
         .as_str()
         .ok_or("Hyprland did not report a window address")?;
@@ -249,7 +249,7 @@ fn reveal_existing_window() -> Result<(), String> {
         let result = std::process::Command::new("hyprctl")
             .args(["dispatch", &expression])
             .output()
-            .map_err(|e| format!("Could not move the selector: {e}"))?;
+            .map_err(|e| format!("Could not move Dusky Papers: {e}"))?;
         if !result.status.success() {
             return Err(String::from_utf8_lossy(&result.stderr).trim().to_owned());
         }
@@ -262,7 +262,7 @@ fn reveal_existing_window() -> Result<(), String> {
     let result = std::process::Command::new("hyprctl")
         .args(["dispatch", &expression])
         .output()
-        .map_err(|e| format!("Could not focus the selector: {e}"))?;
+        .map_err(|e| format!("Could not focus Dusky Papers: {e}"))?;
     if !result.status.success() {
         return Err(String::from_utf8_lossy(&result.stderr).trim().to_owned());
     }
@@ -426,7 +426,7 @@ fn main() -> iced::Result {
     }
 
     if matches!(option, Some("--version" | "-v" | "-V")) {
-        println!("wallpaper_selector {}", env!("CARGO_PKG_VERSION"));
+        println!("dusky-papers {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
@@ -470,12 +470,12 @@ fn main() -> iced::Result {
         Ok(Some(g)) => g,
         Ok(None) => {
             if let Err(error) = reveal_existing_window() {
-                eprintln!("Could not show the running wallpaper selector: {error}");
+                eprintln!("Could not show the running Dusky Papers: {error}");
             }
             return Ok(());
         }
         Err(error) => {
-            eprintln!("Could not start wallpaper selector: {error}");
+            eprintln!("Could not start Dusky Papers: {error}");
             std::process::exit(1);
         }
     };
@@ -486,7 +486,7 @@ fn main() -> iced::Result {
         decorations: false,
         transparent: true,
         platform_specific: iced::window::settings::PlatformSpecific {
-            application_id: "dusky-wallpaper-selector-rust".to_string(),
+            application_id: "dusky-papers".to_string(),
             ..Default::default()
         },
         ..Default::default()
@@ -494,30 +494,30 @@ fn main() -> iced::Result {
 
     let app_config = config.clone();
     iced::application(
-        move || WallpaperSelectorApp::new(app_config.clone()),
-        WallpaperSelectorApp::update,
-        WallpaperSelectorApp::view,
+        move || DuskyPapersApp::new(app_config.clone()),
+        DuskyPapersApp::update,
+        DuskyPapersApp::view,
     )
     .executor::<BackgroundExecutor>()
     .window(window_settings)
-    .subscription(WallpaperSelectorApp::subscription)
+    .subscription(DuskyPapersApp::subscription)
     .theme(theme)
     .style(style)
     .title(title)
     .run()
 }
 
-fn style(_: &WallpaperSelectorApp, theme: &iced::Theme) -> iced::theme::Style {
+fn style(_: &DuskyPapersApp, theme: &iced::Theme) -> iced::theme::Style {
     iced::theme::Style {
         background_color: iced::Color::TRANSPARENT,
         text_color: theme.palette().text,
     }
 }
 
-fn title(_: &WallpaperSelectorApp) -> String {
-    "Wallpaper Selector".to_string()
+fn title(_: &DuskyPapersApp) -> String {
+    "Dusky Papers".to_string()
 }
 
-fn theme(_: &WallpaperSelectorApp) -> iced::Theme {
+fn theme(_: &DuskyPapersApp) -> iced::Theme {
     iced::Theme::Dark
 }
