@@ -16,5 +16,6 @@
     .cat_title { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1F.cat_title%1Fbg | bg: surface */
     strong { color: var(--on_surface) !important; } /* dusky key=sel%1Fstrong%1Ftext | text: on_surface */
     p { color: var(--on_surface) !important; } /* dusky key=sel%1Fp%1Ftext | text: on_surface */
+    html > body > div:nth-of-type(1) > nav { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fhtml%20%3E%20body%20%3E%20div%3Anth-of-type%281%29%20%3E%20nav%1Fbg | bg: surface */
     /* <<< dusky:picks */
 }
