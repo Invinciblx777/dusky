@@ -514,12 +514,12 @@ class UfwEngine(BaseEngine):
     # =========================================================================
     # 5. COMMON SERVICES
     # =========================================================================
-    def is_service_allowed(self, svc_key: str) -> bool:
+    def is_service_allowed(self, svc_key: str, *, rules: list[RuleRecord] | None = None) -> bool:
         svc = COMMON_SERVICES.get(svc_key)
         if not svc:
             return False
         port_spec = svc["port"]
-        numbered = self.get_numbered_rules()
+        numbered = self.get_numbered_rules() if rules is None else rules
         ports = [p.strip() for p in port_spec.split(",")]
 
         for p in ports:
@@ -618,8 +618,8 @@ class UfwEngine(BaseEngine):
         self._run_cmd(["ufw", "reload"])
         return True, f"Unbanned IP {ip} (removed {deleted} rule(s))."
 
-    def get_banned_ips(self) -> list[str]:
-        numbered = self.get_numbered_rules()
+    def get_banned_ips(self, *, rules: list[RuleRecord] | None = None) -> list[str]:
+        numbered = self.get_numbered_rules() if rules is None else rules
         banned: list[str] = []
         for r in numbered:
             if "DENY" in r.action and ("Banned:" in r.comment or "block:" in r.comment):
@@ -1217,9 +1217,10 @@ class UfwEngine(BaseEngine):
             domain_data = self._read_domain_registry()
             state["domains/whitelist_mode"] = "true" if domain_data.get("whitelist_mode") else "false"
 
-            # Common services
+            # One rule snapshot serves every service in this state load.
+            numbered_rules = self.get_numbered_rules()
             for svc_key in COMMON_SERVICES:
-                state[f"services/{svc_key}"] = "true" if self.is_service_allowed(svc_key) else "false"
+                state[f"services/{svc_key}"] = "true" if self.is_service_allowed(svc_key, rules=numbered_rules) else "false"
 
             # Quick port defaults
             state["ports/quick_port"] = "8080"

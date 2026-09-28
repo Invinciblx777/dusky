@@ -989,26 +989,47 @@ SCHEMA[13] = [
 # =============================================================================
 # 4. RICH CUSTOM VIEWS
 # =============================================================================
-def _get_engine(app: Any) -> UfwEngine | None:
-    eng = getattr(UfwEngine, "_instance", None)
-    if not eng and app and hasattr(app, "engine_pool"):
-        for e in list(app.engine_pool.values()):
-            if isinstance(e, UfwEngine):
-                eng = e
-                break
-    return eng
+def prepare_ufw_view(kind):
+    """Capture the engine and selection on the UI thread."""
+    def prepare(app):
+        report = next((item.value or "listening" for rows in app.schema.values()
+                       for item in rows if item.key == "selected_report"), "listening")
+        return app.engine_pool[app.default_engine_key], kind, report
+    return prepare
 
 
-def render_ufw_dashboard_view(app: Any) -> Any:
-    eng = _get_engine(app)
-    if not eng:
-        return Panel(Text("Initializing UFW Engine…", style="dim italic"), title="Dashboard")
+def collect_ufw_view(prepared):
+    """Blocking reads only; the framework serializes these with engine saves."""
+    eng, kind, report = prepared
+    match kind:
+        case "status":
+            rules = eng.get_numbered_rules()
+            return {
+                "status": eng.get_status_verbose(), "rules": rules,
+                "wan": eng.detect_wan_interface() or "Unknown",
+                "domains": eng._read_domain_registry(), "forward": eng.get_sysctl_forwarding(),
+                "waydroid": eng.get_waydroid_nat(), "docker": eng.get_docker_mitigation(),
+                "stealth": eng.get_icmp_ping_stealth(), "banned": eng.get_banned_ips(rules=rules),
+                "listening": eng.get_listening_ports(),
+            }
+        case "ports":
+            return eng.get_detailed_port_map()
+        case "rules":
+            return eng.get_numbered_rules()
+        case "domains":
+            return eng._read_domain_registry()
+        case "connections":
+            return eng.get_active_connections(), eng.get_banned_ips()
+        case "reports":
+            return report, eng.get_report(report)
+    raise ValueError(f"Unknown UFW view: {kind}")
 
-    status = eng.get_status_verbose()
-    rules = eng.get_numbered_rules()
-    wan = eng.detect_wan_interface() or "wlan0"
-    domain_data = eng._read_domain_registry()
-    whitelist_active = domain_data.get("whitelist_mode", False)
+
+def render_ufw_dashboard_view(snapshot: dict) -> Any:
+    status = snapshot["status"]
+    rules = snapshot["rules"]
+    wan = snapshot["wan"]
+    whitelist_active = snapshot["domains"].get("whitelist_mode", False)
 
     is_active = status.get("active", False)
     status_text = Text("● ACTIVE", style="bold green") if is_active else Text("○ INACTIVE", style="bold red")
@@ -1021,10 +1042,10 @@ def render_ufw_dashboard_view(app: Any) -> Any:
     t_power.add_row("Logging:", Text(status.get("logging", "off").upper(), style="bold cyan"))
     t_power.add_row("Active Rules:", Text(str(len(rules)), style="bold yellow"))
     t_power.add_row("WAN Interface:", Text(wan, style="bold magenta"))
-    t_power.add_row("IP Forward:", Text("ENABLED" if eng.get_sysctl_forwarding() else "DISABLED", style="green" if eng.get_sysctl_forwarding() else "dim"))
-    t_power.add_row("Waydroid NAT:", Text("ACTIVE" if eng.get_waydroid_nat() else "OFF", style="green" if eng.get_waydroid_nat() else "dim"))
-    t_power.add_row("Docker Guard:", Text("ENFORCED" if eng.get_docker_mitigation() else "OFF", style="green" if eng.get_docker_mitigation() else "dim"))
-    t_power.add_row("Ping Stealth:", Text("STEALTH (DROPPED)" if eng.get_icmp_ping_stealth() else "STANDARD (REPLY)", style="bold yellow" if eng.get_icmp_ping_stealth() else "dim"))
+    t_power.add_row("IP Forward:", Text("ENABLED" if snapshot["forward"] else "DISABLED", style="green" if snapshot["forward"] else "dim"))
+    t_power.add_row("Waydroid NAT:", Text("ACTIVE" if snapshot["waydroid"] else "OFF", style="green" if snapshot["waydroid"] else "dim"))
+    t_power.add_row("Docker Guard:", Text("ENFORCED" if snapshot["docker"] else "OFF", style="green" if snapshot["docker"] else "dim"))
+    t_power.add_row("Ping Stealth:", Text("STEALTH (DROPPED)" if snapshot["stealth"] else "STANDARD (REPLY)", style="bold yellow" if snapshot["stealth"] else "dim"))
     p_power = Panel(t_power, title="[bold cyan] 󰒃 FIREWALL STATUS [/bold cyan]", border_style="cyan", expand=True)
 
     # Card 2: Traffic Policies
@@ -1038,11 +1059,11 @@ def render_ufw_dashboard_view(app: Any) -> Any:
     t_policy.add_row("Routed Default:", Text(status.get("default_routed", "deny").upper(), style="bold yellow"))
     wl_style = "bold green" if whitelist_active else "dim"
     t_policy.add_row("Whitelist Mode:", Text("ACTIVE (LOCKDOWN)" if whitelist_active else "DISABLED (STANDARD)", style=wl_style))
-    t_policy.add_row("Banned IPs:", Text(str(len(eng.get_banned_ips())), style="bold red" if eng.get_banned_ips() else "dim"))
+    t_policy.add_row("Banned IPs:", Text(str(len(snapshot["banned"])), style="bold red" if snapshot["banned"] else "dim"))
     p_policy = Panel(t_policy, title="[bold green] 󰈀 DEFAULT POLICIES [/bold green]", border_style="green", expand=True)
 
     # Card 3: Listening Services Snapshot
-    listening = eng.get_listening_ports()
+    listening = snapshot["listening"]
     t_listen = Table(box=None, padding=(0, 1), show_header=True)
     t_listen.add_column("Proto", style="dim", width=6)
     t_listen.add_column("Port", style="bold yellow", width=8)
@@ -1068,13 +1089,7 @@ def render_ufw_dashboard_view(app: Any) -> Any:
     return main_grid
 
 
-def render_ports_view(app: Any) -> Any:
-    eng = _get_engine(app)
-    if not eng:
-        return Panel(Text("Loading ports…", style="dim italic"), title="Ports")
-
-    port_map = eng.get_detailed_port_map()
-
+def render_ports_view(port_map: list) -> Any:
     t = Table(expand=True, box=None, padding=(0, 1), show_header=True)
     t.add_column("Port", style="bold yellow", width=8, justify="right")
     t.add_column("Proto", style="dim", width=6)
@@ -1119,12 +1134,7 @@ def render_ports_view(app: Any) -> Any:
     )
 
 
-def render_rules_view(app: Any) -> Any:
-    eng = _get_engine(app)
-    if not eng:
-        return Panel(Text("Loading rules…", style="dim italic"), title="Rules")
-
-    rules = eng.get_numbered_rules()
+def render_rules_view(rules: list) -> Any:
     t = Table(expand=True, box=None, padding=(0, 1), show_header=True)
     t.add_column("#", style="dim bold", width=4, justify="right")
     t.add_column("Action", width=12)
@@ -1145,12 +1155,7 @@ def render_rules_view(app: Any) -> Any:
     return Panel(t, title=f"[bold green] 󰒃 ACTIVE NUMBERED RULES ({len(rules)}) [/bold green]", border_style="green", expand=True)
 
 
-def render_domains_view(app: Any) -> Any:
-    eng = _get_engine(app)
-    if not eng:
-        return Panel(Text("Loading domains…", style="dim italic"), title="Domains")
-
-    data = eng._read_domain_registry()
+def render_domains_view(data: dict) -> Any:
     domains = data.get("domains", [])
     wl = data.get("whitelist_mode", False)
 
@@ -1180,13 +1185,8 @@ def render_domains_view(app: Any) -> Any:
     )
 
 
-def render_connections_view(app: Any) -> Any:
-    eng = _get_engine(app)
-    if not eng:
-        return Panel(Text("Loading connections…", style="dim italic"), title="Connections")
-
-    conns = eng.get_active_connections()
-    banned = eng.get_banned_ips()
+def render_connections_view(snapshot: tuple) -> Any:
+    conns, banned = snapshot
 
     t = Table(expand=True, box=None, padding=(0, 1), show_header=True)
     t.add_column("Proto", style="dim", width=6)
@@ -1216,20 +1216,8 @@ def render_connections_view(app: Any) -> Any:
     )
 
 
-def render_reports_view(app: Any) -> Any:
-    eng = _get_engine(app)
-    if not eng:
-        return Panel(Text("Loading report…", style="dim italic"), title="Report")
-
-    rep_name = "listening"
-    if hasattr(app, "schema"):
-        for tab_items in app.schema.values():
-            for item in tab_items:
-                if item.key == "selected_report":
-                    rep_name = item.value or "listening"
-                    break
-
-    content = eng.get_report(rep_name)
+def render_reports_view(snapshot: tuple) -> Any:
+    rep_name, content = snapshot
     return Panel(
         Text(content, style="white"),
         title=f"[bold yellow] 󰑓 NETFILTER LIVE REPORT: '{rep_name}' [/bold yellow]",
@@ -1244,31 +1232,43 @@ def render_reports_view(app: Any) -> Any:
 CUSTOM_VIEWS = {
     0: {
         "view": render_ufw_dashboard_view,
+        "prepare": prepare_ufw_view("status"),
+        "collect": collect_ufw_view,
         "interval": 2.0,
         "show_options": False,
     },
     2: {
         "view": render_ports_view,
+        "prepare": prepare_ufw_view("ports"),
+        "collect": collect_ufw_view,
         "interval": 2.0,
         "show_options": False,
     },
     4: {
         "view": render_rules_view,
+        "prepare": prepare_ufw_view("rules"),
+        "collect": collect_ufw_view,
         "interval": 2.0,
         "show_options": False,
     },
     6: {
         "view": render_domains_view,
+        "prepare": prepare_ufw_view("domains"),
+        "collect": collect_ufw_view,
         "interval": 3.0,
         "show_options": False,
     },
     9: {
         "view": render_connections_view,
+        "prepare": prepare_ufw_view("connections"),
+        "collect": collect_ufw_view,
         "interval": 2.0,
         "show_options": False,
     },
     14: {
         "view": render_reports_view,
+        "prepare": prepare_ufw_view("reports"),
+        "collect": collect_ufw_view,
         "interval": 3.0,
         "show_options": False,
     },
