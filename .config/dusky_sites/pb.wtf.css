@@ -13,5 +13,8 @@
     a { color: var(--on_surface) !important; } /* dusky key=sel%1Fa%1Ftext | text: on_surface */
     input { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Finput%1Fbg | bg: surface */
     input { color: var(--on_surface) !important; } /* dusky key=sel%1Finput%1Ftext | text: on_surface */
+    .cat_title { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1F.cat_title%1Fbg | bg: surface */
+    strong { color: var(--on_surface) !important; } /* dusky key=sel%1Fstrong%1Ftext | text: on_surface */
+    p { color: var(--on_surface) !important; } /* dusky key=sel%1Fp%1Ftext | text: on_surface */
     /* <<< dusky:picks */
 }
