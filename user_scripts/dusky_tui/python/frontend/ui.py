@@ -1683,7 +1683,7 @@ class ShortcutFlowLayout(Layout):
                 x = 0
                 y += 1
             placements.append(WidgetPlacement(Region(x, y, width, 1), Offset(), Spacing(), child))
-            x += width + 2
+            x += width
         return placements
 
 
