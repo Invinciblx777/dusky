@@ -619,17 +619,22 @@ def resolve_buffer(want: str | None, need_player: bool) -> str:
 
 def wait_for_file(path: str, proc: subprocess.Popen, timeout: float, min_bytes: int = START_BYTES) -> bool:
     t0 = time.time()
+    last_msg = 0.0
     while time.time() - t0 < timeout:
         try:
-            if os.path.getsize(path) >= min_bytes:
+            have = os.path.getsize(path)
+            if have >= min_bytes:
                 return True
         except OSError:
-            pass
+            have = 0
         if proc.poll() is not None:  # recorder died: fail fast
             try:
                 return os.path.getsize(path) >= min_bytes
             except OSError:
                 return False
+        if time.time() - last_msg >= 2.0:
+            print(f"  recording... {have // 1024}KB / {min_bytes // 1024}KB", file=sys.stderr)
+            last_msg = time.time()
         time.sleep(0.5)
     try:
         return os.path.getsize(path) >= min_bytes
@@ -638,14 +643,17 @@ def wait_for_file(path: str, proc: subprocess.Popen, timeout: float, min_bytes: 
 
 
 def join_threshold(fmts: list[dict], choice: str) -> int:
-    """Wait ~3s of stream data before the player joins a growing file.
+    """Wait ~1.5s of stream data before the player joins a growing file.
 
     Joining a .ts that only has a fragment of a segment is what causes the
     brief 'PES packet size mismatch / Packet corrupt' burst on player start.
-    Scales with the chosen rendition's bitrate so 480p doesn't wait long.
+    Scales with the chosen rendition's bitrate so 480p doesn't wait long;
+    capped low because mpv tails growing files gracefully anyway, and a slow
+    network can deliver far below nominal bitrate (measured ~116KB/s on a
+    16Mbps rendition during congestion).
     """
     tbr = next((f["tbr"] for f in fmts if f["id"] == choice), 0) or 0
-    return max(START_BYTES, min(int(tbr * 125 * 3), 32 * 1024 * 1024))
+    return max(START_BYTES, min(int(tbr * 125 * 1.5), 2 * 1024 * 1024))
 
 
 # ---------- CLI ----------
@@ -969,7 +977,8 @@ def main() -> int:
             if rec.poll() is not None:
                 print("ERROR: recorder exited before producing data.", file=sys.stderr)
                 return 1
-            print("WARNING: no data yet, continuing anyway...", file=sys.stderr)
+            print("WARNING: recording slower than expected; starting player anyway — "
+                  "it follows the growing file.", file=sys.stderr)
         if args.record_only:
             print("Recording... Ctrl-C to stop.", file=sys.stderr)
             rec.wait()
