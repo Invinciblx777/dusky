@@ -16,6 +16,13 @@ Examples:
   %(prog)s URL --cookies ~/cookies.txt            # login-walled / sensitive posts
   %(prog)s URL --direct -f best                  # no DVR, plain mpv + yt-dlp
   %(prog)s URL --record-only --keep               # timeshift buffer in tmpfs
+  %(prog)s --set-global buffer=near speed=2       # persist global defaults
+  %(prog)s --history                              # list past streams
+  %(prog)s --replay 0                             # replay #0 with stored settings
+
+Preferences: CLI flag > --replay entry > env > config.toml > builtin.
+Globals live in ~/.config/dusky/settings/ytdlp_stream/config.toml,
+per-stream prefs in history.toml (both 0600; video data stays in tmpfs).
 
 Player keys: } = 2x, ] / [ = faster/slower, Backspace = reset,
 Left/Right = seek, Up/Down = seek 1 min.
@@ -60,6 +67,195 @@ try:
     _RICH = True
 except Exception:
     _RICH = False
+
+
+# ---------- config + history (global prefs + per-stream prefs) ----------
+# ~/.config/dusky/settings/ytdlp_stream/config.toml   global preferences
+# ~/.config/dusky/settings/ytdlp_stream/history.toml  per-URL preferences
+
+def _cfg_dir() -> str:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "dusky", "settings", "ytdlp_stream")
+
+
+CONFIG_FILE = os.path.join(_cfg_dir(), "config.toml")
+HISTORY_FILE = os.path.join(_cfg_dir(), "history.toml")
+MAX_HISTORY = 100
+
+# key: (type, builtin default)
+GLOBAL_SPEC: dict[str, tuple[str, object]] = {
+    "format": ("str", ""),
+    "prefer_codec": ("str", ""),
+    "buffer": ("str", "ask"),
+    "speed": ("float", 1.0),
+    "tmpdir": ("str", ""),
+    "cookies": ("str", ""),
+    "cookies_from_browser": ("str", ""),
+    "min_free": ("int", MIN_FREE_MB_DEFAULT),
+    "timeout": ("float", 30.0),
+    "fullscreen": ("bool", False),
+    "mute": ("bool", False),
+    "low_latency": ("bool", False),
+    "keep": ("bool", False),
+    "show_recorder": ("bool", False),
+}
+
+
+def _tstr(s: str) -> str:
+    out = []
+    for ch in s:
+        o = ord(ch)
+        if ch == '"':
+            out.append('\\"')
+        elif ch == "\\":
+            out.append("\\\\")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\t":
+            out.append("\\t")
+        elif o < 0x20 or o == 0x7F:
+            out.append(f"\\u{o:04X}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
+def _tval(v: object) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    return _tstr(str(v))
+
+
+def _dump_toml(data: dict) -> str:
+    """Minimal writer for our schemas: flat scalars + lists of flat dicts."""
+    lines = []
+    for k, v in data.items():
+        if isinstance(v, list):
+            for item in v:
+                lines.append(f"[[{k}]]")
+                for ik, iv in item.items():
+                    lines.append(f"{ik} = {_tval(iv)}")
+        elif isinstance(v, dict):
+            lines.append(f"[{k}]")
+            for ik, iv in v.items():
+                lines.append(f"{ik} = {_tval(iv)}")
+        else:
+            lines.append(f"{k} = {_tval(v)}")
+    return "\n".join(lines) + "\n"
+
+
+def _load_toml(path: str) -> dict:
+    try:
+        import tomllib
+    except ImportError:
+        return {}
+    try:
+        with open(path, "rb") as f:
+            d = tomllib.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _atomic_write(path: str, text: str) -> None:
+    secure_dir(os.path.dirname(path) or ".")
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=os.path.dirname(path) or ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def load_config() -> dict:
+    d = _load_toml(CONFIG_FILE)
+    return d.get("defaults", d) if isinstance(d, dict) else {}
+
+
+def save_config(values: dict) -> None:
+    _atomic_write(CONFIG_FILE, _dump_toml({"defaults": values}))
+
+
+def parse_global_pair(pair: str) -> tuple[str, object]:
+    if "=" not in pair:
+        raise SystemExit(f"ERROR: --set-global needs KEY=VALUE, got {pair!r}")
+    k, _, raw = pair.partition("=")
+    k, raw = k.strip(), raw.strip()
+    if k not in GLOBAL_SPEC:
+        raise SystemExit(f"ERROR: unknown key {k!r}. Known: {', '.join(sorted(GLOBAL_SPEC))}")
+    typ, _ = GLOBAL_SPEC[k]
+    if typ == "bool":
+        if raw.lower() in ("1", "true", "yes", "on"):
+            return k, True
+        if raw.lower() in ("0", "false", "no", "off"):
+            return k, False
+        raise SystemExit(f"ERROR: {k} needs true/false, got {raw!r}")
+    if typ == "int":
+        try:
+            return k, int(raw)
+        except ValueError:
+            raise SystemExit(f"ERROR: {k} needs an integer, got {raw!r}")
+    if typ == "float":
+        try:
+            return k, float(raw)
+        except ValueError:
+            raise SystemExit(f"ERROR: {k} needs a number, got {raw!r}")
+    return k, raw
+
+
+def load_history() -> list[dict]:
+    d = _load_toml(HISTORY_FILE)
+    e = d.get("entries", [])
+    return [x for x in e if isinstance(x, dict) and x.get("url")] if isinstance(e, list) else []
+
+
+def save_history(entries: list[dict]) -> None:
+    _atomic_write(HISTORY_FILE, _dump_toml({"entries": entries[:MAX_HISTORY]}))
+
+
+ENTRY_FIELDS = ("url", "title", "uploader", "live_status", "format", "buffer",
+                "speed", "prefer_codec", "fullscreen", "mute", "low_latency",
+                "cookies_used", "cookies", "cookies_from_browser",
+                "last_played", "plays")
+
+
+def find_entry(spec: str) -> dict:
+    """Match a history entry by # index, exact URL, or unique substring."""
+    entries = load_history()
+    if not entries:
+        raise SystemExit("ERROR: history is empty.")
+    s = spec.strip()
+    if s.isdigit() and int(s) < len(entries):
+        return entries[int(s)]
+    exact = [e for e in entries if e.get("url") == s]
+    if exact:
+        return exact[0]
+    sub = [e for e in entries if s.lower() in str(e.get("url", "")).lower()
+           or s.lower() in str(e.get("title", "")).lower()]
+    if len(sub) == 1:
+        return sub[0]
+    if not sub:
+        raise SystemExit(f"ERROR: no history match for {spec!r}. Use --history to list.")
+    raise SystemExit("ERROR: ambiguous match:\n" + "\n".join(
+        f"  {i}: {e.get('title')} | {e.get('url')}" for i, e in enumerate(entries) if e in sub))
+
+
+def remember(entry: dict) -> int:
+    """Insert/update entry by URL, newest first. Returns its index (0)."""
+    entries = [e for e in load_history() if e.get("url") != entry["url"]]
+    old = next((e for e in load_history() if e.get("url") == entry["url"]), {})
+    entry["plays"] = int(old.get("plays", 0) or 0) + 1
+    entries.insert(0, {k: entry.get(k) for k in ENTRY_FIELDS})
+    save_history(entries)
+    return 0
 
 
 # ---------- tmpfs enforcement (no disk write amplification) ----------
@@ -154,13 +350,12 @@ def pick_tmpfs(user_dir: str | None, allow_disk: bool) -> str:
 
 # ---------- cookies (login-walled / sensitive broadcasts) ----------
 
-def stage_cookies(args: argparse.Namespace, ram_dir: str) -> tuple[list[str], str | None, str | None]:
+def stage_cookies(src: str | None, browser: str | None, ram_dir: str,
+                  ) -> tuple[list[str], str | None, str | None]:
     """Copy the cookie jar into tmpfs; return (yt-dlp flags, mpv raw opt, staged path).
 
     The original jar is never handed to yt-dlp (it rewrites the file).
     """
-    src = args.cookies or os.environ.get("MPV_DVR_COOKIES")
-    browser = args.cookies_from_browser or os.environ.get("MPV_DVR_COOKIES_FROM_BROWSER")
     if src and browser:
         raise SystemExit("ERROR: use either --cookies or --cookies-from-browser, not both.")
     if browser:
@@ -311,7 +506,8 @@ def _pick_codec_best(fmts: list[dict], fam: str) -> str | None:
     return m[-1]["id"] if m else None
 
 
-def resolve_format(fmts: list[dict], want: str | None, prefer_codec: str | None = None) -> str:
+def resolve_format(fmts: list[dict], want: str | None, prefer_codec: str | None = None,
+                   fallback_best: bool = False) -> str:
     """Return an mpv --ytdl-format value.
 
     Accepts: number from -F, exact format ID, best/worst, a codec family
@@ -319,6 +515,7 @@ def resolve_format(fmts: list[dict], want: str | None, prefer_codec: str | None 
     yt-dlp format selector (passed through untouched, e.g.
     "bv*[vcodec^=av01]+ba/b"). Interactive prompt loops: typing a codec
     filters the table, anything else unknown is treated as a raw selector.
+    With fallback_best (replays), a vanished stored ID degrades to best.
     """
     if not fmts:
         return "best"
@@ -377,8 +574,15 @@ def resolve_format(fmts: list[dict], want: str | None, prefer_codec: str | None 
     if wl in CODEC_ALIASES:
         hit = _pick_codec_best(fmts, CODEC_ALIASES[wl])
         if hit is None:
+            if fallback_best:
+                print(f"WARNING: stored codec {wl} gone, falling back to best.", file=sys.stderr)
+                return _best_of(fmts)
             raise SystemExit(f"ERROR: no {wl} formats. Use -F to list.")
         return hit
+    if fallback_best and "/" not in w and "[" not in w and "+" not in w and "*" not in w:
+        # Plain stored ID that no longer exists (not a raw selector): degrade.
+        print(f"WARNING: stored format {w!r} gone, falling back to best.", file=sys.stderr)
+        return _best_of(fmts)
     # Raw yt-dlp format selector passthrough (e.g. "bv*[height<=720]+ba/b").
     print(f"Passing custom yt-dlp format selector to mpv: {w}", file=sys.stderr)
     return w
@@ -390,8 +594,9 @@ def resolve_buffer(want: str | None, need_player: bool) -> str:
     Never forced: ask prompts on a tty, defaults to near when piped or when
     there is no player (--record-only / -F). Direct-live note: full widens
     the in-memory rewind window but can't exceed the server sliding window.
+    Global/env/CLI merging happens before this call, so want is already final.
     """
-    w = (want or os.environ.get("MPV_DVR_BUFFER") or "ask").strip().lower()
+    w = (want or "ask").strip().lower()
     if w not in ("ask", "full", "near"):
         raise SystemExit("ERROR: --buffer must be ask/full/near")
     if not need_player or w in ("full", "near"):
@@ -448,51 +653,206 @@ def join_threshold(fmts: list[dict], choice: str) -> int:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog=PROG, description="Watch YouTube/X live in mpv with tmpfs DVR (rewind + 2x).",
-        epilog="Player keys: } = 2x, ]/[ = speed, Backspace = reset, Left/Right = seek.",
+        epilog="Precedence: CLI > --replay entry > env > config.toml > builtin. "
+               "Player keys: } = 2x, ]/[ = speed, Backspace = reset, Left/Right = seek.",
     )
-    ap.add_argument("url", help="youtube.com/watch, youtu.be, x.com/i/broadcasts/..., x.com/.../status/... works for VOD too")
+    ap.add_argument("url", nargs="?",
+                    help="youtube.com/watch, youtu.be, x.com/i/broadcasts/..., x.com/.../status/... works for VOD too")
     ap.add_argument("-F", "--list-formats", action="store_true", help="list available resolutions and exit")
-    ap.add_argument("-f", "--format", default=os.environ.get("MPV_DVR_FORMAT"),
+    ap.add_argument("-f", "--format", default=None,
                     help="format ID, number from -F, codec (av1/vp9/hevc/avc), best/worst, "
-                         "or raw yt-dlp selector (default: interactive prompt, best if piped)")
-    ap.add_argument("--prefer-codec", default=os.environ.get("MPV_DVR_CODEC"),
+                         "or raw yt-dlp selector (default: prompt, best if piped)")
+    ap.add_argument("--prefer-codec", default=None,
                     help="auto-pick best format with this codec: av1/vp9/hevc/avc (ignored if -f given)")
-    ap.add_argument("--buffer", default=os.environ.get("MPV_DVR_BUFFER", "ask"),
+    ap.add_argument("--buffer", default=None,
                     help="player RAM window: ask/full/near (default: ask on tty, near if piped). "
                          "full = 1G back/forth scrub window; file stays seekable either way")
-    ap.add_argument("--speed", type=float, default=float(os.environ.get("MPV_DVR_SPEED", "1.0")),
-                    help="initial player speed, 2 = 2x (default: 1.0)")
-    ap.add_argument("--tmpdir", default=os.environ.get("MPV_DVR_TMPDIR"),
-                    help="tmpfs dir for recording (default: /mnt/zram1, /dev/shm, then /tmp)")
+    ap.add_argument("--speed", type=float, default=None, help="initial player speed, 2 = 2x (default: 1.0)")
+    ap.add_argument("--tmpdir", default=None, help="tmpfs dir for recording (default: /mnt/zram1, /dev/shm, /tmp)")
     ap.add_argument("--cookies", default=None,
                     help="Netscape cookie file for login-walled broadcasts (copied to tmpfs, original untouched)")
     ap.add_argument("--cookies-from-browser", default=None, metavar="BROWSER",
                     help="e.g. chromium, firefox (passed to yt-dlp and mpv)")
-    ap.add_argument("--allow-disk", action="store_true", help="allow non-tmpfs --tmpdir (SSD wear, not recommended)")
-    ap.add_argument("--min-free", type=int, default=MIN_FREE_MB_DEFAULT, metavar="MB",
-                    help="required free tmpfs MB (default: %(default)s)")
-    ap.add_argument("--keep", action="store_true", help="keep tmpfs recording on exit")
-    ap.add_argument("--show-recorder", action="store_true", help="also show the live recorder window (default: headless)")
+    ap.add_argument("--allow-disk", dest="allow_disk", default=None,
+                    action=argparse.BooleanOptionalAction, help="allow non-tmpfs --tmpdir (SSD wear)")
+    ap.add_argument("--min-free", type=int, default=None, metavar="MB", help="required free tmpfs MB (default: 500)")
+    ap.add_argument("--keep", dest="keep", default=None,
+                    action=argparse.BooleanOptionalAction, help="keep tmpfs recording on exit")
+    ap.add_argument("--show-recorder", dest="show_recorder", default=None,
+                    action=argparse.BooleanOptionalAction,
+                    help="also show the live recorder window (default: headless)")
     ap.add_argument("--record-only", action="store_true", help="record to tmpfs without launching the player")
     ap.add_argument("--direct", action="store_true", help="no DVR: plain mpv + yt-dlp (no rewind buffer)")
-    ap.add_argument("--fullscreen", action="store_true", help="start player fullscreen")
-    ap.add_argument("--mute", action="store_true", help="start player muted")
-    ap.add_argument("--low-latency", action="store_true", help="recorder uses mpv --profile=low-latency")
-    ap.add_argument("--timeout", type=float, default=30.0, help="seconds to wait for recording to start (default: %(default)s)")
-    ap.add_argument("--player-args", default="", help='extra player args, e.g. --player-args="--fullscreen --volume=80"')
+    ap.add_argument("--fullscreen", dest="fullscreen", default=None,
+                    action=argparse.BooleanOptionalAction, help="start player fullscreen")
+    ap.add_argument("--mute", dest="mute", default=None,
+                    action=argparse.BooleanOptionalAction, help="start player muted")
+    ap.add_argument("--low-latency", dest="low_latency", default=None,
+                    action=argparse.BooleanOptionalAction, help="recorder uses mpv --profile=low-latency")
+    ap.add_argument("--timeout", type=float, default=None, help="seconds to wait for recording to start (default: 30)")
+    ap.add_argument("--player-args", default="", help='extra player args, e.g. --player-args="--volume=80"')
     ap.add_argument("--recorder-args", default="", help="extra recorder args, same quoting")
     ap.add_argument("--print-cmds", action="store_true", help="print mpv commands without running them")
+    mg = ap.add_argument_group("config + history",
+                               f"stored in {os.path.join(_cfg_dir())} (0600, video stays in tmpfs)")
+    mg.add_argument("--set-global", action="append", nargs="+", default=[], metavar="KEY=VALUE",
+                    help=f"persist global defaults, e.g. --set-global buffer=near speed=2 "
+                         f"({', '.join(sorted(GLOBAL_SPEC))})")
+    mg.add_argument("--show-config", action="store_true", help="show global defaults and exit")
+    mg.add_argument("--history", action="store_true", help="list previously played streams and exit")
+    mg.add_argument("--replay", default=None, metavar="N|URL",
+                    help="replay a history entry with its stored settings (index, URL, or title match)")
+    mg.add_argument("--forget", default=None, metavar="N|URL", help="drop a history entry and exit")
+    mg.add_argument("--clear-history", action="store_true", help="drop all history and exit")
     return ap
+
+
+OPT_ENV = {
+    "format": "MPV_DVR_FORMAT", "prefer_codec": "MPV_DVR_CODEC", "buffer": "MPV_DVR_BUFFER",
+    "speed": "MPV_DVR_SPEED", "tmpdir": "MPV_DVR_TMPDIR", "cookies": "MPV_DVR_COOKIES",
+    "cookies_from_browser": "MPV_DVR_COOKIES_FROM_BROWSER",
+}
+
+
+def _eff(cli: object, entry: dict, key: str, cfg: dict, builtin: object) -> object:
+    """Precedence: CLI > replay entry > env > config.toml > builtin."""
+    if cli is not None and cli != "":
+        return cli
+    if entry.get(key) not in (None, ""):
+        return entry[key]
+    env = os.environ.get(OPT_ENV[key], "") if key in OPT_ENV else ""
+    if env not in (None, ""):
+        return env
+    if cfg.get(key) not in (None, ""):
+        return cfg[key]
+    return builtin
+
+
+def _eff_bool(cli: object | None, entry: dict, key: str, cfg: dict, builtin: bool) -> bool:
+    if cli is not None:
+        return bool(cli)
+    if entry.get(key) is not None:
+        return bool(entry[key])
+    if cfg.get(key) is not None:
+        return bool(cfg[key])
+    return builtin
+
+
+def _eff_float(cli: object | None, entry: dict, key: str, cfg: dict, builtin: float, env_name: str) -> float:
+    for src in (cli, entry.get(key), os.environ.get(env_name), cfg.get(key)):
+        if src in (None, ""):
+            continue
+        try:
+            return float(src)  # type: ignore[arg-type]
+        except (ValueError, TypeError):
+            raise SystemExit(f"ERROR: {key} needs a number, got {src!r}")
+    return builtin
+
+
+def show_history() -> None:
+    entries = load_history()
+    if not entries:
+        print("History is empty.")
+        return
+    if _RICH and sys.stdout.isatty():
+        t = Table(show_header=True, header_style="bold")
+        for col in ("#", "LAST PLAYED", "TITLE", "FORMAT", "BUF", "SPEED", "PLAYS"):
+            t.add_column(col, justify="right" if col in ("#", "SPEED", "PLAYS") else "left")
+        for i, e in enumerate(entries):
+            ts = time.strftime("%m-%d %H:%M", time.localtime(int(e.get("last_played", 0) or 0)))
+            t.add_row(str(i), ts, str(e.get("title") or "?")[:40], str(e.get("format") or "?"),
+                      str(e.get("buffer") or "?"), str(e.get("speed") or "?"), str(e.get("plays", 1)))
+            t.add_row("", "", f"[dim]{str(e.get('url') or '')[:80]}[/dim]", "", "", "", "")
+        Console().print(t)
+        return
+    for i, e in enumerate(entries):
+        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(e.get("last_played", 0) or 0)))
+        print(f"{i}: [{ts}] {e.get('title')} | f={e.get('format')} buf={e.get('buffer')} "
+              f"spd={e.get('speed')} x{e.get('plays', 1)}\n    {e.get('url')}")
+
+
+def _eff_int(cli: object | None, entry: dict, key: str, cfg: dict, builtin: int) -> int:
+    for src in (cli, entry.get(key), cfg.get(key)):
+        if src in (None, ""):
+            continue
+        try:
+            return int(src)  # type: ignore[arg-type]
+        except (ValueError, TypeError):
+            raise SystemExit(f"ERROR: {key} needs an integer, got {src!r}")
+    return builtin
 
 
 def main() -> int:
     args = build_parser().parse_args()
-    if args.speed < 0.1 or args.speed > 100:
-        raise SystemExit("ERROR: --speed must be 0.1..100")
     if shutil.which("mpv") is None:
         raise SystemExit("ERROR: mpv not found in PATH")
     if shutil.which("yt-dlp") is None:
         raise SystemExit("ERROR: yt-dlp not found in PATH")
+
+    # Management commands (no URL needed).
+    if args.set_global:
+        cfg = load_config()
+        for pair in [p for group in args.set_global for p in group]:
+            k, v = parse_global_pair(pair)
+            cfg[k] = v
+        save_config({k: v for k, v in cfg.items() if k in GLOBAL_SPEC})
+        print(f"Saved globals to {CONFIG_FILE}")
+        return 0
+    if args.show_config:
+        cfg = load_config()
+        print(f"# {CONFIG_FILE}")
+        if not cfg:
+            print("# (empty — all builtins)")
+        for k in sorted(GLOBAL_SPEC):
+            if k in cfg:
+                print(f"{k} = {_tval(cfg[k])}")
+        return 0
+    if args.history:
+        show_history()
+        return 0
+    if args.forget is not None:
+        victim = find_entry(args.forget)
+        entries = [e for e in load_history() if e.get("url") != victim.get("url")]
+        save_history(entries)
+        print(f"Forgot: {victim.get('title')} | {victim.get('url')}")
+        return 0
+    if args.clear_history:
+        save_history([])
+        print("History cleared.")
+        return 0
+
+    # Replay supplies URL + per-stream prefs; explicit CLI still wins.
+    entry: dict = find_entry(args.replay) if args.replay else {}
+    if entry:
+        print(f"Replaying #{load_history().index(entry)}: {entry.get('title')} "
+              f"(stored f={entry.get('format')} buf={entry.get('buffer')} spd={entry.get('speed')})",
+              file=sys.stderr)
+    url = args.url or entry.get("url")
+    if not url:
+        raise SystemExit("ERROR: URL required (or use --replay N).")
+    cfg = load_config()
+    cli_fmt_given = args.format not in (None, "")
+
+    args.url = url
+    args.format = _eff(args.format, entry, "format", cfg, None)
+    args.prefer_codec = _eff(args.prefer_codec, entry, "prefer_codec", cfg, None)
+    args.buffer = _eff(args.buffer, entry, "buffer", cfg, "ask")
+    args.speed = _eff_float(args.speed, entry, "speed", cfg, 1.0, "MPV_DVR_SPEED")
+    args.tmpdir = _eff(args.tmpdir, entry, "tmpdir", cfg, None)
+    cookie_src = _eff(args.cookies, {"cookies": entry.get("cookies")}, "cookies", cfg, None)
+    browser = _eff(args.cookies_from_browser, entry, "cookies_from_browser", cfg, None)
+    args.min_free = _eff_int(args.min_free, entry, "min_free", cfg, MIN_FREE_MB_DEFAULT)
+    args.timeout = _eff_float(args.timeout, entry, "timeout", cfg, 30.0, "MPV_DVR_TIMEOUT")
+    args.fullscreen = _eff_bool(args.fullscreen, entry, "fullscreen", cfg, False)
+    args.mute = _eff_bool(args.mute, entry, "mute", cfg, False)
+    args.low_latency = _eff_bool(args.low_latency, entry, "low_latency", cfg, False)
+    args.keep = _eff_bool(args.keep, entry, "keep", cfg, False)
+    args.show_recorder = _eff_bool(args.show_recorder, entry, "show_recorder", cfg, False)
+    args.allow_disk = _eff_bool(args.allow_disk, entry, "allow_disk", cfg, False)
+    if not 0.1 <= args.speed <= 100:
+        raise SystemExit("ERROR: --speed must be 0.1..100")
+    if args.timeout <= 0 or args.min_free <= 0:
+        raise SystemExit("ERROR: --timeout/--min-free must be positive")
 
     info: dict
     tmpfs = pick_tmpfs(args.tmpdir, args.allow_disk)
@@ -500,7 +860,8 @@ def main() -> int:
         raise SystemExit(f"ERROR: {tmpfs} is not tmpfs. Aborting to avoid disk writes.")
     check_free(tmpfs, args.min_free)
     watch = secure_subdir(tmpfs, "watch-later")
-    yt_cookie_flags, mpv_cookie_opt, staged_cookies = stage_cookies(args, tmpfs)
+    yt_cookie_flags, mpv_cookie_opt, staged_cookies = stage_cookies(
+        cookie_src, browser, tmpfs)
     raw_opts = ["no-cache-dir="] + ([mpv_cookie_opt] if mpv_cookie_opt else [])
 
     def _drop(path: str | None) -> None:
@@ -521,7 +882,8 @@ def main() -> int:
         _drop(staged_cookies)
         return 0
 
-    choice = resolve_format(fmts, args.format, args.prefer_codec)
+    choice = resolve_format(fmts, args.format, args.prefer_codec,
+                              fallback_best=bool(entry) and not cli_fmt_given)
     print(f"Selected format: {choice}", file=sys.stderr)
     bufmode = resolve_buffer(args.buffer, need_player=not args.record_only)
     buf_flags = BUFFER_PRESETS[bufmode]
@@ -529,6 +891,17 @@ def main() -> int:
         print(f"Buffer mode: {bufmode} ({' '.join(buf_flags)})", file=sys.stderr)
     else:
         print(f"Buffer mode: {bufmode} (mpv defaults)", file=sys.stderr)
+    if not args.print_cmds:
+        remember({
+            "url": url, "title": info.get("title") or "?", "uploader": info.get("uploader") or "?",
+            "live_status": str(info.get("live_status") or info.get("is_live") or "?"),
+            "format": choice, "buffer": bufmode, "speed": args.speed,
+            "prefer_codec": args.prefer_codec or "", "fullscreen": args.fullscreen,
+            "mute": args.mute, "low_latency": args.low_latency,
+            "cookies_used": bool(cookie_src or browser), "cookies": cookie_src or "",
+            "cookies_from_browser": browser or "", "last_played": int(time.time()), "plays": 0,
+        })
+        print("Saved to history (#0). Replay with: --replay 0", file=sys.stderr)
 
     extra_player = shlex.split(args.player_args) if args.player_args else []
     extra_rec = shlex.split(args.recorder_args) if args.recorder_args else []
