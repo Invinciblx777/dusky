@@ -1,6 +1,6 @@
 # Current architecture and invariants
 
-Production snapshot verified against saved source fingerprints on 2026-09-28. Observed runtime: Python 3.14.7, Textual 8.2.8, kernel 7.3.0-rc4-dusky-battery. Verify the final ISO package manifest before relying on package-specific behavior; these observations are not version pins.
+Current production checked on 2026-09-29: engine, schema, launcher and lifecycle tests match the saved source fingerprints. UI differs only by compact footer spacing (`x += width` instead of `x += width + 2`); shortcut CSS already supplies horizontal padding. Observed runtime: Python 3.14.7, Textual 8.2.8, kernel 7.3.0-rc4-dusky-battery. Verify the final ISO package manifest before relying on package-specific behavior; these observations are not version pins.
 
 ## Lifecycle
 
@@ -47,7 +47,7 @@ A bound engine handle can be captured; its operations use the shared save lock. 
 ## Verification status
 
 - Original 131 tests are unchanged; 13 tests in `tests/test_startup_lifecycle.py` cover lazy mount/retry, focus/search, sparse/mixed tabs and notices, Widget instances/classes, footer widths, active polling, collection coalescing, thread separation, stale results, shutdown drain, cached revisit/invalidation, UFW read reuse and pure report rendering.
-- A full run of the retained-snapshot implementation passed 143 tests in 229.643 seconds. After the final narrow banned-rule reuse change, all 13 additions passed in 35.023 seconds and all 14 original UFW engine tests passed in 0.367 seconds. A single final 144-test run was not performed. This is recorded verification, not a fresh test run during handoff cleanup.
+- Fresh complete discovery on 2026-09-29 passed **all 144 tests in 45.312 seconds**, including footer wrapping/non-overlap at 48/80/120 columns with the current compact spacing. The raw log is `verification-tests-20260929.log`; see `final-checklist.md` for current acceptance limits.
 - The raw five-run UFW reference has no benchmark errors or nonzero external commands. Renderers ran on the main thread, collectors on executor threads; no hidden idle Rich factories/collectors were observed.
 - The profiler previously rejected an intentional collector failure. Its private hooks and readiness assumptions must still be rechecked after framework/Textual changes.
 

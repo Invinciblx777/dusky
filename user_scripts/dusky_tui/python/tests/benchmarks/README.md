@@ -5,14 +5,15 @@ Start here. This folder is self-contained; no previous AI plan or RAM workspace 
 ## Contents
 
 - [implementation.md](implementation.md): current architecture, contracts and verification limits.
+- [final-checklist.md](final-checklist.md): final architectural checklist and fresh full-suite verification, 2026-09-29.
 - [plan.md](plan.md): investigation priorities for further optimization; hypotheses require measurements.
 - [benchmark_startup.py](benchmark_startup.py): fresh-process profiler of the actual launcher.
 - [fixture.py](fixture.py): root-free functional smoke workload using a temporary INI file.
-- [baseline-ufw-8w.json](baseline-ufw-8w.json): unmodified five-run reference for the current production sources, recorded 2026-09-28.
+- [baseline-ufw-8w.json](baseline-ufw-8w.json): unmodified five-run reference for the recorded production snapshot, dated 2026-09-28.
 - [baseline-summary.json](baseline-summary.json): current-only reference summary and source identities.
 - [harness-verification.json](harness-verification.json): fresh one-run smoke and privileged UFW checks of this harness; not a matched 8 W comparison.
 
-The raw reference preserves original recorded absolute paths as provenance. Those paths are not runtime dependencies. Its profiler predates this folder's launcher-default and source-fingerprint improvements. Always capture a fresh baseline before changing production code; the reference is one machine/workload, not a performance target for every installation.
+The raw reference preserves original recorded absolute paths as provenance. Those paths are not runtime dependencies. Its profiler predates this folder's launcher-default and source-fingerprint improvements. Current UI differs from that reference only by the user's compact footer spacing (`x += width`, with existing shortcut padding retained); engine, schema, launcher and lifecycle-test hashes still match. Always capture a fresh baseline before changing production code; the reference is one machine/workload, not a performance target for every installation.
 
 ## Run the benchmarks
 
