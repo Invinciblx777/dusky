@@ -2380,11 +2380,19 @@ impl DuskyPapersApp {
         let accent = self.theme.accent;
         let card_radius = 12.0 + 2.0 * emphasis;
 
-        // Smoothly fade cards to transparent as they approach the viewport boundary (distance > 2.0 up to 4.0)
-        let edge_fade = (if distance > 2.0 {
-            (1.0 - ((distance - 2.0) / 2.0).clamp(0.0, 1.0)).powf(1.5)
-        } else {
+        // Native carousel falloff: 1.0, 1.0, 0.95, 0.40, 0.10, then to transparent.
+        let edge_fade = (if distance <= 1.0 {
             1.0
+        } else if distance <= 2.0 {
+            1.0 - (distance - 1.0) * 0.05
+        } else if distance <= 3.0 {
+            0.95 - (distance - 2.0) * 0.55
+        } else if distance <= 4.0 {
+            0.40 - (distance - 3.0) * 0.30
+        } else if distance <= 5.0 {
+            0.10 * (1.0 - (distance - 4.0))
+        } else {
+            0.0
         }) * entrance;
 
         // Image layer (reads thumbnail from disk; NEVER generates synchronously)
