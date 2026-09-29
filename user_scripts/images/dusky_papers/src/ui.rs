@@ -1548,7 +1548,7 @@ impl DuskyPapersApp {
 
         let accent = self.theme.accent;
 
-        // --- Top Bar: Floating HUD Capsule (skwd-wall style) ---
+        // --- Top Bar: Floating HUD Capsule ---
         let all_active = !self.show_only_favorites;
         let all_btn = button(
             text(format!("ALL ({})", self.all_wallpapers.len()))
@@ -2367,7 +2367,7 @@ impl DuskyPapersApp {
         center - fraction * focus_step
     }
 
-    /// Center expanded card matching skwd-wall Frame 1
+    /// Center expanded card
     fn build_center_card<'a>(
         &'a self,
         item: &'a WallpaperItem,

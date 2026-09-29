@@ -19,7 +19,7 @@ impl Default for AppTheme {
             bg: Color::from_rgb8(10, 12, 16),
             card_bg: Color::from_rgb8(16, 18, 26),
             fg: Color::from_rgb8(240, 243, 255),
-            accent: Color::from_rgb8(255, 182, 141), // #ffb68d peach / warm amber (matching skwd-wall)
+            accent: Color::from_rgb8(255, 182, 141), // #ffb68d peach / warm amber
             muted: Color::from_rgb8(140, 150, 175),
             success: Color::from_rgb8(52, 211, 153),
         }
