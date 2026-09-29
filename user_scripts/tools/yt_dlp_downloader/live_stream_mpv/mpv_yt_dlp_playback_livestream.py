@@ -15,6 +15,8 @@ Examples:
   %(prog)s --set-global buffer=near speed=2       # persist global defaults
   %(prog)s --history                              # list past streams
   %(prog)s --replay 0                             # replay #0 with stored settings
+  %(prog)s --doctor                               # self-check executables + mpv options
+  %(prog)s URL --ytdlp-option=socket-timeout=15   # extra yt-dlp option via probe + hook
 
 Preferences: CLI flag > --replay entry > env > config.toml > builtin.
 Globals live in ~/.config/dusky/settings/ytdlp_stream/config.toml,
@@ -35,8 +37,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -97,6 +101,9 @@ GLOBAL_SPEC: dict[str, tuple[str, object]] = {
     "keep": ("bool", False),
     "show_recorder": ("bool", False),
     "mode": ("str", "live"),
+    "start": ("str", ""),
+    "ignore_ytdlp_config": ("bool", True),
+    "floor_mb": ("int", 256),
 }
 
 
@@ -164,8 +171,15 @@ def _atomic_write(path: str, text: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
+        dirfd = os.open(os.path.dirname(path) or ".", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dirfd)
+        finally:
+            os.close(dirfd)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -176,11 +190,14 @@ def _atomic_write(path: str, text: str) -> None:
 
 def load_config() -> dict:
     d = _load_toml(CONFIG_FILE)
-    return d.get("defaults", d) if isinstance(d, dict) else {}
+    if d.get("version", 1) != 1:
+        raise SystemExit(f"ERROR: unsupported config version in {CONFIG_FILE}")
+    d = d.get("defaults", d) if isinstance(d, dict) else {}
+    return d if isinstance(d, dict) else {}
 
 
 def save_config(values: dict) -> None:
-    _atomic_write(CONFIG_FILE, _dump_toml({"defaults": values}))
+    _atomic_write(CONFIG_FILE, _dump_toml({"version": 1, "defaults": values}))
 
 
 def parse_global_pair(pair: str) -> tuple[str, object]:
@@ -212,12 +229,14 @@ def parse_global_pair(pair: str) -> tuple[str, object]:
 
 def load_history() -> list[dict]:
     d = _load_toml(HISTORY_FILE)
+    if d.get("version", 1) != 1:
+        raise SystemExit(f"ERROR: unsupported history version in {HISTORY_FILE}")
     e = d.get("entries", [])
     return [x for x in e if isinstance(x, dict) and x.get("url")] if isinstance(e, list) else []
 
 
 def save_history(entries: list[dict]) -> None:
-    _atomic_write(HISTORY_FILE, _dump_toml({"entries": entries[:MAX_HISTORY]}))
+    _atomic_write(HISTORY_FILE, _dump_toml({"version": 1, "entries": entries[:MAX_HISTORY]}))
 
 
 ENTRY_FIELDS = ("url", "title", "uploader", "live_status", "format", "buffer",
@@ -227,12 +246,14 @@ ENTRY_FIELDS = ("url", "title", "uploader", "live_status", "format", "buffer",
 
 
 def parse_start(value: str) -> str:
-    """Validate an mpv --start value: seconds, MM:SS, HH:MM:SS, negatives from edge."""
+    """Validate an mpv --start value: seconds, MM:SS, HH:MM:SS, negatives from
+    edge, or percent (mpv master also accepts pp% and #chapter; chapters are
+    meaningless on live streams so only % is allowed here)."""
     import re
-    if re.fullmatch(r"-?(\d+:){0,2}\d+(\.\d+)?", value.strip()):
+    if re.fullmatch(r"-?(\d+:){0,2}\d+(\.\d+)?%?", value.strip()):
         return value.strip()
     raise SystemExit(f"ERROR: bad --start {value!r}. Use seconds (90), MM:SS (1:30), "
-                     f"HH:MM:SS, or negative from live edge (-1800).")
+                     f"HH:MM:SS, percent (50%), or negative from live edge (-1800).")
 
 
 def find_entry(spec: str) -> dict:
@@ -724,6 +745,122 @@ class EdgeTracker(threading.Thread):
         self._stop.set()
 
 
+# ---------- borrowed-hardened bits (ytdl pin, doctor, space guard) ----------
+
+def resolve_ytdlp() -> str:
+    found = shutil.which("yt-dlp")
+    if not found:
+        raise SystemExit("ERROR: yt-dlp not found in PATH")
+    path = str(found)
+    if ":" in path:
+        raise SystemExit(f"ERROR: yt-dlp path contains ':' ({path}); mpv uses ':' as ytdl_path separator")
+    return path
+
+
+YTDLP_OPT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+def parse_ytdlp_option(text: str) -> tuple[str, str | None]:
+    key, sep, value = text.partition("=")
+    key = key.strip().removeprefix("--")
+    if not key or not YTDLP_OPT_RE.fullmatch(key):
+        raise SystemExit(f"ERROR: invalid yt-dlp option key: {key!r}")
+    return key, value if sep else None
+
+
+def build_raw_opts(cookie_opt: str | None, ignore_config: bool,
+                   extra: list[str]) -> list[str]:
+    """mpv --ytdl-raw-options entries; duplicates are a hard error (map semantics)."""
+    out = ["no-cache-dir="]
+    if ignore_config:
+        out.append("ignore-config=")
+    if cookie_opt:
+        out.append(cookie_opt)
+    for raw in extra:
+        key, value = parse_ytdlp_option(raw)
+        out.append(f"{key}=" if value is None else f"{key}={value}")
+    seen: set[str] = set()
+    for item in out:
+        k = item.split("=", 1)[0]
+        if k in seen:
+            raise SystemExit(f"ERROR: duplicate yt-dlp option {k!r}; ytdl-raw-options is a key/value map")
+        seen.add(k)
+    return out
+
+
+def doctor(mpv: str, ytdlp: str) -> int:
+    def first(cmd: list[str]) -> str:
+        try:
+            p = subprocess.run(cmd, text=True, capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            return "unavailable"
+        text = (p.stdout or p.stderr or "").strip()
+        return text.splitlines()[0] if text else f"exit {p.returncode}"
+
+    print(f"python : {sys.version.split()[0]} ({sys.executable})")
+    print(f"mpv    : {first([mpv, '--version'])}")
+    print(f"         {mpv}")
+    print(f"yt-dlp : {first([ytdlp, '--version'])}")
+    print(f"         {ytdlp}")
+    try:
+        p = subprocess.run([mpv, "--list-options"], text=True, capture_output=True, timeout=15)
+        options = p.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        options = ""
+    required = {"--ytdl-format", "--ytdl-raw-options", "--stream-record",
+                "--demuxer-max-bytes", "--demuxer-max-back-bytes",
+                "--force-seekable", "--input-ipc-server", "--input-conf"}
+    missing = sorted(o for o in required if o not in options)
+    if missing:
+        print("ERROR  : mpv lacks required options: " + ", ".join(missing))
+        return 1
+    print("mpv    : required ytdl/stream/demuxer/ipc options present")
+    for cand in CANDIDATE_TMPFS:
+        fs = _mount_fstype(cand)
+        try:
+            free = shutil.disk_usage(cand).free // (1024 * 1024)
+        except OSError:
+            free = -1
+        print(f"tmpfs  : {cand} ({fs or 'missing'}, {free} MiB free)")
+    try:
+        import rich  # noqa: F401
+        print("rich   : available (tables enabled)")
+    except ImportError:
+        print("rich   : missing (plain-text tables)")
+    return 0
+
+
+class SpaceGuard(threading.Thread):
+    """Stop recording processes before tmpfs exhaustion (daemon)."""
+
+    def __init__(self, pool: str, floor_mb: int, victims: list) -> None:
+        super().__init__(daemon=True)
+        self.pool = pool
+        self.floor_mb = floor_mb
+        self.victims = victims
+        self._stop = threading.Event()
+
+    def run(self) -> None:
+        while not self._stop.wait(10.0):
+            try:
+                free = shutil.disk_usage(self.pool).free // (1024 * 1024)
+            except OSError:
+                return
+            if free < self.floor_mb:
+                print(f"ERROR: tmpfs free {free} MiB < floor {self.floor_mb} MiB; "
+                      f"stopping recording to protect RAM.", file=sys.stderr)
+                for proc in self.victims:
+                    try:
+                        if proc.poll() is None:
+                            proc.send_signal(signal.SIGINT)
+                    except Exception:
+                        pass
+                return
+
+    def halt(self) -> None:
+        self._stop.set()
+
+
 # ---------- CLI ----------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -771,11 +908,19 @@ def build_parser() -> argparse.ArgumentParser:
                     action=argparse.BooleanOptionalAction, help="recorder uses mpv --profile=low-latency")
     ap.add_argument("--timeout", type=float, default=None, help="seconds to wait for recording to start (default: 30)")
     ap.add_argument("--start", default=None,
-                    help="open at position: seconds (3600), MM:SS, HH:MM:SS, or negative seconds "
-                         "from live edge (-1800). In-player clicks cannot seek on live HLS "
-                         "(ffmpeg demuxer clamps to edge) — this is the time-travel knob.")
+                    help="open at position: seconds (3600), MM:SS, HH:MM:SS, percent (50%%), "
+                         "or negative seconds from live edge (-1800). In-player clicks cannot "
+                         "seek on live HLS (ffmpeg demuxer clamps to edge) — this is the time-travel knob.")
     ap.add_argument("--player-args", default="", help='extra player args, e.g. --player-args="--volume=80"')
     ap.add_argument("--recorder-args", default="", help="extra recorder args (file mode only)")
+    ap.add_argument("--ytdlp-option", action="append", default=[], metavar="KEY[=VALUE]",
+                    help="pass a yt-dlp option to probe + mpv hook, e.g. --ytdlp-option=socket-timeout=15")
+    ap.add_argument("--ignore-ytdlp-config", dest="ignore_ytdlp_config",
+                    default=None, action=argparse.BooleanOptionalAction,
+                    help="ignore external yt-dlp config files for determinism (default: on)")
+    ap.add_argument("--floor-mb", type=int, default=None, metavar="MB",
+                    help="stop recording if tmpfs free space falls below this (default: 256)")
+    ap.add_argument("--doctor", action="store_true", help="check executables and required mpv options, then exit")
     ap.add_argument("--print-cmds", action="store_true", help="print mpv commands without running them")
     mg = ap.add_argument_group("config + history",
                                f"stored in {os.path.join(_cfg_dir())} (0600, video stays in tmpfs)")
@@ -869,10 +1014,12 @@ def _eff_int(cli: object | None, entry: dict, key: str, cfg: dict, builtin: int)
 
 def main() -> int:
     args = build_parser().parse_args()
-    if shutil.which("mpv") is None:
+    mpv_bin = shutil.which("mpv")
+    if mpv_bin is None:
         raise SystemExit("ERROR: mpv not found in PATH")
-    if shutil.which("yt-dlp") is None:
-        raise SystemExit("ERROR: yt-dlp not found in PATH")
+    ytdlp = resolve_ytdlp()
+    if args.doctor:
+        return doctor(mpv_bin, ytdlp)
 
     # Management commands (no URL needed).
     if args.set_global:
@@ -934,6 +1081,8 @@ def main() -> int:
     args.keep = _eff_bool(args.keep, entry, "keep", cfg, False)
     args.show_recorder = _eff_bool(args.show_recorder, entry, "show_recorder", cfg, False)
     args.allow_disk = _eff_bool(args.allow_disk, entry, "allow_disk", cfg, False)
+    ignore_cfg = _eff_bool(args.ignore_ytdlp_config, entry, "ignore_ytdlp_config", cfg, True)
+    floor_mb = _eff_int(args.floor_mb, entry, "floor_mb", cfg, 256)
     mode = str(_eff(args.mode, entry, "mode", cfg, "live")).strip().lower()
     if args.direct:
         print("NOTE: --direct is deprecated, use --mode plain.", file=sys.stderr)
@@ -945,8 +1094,11 @@ def main() -> int:
     start_opt = [f"--start={parse_start(str(start))}"] if start not in (None, "") else []
     if not 0.1 <= args.speed <= 100:
         raise SystemExit("ERROR: --speed must be 0.1..100")
-    if args.timeout <= 0 or args.min_free <= 0:
-        raise SystemExit("ERROR: --timeout/--min-free must be positive")
+    if args.timeout <= 0 or args.min_free <= 0 or floor_mb <= 0:
+        raise SystemExit("ERROR: --timeout/--min-free/--floor-mb must be positive")
+    if floor_mb >= args.min_free:
+        print(f"WARNING: --floor-mb ({floor_mb}) >= --min-free ({args.min_free}); "
+              f"guard may fire immediately.", file=sys.stderr)
 
     info: dict
     tmpfs = pick_tmpfs(args.tmpdir, args.allow_disk)
@@ -956,7 +1108,22 @@ def main() -> int:
     watch = secure_subdir(tmpfs, "watch-later")
     yt_cookie_flags, mpv_cookie_opt, staged_cookies = stage_cookies(
         cookie_src, browser, tmpfs)
-    raw_opts = ["no-cache-dir="] + ([mpv_cookie_opt] if mpv_cookie_opt else [])
+    yt_extra: list[str] = []
+    if ignore_cfg:
+        yt_extra.append("--ignore-config")
+    yt_extra += yt_cookie_flags
+    seen_keys = {"no-playlist", "no-cache-dir", "no-warnings",
+                 "cookies", "cookies-from-browser", "ignore-config"}
+    for raw in args.ytdlp_option:
+        key, value = parse_ytdlp_option(raw)
+        if key in seen_keys:
+            raise SystemExit(f"ERROR: --ytdlp-option {key!r} collides with a built-in flag")
+        seen_keys.add(key)
+        yt_extra.append(f"--{key}")
+        if value is not None:
+            yt_extra.append(value)
+    raw_opts = build_raw_opts(mpv_cookie_opt, ignore_cfg, args.ytdlp_option)
+    pin_opt = f"--script-opts-append=ytdl_hook-ytdl_path={ytdlp}"
 
     def _drop(path: str | None) -> None:
         if path:
@@ -965,7 +1132,7 @@ def main() -> int:
             except OSError:
                 pass
 
-    info = run_yt_dlp_json(args.url, yt_cookie_flags)
+    info = run_yt_dlp_json(args.url, yt_extra)
     fmts = fmt_list(info)
     header = (f"Title: {info.get('title') or '?'} | uploader: {info.get('uploader') or '?'} | "
               f"live: {info.get('live_status') or info.get('is_live') or '?'}")
@@ -1004,7 +1171,7 @@ def main() -> int:
     std_flags = ["--no-save-position-on-quit", "--no-resume-playback"]
 
     if mode == "plain":
-        cmd = ["mpv", f"--ytdl-format={choice}", f"--speed={args.speed}"]
+        cmd = ["mpv", pin_opt, f"--ytdl-format={choice}", f"--speed={args.speed}"]
         cmd += [f"--ytdl-raw-options={o}" for o in raw_opts]
         cmd += std_flags + buf_flags + start_opt
         if args.fullscreen:
@@ -1045,7 +1212,7 @@ def main() -> int:
                 total = total * 60 + p
             return int(-total if neg else total)
 
-        base_cmd = ["mpv", f"--ytdl-format={choice}", f"--speed={args.speed}"]
+        base_cmd = ["mpv", pin_opt, f"--ytdl-format={choice}", f"--speed={args.speed}"]
         base_cmd += [f"--ytdl-raw-options={o}" for o in raw_opts]
         base_cmd += std_flags + [f"--watch-later-dir={watch}"] + buf_flags
         if args.fullscreen:
@@ -1088,6 +1255,9 @@ def main() -> int:
                 pass
             return 0
         rc_live = 0
+        holders: list[subprocess.Popen] = []
+        guard = SpaceGuard(tmpfs, floor_mb, holders)
+        guard.start()
         try:
             open_start = first_start
             while True:
@@ -1099,7 +1269,18 @@ def main() -> int:
                     f"--input-ipc-server={sock}", f"--input-conf={travel_conf}",
                     "--", args.url]
                 print("+ " + " ".join(shlex.quote(c) for c in cmd), file=sys.stderr)
-                rc_live = subprocess.call(cmd, env=env)
+                proc = subprocess.Popen(cmd, env=env)
+                holders[:] = [proc]
+                try:
+                    rc_live = proc.wait()
+                except KeyboardInterrupt:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    raise
+                holders[:] = []
                 if rc_live not in TRAVEL_DELTAS:
                     break
                 cur = final_base if final_base is not None else tracker.edge
@@ -1132,6 +1313,7 @@ def main() -> int:
             return 130
         finally:
             tracker.halt()
+            guard.halt()
             _drop(staged_cookies)
             try:
                 os.unlink(sock)
@@ -1148,7 +1330,7 @@ def main() -> int:
                     pass
             else:
                 print(f"Kept (tmpfs): {rec_path}", file=sys.stderr)
-    rec_cmd = ["mpv", f"--ytdl-format={choice}", f"--stream-record={rec_path}"]
+    rec_cmd = ["mpv", pin_opt, f"--ytdl-format={choice}", f"--stream-record={rec_path}"]
     rec_cmd += [f"--ytdl-raw-options={o}" for o in raw_opts]
     rec_cmd += std_flags + [f"--watch-later-dir={watch}"]
     if args.low_latency:
@@ -1175,6 +1357,8 @@ def main() -> int:
         return 0
 
     rec = subprocess.Popen(rec_cmd, env=env)
+    file_guard = SpaceGuard(tmpfs, floor_mb, [rec])
+    file_guard.start()
     try:
         need = join_threshold(fmts, choice)
         print(f"Waiting for ~{need // 1024}KB before player joins (cleaner start)...", file=sys.stderr)
@@ -1195,6 +1379,7 @@ def main() -> int:
         print("\nStopping...", file=sys.stderr)
         return 130
     finally:
+        file_guard.halt()
         try:
             if rec.poll() is None:
                 rec.terminate()
