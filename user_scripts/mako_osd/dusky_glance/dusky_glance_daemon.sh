@@ -81,6 +81,10 @@ case "$MODE" in
         (( $# >= 2 && $# <= 3 )) || usage
         [[ "$2" != /* && "$2" != *..* && "$2" != :* &&
            -f "/usr/share/zoneinfo/$2" ]] || die 'Expected an installed IANA timezone'
+        if ! { IFS= read -r -N 4 tz_magic < "/usr/share/zoneinfo/$2"; } 2>/dev/null ||
+           [[ "$tz_magic" != TZif ]]; then
+            die 'Expected an installed IANA timezone'
+        fi
         validate_label "${3:-Time}"
         set -- "$MODE" "$2" "${3:-Time}" ;;
     --disk-read|--disk-write|--disk-temp)
@@ -138,9 +142,6 @@ same_process() {
     local actual
     actual=$(process_start "$1") || return 1
     [[ "$actual" == "$2" ]]
-}
-stale_record() {
-    rm -f -- "${1%.pid}.fifo" "$1"
 }
 request_stop() {
     local record="$1" fifo="${1%.pid}.fifo" pid="" started=""
@@ -1237,6 +1238,7 @@ case "$MODE" in
             (( ${#temp_files[@]} == 0 )) && period=5
             if (( SECONDS - last_discover >= period )); then
                 last_discover=$SECONDS
+                temp_files=()
                 for dir in /sys/class/hwmon/hwmon*/; do
                     name=""
                     { read -r name < "${dir}name"; } 2>/dev/null || continue
@@ -1564,7 +1566,6 @@ case "$MODE" in
         STATE_FILE="$NET_STATE_DIR/state"
         EXT_STATE_FILE="$NET_STATE_DIR/state_ext"
         HEARTBEAT_FILE="$NET_STATE_DIR/heartbeat"
-        DAEMON_PID_FILE="$NET_STATE_DIR/daemon.pid"
 
         wake_network_daemon() {
             [[ -d "$NET_STATE_DIR" ]] || mkdir -m 700 -p -- "$NET_STATE_DIR" 2>/dev/null || true
