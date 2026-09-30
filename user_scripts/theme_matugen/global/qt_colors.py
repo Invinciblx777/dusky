@@ -12,17 +12,25 @@ import xml.etree.ElementTree as ET
 from theme_files import atomic_write, atomic_symlink, publication_lock
 
 
-def publish(kind: str) -> None:
+def publish(kind: str, bootstrap: bool = False) -> None:
     config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     generated = config / "matugen/generated"
     with publication_lock("qt"):
         if kind in ("qt5ct", "qt6ct"):
-            text = (generated / f"{kind}-colors.conf").read_text()
+            source = generated / f"{kind}-colors.conf"
+            if bootstrap and not source.exists():
+                source = config / "matugen/generated_fresh" / source.name
+            text = source.read_text()
             scheme = configparser.ConfigParser(interpolation=None)
             scheme.read_string(text)
             lines = ["[ColorScheme]"]
             for group in ("active_colors", "disabled_colors", "inactive_colors"):
                 colors = [c.strip() for c in scheme["ColorScheme"][group].split(",")]
+                # Installation seeds predating Accent contain a complete
+                # 21-role palette. Qt defaults Accent to Highlight. Migrate
+                # only during setup; wallpaper hooks still require 22 roles.
+                if bootstrap and kind == "qt6ct" and len(colors) == 21:
+                    colors.append(colors[12])
                 # The shared template includes Qt6's Accent (role 21). Qt5 has
                 # 21 roles, including PlaceholderText; omit only Accent there.
                 if len(colors) not in ((21, 22) if kind == "qt5ct" else (22,)):
@@ -74,9 +82,12 @@ def publish(kind: str) -> None:
 
 if __name__ == "__main__":
     kinds = ("qt5ct", "qt6ct", "kvantum_kvconfig", "kvantum_svg")
-    if len(sys.argv) != 2 or sys.argv[1] not in kinds:
-        raise SystemExit("Usage: qt_colors.py " + "|".join(kinds))
+    bootstrap = len(sys.argv) == 3 and sys.argv[2] == "--bootstrap"
+    if (len(sys.argv) != 2 and not bootstrap) or sys.argv[1] not in kinds:
+        raise SystemExit("Usage: qt_colors.py " + "|".join(kinds) + " [--bootstrap]")
+    if bootstrap and sys.argv[1] not in ("qt5ct", "qt6ct"):
+        raise SystemExit("--bootstrap is only for Qt palette installation")
     try:
-        publish(sys.argv[1])
+        publish(sys.argv[1], bootstrap)
     except Exception as error:
         raise SystemExit(f"qt_colors: {error}") from error
