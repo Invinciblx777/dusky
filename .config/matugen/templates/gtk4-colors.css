@@ -229,4 +229,98 @@
   --light-5: {{colors.on_surface.default.hex}};
 }
 
+/* Plain GTK4's built-in theme uses compiled colors rather than libadwaita's
+ * variables. Override paint properties only; retain all widget geometry. */
+window.background {
+  background-color: @window_bg_color;
+  color: @window_fg_color;
+}
+notebook > stack, .view, textview text, list, columnview, gridview {
+  background-color: @view_bg_color;
+  color: @view_fg_color;
+}
+notebook > header, headerbar, popover > contents {
+  background-color: @headerbar_bg_color;
+  color: @headerbar_fg_color;
+  border-color: @headerbar_border_color;
+  background-image: none;
+}
+notebook > header > tabs > tab {
+  color: @window_fg_color;
+  background-color: transparent;
+}
+notebook > header > tabs > tab:checked {
+  color: @accent_color;
+  box-shadow: inset 0 -3px @accent_color;
+}
+button, entry, spinbutton {
+  color: @window_fg_color;
+  background-color: {{colors.surface_container.default.hex}};
+  background-image: none;
+  border-color: @border_color;
+}
+button:hover {
+  background-color: {{colors.surface_container_high.default.hex}};
+}
+/* Marked scales draw shaped handles with theme image assets. Never erase
+ * those images or fill their rectangular allocation with a solid color.
+ * Unmarked handles use CSS geometry and can be recolored directly. */
+scale:not(.marks-before):not(.marks-after):not(.color) > trough > slider {
+  background-color: @window_fg_color;
+  background-image: none;
+  border-color: @window_bg_color;
+}
+scale:not(.marks-before):not(.marks-after):not(.color) > trough > slider:hover,
+scale:not(.marks-before):not(.marks-after):not(.color) > trough > slider:active {
+  background-color: @accent_bg_color;
+}
+scale:not(.marks-before):not(.marks-after):not(.color) > trough > slider:disabled {
+  background-color: alpha(@window_fg_color, 0.45);
+}
+button:active, button:checked {
+  background-color: {{colors.primary_container.default.hex}};
+  color: {{colors.on_primary_container.default.hex}};
+}
+button.flat:not(:hover):not(:active):not(:checked) {
+  background-color: transparent;
+  border-color: transparent;
+}
+button.suggested-action, check:checked, radio:checked, switch:checked,
+scale highlight, progressbar progress {
+  background-color: @accent_bg_color;
+  background-image: none;
+  color: @accent_fg_color;
+  border-color: @accent_bg_color;
+}
+scale trough, progressbar trough, switch {
+  background-color: {{colors.surface_container_highest.default.hex}};
+  background-image: none;
+  border-color: @border_color;
+}
+row:selected, .view:selected, textview text selection {
+  background-color: {{colors.primary_container.default.hex}};
+  color: {{colors.on_primary_container.default.hex}};
+}
+/* Stock dropdown rules are more specific than the generic selected row.
+ * Cover mouse hover and keyboard selection in both GTK popup implementations. */
+dropdown popover listview > row.activatable:selected,
+dropdown popover listview > row.activatable:selected:hover,
+combobox popover listview > row.activatable:selected,
+combobox popover listview > row.activatable:selected:hover,
+popover.menu modelbutton:selected,
+popover.menu modelbutton:selected:active,
+modelbutton.flat:hover {
+  background-color: {{colors.primary_container.default.hex}};
+  background-image: none;
+  color: {{colors.on_primary_container.default.hex}};
+}
+separator {
+  background-color: @border_color;
+}
+button:disabled, entry:disabled, spinbutton:disabled {
+  color: alpha(@window_fg_color, 0.45);
+  background-color: {{colors.surface_container_low.default.hex}};
+  background-image: none;
+}
+
 /* dusky-palette-complete */

@@ -101,8 +101,11 @@ restart to discard their cached overrides.
 | Publisher | `gtk_colors.py 4` |
 | Published user stylesheet | `~/.config/gtk-4.0/gtk.css` |
 
-The template supplies CSS color variables, named colors and color overrides
-for GTK4/libadwaita widgets. GTK validates the generated CSS before publication.
+The template supplies CSS color variables and named colors for libadwaita,
+plus explicit paint-property rules for plain GTK4 widgets. The built-in GTK4
+theme compiles many colors into its stylesheet, so variables alone do not
+recolor plain GTK4 applications such as pavucontrol. GTK validates the generated
+CSS before publication.
 The overrides do not replace the application's widget geometry.
 
 GTK4/libadwaita user CSS is cached by running applications. Reopen an app after
