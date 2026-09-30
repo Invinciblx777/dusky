@@ -260,8 +260,10 @@ def build_cmdlines(topo: Dict, luks: Dict, hooks_str: str) -> Tuple[str, str, st
                 bname = Path(luks["BACKING_DEV"]).resolve().name
                 rot_cand = Path(f"/sys/class/block/{bname}/queue/rotational")
                 if not rot_cand.exists():
-                    parent_name = re.sub(r"p?\d+$", "", bname)
-                    rot_cand = Path(f"/sys/class/block/{parent_name}/queue/rotational")
+                    block = Path(f"/sys/class/block/{bname}").resolve()
+                    if (block / "partition").exists():
+                        block = block.parent
+                    rot_cand = block / "queue/rotational"
                 if rot_cand.exists() and rot_cand.read_text().strip() == "0":
                     sd_luks_opts += ["no-read-workqueue", "no-write-workqueue"]
             except Exception:
@@ -350,8 +352,8 @@ def install_systemd_boot_uefi(primary_opts: str, fallback_opts: str):
         console.print("[cyan]Fresh install...[/cyan]")
         r = run("bootctl", "install", f"--esp-path={ESP_MNT}", "--variables=yes", "--efi-boot-option-description-with-device=yes", "--graceful", check=False)
         if r.returncode != 0:
-            console.print("[yellow]bootctl install non-zero, trying fallback with --no-variables...[/yellow]")
-            run("bootctl", "install", f"--esp-path={ESP_MNT}", "--no-variables", "--graceful", check=False)
+            console.print("[yellow]bootctl install non-zero, trying fallback without EFI variable updates...[/yellow]")
+            run("bootctl", "install", f"--esp-path={ESP_MNT}", "--variables=no", "--graceful", check=False)
 
     # Ensure systemd-bootx64.efi is present in ESP
     systemd_efi = ESP_MNT / "EFI" / "systemd" / "systemd-bootx64.efi"
@@ -381,7 +383,7 @@ def install_systemd_boot_uefi(primary_opts: str, fallback_opts: str):
         if r_efiv.returncode == 0 and r_efiv.stdout:
             zero_entries = []
             for line in r_efiv.stdout.splitlines():
-                if "00000000-0000-0000-0000-000000000000" in line:
+                if "00000000-0000-0000-0000-000000000000" in line and "\\EFI\\systemd\\systemd-boot" in line:
                     m = re.match(r"^Boot([0-9A-Fa-f]{4})", line)
                     if m:
                         zero_entries.append(m.group(1))
@@ -389,16 +391,19 @@ def install_systemd_boot_uefi(primary_opts: str, fallback_opts: str):
                 console.print(f"[yellow]Removing zeroed GUID NVRAM entry Boot{bnum}...[/yellow]")
                 run("efibootmgr", "-b", bnum, "-B", check=False)
 
+            esp_dev = run("findmnt", "-n", "-e", "-o", "SOURCE", str(ESP_MNT)).stdout.splitlines()[-1].strip()
+            esp_uuid = run("blkid", "-s", "PARTUUID", "-o", "value", esp_dev).stdout.strip().lower()
+            if not esp_uuid:
+                raise ValueError("Cannot identify the selected ESP partition UUID")
             has_valid_entry = False
             r_efiv2 = run("efibootmgr", "-v", check=False)
             for line in r_efiv2.stdout.splitlines():
-                if "Linux Boot Manager" in line and "00000000-0000" not in line and "HD(" in line:
+                if f"gpt,{esp_uuid}," in line.lower() and "\\efi\\systemd\\systemd-bootx64.efi" in line.lower():
                     has_valid_entry = True
                     break
 
             if not has_valid_entry:
                 console.print("[cyan]Registering valid NVRAM entry via efibootmgr...[/cyan]")
-                esp_dev = run("findmnt", "-n", "-e", "-o", "SOURCE", str(ESP_MNT), check=False).stdout.strip()
                 if esp_dev:
                     parent_disk = get_parent_disk(Path(esp_dev))
                     m_part = re.search(r"(\d+)$", esp_dev)
@@ -453,6 +458,15 @@ def install_systemd_boot_uefi(primary_opts: str, fallback_opts: str):
             f"initrd  /initramfs-{pkgbase}-fallback.img\n"
             f"options {fallback_opts}\n"
         )
+
+    # Start the newly installed OS once; @saved remembers later user choices.
+    primary_pkg = next((pkg for _, pkg in kernels if pkg == "linux"), kernels[0][1])
+    first_entry = f"arch-{primary_pkg}.conf"
+    selection = run("bootctl", f"--esp-path={ESP_MNT}", "set-oneshot", first_entry, check=False)
+    if selection.returncode != 0:
+        # Firmware with read-only variables still needs a usable initial default.
+        LOADER_CONF.write_text(loader_conf_str.replace("default  @saved", f"default  {first_entry}"))
+        console.print("[yellow]EFI variables unavailable; using the installed kernel as the default.[/yellow]")
 
     run("systemctl", "enable", "systemd-boot-update.service", check=False)
     console.print(Panel(f"[bold green]UEFI Complete\nKernels: {', '.join([k[1] for k in kernels])}\nMicrocode: embedded via microcode hook (no initrd line)\nWindows: auto-windows\nrandom-seed: auto since systemd 257[/bold green]", box=box.ROUNDED))

@@ -275,6 +275,12 @@ main() {
     elif [[ "${EUID}" -ne 0 ]]; then
         target_user="${USER:-$(id -un)}"
         MODE_AUTO=true # Live system normal user, bypass y/n prompt
+    elif [[ -f ./.arch_credentials ]]; then
+        # The ISO stages the selected account here; do not guess another user.
+        # Source in a subshell so passwords do not enter this script's environment.
+        # shellcheck source=/dev/null
+        target_user="$(source ./.arch_credentials && printf '%s' "${TARGET_USER:-}")"
+        MODE_AUTO=true
     else
         # Raw root shell (e.g., arch-chroot)
         local -a available_users=()

@@ -308,7 +308,9 @@ def parse_credentials(path="./.arch_credentials"):
     try:
         script = f'set +u; source {shlex.quote(str(cred))} 2>/dev/null; printf "TARGET_USER=%s\\nENCRYPT_ROOT=%s\\nROOT_PASS=%s\\n" "$TARGET_USER" "$ENCRYPT_ROOT" "$ROOT_PASS"'
         r = subprocess.run(["bash","-c",script], text=True, capture_output=True, check=False, timeout=5)
-        for line in r.stdout.splitlines():
+        # Only the printf record separator is a newline; Unicode separators
+        # inside the password must not be interpreted as record boundaries.
+        for line in r.stdout.split("\n"):
             if "=" not in line:
                 continue
             k,v = line.split("=",1)
@@ -536,7 +538,7 @@ def safe_deactivate_swaps_for_device(target_dev):
         pass
     for name in candidates:
         try:
-            if name in wanted or (name.startswith("/mnt/") and name.endswith("swapfile")) or (Path(name).name == "swapfile" and (name.startswith("/mnt/") or name == "/swap/swapfile")):
+            if device_is_on_disk(name, target_dev) or name in wanted or (name.startswith("/mnt/") and name.endswith("swapfile")) or (Path(name).name == "swapfile" and (name.startswith("/mnt/") or name == "/swap/swapfile")):
                 if target_dev:
                     check_src = name
                     if Path(name).is_file():
@@ -567,7 +569,6 @@ def teardown_target_storage(target_dev: str, max_retries: int = 4) -> None:
         run("sync", check=False, capture=True)
 
         # 2. Aggressive Swap Deactivation
-        run("swapoff", "-a", check=False, capture=True)
         try:
             safe_deactivate_swaps_for_device(resolved_disk)
         except Exception:
@@ -629,9 +630,6 @@ def teardown_target_storage(target_dev: str, max_retries: int = 4) -> None:
                         if run("cryptsetup", "close", dm_name, check=False, capture=True).returncode != 0:
                             run("dmsetup", "remove", "--force", "--retry", dm_name, check=False, capture=True)
 
-            if Path(f"/dev/mapper/{TARGET_CRYPT_NAME}").exists():
-                if run("cryptsetup", "close", TARGET_CRYPT_NAME, check=False, capture=True).returncode != 0:
-                    run("dmsetup", "remove", "--force", "--retry", TARGET_CRYPT_NAME, check=False, capture=True)
         except Exception:
             pass
 
@@ -996,13 +994,28 @@ def prompt_root_and_efi(target_dev, boot_mode, has_win, win_esp):
         if has_win and win_esp and _same_dev(efi, win_esp):
             format_efi = Confirm.ask(f"EFI {efi} looks like Windows ESP {win_esp}. Format? [red]NO keeps Windows[/red]", console=console, default=False)
         else:
-            ans = Prompt.ask(f"Format EFI {efi} as {DUSKY_EFI_LABEL}? (y/n/q)", choices=["y","n","q"], default="y", show_choices=False, console=console)
+            ans = Prompt.ask(f"Format EFI {efi} as {DUSKY_EFI_LABEL}? (y/n/q)", choices=["y","n","q"], default="n", show_choices=False, console=console)
             if ans == "q":
                 return None, None, None
             format_efi = (ans == "y")
     return root, efi, format_efi
 
 def format_root_and_efi(root_part, efi_part, format_efi, do_encrypt, boot_mode, has_win, win_esp, creds, luks_ba=None):
+    # Validate the shared ESP before modifying ROOT or its encryption header.
+    if boot_mode == "UEFI":
+        if not efi_part or _same_dev(root_part, efi_part):
+            raise ValueError("UEFI requires a separate EFI partition")
+        esp_type = run("blkid", "-p", "-c", "/dev/null", "-o", "value", "-s", "PART_ENTRY_TYPE", efi_part, check=False)
+        if esp_type.stdout.strip().lower() not in (EFI_GUID, "0xef"):
+            raise ValueError("Select a partition marked as EFI System Partition")
+        if not format_efi:
+            fs = run("blkid", "-p", "-c", "/dev/null", "-o", "value", "-s", "TYPE", efi_part, check=False)
+            if fs.stdout.strip() != "vfat":
+                raise ValueError("The preserved EFI partition must contain FAT")
+    if do_encrypt and not luks_ba:
+        raise ValueError("Encryption requires a nonempty passphrase")
+    if do_encrypt and Path(f"/dev/mapper/{TARGET_CRYPT_NAME}").exists():
+        raise ValueError("cryptroot must be closed before formatting encrypted ROOT")
     if run("cryptsetup","isLuks",root_part, check=False, capture=True).returncode == 0:
         console.print(f"[yellow]Existing LUKS on {root_part}, erasing header[/yellow]")
         run("cryptsetup","--batch-mode","erase",root_part, check=False, capture=True)
@@ -1025,38 +1038,26 @@ def format_root_and_efi(root_part, efi_part, format_efi, do_encrypt, boot_mode, 
             pbkdf = ["--pbkdf-memory", "262144", "--pbkdf-parallel", "1"]
         elif mem_kb < 4_200_000:
             pbkdf = ["--pbkdf-memory", "524288"]
-        sector_args = []
+        # Let cryptsetup select sectors from device topology, including 512e/4Kn.
         try:
-            r_pbsz = run("blockdev", "--getpbsz", root_part, check=False, capture=True)
-            pbsz = r_pbsz.stdout.strip()
-            if pbsz == "4096":
-                sector_args = ["--sector-size", "4096"]
-            else:
-                pname = Path(root_part).resolve().name
-                rot = Path(f"/sys/class/block/{pname}/queue/rotational")
-                if not rot.exists():
-                    parent_name = re.sub(r"p?\d+$", "", pname)
-                    rot = Path(f"/sys/class/block/{parent_name}/queue/rotational")
-                if rot.exists() and rot.read_text().strip() == "0":
-                    sector_args = ["--sector-size", "4096"]
-        except Exception:
-            pass
-        try:
-            fmt = ["cryptsetup", "--batch-mode", "--type", "luks2", "--pbkdf", "argon2id", "--label", DUSKY_ROOT_LABEL] + pbkdf + sector_args + ["luksFormat", "--key-file", "-", root_part]
+            fmt = ["cryptsetup", "--batch-mode", "--type", "luks2", "--pbkdf", "argon2id", "--label", DUSKY_ROOT_LABEL] + pbkdf + ["luksFormat", "--key-file", "-", root_part]
             r = run(*fmt, input_text=luks_ba, check=False, capture=True)
             if r.returncode == 3:
-                fmt = ["cryptsetup", "--batch-mode", "--type", "luks2", "--pbkdf", "argon2id", "--label", DUSKY_ROOT_LABEL, "--pbkdf-memory", "262144", "--pbkdf-parallel", "1"] + sector_args + ["luksFormat", "--key-file", "-", root_part]
+                fmt = ["cryptsetup", "--batch-mode", "--type", "luks2", "--pbkdf", "argon2id", "--label", DUSKY_ROOT_LABEL, "--pbkdf-memory", "262144", "--pbkdf-parallel", "1"] + ["luksFormat", "--key-file", "-", root_part]
                 r = run(*fmt, input_text=luks_ba, check=False, capture=True)
             if r.returncode != 0:
                 console.print(f"[red]luksFormat fail {r.returncode}[/red]")
+                console.print((r.stderr or b"").decode("utf-8", "replace"), markup=False)
                 sys.exit(1)
             crypt_open_args = ["cryptsetup", "open", "--type", "luks2", "--allow-discards"]
             try:
                 pname = Path(root_part).resolve().name
                 rot_cand = Path(f"/sys/class/block/{pname}/queue/rotational")
                 if not rot_cand.exists():
-                    parent_name = re.sub(r"p?\d+$", "", pname)
-                    rot_cand = Path(f"/sys/class/block/{parent_name}/queue/rotational")
+                    block = Path(f"/sys/class/block/{pname}").resolve()
+                    if (block / "partition").exists():
+                        block = block.parent
+                    rot_cand = block / "queue/rotational"
                 if rot_cand.exists() and rot_cand.read_text().strip() == "0":
                     crypt_open_args += ["--perf-no_read_workqueue", "--perf-no_write_workqueue"]
             except Exception:
@@ -1065,6 +1066,7 @@ def format_root_and_efi(root_part, efi_part, format_efi, do_encrypt, boot_mode, 
             ro = run(*crypt_open_args, input_text=luks_ba, check=False, capture=True)
             if ro.returncode != 0:
                 console.print("[red]cryptsetup open fail[/red]")
+                console.print((ro.stderr or b"").decode("utf-8", "replace"), markup=False)
                 sys.exit(1)
         finally:
             if luks_ba:
@@ -1092,26 +1094,9 @@ def format_root_and_efi(root_part, efi_part, format_efi, do_encrypt, boot_mode, 
                 console.print(f"[red]Details: {detail}[/red]")
                 raise
         
-    if boot_mode == "UEFI" and efi_part:
-        if format_efi:
-            if has_win and win_esp and _same_dev(efi_part, win_esp):
-                console.print("[yellow]Preserving Windows ESP[/yellow]")
-            else:
-                for attempt in range(1, 4):
-                    try:
-                        run("wipefs", "--all", "--force", "--lock=yes", efi_part, capture=True)
-                        break
-                    except subprocess.CalledProcessError:
-                        if attempt == 3:
-                            run("wipefs", "--all", "--force", efi_part, check=False, capture=True)
-                        time.sleep(1)
-                run("mkfs.fat","-F","32","-n",DUSKY_EFI_LABEL,efi_part, capture=True)
-        else:
-            if not has_win:
-                try:
-                    run("fatlabel",efi_part,DUSKY_EFI_LABEL, check=False, capture=True)
-                except:
-                    pass
+    if boot_mode == "UEFI" and efi_part and format_efi:
+        run("wipefs", "--all", "--force", "--lock=yes", efi_part, capture=True)
+        run("mkfs.fat", "-F", "32", "-n", DUSKY_EFI_LABEL, efi_part, capture=True)
     run("udevadm", "settle", "--timeout=5", check=False, capture=True)
     return btrfs_target
 
@@ -1466,6 +1451,11 @@ def strategy_rescue(target_dev, boot_mode, creds, has_win, win_esp):
         console.print(f"[yellow]{root_part} is LUKS, unlocking without formatting...[/yellow]")
         ensure_mapper_free(target_dev)
         if Path(f"/dev/mapper/{TARGET_CRYPT_NAME}").exists():
+            status = run("cryptsetup", "status", TARGET_CRYPT_NAME)
+            backing = next((line.split(":", 1)[1].strip() for line in status.stdout.splitlines()
+                            if line.strip().startswith("device:")), "")
+            if not backing or not _same_dev(backing, root_part):
+                raise ValueError("cryptroot belongs to another device")
             console.print(f"[yellow]Mapper {TARGET_CRYPT_NAME} already exists, using it[/yellow]")
         else:
             if creds.get("ROOT_PASS"):

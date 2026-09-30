@@ -164,7 +164,6 @@ def unmount_mount_tree():
             if Path(n).name=="swapfile" and (n in ("/mnt/swap/swapfile","/swap/swapfile") or n.startswith("/mnt/")):
                 run("swapoff",n, check=False, capture=True)
         safe_deactivate_swaps()
-        run("swapoff", "-a", check=False, capture=True)
     except:
         pass
     mnts = findmnt_json("/mnt")
@@ -234,14 +233,11 @@ def ensure_subvolume(path: Path, nocow=False):
     else:
         run("btrfs","subvolume","create",str(path), capture=True)
         existed=False
-    if nocow:
-        try:
-            run("chattr","-c",str(path), check=False, capture=True)
-            run("btrfs","property","set",str(path),"compression","none", check=False, capture=True)
-        except:
-            pass
-        if not existed or is_empty_dir(path):
-            run("chattr","+C",str(path), check=False, capture=True)
+    if nocow and (not existed or is_empty_dir(path)):
+        # compression=none sets NOCOMPRESS (m), which conflicts with NOCOW.
+        run("chattr", "-c", str(path), capture=True)
+        run("chattr", "-m", str(path), capture=True)
+        run("chattr", "+C", str(path), capture=True)
 
 def load_state():
     state={}
@@ -282,155 +278,121 @@ def get_partition_path(disk,num):
         return f"{disk}p{num_str}"
     return f"{disk}{num_str}"
 
+def load_root_password():
+    cred_file = Path("./.arch_credentials")
+    if not cred_file.exists():
+        return None
+    try:
+        script = f'set +u; source {shlex.quote(str(cred_file))} && printf "%s" "$ROOT_PASS"'
+        result = subprocess.run(["bash", "-c", script], capture_output=True, check=True, timeout=5)
+        # Binary output preserves the exact key bytes, including whitespace.
+        return bytearray(result.stdout) if result.stdout else None
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+
 def determine_root_partition(auto_mode):
     state=load_state()
-    encrypt_hint=state.get("encrypt")
-    has_mapper=Path("/dev/mapper/cryptroot").exists()
-    use_crypt=False
-    if isinstance(encrypt_hint,bool):
-        use_crypt=encrypt_hint
-    elif has_mapper:
-        use_crypt=True
-
-    if use_crypt:
-        mapped=Path("/dev/mapper/cryptroot")
-        if not mapped.exists():
-            prov=state.get("root_part")
-            if prov and Path(prov).exists() and run("cryptsetup","isLuks",prov,check=False,capture=True).returncode == 0:
-                console.print(f"[yellow]Opening LUKS mapper cryptroot on {prov}...[/yellow]")
-                cred_pass = None
-                try:
-                    cred_file = Path("./.arch_credentials")
-                    if cred_file.exists():
-                        script = f'set +u; source {shlex.quote(str(cred_file))} 2>/dev/null; echo "$ROOT_PASS"'
-                        r_pass = subprocess.run(["bash","-c",script], text=True, capture_output=True, check=False, timeout=5)
-                        if r_pass.stdout.strip():
-                            cred_pass = bytearray(r_pass.stdout.strip().encode())
-                except Exception:
-                    pass
-                if cred_pass:
-                    run("cryptsetup","open","--allow-discards","--key-file","-",prov,"cryptroot", input_text=cred_pass, check=False, capture=True)
-                    for i in range(len(cred_pass)): cred_pass[i] = 0
-            if not mapped.exists():
-                console.print("[red]LUKS expected no mapper[/red]")
-                sys.exit(1)
-        backing=""
-        try:
-            for dm in Path("/sys/class/block").iterdir():
-                if not dm.name.startswith("dm-"):
-                    continue
-                try:
-                    if (dm/"dm"/"name").read_text().strip()=="cryptroot":
-                        slaves=list((dm/"slaves").iterdir())
-                        if slaves:
-                            backing=f"/dev/{slaves[0].name}"
-                            break
-                except:
-                    continue
-        except:
-            pass
-        if not backing:
-            r=run("cryptsetup","status","cryptroot",check=False,capture=True)
-            for line in r.stdout.splitlines():
-                if line.strip().lower().startswith("device:"):
-                    backing=line.split(":",1)[1].strip()
-                    break
-        if not backing:
-            console.print("[red]No backing[/red]")
+    provisioned = state.get("root_part")
+    mapped = Path("/dev/mapper/cryptroot")
+    if provisioned:
+        root_part = Path(provisioned).resolve()
+        if not root_part.exists():
+            console.print(f"[red]Provisioned root {root_part} is missing.[/red]")
             sys.exit(1)
-        root_part=Path(backing).resolve()
-        mapped_root=mapped
+    elif state.get("encrypt") is True and mapped.exists():
+        root_part = mapper_backing()
+    elif auto_mode:
+        r=run("lsblk","-pnro","NAME,FSTYPE,LABEL",check=False,capture=True)
+        btrfs_parts=[]
+        duskies=[]
+        for line in r.stdout.splitlines():
+            cols=line.split()
+            if len(cols)<2:
+                continue
+            name=cols[0]
+            fstype=cols[1]
+            label=cols[2] if len(cols)>2 else ""
+            if fstype=="btrfs":
+                if label==DUSKY_ROOT_LABEL:
+                    duskies.append(name)
+                btrfs_parts.append(name)
+        if len(duskies)==1:
+            root_part=Path(duskies[0]).resolve()
+            mapped_root=root_part
+        elif len(btrfs_parts)==1:
+            root_part=Path(btrfs_parts[0]).resolve()
+            mapped_root=root_part
+        else:
+            console.print("[red]Cannot auto-detect btrfs root[/red]")
+            sys.exit(1)
     else:
-        if auto_mode:
-            prov=state.get("root_part")
-            if prov and Path(prov).exists():
-                if run("cryptsetup","isLuks",prov,check=False,capture=True).returncode == 0:
-                    mapped=Path("/dev/mapper/cryptroot")
-                    if not mapped.exists():
-                        cred_pass = None
-                        try:
-                            cred_file = Path("./.arch_credentials")
-                            if cred_file.exists():
-                                script = f'set +u; source {shlex.quote(str(cred_file))} 2>/dev/null; echo "$ROOT_PASS"'
-                                r_pass = subprocess.run(["bash","-c",script], text=True, capture_output=True, check=False, timeout=5)
-                                if r_pass.stdout.strip():
-                                    cred_pass = bytearray(r_pass.stdout.strip().encode())
-                        except Exception:
-                            pass
-                        if cred_pass:
-                            run("cryptsetup","open","--allow-discards","--key-file","-",prov,"cryptroot", input_text=cred_pass, check=False, capture=True)
-                            for i in range(len(cred_pass)): cred_pass[i] = 0
-                    if mapped.exists():
-                        root_part=Path(prov).resolve()
-                        mapped_root=mapped
-                    else:
-                        root_part=Path(prov).resolve()
-                        mapped_root=root_part
-                else:
-                    root_part=Path(prov).resolve()
-                    mapped_root=root_part
-            else:
-                r=run("lsblk","-pnro","NAME,FSTYPE,LABEL",check=False,capture=True)
-                btrfs_parts=[]
-                duskies=[]
-                for line in r.stdout.splitlines():
-                    cols=line.split()
-                    if len(cols)<2:
-                        continue
-                    name=cols[0]
-                    fstype=cols[1]
-                    label=cols[2] if len(cols)>2 else ""
-                    if fstype=="btrfs":
-                        if label==DUSKY_ROOT_LABEL:
-                            duskies.append(name)
-                        btrfs_parts.append(name)
-                if len(duskies)==1:
-                    root_part=Path(duskies[0]).resolve()
-                    mapped_root=root_part
-                elif len(btrfs_parts)==1:
-                    root_part=Path(btrfs_parts[0]).resolve()
-                    mapped_root=root_part
-                else:
-                    console.print("[red]Cannot auto-detect btrfs root[/red]")
-                    sys.exit(1)
-        else:
-            r=run("lsblk","-l","-o","NAME,SIZE,TYPE,FSTYPE,LABEL,PARTLABEL",check=False,capture=True)
-            console.print(r.stdout)
-            while True:
-                raw=Prompt.ask("Enter DUSKY BTRFS root (e.g. vda2)",console=console)
-                if not VALID_PART_RE.match(raw):
-                    console.print("[red]Invalid[/red]")
+        r=run("lsblk","-l","-o","NAME,SIZE,TYPE,FSTYPE,LABEL,PARTLABEL",check=False,capture=True)
+        console.print(r.stdout)
+        while True:
+            raw=Prompt.ask("Enter DUSKY BTRFS root (e.g. vda2)",console=console)
+            if not VALID_PART_RE.match(raw):
+                console.print("[red]Invalid[/red]")
+                continue
+            name=raw.removeprefix("/dev/")
+            p=Path("/dev")/name
+            try:
+                rp=p.resolve()
+                if not rp.exists():
+                    console.print(f"[red]{rp} no exist[/red]")
                     continue
-                name=raw.removeprefix("/dev/")
-                p=Path("/dev")/name
-                try:
-                    rp=p.resolve()
-                    if not rp.exists():
-                        console.print(f"[red]{rp} no exist[/red]")
-                        continue
-                    root_part=rp
-                    mapped_root=rp
-                    break
-                except Exception as e:
-                    console.print(f"[red]{e}[/red]")
-    if not root_part.exists():
-        console.print(f"[red]{root_part} invalid[/red]")
+                root_part=rp
+                mapped_root=rp
+                break
+            except Exception as e:
+                console.print(f"[red]{e}[/red]")
+    if mapped.exists() and root_part == mapped.resolve():
+        root_part = mapper_backing()
+    encrypted = run("cryptsetup", "isLuks", str(root_part), check=False).returncode == 0
+    if state.get("encrypt") is True and not encrypted:
+        console.print(f"[red]{root_part} is not the expected LUKS root.[/red]")
         sys.exit(1)
-    try:
-        r=run("lsblk","-ndlo","PKNAME",str(root_part),check=False,capture=True)
-        pk=r.stdout.strip().splitlines()[0].strip() if r.stdout.strip() else ""
-        if pk:
-            root_disk=Path(f"/dev/{pk}").resolve()
+    mapped_root = root_part
+    if encrypted:
+        if mapped.exists():
+            if mapper_backing() != root_part:
+                console.print(f"[red]cryptroot belongs to another device, not {root_part}.[/red]")
+                sys.exit(1)
         else:
-            raise ValueError
-    except:
-        m=re.match(r"^(.*?)(?:p?\d+)$",root_part.name)
-        if m:
-            root_disk=Path(f"/dev/{m.group(1)}").resolve()
-        else:
-            console.print(f"[red]Failed parent disk[/red]")
-            sys.exit(1)
-    return mapped_root, root_part, root_disk
+            password = load_root_password()
+            if not password:
+                console.print("[red]Cannot unlock root: ROOT_PASS is missing from .arch_credentials.[/red]")
+                sys.exit(1)
+            args = ["cryptsetup", "open", "--type", "luks2", "--allow-discards"]
+            block = Path("/sys/class/block") / root_part.name
+            if (block / "partition").exists():
+                block = block.resolve().parent
+            try:
+                if (block / "queue/rotational").read_text().strip() == "0":
+                    args += ["--perf-no_read_workqueue", "--perf-no_write_workqueue"]
+            except OSError:
+                pass
+            try:
+                # Like Archinstall, stop at unlock failure; never use the raw LUKS device.
+                run(*args, "--key-file", "-", str(root_part), "cryptroot", input_text=password)
+            finally:
+                password[:] = b"\0" * len(password)
+            if not mapped.exists() or mapper_backing() != root_part:
+                console.print("[red]Unlock did not produce the expected cryptroot mapper.[/red]")
+                sys.exit(1)
+        mapped_root = mapped
+    r = run("lsblk", "-ndlo", "PKNAME", str(root_part))
+    parents = r.stdout.splitlines()
+    root_disk = Path("/dev") / parents[0].strip() if parents and parents[0].strip() else root_part
+    return mapped_root, root_part, root_disk.resolve()
+
+
+def mapper_backing():
+    result = run("cryptsetup", "status", "cryptroot")
+    for line in result.stdout.splitlines():
+        if line.strip().startswith("device:"):
+            return Path(line.split(":", 1)[1].strip()).resolve()
+    console.print("[red]Cannot determine cryptroot's backing device.[/red]")
+    sys.exit(1)
 
 def probe_fstype(dev):
     """
@@ -450,12 +412,7 @@ def validate_root_state(mapped_root):
     if not mapped_root.exists():
         console.print(f"[red]{mapped_root} not found[/red]")
         sys.exit(1)
-    r=run("lsblk","-ndlo","FSTYPE",str(mapped_root),check=False,capture=True)
-    fstype=r.stdout.strip().lower()
-    if fstype!="btrfs":
-        # udev may not know about a filesystem created moments ago in 030;
-        # trust a direct blkid probe before declaring the partition bad.
-        fstype=probe_fstype(mapped_root) or fstype
+    fstype = probe_fstype(mapped_root)
     if fstype!="btrfs":
         console.print(f"[red]{mapped_root} is '{fstype or 'no filesystem'}', expected btrfs.[/red]")
         console.print("[yellow]This usually means the partition selected as ROOT in the partitioning step was never formatted:[/yellow]")
@@ -470,16 +427,9 @@ def validate_root_state(mapped_root):
         sys.exit(1)
 
 def validate_efi_partition(part):
-    r=run("lsblk","-ndlo","FSTYPE,PARTTYPE",str(part),check=False,capture=True)
-    out=r.stdout.lower()
-    if EFI_GPT_TYPE not in out and "0xef" not in out and "vfat" not in out and "fat32" not in out:
-        # Same stale-udev concern as validate_root_state: ask blkid directly.
-        btype=probe_fstype(part)
-        pt=run("blkid","-p","-c","/dev/null","-o","value","-s","PART_ENTRY_TYPE",str(part),check=False,capture=True)
-        out=f"{out} {btype} {(pt.stdout or '').lower()}"
-    if EFI_GPT_TYPE not in out and "0xef" not in out and "vfat" not in out and "fat32" not in out:
-        console.print(f"[red]{part} is not an EFI System Partition (no ESP type, not vfat).[/red]")
-        console.print("[yellow]Pick the small vfat/EFI partition (on Windows dual-boot that is the existing Windows EFI, ~100M-1G), not the Windows data partition.[/yellow]")
+    part_type = run("blkid", "-p", "-c", "/dev/null", "-o", "value", "-s", "PART_ENTRY_TYPE", str(part), check=False).stdout.strip().lower()
+    if part_type not in (EFI_GPT_TYPE, "0xef") or probe_fstype(part) != "vfat":
+        console.print(f"[red]{part} must be an EFI System Partition containing FAT.[/red]")
         sys.exit(1)
 
 def is_mounted(dev):
@@ -502,52 +452,26 @@ def flatten_lsblk(data):
         _walk(data)
     return nodes
 
-def auto_detect_efi_partition(root_disk,root_part):
+def auto_detect_efi_partition(root_disk, root_part):
     try:
-        r=run("lsblk","--json","--paths","--tree","-o","NAME,PATH,TYPE,PARTTYPE,FSTYPE,PARTLABEL,LABEL",str(root_disk),check=False,capture=True)
-        data=json.loads(r.stdout)
-        nodes=flatten_lsblk(data)
-        guid=[]
-        dusky=[]
-        labelm=[]
-        vfat=[]
-        non_root=[]
-        for ch in nodes:
-            ptype=(ch.get("parttype") or "").lower()
-            fstype=(ch.get("fstype") or "").lower()
-            partlabel=ch.get("partlabel") or ""
-            label=ch.get("label") or ""
-            name=ch.get("path") or ch.get("name")
-            if not name:
+        result = run("lsblk", "--json", "--paths", "--tree", "-o",
+                     "PATH,TYPE,PARTTYPE,PARTLABEL,LABEL", str(root_disk))
+        candidates = []
+        preferred = []
+        for node in flatten_lsblk(json.loads(result.stdout)):
+            if node.get("type") != "part" or (node.get("parttype") or "").lower() not in (EFI_GPT_TYPE, "0xef"):
                 continue
-            try:
-                pp=Path(name).resolve()
-            except:
-                pp=Path(name)
-            if pp==root_part.resolve():
+            part = Path(node["path"]).resolve()
+            if part == root_part.resolve():
                 continue
-            if ch.get("type")!="part":
-                continue
-            non_root.append(pp)
-            if label==DUSKY_EFI_LABEL or partlabel==DUSKY_EFI_LABEL:
-                dusky.append(pp)
-            elif ptype==EFI_GPT_TYPE:
-                guid.append(pp)
-            if "efi" in partlabel.lower():
-                labelm.append(pp)
-            if fstype in ("vfat","fat32"):
-                vfat.append(pp)
-        if len(dusky)==1:
-            return dusky[0]
-        if len(guid)==1:
-            return guid[0]
-        if len(labelm)==1:
-            return labelm[0]
-        if len(vfat)==1:
-            return vfat[0]
-        if len(non_root)==1:
-            return non_root[0]
-    except:
+            candidates.append(part)
+            if DUSKY_EFI_LABEL in (node.get("label"), node.get("partlabel")):
+                preferred.append(part)
+        if len(preferred) == 1:
+            return preferred[0]
+        if len(candidates) == 1:
+            return candidates[0]
+    except (OSError, subprocess.CalledProcessError, ValueError, KeyError):
         pass
     return None
 
@@ -574,7 +498,10 @@ def determine_efi_partition(auto_mode,root_disk,root_part):
         return None
     state=load_state()
     prov=state.get("efi_part")
-    if prov and Path(prov).exists():
+    if prov:
+        if not Path(prov).exists():
+            console.print(f"[red]Provisioned EFI {prov} is missing.[/red]")
+            sys.exit(1)
         console.print(f"[cyan]Auto EFI {prov}[/cyan]")
         return Path(prov).resolve()
     det=auto_detect_efi_partition(root_disk,root_part)
@@ -582,18 +509,8 @@ def determine_efi_partition(auto_mode,root_disk,root_part):
         console.print(f"[cyan]Auto EFI {det}[/cyan]")
         return det
     if auto_mode or not sys.stdin.isatty():
-        try:
-            parts = flatten_lsblk(json.loads(run("lsblk","--json","--paths","--tree","-o","NAME,PATH,TYPE,PARTTYPE,FSTYPE,PARTLABEL,LABEL",str(root_disk),check=False,capture=True).stdout))
-            for p in parts:
-                if p.get("type") == "part" and (p.get("parttype","").lower() == EFI_GPT_TYPE or p.get("fstype","").lower() in ("vfat","fat32")):
-                    p_path = Path(p.get("path") or p.get("name")).resolve()
-                    if p_path != root_part.resolve():
-                        console.print(f"[cyan]Auto-fallback EFI {p_path}[/cyan]")
-                        return p_path
-        except Exception:
-            pass
-        console.print("[yellow]No EFI partition detected in auto mode[/yellow]")
-        return None
+        console.print("[red]No unambiguous EFI partition found; select it in the partitioning step.[/red]")
+        sys.exit(1)
     return prompt_for_efi_partition(root_disk)
 
 def construct_subvolume_matrix(mapped_root):
@@ -723,7 +640,7 @@ def sync_secondary_efi_bootloaders(primary_esp_mnt: str = "/mnt/boot", primary_e
                 fstype = (child.get("fstype") or "").lower()
                 is_esp = ptype == esp_guid
                 is_vfat = fstype in ("vfat", "fat32")
-                if not (is_esp or is_vfat):
+                if not (is_esp and is_vfat):
                     continue
 
                 tmp_dir = None
@@ -742,9 +659,14 @@ def sync_secondary_efi_bootloaders(primary_esp_mnt: str = "/mnt/boot", primary_e
                         if not v_name or v_name.startswith(".") or v_name.lower() in ("boot", "systemd"):
                             continue
                         dst_vendor = target_efi_dir / v_name
+                        if dst_vendor.exists():
+                            continue
                         console.print(f"[cyan]Syncing secondary EFI vendor directory '{v_name}' from {p_res} -> {dst_vendor}[/cyan]")
                         try:
-                            shutil.copytree(vendor_dir, dst_vendor, dirs_exist_ok=True, copy_function=shutil.copy2)
+                            with tempfile.TemporaryDirectory(prefix=".dusky-efi-", dir=target_efi_dir) as staging:
+                                candidate = Path(staging) / v_name
+                                shutil.copytree(vendor_dir, candidate, copy_function=shutil.copy2)
+                                candidate.rename(dst_vendor)
                         except Exception as e:
                             console.print(f"[yellow]Warning syncing {v_name}: {e}[/yellow]")
                 except Exception as e:
@@ -856,6 +778,9 @@ def run_common(auto_mode):
         efi_part=determine_efi_partition(auto_mode,root_disk,root_part)
         if efi_part:
             efi_part=efi_part.resolve()
+            if efi_part == root_part.resolve():
+                console.print("[red]ROOT and EFI cannot be the same partition.[/red]")
+                sys.exit(1)
             validate_efi_partition(efi_part)
             tmp_obj=None
             try:
