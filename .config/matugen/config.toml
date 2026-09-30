@@ -9,27 +9,17 @@
 # 1. GTK, Qt & Core Theming
 # =============================================================================
 
+# GTK loads user CSS once. Publish complete palettes separately, and reload GTK3
+# using two identically laid-out adw-gtk3 wrappers (one theme change per update).
 [templates.gtk3]
 input_path  = '~/.config/matugen/templates/gtk3-colors.css'
 output_path = '~/.config/matugen/generated/gtk-3.css'
-post_hook   = '''
-  ln -nfs "$HOME/.config/matugen/generated/gtk-3.css" "$HOME/.config/gtk-3.0/gtk.css"
-  gsettings set org.gnome.desktop.interface gtk-theme "Adwaita" || :
-  gsettings set org.gnome.desktop.interface gtk-theme "adw-gtk3-dark" || :
-  # Portal file chooser (xdg-desktop-portal-gtk) caches theme at startup; new
-  # dialogs opened after a matugen switch would otherwise stay teal/cyan until
-  # next login. Cheap try-restart makes the next Select folder pick up pink.
-  systemctl --user try-restart xdg-desktop-portal-gtk >/dev/null 2>&1 || :
-'''
+post_hook   = 'python3 "$HOME/user_scripts/theme_matugen/gtk_colors.py" 3'
 
 [templates.gtk4]
 input_path  = '~/.config/matugen/templates/gtk4-colors.css'
 output_path = '~/.config/matugen/generated/gtk-4.css'
-post_hook   = '''
-  ln -nfs "$HOME/.config/matugen/generated/gtk-4.css" "$HOME/.config/gtk-4.0/gtk.css"
-  ln -nfs "/usr/share/themes/adw-gtk3-dark/gtk-4.0/libadwaita.css" "$HOME/.config/gtk-4.0/libadwaita.css"
-  ln -nfs "/usr/share/themes/adw-gtk3-dark/gtk-4.0/libadwaita-tweaks.css" "$HOME/.config/gtk-4.0/libadwaita-tweaks.css"
-'''
+post_hook   = 'python3 "$HOME/user_scripts/theme_matugen/gtk_colors.py" 4'
 
 [templates.gtksourceview]
 input_path  = '~/.config/matugen/templates/gtksourceview.xml'

@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Publish Matugen GTK palettes without exposing truncated files to applications.
+
+GTK3's user CSS is cached for the process lifetime. Two theme names importing
+the same adw-gtk3 layout let GTK reload colors with a single settings change.
+GTK4/libadwaita user CSS is also cached; its new palette applies on app restart.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+
+import gi
+
+
+def atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            stream.write(content)
+            os.fchmod(stream.fileno(), 0o644)
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def validate(version: str, palette: str) -> None:
+    if not palette.endswith("/* dusky-palette-complete */\n"):
+        raise ValueError("Incomplete GTK palette; retaining the published colors")
+    gi.require_version("Gtk", f"{version}.0")
+    from gi.repository import Gtk
+
+    provider = Gtk.CssProvider()
+    errors = []
+    provider.connect("parsing-error", lambda _p, _s, error: errors.append(str(error)))
+    if version == "3":
+        provider.load_from_data(palette.encode())
+    else:
+        provider.load_from_string(palette)
+    if errors:
+        raise ValueError("Invalid GTK palette: " + "; ".join(errors))
+
+
+def publish(version: str) -> None:
+    config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    data = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+    # Serialize publication and selection, including simultaneous Matugen hooks.
+    with (config / "matugen" / ".gtk-colors.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        palette = (config / "matugen/generated" / f"gtk-{version}.css").read_text()
+        validate(version, palette)
+        gtk = config / f"gtk-{version}.0"
+        if version == "4":
+            atomic_write(gtk / "gtk.css", palette)
+            return
+
+        from gi.repository import Gio
+
+        # Discover the installed theme through GTK's documented data search paths.
+        roots = [data, Path.home() / ".themes"]
+        roots.extend(Path(p) for p in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":"))
+        bases = [(root if root.name == ".themes" else root / "themes") / "adw-gtk3-dark/gtk-3.0/gtk.css" for root in roots]
+        base = next((p for p in bases if p.is_file()), None)
+        if base is None:
+            raise FileNotFoundError("adw-gtk3-dark is not installed")
+
+        settings = Gio.Settings.new("org.gnome.desktop.interface")
+        names = ("dusky-matugen-a", "dusky-matugen-b")
+        current = settings.get_string("gtk-theme")
+        selected = names[1] if current == names[0] else names[0]
+        stylesheet = f'@import url("{base.as_uri()}");\n\n' + palette
+        for name in names:
+            theme = data / "themes" / name / "gtk-3.0"
+            atomic_write(theme / "gtk.css", stylesheet)
+            atomic_write(theme / "gtk-dark.css", stylesheet)
+
+        # Remove the managed cached overrides; all GTK3 colors now come from the
+        # reloadable theme provider. Existing apps need one restart to drop them.
+        atomic_write(gtk / "gtk.css", "/* Matugen colors live in the reloadable dusky-matugen GTK3 theme. */\n")
+        ini = gtk / "settings.ini"
+        content = ini.read_text() if ini.exists() else "[Settings]\n"
+        if re.search(r"^gtk-theme-name\s*=", content, re.M):
+            content = re.sub(r"^gtk-theme-name\s*=.*$", f"gtk-theme-name={selected}", content, flags=re.M)
+        else:
+            content = content.replace("[Settings]", f"[Settings]\ngtk-theme-name={selected}", 1)
+        atomic_write(ini, content)
+        if not settings.set_string("gtk-theme", selected):
+            raise RuntimeError("Cannot update the GTK theme setting")
+        Gio.Settings.sync()
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] not in (["3"], ["4"]):
+        raise SystemExit("Usage: gtk_colors.py 3|4")
+    try:
+        publish(sys.argv[1])
+    except Exception as error:
+        raise SystemExit(f"gtk_colors: {error}") from error
