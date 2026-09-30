@@ -13,8 +13,8 @@ shopt -s extglob
 # =============================================================================
 
 declare -r CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/dusky-kokoro"
-declare -r CONFIG_FILE="${CONFIG_DIR}/config.toml"
-declare -r CONTAINED_DIR="${HOME}/contained_apps/uv/dusky_kokoro"
+declare -r CONFIG_FILE="${DUSKY_CONFIG:-$CONFIG_DIR/config.toml}"
+declare -r CONTAINED_DIR="${DUSKY_HOME:-$HOME/contained_apps/uv/dusky_kokoro}"
 declare -r TRIGGER_SCRIPT="${HOME}/user_scripts/tts_stt/dusky_kokoro/trigger.sh"
 
 declare -r APP_TITLE="Dusky Kokoro TTS Setup"
@@ -64,7 +64,7 @@ register_items() {
     register 2 "Prefetch Segments"       'prefetch_segments|int||1|16|1' "4"
 
     # Tab 3: Engine & GPU
-    register 3 "Hardware Provider"       'provider|cycle||"cuda","cpu","rocm","openvino","auto"||' '"cuda"'
+    register 3 "Hardware Provider"       'provider|cycle||"cuda","cpu","migraphx","openvino","auto"||' '"auto"'
     register 3 "Model Precision"         'precision|cycle||"fp16-gpu","int8","f32","fp16","auto"||' '"auto"'
     register 3 "Model Idle Unload (s)"   'model_idle_timeout_s|float||5.0|300.0|5.0' "30.0"
     register 3 "Process Idle Exit (s)"   'process_idle_timeout_s|float||10.0|600.0|10.0' "30.0"
@@ -168,7 +168,7 @@ clear_status() {
 }
 
 check_daemon_status() {
-    local pid_file="/tmp/dusky_kokoro.pid"
+    local pid_file="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/dusky-kokoro/daemon.pid"
     if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
         DAEMON_STATUS_UI="${C_GREEN}● RUNNING${C_RESET}"
         DAEMON_IS_RUNNING="1"
@@ -268,7 +268,7 @@ enabled = true
 bit_depth = 16
 
 [engine]
-provider = "cuda"
+provider = "auto"
 precision = "auto"
 model_idle_timeout_s = 30.0
 gpu_mem_limit_mb = 2048
@@ -357,8 +357,8 @@ strip_ansi() {
 register() {
     local -i tab_idx=$1
     local label="$2" config="$3" default_val="${4:-}"
-    local key type block min max step
-    IFS='|' read -r key type block min max step <<< "$config"
+    local key type _block min max step
+    IFS='|' read -r key type _block min max step <<< "$config"
 
     ITEM_MAP["${tab_idx}::${label}"]="$config"
     if [[ -n "$default_val" ]]; then
@@ -480,7 +480,7 @@ populate_config_cache() {
 }
 
 write_value_to_file() {
-    local key="$1" new_val="$2" block="${3:-}"
+    local key="$1" new_val="$2"
     local cache_key="${key}"
     local current_val="${CONFIG_CACHE["$cache_key"]:-}"
 
@@ -492,10 +492,26 @@ write_value_to_file() {
 
     create_tmpfile || { set_status "Atomic save unavailable."; return 1; }
 
-    TARGET_KEY="$key" NEW_VALUE="$new_val" \
+    local section
+    case "$key" in
+        blend|voice_*|weight_*|lang|spec|speed) section=voice ;;
+        mpv_speed|volume|window|window_geometry|prefetch_segments) section=playback ;;
+        enabled|bit_depth) section=archive ;;
+        process_idle_timeout_s) section=daemon ;;
+        sentence_pause_ms|paragraph_pause_ms|trim_silence) section=text ;;
+        *) section=engine ;;
+    esac
+    TARGET_SECTION="$section" TARGET_KEY="$key" NEW_VALUE="$new_val" \
     LC_ALL=C awk '
-    BEGIN { target_nr = 0; skip_dict = 0 }
+    BEGIN { target_nr = 0; section = ""; section_end = 0; section_found = 0 }
     { lines[NR] = $0 }
+    /^[[:space:]]*\[/ {
+        if (section == ENVIRON["TARGET_SECTION"]) section_end = NR - 1
+        section = $0
+        sub(/^[[:space:]]*\[/, "", section)
+        sub(/\].*$/, "", section)
+        if (section == ENVIRON["TARGET_SECTION"]) section_found = 1
+    }
     {
         if (match($0, /^[[:space:]]*[A-Za-z0-9_]+[[:space:]]*=/)) {
             eq_pos = index($0, "=")
@@ -503,7 +519,7 @@ write_value_to_file() {
             sub(/^[[:space:]]+/, "", k)
             sub(/[[:space:]]+$/, "", k)
 
-            if (k == ENVIRON["TARGET_KEY"]) {
+            if (section == ENVIRON["TARGET_SECTION"] && k == ENVIRON["TARGET_KEY"]) {
                 target_nr = NR
             }
         }
@@ -527,10 +543,16 @@ write_value_to_file() {
                 }
             }
         } else {
+            if (section == ENVIRON["TARGET_SECTION"]) section_end = NR
             for (i = 1; i <= NR; i++) {
                 print lines[i]
+                if (section_found && i == section_end)
+                    print ENVIRON["TARGET_KEY"] " = " ENVIRON["NEW_VALUE"]
             }
-            print ENVIRON["TARGET_KEY"] " = " ENVIRON["NEW_VALUE"]
+            if (!section_found) {
+                print "\n[" ENVIRON["TARGET_SECTION"] "]"
+                print ENVIRON["TARGET_KEY"] " = " ENVIRON["NEW_VALUE"]
+            }
         }
         exit 0
     }
@@ -568,31 +590,21 @@ sync_voice_spec() {
 
     v1="${v1//\"/}"; v2="${v2//\"/}"; v3="${v3//\"/}"
     local new_spec
-    if [[ "${b,,}" == "false" || "$v2" == "none" || "$w2" == "0" || "$w2" == "0.0" || "$w2" == "0.00" ]]; then
-        new_spec="\"${v1}\""
-    elif [[ "$v3" != "none" && "$w3" != "0" && "$w3" != "0.0" && "$w3" != "0.00" ]]; then
-        local -a norm
-        mapfile -t norm < <(LC_ALL=C awk -v w1="$w1" -v w2="$w2" -v w3="$w3" 'BEGIN {
-            s = w1 + w2 + w3
-            if (s <= 0) s = 1.0
-            n1 = sprintf("%.2f", w1 / s)
-            n2 = sprintf("%.2f", w2 / s)
-            n3 = sprintf("%.2f", 1.0 - n1 - n2)
-            if (n3 < 0) n3 = "0.00"
-            print n1; print n2; print n3
-        }')
-        new_spec="\"${v1}:${norm[0]},${v2}:${norm[1]},${v3}:${norm[2]}\""
-    else
-        local -a norm
-        mapfile -t norm < <(LC_ALL=C awk -v w1="$w1" -v w2="$w2" 'BEGIN {
-            s = w1 + w2
-            if (s <= 0) s = 1.0
-            n1 = sprintf("%.2f", w1 / s)
-            n2 = sprintf("%.2f", 1.0 - n1)
-            print n1; print n2
-        }')
-        new_spec="\"${v1}:${norm[0]},${v2}:${norm[1]}\""
-    fi
+    new_spec=$(LC_ALL=C awk -v blend="$b" -v v1="$v1" -v w1="$w1" -v v2="$v2" -v w2="$w2" -v v3="$v3" -v w3="$w3" 'BEGIN {
+        if (blend == "false") { printf "\"%s\"", v1; exit }
+        v[1]=v1; v[2]=v2; v[3]=v3
+        w[1]=w1; w[2]=w2; w[3]=w3
+        total=0
+        for (i=1; i<=3; i++) if (v[i] != "none" && w[i]>0) total+=w[i]
+        if (total<=0) { printf "\"%s\"", v1; exit }
+        printf "\""
+        sep=""
+        for (i=1; i<=3; i++) if (v[i] != "none" && w[i]>0) {
+            printf "%s%s:%.8g", sep, v[i], w[i]/total
+            sep=","
+        }
+        printf "\""
+    }')
     write_value_to_file "spec" "$new_spec"
 }
 
@@ -617,8 +629,8 @@ load_active_values() {
         cache_key="${key}"
         if [[ -n "${CONFIG_CACHE["$cache_key"]+_}" ]]; then
             VALUE_CACHE["${REPLY_CTX}::${item}"]="${CONFIG_CACHE["$cache_key"]}"
-        elif [[ -n "${RAW_DEFAULTS["${REPLY_CTX}::${item}"]+_}" ]]; then
-            VALUE_CACHE["${REPLY_CTX}::${item}"]="${RAW_DEFAULTS["${REPLY_CTX}::${item}"]}"
+        elif [[ -n "${DEFAULTS["${REPLY_CTX}::${item}"]+_}" ]]; then
+            VALUE_CACHE["${REPLY_CTX}::${item}"]="${DEFAULTS["${REPLY_CTX}::${item}"]}"
         else
             VALUE_CACHE["${REPLY_CTX}::${item}"]="$UNSET_MARKER"
         fi
@@ -654,6 +666,8 @@ reset_defaults() {
         fi
     done
 
+    sync_voice_spec
+    post_write_action
     if (( any_failed )); then
         set_status "Some defaults were not written."
     else
@@ -668,12 +682,12 @@ modify_value() {
     local REPLY_REF REPLY_CTX
     get_active_context
 
-    local key type block min max step current new_val
-    IFS='|' read -r key type block min max step <<< "${ITEM_MAP["${REPLY_CTX}::${label}"]}"
+    local key type _block min max step current new_val
+    IFS='|' read -r key type _block min max step <<< "${ITEM_MAP["${REPLY_CTX}::${label}"]}"
     current="${VALUE_CACHE["${REPLY_CTX}::${label}"]:-}"
 
     if [[ "$current" == "$UNSET_MARKER" || -z "$current" ]]; then
-        current="${RAW_DEFAULTS["${REPLY_CTX}::${label}"]:-}"
+        current="${DEFAULTS["${REPLY_CTX}::${label}"]:-}"
         [[ -z "$current" ]] && current="${min:-0}"
     fi
 
