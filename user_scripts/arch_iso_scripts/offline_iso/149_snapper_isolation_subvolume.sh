@@ -533,13 +533,18 @@ ensure_fstab_entry_for_snapshots() {
     mount_opts+="subvol=/${subvol_target#/}"
 
     canonical_target="$(realpath -m "$mount_target")"
+    # fstab uses octal escapes for whitespace and literal backslashes.
+    canonical_target="${canonical_target//\\/\\134}"
+    canonical_target="${canonical_target// /\\040}"
+    canonical_target="${canonical_target//$'\t'/\\011}"
+    canonical_target="${canonical_target//$'\n'/\\012}"
     newline="UUID=${fs_uuid} ${canonical_target} btrfs ${mount_opts} 0 0"
 
     tmp="$(mktemp)"
     ACTIVE_TEMP_FILES+=("$tmp")
 
-    awk -v mp="$canonical_target" -v newline="$newline" '
-        BEGIN { done = 0 }
+    DUSKY_MOUNT_TARGET="$canonical_target" DUSKY_FSTAB_ENTRY="$newline" awk '
+        BEGIN { done = 0; mp = ENVIRON["DUSKY_MOUNT_TARGET"]; newline = ENVIRON["DUSKY_FSTAB_ENTRY"] }
         /^[[:space:]]*#/ || NF < 2 { print $0; next }
         {
             curr_mp = $2
@@ -600,6 +605,132 @@ tune_snapper() {
         FREE_LIMIT="0.0" \
         BACKGROUND_COMPARISON="no" \
         QGROUP=""
+}
+
+# Keep browser state outside root/home snapshots, including after a home rollback.
+# Local desktop accounts come from passwd; no installation username is embedded.
+drain_browser_original() {
+    local hidden="$1"
+    test -d "$hidden" || return 0
+    # Keep the original directory/subvolume inode: deleting an underlying subvolume
+    # would detach its overlying browser mount from pathname lookup.
+    find "$hidden" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} +
+}
+
+isolate_browser_directory() {
+    local base="$1" top="$2" uid="$3" gid="$4" path="$5" role="$6"
+    local parent subvol destination pending hidden fsroot relative
+    parent="$(dirname "$path")"
+    if ! test -d "$parent"; then
+        install -d -m 0700 -o "$uid" -g "$gid" -- "$parent"
+    fi
+    path="$(realpath -m "$path")"
+    parent="$(dirname "$path")"
+    # A symlinked profile may resolve outside the account's home mount.
+    local actual_base
+    actual_base="$(findmnt -n -o TARGET -T "$parent")"
+    load_mount_info "$actual_base"
+    [[ "${CACHE_MNT_UUID["$actual_base"]}" == "${CACHE_MNT_UUID["$base"]}" ]] ||
+        fatal "Browser directory $path is on a different filesystem from $base."
+    base="$actual_base"
+    subvol="@browser_${uid}_${role}"
+    destination="$top/$subvol"
+    pending="${destination}.pending"
+
+    fsroot="$(get_mount_subvolume_path "$base")"
+    relative="${path#"${base%/}"/}"
+    hidden="$top/${fsroot:+$fsroot/}$relative"
+    if mountpoint -q "$path"; then
+        current_snapshots_mount_matches_expected "$path" "$subvol" "$base" ||
+            fatal "Browser directory $path is mounted from an unexpected subvolume."
+        ensure_fstab_entry_for_snapshots "$base" "$path" "$subvol"
+        drain_browser_original "$hidden"
+        return 0
+    fi
+    # Copying a live profile can lose writes that arrive during migration.
+    if pgrep -u "$uid" -x 'firefox|firefox-bin|chrome|chromium|chromium-browser' >/dev/null; then
+        fatal "Close Firefox, Chromium and Chrome for user ID $uid before isolating browser data."
+    fi
+    test ! -e "$path" || test -d "$path" || fatal "Browser path is not a directory: $path"
+    [[ "$(findmnt -n -e -o UUID -T "$parent")" == "${CACHE_MNT_UUID["$base"]}" ]] ||
+        fatal "Browser directory $path is on a different filesystem from $base."
+    # The unmounted directory remains intact underneath the new mount until success.
+    if test -d "$path"; then
+        local descendants entry prefix="${fsroot:+$fsroot/}$relative/"
+        descendants="$(btrfs subvolume list -o "$path")"
+        while IFS= read -r entry; do
+            [[ "${entry#* path }" != "$prefix"* ]] ||
+                fatal "Browser directory $path contains nested subvolumes; migrate those explicitly first."
+        done <<< "$descendants"
+    fi
+    if test -e "$destination"; then
+        path_is_btrfs_subvolume "$destination" || fatal "$destination is not a subvolume."
+    fi
+    if ! test -e "$destination" || ! dir_is_empty "$path"; then
+        if test -e "$pending"; then
+            path_is_btrfs_subvolume "$pending" || fatal "$pending is not a subvolume."
+            delete_unmounted_subvolume "$pending"
+        fi
+        btrfs subvolume create "$pending" >/dev/null
+        if test -d "$path"; then
+            cp -aT --reflink=auto -- "$path" "$pending"
+        else
+            chown "$uid:$gid" "$pending"
+            chmod 0700 "$pending"
+        fi
+        sync -f "$pending"
+        if test -e "$destination"; then
+            delete_unmounted_subvolume "$destination"
+        fi
+        mv -- "$pending" "$destination"
+        sync -f "$top"
+    fi
+    if ! test -d "$path"; then
+        install -d -m 0700 -o "$uid" -g "$gid" -- "$path"
+    fi
+    ensure_fstab_entry_for_snapshots "$base" "$path" "$subvol"
+    mount "$path"
+    current_snapshots_mount_matches_expected "$path" "$subvol" "$base" ||
+        fatal "Browser subvolume mount verification failed for $path."
+    # Remove the old copy only after the persistent copy and mount are verified.
+    drain_browser_original "$hidden"
+    sync -f "$top"
+    info "Browser data isolated: $path ($subvol)."
+}
+
+isolate_browser_profiles() {
+    local _name _password uid gid _gecos account_home _shell uid_min uid_max base top role relative canonical
+    local -A isolated_paths=()
+    uid_min="$(awk '$1 == "UID_MIN" {print $2; exit}' /etc/login.defs)"
+    uid_max="$(awk '$1 == "UID_MAX" {print $2; exit}' /etc/login.defs)"
+    [[ "$uid_min" =~ ^[0-9]+$ && "$uid_max" =~ ^[0-9]+$ ]] || fatal "Cannot determine desktop UID range."
+    while IFS=: read -r _name _password uid gid _gecos account_home _shell; do
+        (( uid >= uid_min && uid <= uid_max )) || continue
+        test -d "$account_home" || continue
+        account_home="$(realpath -e "$account_home")"
+        [[ "$(stat -f -c %T "$account_home")" == btrfs ]] || fatal "Home directory $account_home is not Btrfs."
+        base="$(findmnt -n -o TARGET -T "$account_home")"
+        top=""
+        mount_top_level_for_base "$base" top
+        isolated_paths=()
+        while read -r role relative; do
+            # Never create ~/.mozilla on a fresh account: Firefox detects it as legacy.
+            [[ "$role" != firefox_legacy ]] || test -e "$account_home/$relative" || test -L "$account_home/$relative" || continue
+            canonical="$(realpath -m "$account_home/$relative")"
+            [[ ! -v isolated_paths["$canonical"] ]] || continue
+            isolate_browser_directory "$base" "$top" "$uid" "$gid" "$account_home/$relative" "$role"
+            isolated_paths["$canonical"]=1
+        done <<'BROWSER_PATHS'
+chromium .config/chromium
+chrome .config/google-chrome
+firefox .config/mozilla
+firefox_legacy .mozilla
+chromium_cache .cache/chromium
+chrome_cache .cache/google-chrome
+firefox_cache .cache/mozilla
+BROWSER_PATHS
+        release_temp_mount "$top"
+    done < /etc/passwd
 }
 
 apply_global_btrfs_tuning() {
@@ -836,7 +967,7 @@ EOF
     remove_array_value ACTIVE_TEMP_FILES "$tmp_service"
     remove_array_value ACTIVE_TEMP_FILES "$tmp_timer"
 
-    systemd-analyze verify "$service_file" "$timer_file" || fatal "Generated snapshot units failed verification."
+    systemd-analyze verify --man=no "$service_file" "$timer_file" || fatal "Generated snapshot units failed verification."
     systemctl enable dusky_snapshot.timer || fatal "Could not enable scheduled snapshot timer."
     info "Custom scheduled snapshot timer deployed for ${SNAPSHOT_TIME}."
 }
@@ -857,6 +988,7 @@ preflight_checks() {
     require_cmd blkid
     require_cmd install
     require_cmd flock
+    require_cmd pgrep
     require_cmd systemd-analyze
     require_cmd mount
     require_cmd umount
@@ -895,6 +1027,9 @@ execute "Write /home/.snapshots to fstab" ensure_fstab_entry_for_snapshots "/hom
 execute "Mount /home/.snapshots" mount_snapshots "/home/.snapshots" "@home_snapshots" "/home"
 execute "Verify Snapper home" verify_snapper_works "home"
 execute "Tune Snapper home" tune_snapper "home"
+
+# --- BROWSER PROFILE AND CACHE ISOLATION ---
+execute "Isolate browser profiles and caches" isolate_browser_profiles
 
 # --- SYSTEM WIDE OPTIMIZATIONS ---
 execute "Apply Global Btrfs Settings" apply_global_btrfs_tuning

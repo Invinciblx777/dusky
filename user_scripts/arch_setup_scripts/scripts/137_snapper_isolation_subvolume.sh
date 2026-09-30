@@ -24,6 +24,7 @@ declare -A CACHE_MNT_OPTS=()
 declare -a ACTIVE_TEMP_MOUNTS=()
 declare -a ACTIVE_TEMP_FILES=()
 SUDO_PID=""
+DUSKY_SNAPSHOT_WAS_ACTIVE=false
 SNAPPER_CLEANUP_WAS_ACTIVE=false
 SNAPPER_TIMELINE_WAS_ACTIVE=false
 SNAPPER_TIMELINE_WAS_ENABLED=false
@@ -53,6 +54,9 @@ cleanup() {
     fi
 
     if [[ "$SETUP_COMPLETE" != true ]]; then
+        if [[ "$DUSKY_SNAPSHOT_WAS_ACTIVE" == true ]] && ! systemctl is-active --quiet dusky_snapshot.timer; then
+            sudo systemctl start dusky_snapshot.timer || warn "Could not restart the scheduled snapshot timer."
+        fi
         if [[ "$SNAPPER_TIMELINE_WAS_ENABLED" == true ]] && ! systemctl is-enabled --quiet snapper-timeline.timer; then
             sudo systemctl enable snapper-timeline.timer || warn "Could not restore the Snapper timeline timer enablement."
         fi
@@ -166,7 +170,7 @@ load_mount_info() {
 
     local findmnt_out source uuid opts
 
-    findmnt_out="$(findmnt -n -e -o SOURCE,UUID,OPTIONS -M "$target" 2>/dev/null || true)"
+    findmnt_out="$(sudo findmnt -n -e -o SOURCE,UUID,OPTIONS -M "$target" 2>/dev/null || true)"
     [[ -n "$findmnt_out" ]] || fatal "Could not determine mount info for $target"
 
     read -r source uuid opts <<< "$findmnt_out"
@@ -185,7 +189,7 @@ load_mount_info() {
 
 get_mount_subvolume_path() {
     local target="$1" path
-    path="$(findmnt -n -e -o FSROOT -M "$target")" || fatal "Could not identify mounted Btrfs root for $target"
+    path="$(sudo findmnt -n -e -o FSROOT -M "$target")" || fatal "Could not identify mounted Btrfs root for $target"
     path="${path#/}"
     printf '%s\n' "$path"
 }
@@ -224,10 +228,10 @@ path_is_btrfs_subvolume() {
 delete_unmounted_subvolume() {
     local target="$1" subvol_id fs_uuid default_id mounts_json mount_list mounted mounted_id
     subvol_id="$(sudo btrfs inspect-internal rootid "$target")" || fatal "Cannot identify subvolume $target"
-    fs_uuid="$(findmnt -n -e -o UUID -T "$target")" || fatal "Cannot identify filesystem for $target"
+    fs_uuid="$(sudo findmnt -n -e -o UUID -T "$target")" || fatal "Cannot identify filesystem for $target"
     default_id="$(sudo btrfs subvolume get-default "$target" | awk '{print $2}')" || fatal "Cannot inspect Btrfs default for $target"
     [[ "$subvol_id" != "$default_id" ]] || fatal "Refusing to delete default subvolume $target"
-    mounts_json="$(findmnt --json --list -t btrfs -o TARGET,UUID)" || fatal "Cannot inspect Btrfs mounts"
+    mounts_json="$(sudo findmnt --json --list -t btrfs -o TARGET,UUID)" || fatal "Cannot inspect Btrfs mounts"
     mount_list="$(mktemp)"
     ACTIVE_TEMP_FILES+=("$mount_list")
     python3 -c 'import json, sys
@@ -291,9 +295,9 @@ current_snapshots_mount_matches_expected() {
     load_mount_info "$base_target"
     target_uuid="${CACHE_MNT_UUID["$base_target"]}"
 
-    findmnt -M "$mount_target" >/dev/null 2>&1 || return 1
+    sudo findmnt -M "$mount_target" >/dev/null 2>&1 || return 1
 
-    snap_info="$(findmnt -n -e -o UUID,FSROOT -M "$mount_target" 2>/dev/null || true)"
+    snap_info="$(sudo findmnt -n -e -o UUID,FSROOT -M "$mount_target" 2>/dev/null || true)"
     read -r snap_uuid mounted_root <<< "$snap_info"
 
     [[ "$snap_uuid" == "$target_uuid" ]] || return 1
@@ -310,7 +314,7 @@ verify_snapshots_mount() {
 
     findmnt -M "$mount_target" >/dev/null 2>&1 || fatal "${mount_target} is not mounted."
 
-    snap_info="$(findmnt -n -e -o UUID,FSROOT -M "$mount_target" 2>/dev/null || true)"
+    snap_info="$(sudo findmnt -n -e -o UUID,FSROOT -M "$mount_target" 2>/dev/null || true)"
     read -r snap_uuid mounted_root <<< "$snap_info"
 
     [[ "$snap_uuid" == "$target_uuid" ]] || fatal "${mount_target} filesystem UUID mismatch."
@@ -595,14 +599,19 @@ ensure_fstab_entry_for_snapshots() {
     [[ -n "$mount_opts" ]] && mount_opts+=","
     mount_opts+="subvol=/${subvol_target#/}"
 
-    canonical_target="$(realpath -m "$mount_target")"
+    canonical_target="$(sudo realpath -m "$mount_target")"
+    # fstab uses octal escapes for whitespace and literal backslashes.
+    canonical_target="${canonical_target//\\/\\134}"
+    canonical_target="${canonical_target// /\\040}"
+    canonical_target="${canonical_target//$'\t'/\\011}"
+    canonical_target="${canonical_target//$'\n'/\\012}"
     newline="UUID=${fs_uuid} ${canonical_target} btrfs ${mount_opts} 0 0"
 
     tmp="$(mktemp)"
     ACTIVE_TEMP_FILES+=("$tmp")
 
-    awk -v mp="$canonical_target" -v newline="$newline" '
-        BEGIN { done = 0 }
+    DUSKY_MOUNT_TARGET="$canonical_target" DUSKY_FSTAB_ENTRY="$newline" awk '
+        BEGIN { done = 0; mp = ENVIRON["DUSKY_MOUNT_TARGET"]; newline = ENVIRON["DUSKY_FSTAB_ENTRY"] }
 
         /^[[:space:]]*#/ || NF < 2 {
             print $0
@@ -629,7 +638,7 @@ ensure_fstab_entry_for_snapshots() {
         }
     ' /etc/fstab > "$tmp"
 
-    if ! findmnt --verify --tab-file "$tmp" >/dev/null 2>&1; then
+    if ! sudo findmnt --verify --tab-file "$tmp" >/dev/null 2>&1; then
         fatal "Generated fstab failed libmount validation."
     fi
 
@@ -682,6 +691,10 @@ tune_snapper() {
 }
 
 quiesce_snapper() {
+    if systemctl is-active --quiet dusky_snapshot.timer; then
+        DUSKY_SNAPSHOT_WAS_ACTIVE=true
+        sudo systemctl stop dusky_snapshot.timer || fatal "Could not pause the scheduled snapshot timer."
+    fi
     if systemctl is-active --quiet snapper-cleanup.timer; then
         SNAPPER_CLEANUP_WAS_ACTIVE=true
     fi
@@ -694,12 +707,149 @@ quiesce_snapper() {
     if systemctl is-active --quiet snapper-timeline.timer || systemctl is-active --quiet snapper-cleanup.timer; then
         sudo systemctl stop snapper-timeline.timer snapper-cleanup.timer || fatal "Could not pause Snapper timers."
     fi
+    # Let already-running jobs finish before moving snapshot or browser data.
+    local service state
+    for service in dusky_snapshot.service snapper-timeline.service snapper-cleanup.service; do
+        while :; do
+            state="$(systemctl show --property=ActiveState --value "$service")"
+            case "$state" in
+                activating|active|deactivating) sleep 0.2 ;;
+                *) break ;;
+            esac
+        done
+    done
+}
+
+# Keep browser state outside root/home snapshots, including after a home rollback.
+# Local desktop accounts come from passwd; no installation username is embedded.
+drain_browser_original() {
+    local hidden="$1"
+    sudo test -d "$hidden" || return 0
+    # Keep the original directory/subvolume inode: deleting an underlying subvolume
+    # would detach its overlying browser mount from pathname lookup.
+    sudo find "$hidden" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} +
+}
+
+isolate_browser_directory() {
+    local base="$1" top="$2" uid="$3" gid="$4" path="$5" role="$6"
+    local parent subvol destination pending hidden fsroot relative
+    parent="$(dirname "$path")"
+    if ! sudo test -d "$parent"; then
+        sudo install -d -m 0700 -o "$uid" -g "$gid" -- "$parent"
+    fi
+    path="$(sudo realpath -m "$path")"
+    parent="$(dirname "$path")"
+    # A symlinked profile may resolve outside the account's home mount.
+    local actual_base
+    actual_base="$(sudo findmnt -n -o TARGET -T "$parent")"
+    load_mount_info "$actual_base"
+    [[ "${CACHE_MNT_UUID["$actual_base"]}" == "${CACHE_MNT_UUID["$base"]}" ]] ||
+        fatal "Browser directory $path is on a different filesystem from $base."
+    base="$actual_base"
+    subvol="@browser_${uid}_${role}"
+    destination="$top/$subvol"
+    pending="${destination}.pending"
+
+    fsroot="$(get_mount_subvolume_path "$base")"
+    relative="${path#"${base%/}"/}"
+    hidden="$top/${fsroot:+$fsroot/}$relative"
+    if sudo mountpoint -q "$path"; then
+        current_snapshots_mount_matches_expected "$path" "$subvol" "$base" ||
+            fatal "Browser directory $path is mounted from an unexpected subvolume."
+        ensure_fstab_entry_for_snapshots "$base" "$path" "$subvol"
+        drain_browser_original "$hidden"
+        return 0
+    fi
+    # Copying a live profile can lose writes that arrive during migration.
+    if pgrep -u "$uid" -x 'firefox|firefox-bin|chrome|chromium|chromium-browser' >/dev/null; then
+        fatal "Close Firefox, Chromium and Chrome for user ID $uid before isolating browser data."
+    fi
+    sudo test ! -e "$path" || sudo test -d "$path" || fatal "Browser path is not a directory: $path"
+    [[ "$(sudo findmnt -n -e -o UUID -T "$parent")" == "${CACHE_MNT_UUID["$base"]}" ]] ||
+        fatal "Browser directory $path is on a different filesystem from $base."
+    # The unmounted directory remains intact underneath the new mount until success.
+    if sudo test -d "$path"; then
+        local descendants entry prefix="${fsroot:+$fsroot/}$relative/"
+        descendants="$(sudo btrfs subvolume list -o "$path")"
+        while IFS= read -r entry; do
+            [[ "${entry#* path }" != "$prefix"* ]] ||
+                fatal "Browser directory $path contains nested subvolumes; migrate those explicitly first."
+        done <<< "$descendants"
+    fi
+    if sudo test -e "$destination"; then
+        path_is_btrfs_subvolume "$destination" || fatal "$destination is not a subvolume."
+    fi
+    if ! sudo test -e "$destination" || ! dir_is_empty "$path"; then
+        if sudo test -e "$pending"; then
+            path_is_btrfs_subvolume "$pending" || fatal "$pending is not a subvolume."
+            delete_unmounted_subvolume "$pending"
+        fi
+        sudo btrfs subvolume create "$pending" >/dev/null
+        if sudo test -d "$path"; then
+            sudo cp -aT --reflink=auto -- "$path" "$pending"
+        else
+            sudo chown "$uid:$gid" "$pending"
+            sudo chmod 0700 "$pending"
+        fi
+        sudo sync -f "$pending"
+        if sudo test -e "$destination"; then
+            delete_unmounted_subvolume "$destination"
+        fi
+        sudo mv -- "$pending" "$destination"
+        sudo sync -f "$top"
+    fi
+    if ! sudo test -d "$path"; then
+        sudo install -d -m 0700 -o "$uid" -g "$gid" -- "$path"
+    fi
+    ensure_fstab_entry_for_snapshots "$base" "$path" "$subvol"
+    sudo mount "$path"
+    current_snapshots_mount_matches_expected "$path" "$subvol" "$base" ||
+        fatal "Browser subvolume mount verification failed for $path."
+    # Remove the old copy only after the persistent copy and mount are verified.
+    drain_browser_original "$hidden"
+    sudo sync -f "$top"
+    info "Browser data isolated: $path ($subvol)."
+}
+
+isolate_browser_profiles() {
+    local _name _password uid gid _gecos account_home _shell uid_min uid_max base top role relative canonical
+    local -A isolated_paths=()
+    uid_min="$(awk '$1 == "UID_MIN" {print $2; exit}' /etc/login.defs)"
+    uid_max="$(awk '$1 == "UID_MAX" {print $2; exit}' /etc/login.defs)"
+    [[ "$uid_min" =~ ^[0-9]+$ && "$uid_max" =~ ^[0-9]+$ ]] || fatal "Cannot determine desktop UID range."
+    while IFS=: read -r _name _password uid gid _gecos account_home _shell; do
+        (( uid >= uid_min && uid <= uid_max )) || continue
+        sudo test -d "$account_home" || continue
+        account_home="$(sudo realpath -e "$account_home")"
+        [[ "$(sudo stat -f -c %T "$account_home")" == btrfs ]] || fatal "Home directory $account_home is not Btrfs."
+        base="$(sudo findmnt -n -o TARGET -T "$account_home")"
+        top=""
+        mount_top_level_for_base "$base" top
+        isolated_paths=()
+        while read -r role relative; do
+            # Never create ~/.mozilla on a fresh account: Firefox detects it as legacy.
+            [[ "$role" != firefox_legacy ]] || sudo test -e "$account_home/$relative" || sudo test -L "$account_home/$relative" || continue
+            canonical="$(sudo realpath -m "$account_home/$relative")"
+            [[ ! -v isolated_paths["$canonical"] ]] || continue
+            isolate_browser_directory "$base" "$top" "$uid" "$gid" "$account_home/$relative" "$role"
+            isolated_paths["$canonical"]=1
+        done <<'BROWSER_PATHS'
+chromium .config/chromium
+chrome .config/google-chrome
+firefox .config/mozilla
+firefox_legacy .mozilla
+chromium_cache .cache/chromium
+chrome_cache .cache/google-chrome
+firefox_cache .cache/mozilla
+BROWSER_PATHS
+        release_temp_mount "$top"
+    done < /etc/passwd
 }
 
 apply_global_btrfs_tuning() {
     local path uuid status seen=' '
     for path in / /home; do
-        uuid="$(findmnt -n -e -o UUID -M "$path")" || fatal "Cannot inspect filesystem at $path"
+        uuid="$(sudo findmnt -n -e -o UUID -M "$path")" || fatal "Cannot inspect filesystem at $path"
         [[ "$seen" == *" $uuid "* ]] && continue
         seen+="$uuid "
         status="$(sudo btrfs quota status "$path" | awk '/Enabled:/ {print $2}')" || fatal "Cannot inspect Btrfs quota status at $path"
@@ -927,7 +1077,7 @@ EOF
     rm -f "$tmp_service" "$tmp_timer"
     remove_array_value ACTIVE_TEMP_FILES "$tmp_service" "$tmp_timer"
 
-    sudo systemd-analyze verify "$service_file" "$timer_file" || fatal "Generated snapshot units failed verification."
+    sudo systemd-analyze verify --man=no "$service_file" "$timer_file" || fatal "Generated snapshot units failed verification."
     sudo systemctl daemon-reload
     sudo systemctl enable --now dusky_snapshot.timer
 
@@ -952,6 +1102,7 @@ preflight_checks() {
     require_cmd blkid
     require_cmd install
     require_cmd flock
+    require_cmd pgrep
     require_cmd systemd-analyze
     require_cmd mount
     require_cmd umount
@@ -1012,6 +1163,9 @@ execute "Write /home/.snapshots to fstab" ensure_fstab_entry_for_snapshots "/hom
 execute "Mount /home/.snapshots" mount_snapshots "/home/.snapshots" "@home_snapshots" "/home"
 execute "Verify Snapper home" verify_snapper_works "home"
 execute "Tune Snapper home" tune_snapper "home"
+
+# --- BROWSER PROFILE AND CACHE ISOLATION ---
+execute "Isolate browser profiles and caches" isolate_browser_profiles
 
 # --- SYSTEM WIDE OPTIMIZATIONS ---
 execute "Apply Global Btrfs Settings" apply_global_btrfs_tuning
