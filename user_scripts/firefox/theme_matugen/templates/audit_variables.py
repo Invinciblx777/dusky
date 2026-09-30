@@ -150,14 +150,7 @@ def audit(directory: Path, source_only: bool) -> int:
                  and {"theme", "nativeMessaging", "storage"} <= set(manifest.get("permissions", [])),
                  "Extension ID and required theme/host permissions")
     xpi = setup.resolve_source_xpi(ROOT)
-    checks.check(xpi is not None, "Packaged extension has expected ID and signature metadata (Firefox validates the signature)")
-    if xpi:
-        with zipfile.ZipFile(xpi) as archive:
-            mismatched = [name for name in ("background.js", "content.js", "defaults.js")
-                          if archive.read(name) != (extension / "extension" / name).read_bytes()]
-            if json.loads(archive.read("manifest.json")) != manifest:
-                mismatched.append("manifest.json")
-        print(f"NOTE Signed XPI differs from development source: {', '.join(mismatched)}; rebuild/re-sign to deploy source changes." if mismatched else "NOTE Signed XPI matches development source.")
+    checks.check(xpi is not None, "Signed package matches shipped extension source (Firefox validates the signature)")
     if not source_only:
         checks.check(scope in uncomment(palette_text), "Generated palette has current document scope (regenerate if stale)")
         config = json.loads((home / ".config/dusky/settings/dusky_sites/config.json").read_text())
@@ -169,6 +162,10 @@ def audit(directory: Path, source_only: bool) -> int:
         profiles = {profile for base in setup._profile_base_dirs(home) for profile in setup.iter_firefox_profiles(base)}
         checks.check(bool(profiles), "Native Firefox profiles found")
         for profile in sorted(profiles):
+            installed_xpi = profile / "extensions" / f"{setup.EXTENSION_ID}.xpi"
+            checks.check(xpi is not None and installed_xpi.is_file()
+                         and installed_xpi.read_bytes() == xpi.read_bytes(),
+                         f"{profile.name}: installed extension matches current signed package (restart Firefox to load)")
             chrome = profile / "chrome"
             menu = chrome / "dusky_menu.css"
             checks.check(menu.is_file() and menu.read_text() == setup.MENU_CSS_CONTENT, f"{profile.name}: chrome stylesheet matches setup source")
@@ -191,6 +188,7 @@ def audit(directory: Path, source_only: bool) -> int:
             link = chrome / "dusky_palette.css"
             checks.check(link.is_symlink() and link.resolve() == colors.resolve() and link.is_file(), f"{profile.name}: live palette link resolves to configured colorsPath")
         manifests = [root / "native-messaging-hosts" / setup.MANIFEST_NAME for root in setup._browser_data_dirs(home)]
+        checks.check(manifests[0].is_file(), "Firefox native-manifest lookup registration exists under ~/.mozilla")
         found = False
         for path in manifests:
             if not path.is_file():

@@ -302,6 +302,7 @@ declare -ra UPDATE_SEQUENCE=(
     "U | ignore-fail | tui_matugen.py --smart"
     "U | ignore-fail | hypr_anim.sh --current"
     "U | ignore-fail | theme_ctl.sh refresh"
+    "U | dusky_sites_setup.py --update-installed --yes"
     "U | ignore-fail | update_counter.sh"
     "U | tui_starship.py --apply-state"
     "U | 480_dusky_commands.py -a"

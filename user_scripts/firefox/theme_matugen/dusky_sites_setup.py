@@ -422,9 +422,19 @@ def resolve_source_host(script_dir: Path) -> Path:
     return candidates[0]
 
 def resolve_source_xpi(script_dir: Path) -> Path | None:
-    """Find an XPI with our ID and signature metadata; Firefox validates signing."""
+    """Find a signed package matching shipped source; Firefox validates signing."""
+    source_dir = Path.home() / ".config/firefox_extentions/dusky_sites/extension"
+    if not source_dir.is_dir():
+        source_dir = script_dir / "extension"
+    expected_manifest = None
+    expected_scripts = {}
+    if source_dir.is_dir():
+        expected_manifest = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
+        expected_scripts = {name: (source_dir / name).read_bytes()
+                            for name in ("background.js", "content.js", "defaults.js")}
+    stale_packages = []
+
     def _xpi_has_expected_id(xpi: Path) -> bool:
-        import json
         import zipfile
         try:
             with zipfile.ZipFile(xpi) as zf:
@@ -432,13 +442,21 @@ def resolve_source_xpi(script_dir: Path) -> Path | None:
                     return False
                 with zf.open("manifest.json") as fh:
                     data = json.load(fh)
+                root = data.get("browser_specific_settings") if isinstance(data, dict) else None
+                gecko = root.get("gecko") if isinstance(root, dict) else None
+                if not isinstance(gecko, dict) or gecko.get("id") != EXTENSION_ID:
+                    return False
+                if expected_manifest is not None:
+                    mismatched = [name for name, content in expected_scripts.items()
+                                  if name not in zf.namelist() or zf.read(name) != content]
+                    if data != expected_manifest:
+                        mismatched.append("manifest.json")
+                    if mismatched:
+                        stale_packages.append(f"{xpi}: {', '.join(mismatched)}")
+                        return False
         except (OSError, zipfile.BadZipFile, json.JSONDecodeError, KeyError):
             return False
-        if not isinstance(data, dict):
-            return False
-        root = data.get("browser_specific_settings")
-        gecko = root.get("gecko") if isinstance(root, dict) else None
-        return isinstance(gecko, dict) and gecko.get("id") == EXTENSION_ID
+        return True
 
     candidates = [
         Path.home() / ".config" / "firefox_extentions" / "dusky_sites" / "xpi" / f"{EXTENSION_ID}.xpi",
@@ -446,7 +464,9 @@ def resolve_source_xpi(script_dir: Path) -> Path | None:
         script_dir / "xpi" / f"{EXTENSION_ID}.xpi",
         script_dir / f"{EXTENSION_ID}.xpi",
     ]
+    seen = set()
     for c in candidates:
+        seen.add(c)
         if c.is_file() and _xpi_has_expected_id(c):
             return c
 
@@ -459,8 +479,15 @@ def resolve_source_xpi(script_dir: Path) -> Path | None:
     for d in search_dirs:
         if d.is_dir():
             for xpi in sorted(d.glob("*.xpi")):
+                if xpi in seen:
+                    continue
+                seen.add(xpi)
                 if xpi.is_file() and _xpi_has_expected_id(xpi):
                     return xpi
+    if stale_packages:
+        raise ValueError("Signed XPI does not match the shipped extension source. "
+                         "Update the signed package before running setup.\n  "
+                         + "\n  ".join(stale_packages))
     return None
 
 # ─────────────────────────────────────────────────────────────
@@ -691,6 +718,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--uninstall", "--purge", action="store_true", help="Remove installed extension, host, manifests, stylesheets and settings")
     parser.add_argument("--yes", action="store_true", help="Skip the uninstall confirmation")
+    parser.add_argument("--update-installed", action="store_true", help="Update an existing installation; skip if its native host is absent")
     args = parser.parse_args()
     if args.uninstall:
         auto_yes = args.yes
@@ -704,11 +732,25 @@ def main() -> None:
         run_uninstall(home)
         return
 
+    home = Path.home()
+    xdg_data_home_raw = os.environ.get("XDG_DATA_HOME", "").strip()
+    data_home = Path(xdg_data_home_raw).expanduser() if xdg_data_home_raw else home / ".local" / "share"
+    if not data_home.is_absolute():
+        data_home = home / ".local" / "share"
+    install_dir = data_home / "dusky-sites"
+    installed_host = install_dir / HOST_INSTALL_NAME
+    if args.update_installed and not installed_host.is_file():
+        print("Dusky Sites is not installed; skipping automatic update.")
+        return
+
     print(f"\n{C_CYAN}Dusky Sites Setup Script (Arch Linux / Python 3.14.7+){C_RESET}\n")
 
     script_dir = Path(__file__).parent.resolve()
     source_host = resolve_source_host(script_dir)
-    source_xpi = resolve_source_xpi(script_dir)
+    try:
+        source_xpi = resolve_source_xpi(script_dir)
+    except (OSError, ValueError) as error:
+        print_error(str(error))
 
     print_step("Performing pre-flight checks...")
     if sys.version_info < (3, 14, 7):
@@ -731,19 +773,9 @@ def main() -> None:
     if source_xpi and source_xpi.is_file():
         print_success(f"Found signed WebExtension package at {source_xpi}")
     else:
-        print_warn("Signed XPI package not found; fallback to manual add-on load.")
+        print_error("Signed XPI package not found. Supply the signed extension package before running setup.")
 
-    home = Path.home()
-    xdg_data_home_raw = os.environ.get("XDG_DATA_HOME", "").strip()
-    if xdg_data_home_raw:
-        data_home = Path(xdg_data_home_raw).expanduser()
-        if not data_home.is_absolute():
-            data_home = home / ".local" / "share"
-    else:
-        data_home = home / ".local" / "share"
-    install_dir = data_home / "dusky-sites"
     install_dir.mkdir(parents=True, exist_ok=True)
-    installed_host = install_dir / HOST_INSTALL_NAME
 
     print_step("Installing host to stable XDG path...")
     try:
@@ -790,11 +822,10 @@ def main() -> None:
 
     for name, path in candidates:
         nmh_dir = path / "native-messaging-hosts"
-        if path.is_dir() or nmh_dir.is_dir():
+        # Firefox 157's XREUserNativeManifests remains ~/.mozilla even when
+        # its profile registry is under ~/.config/mozilla/firefox.
+        if path == home / ".mozilla" or path.is_dir() or nmh_dir.is_dir():
             targets.append((name, nmh_dir))
-
-    if not targets:
-        targets.append(("Firefox (Default)", home / ".mozilla" / "native-messaging-hosts"))
 
     print_step("Installing native messaging manifests...")
     manifest_payload = {

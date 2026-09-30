@@ -176,6 +176,7 @@ tasks = [
     "U | ignore-fail | tui_matugen.py --smart",
     "U | ignore-fail | hypr_anim.sh --current",
     "U | ignore-fail | theme_ctl.sh refresh",
+    "U | dusky_sites_setup.py --update-installed --yes",
     "U | ignore-fail | update_counter.sh",
     # "U | once | system_update.sh --pacman",
     "S | once | fix_wayland_session.py",

@@ -73,8 +73,22 @@ Setup enables profile stylesheets, installs the host and manifests, and copies
 an XPI when its extension ID and signature metadata match. Firefox performs
 cryptographic signature and compatibility checks and manages its own add-on
 state. Setup never edits `extensions.json` or marks an incompatible add-on active.
+Setup requires a signed package and rejects packages whose manifest or runtime
+JavaScript differs from the shipped source before writing installation files.
 Restart Firefox to discover copied extensions and load stylesheets. Missing
 profiles or profile write failures produce a nonzero setup exit status.
+
+Both Dusky update sequences run setup with `--update-installed` after refreshing
+Matugen output, so pulling new source and its signed XPI also updates existing
+profiles and the native host. This mode skips installations whose native host is
+absent, preserving an explicit uninstall and leaving new installations to the
+TUI's Install / Update action or a normal setup run.
+The setup task runs on every update, including updates where only the XPI changes.
+Restart Firefox after the update; a running browser retains its loaded extension.
+The audit checks each registered profile's XPI against the current signed package.
+Setup always registers the host under `~/.mozilla/native-messaging-hosts`,
+Firefox 157's native-manifest lookup path, even with profiles only in the XDG
+registry. Profile location does not determine the native-host lookup location.
 
 The signed XPI under `~/.config/firefox_extentions/dusky_sites/xpi` is a separate
 artifact. Source edits do **not** update it. Rebuild and re-sign the extension
