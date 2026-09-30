@@ -9,8 +9,11 @@ GTK4/libadwaita user CSS is also cached; its new palette applies on app restart.
 from __future__ import annotations
 
 import os
+import hashlib
 from pathlib import Path
+import shutil
 import sys
+import tempfile
 
 import gi
 from theme_files import atomic_write, publication_lock, merge_groups
@@ -31,6 +34,30 @@ def validate(version: str, palette: str) -> None:
         provider.load_from_string(palette)
     if errors:
         raise ValueError("Invalid GTK palette: " + "; ".join(errors))
+
+
+def shared_base(source: Path, data: Path) -> Path:
+    """Cache an immutable base including assets where Flatpak can see it.
+
+    Check file metadata on publication; copy only after a base-theme update.
+    Publish complete directories so an app never imports a half-copied theme.
+    """
+    root = source.parent
+    digest = hashlib.sha256(str(root.resolve()).encode())
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            stat = path.stat()
+            digest.update(repr((str(path.relative_to(root)), stat.st_size,
+                                stat.st_mtime_ns)).encode())
+    cache = data / "themes/dusky-matugen-base"
+    destination = cache / digest.hexdigest()[:20]
+    if not destination.is_dir():
+        cache.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".base-", dir=cache) as temporary:
+            staged = Path(temporary) / "theme"
+            shutil.copytree(root, staged)
+            os.rename(staged, destination)
+    return destination / source.name
 
 
 def publish(version: str) -> None:
@@ -54,6 +81,7 @@ def publish(version: str) -> None:
         base = next((p for p in bases if p.is_file()), None)
         if base is None:
             raise FileNotFoundError("adw-gtk3-dark is not installed")
+        base = shared_base(base, data)
 
         settings = Gio.Settings.new("org.gnome.desktop.interface")
         names = ("dusky-matugen-a", "dusky-matugen-b")

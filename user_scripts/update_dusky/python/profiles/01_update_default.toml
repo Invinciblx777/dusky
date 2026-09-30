@@ -136,6 +136,7 @@ tasks = [
     # "S | 325_hosts_files_block.sh",
     # "S | once | 330_gtk_root_symlink.sh",
     "U | once | 331_sync_kde_apps.py",
+    "U | once | 332_flatpack_apps_themeing.py",
     # "S | 335_preload_config.sh",
     # "S | once | 350_dns_systemd_resolve.sh",
     # "U | once | 360_obsidian_pensive_vault_configure.sh",
