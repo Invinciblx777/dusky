@@ -37,7 +37,6 @@ update_qt_config() {
     local app_name="$1"       # e.g., qt5ct
     local conf_file="$2"      # Full path to config
     local dialog_val="$3"     # default or xdgdesktopportal
-    local colors_file="$4"    # filename of the colors conf
 
     log_info "Processing configuration for ${BOLD}${app_name}${RESET}..."
 
@@ -47,10 +46,10 @@ update_qt_config() {
     mkdir -p "$config_dir" "$colors_dir"
 
     # Publish a complete palette; do not point apps at Matugen's in-place writes.
-    local gen_colors="$CONFIG_HOME/matugen/generated/$colors_file"
-    if [[ -f "$gen_colors" ]]; then
-        python3 "$HOME/user_scripts/theme_matugen/global/qt_colors.py" "$app_name"
-    fi
+    # Bootstrap can use the shipped seed before initial generation, and adds
+    # Qt6's Accent role to complete 21-role installation palettes. It still
+    # rejects malformed input before enabling custom_palette.
+    python3 "$HOME/user_scripts/theme_matugen/global/qt_colors.py" "$app_name" --bootstrap
 
     # Retain an existing widget style; a color setup must not replace its layout.
     local widget_style=Fusion configured_style
@@ -195,10 +194,10 @@ QT6_CONF="$CONFIG_HOME/qt6ct/qt6ct.conf"
 
 # Update Qt5 Config
 # Requirements: standard_dialogs=default, qt5ct-colors.conf
-update_qt_config "qt5ct" "$QT5_CONF" "default" "qt5ct-colors.conf"
+update_qt_config "qt5ct" "$QT5_CONF" "default"
 
 # Update Qt6 Config
 # Requirements: standard_dialogs=xdgdesktopportal, qt6ct-colors.conf
-update_qt_config "qt6ct" "$QT6_CONF" "xdgdesktopportal" "qt6ct-colors.conf"
+update_qt_config "qt6ct" "$QT6_CONF" "xdgdesktopportal"
 
 log_success "Qt configuration sync complete."
