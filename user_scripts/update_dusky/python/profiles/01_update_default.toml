@@ -95,7 +95,7 @@ tasks = [
     "S | once | 127_pam_keyring_greetd.py --mode auto",
     "U | once | 130_systemd_dbus_service_manager.py --default",
     # "U | 135_battery_notify_service.sh",
-    "U | once | 137_snapper_isolation_subvolume.sh --auto",
+    # "U | once | 137_snapper_isolation_subvolume.sh --auto",
     "U | once | 140_dusky_font_configurator.py",
     "U | once | 145_matugen_directories.py",
     # "U | 150_wallpapers_download.sh",
