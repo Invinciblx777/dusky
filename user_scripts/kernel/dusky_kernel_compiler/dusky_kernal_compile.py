@@ -35,7 +35,7 @@ import kernel_storage
 import collections
 import functools
 import fcntl
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import gzip
 import hashlib
 import itertools
@@ -5144,7 +5144,7 @@ def checkpoint_run(cmd):
 
 
 @contextmanager
-def storage_session(use_ram: bool):
+def storage_session(use_ram: bool, tree_name: str):
     global THINLTO_CACHE_DIR, CCACHE_DIR, RAM_RESERVE_GIB
     if not use_ram:
         yield
@@ -5153,7 +5153,7 @@ def storage_session(use_ram: bool):
     old_lto, old_ccache = THINLTO_CACHE_DIR, CCACHE_DIR
     settings = STORAGE | {"persistent_dir": persistent}
     try:
-        with kernel_storage.ram_workspace(settings, run, note, checkpoint_run) as ram:
+        with kernel_storage.ram_workspace(settings, run, note, checkpoint_run, tree_name=tree_name) as ram:
             set_build_dir(ram)
             THINLTO_CACHE_DIR, CCACHE_DIR = ram / "thinlto-cache", ram / "ccache"
             RAM_RESERVE_GIB = settings["ram_reserve_gib"]
@@ -5214,7 +5214,7 @@ def do_build(args: argparse.Namespace) -> int:
         warn(f"Unrecognized response '{action}'. Choose [y]es to proceed, [e]dit to modify, or [n]o to abort.")
 
     check_dependencies(profile, facts, profile.g("compiler", "toolchain"), bool(profile.g("compiler", "rust")))
-    with build_workspace_lock(), storage_session(use_ram):
+    with build_workspace_lock(), ExitStack() as workspace:
         if not args.no_install and not args.configure_only:
             PRIV.ensure()
             check_pacman_preflight(require_install=True)
@@ -5224,7 +5224,6 @@ def do_build(args: argparse.Namespace) -> int:
         host_facts.cache_clear()
         facts = host_facts()
         target_facts = target_facts_for_profile(profile, facts)
-        check_disk_space(profile.g("compiler", "lto"), installing=not args.no_install and not args.configure_only)
         rule("Kernel release")
         release = choose_release(profile, fetch_releases(), exact_pin=bool(args.pin or os.environ.get("DUSKY_PIN")))
         # Record the one-time choice in the resolved profile packaged with this build.
@@ -5240,6 +5239,8 @@ def do_build(args: argparse.Namespace) -> int:
                                "runtime": sha256_file(SCRIPT_DIR / "kernel_runtime.py"),
                                "patches": {f.name: sha256_file(f) for f in sorted((SCRIPT_DIR / "patches").glob("*.patch"))}}, sort_keys=True)
         patchset = profile.name + "-" + hashlib.sha256(identity.encode()).hexdigest()[:16]
+        workspace.enter_context(storage_session(use_ram, tree_dir_for(release, patchset).name))
+        check_disk_space(profile.g("compiler", "lto"), installing=not args.no_install and not args.configure_only)
         tree = unpack(tarball, release, patchset, bool(args.fresh))
         sched = apply_scheduler_patch(tree, profile, release)
         apply_enhancement_patches(tree, profile, release, target_facts)

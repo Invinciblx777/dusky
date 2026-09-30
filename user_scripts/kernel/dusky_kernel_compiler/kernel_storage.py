@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tomllib
 
@@ -61,13 +62,13 @@ def sync_tree(source: Path, dest: Path, run) -> None:
 
 
 @contextmanager
-def ram_workspace(settings: dict, run, note, save_run=None):
+def ram_workspace(settings: dict, run, note, save_run=None, *, tree_name: str):
     """Caller holds the persistent workspace lock throughout restore/build/save."""
     persistent = settings['persistent_dir']
     ram = settings['zram_dir'] / hashlib.sha256(str(persistent).encode()).hexdigest()[:12]
     if not ram_mount(ram):
         raise StorageError(f'{ram}: not on a mounted tmpfs or ZRAM device')
-    pairs = [(persistent / 'src', ram / 'src'), (persistent / 'seeds', ram / 'seeds'),
+    pairs = [(persistent / 'src' / tree_name, ram / 'src' / tree_name), (persistent / 'seeds', ram / 'seeds'),
              (settings['thinlto_dir'], ram / 'thinlto-cache'), (settings['ccache_dir'], ram / 'ccache')]
     for disk, volatile in pairs:
         if disk == ram or disk in ram.parents or ram in disk.parents or ram_mount(disk):
@@ -79,7 +80,17 @@ def ram_workspace(settings: dict, run, note, save_run=None):
     # A failed checkpoint must never be overwritten by an older disk copy.
     if marker.exists():
         raise StorageError(f'Unsaved RAM workspace at {ram}; copy its src/seeds/caches to persistent storage before removing {marker}')
-    note(f'Restoring build objects and caches from {persistent} to {ram}')
+    # Previous sessions have checkpointed these trees. Discard only their RAM
+    # copies; never sync/delete the persistent src parent containing other builds.
+    source_root = ram / 'src'
+    source_root.mkdir(exist_ok=True)
+    for previous in source_root.iterdir():
+        if previous.name != tree_name:
+            if previous.is_dir() and not previous.is_symlink():
+                shutil.rmtree(previous)
+            else:
+                previous.unlink()
+    note(f'Restoring selected build {tree_name} and shared caches from {persistent} to {ram}')
     for disk, volatile in pairs:
         sync_tree(disk, volatile, run)
     marker.touch()

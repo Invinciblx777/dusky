@@ -442,6 +442,39 @@ class AuditTests(unittest.TestCase):
         with patch.object(k, '_read', return_value='MemAvailable: 16777216 kB'), patch.object(k, 'RAM_RESERVE_GIB', 8), patch.object(os, 'process_cpu_count', return_value=32):
             self.assertEqual(k.auto_jobs(facts(threads=32, mem_gib=64), 'thin'), 6)
 
+    def test_ram_session_routes_selected_tree_and_restores_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); disk = root / 'disk'; disk.mkdir()
+            cfg = dict(persistent_dir=disk, packages_dir=disk / 'packages',
+                       thinlto_dir=disk / 'thinlto-cache', ccache_dir=disk / 'ccache',
+                       zram_dir=root / 'ram', ram_reserve_gib=8)
+            for name in ('linux-selected', 'linux-other'):
+                obj = disk / 'src' / name / 'test.o'
+                obj.parent.mkdir(parents=True); obj.write_bytes(name.encode())
+            values = dict(STORAGE=cfg, BUILD_DIR=disk, SRC_DIR=disk / 'src',
+                          THINLTO_CACHE_DIR=cfg['thinlto_dir'], CCACHE_DIR=cfg['ccache_dir'],
+                          TARBALL_DIR=disk / 'tarballs', PATCH_CACHE=disk / 'patches',
+                          PKGDEST_DIR=cfg['packages_dir'], IMPORT_DIR=root / 'imports', RAM_RESERVE_GIB=0)
+            def rsync(argv):
+                return subprocess.run(argv, check=True, capture_output=True)
+            with patch.multiple(k, **values), patch.object(k, 'run', side_effect=rsync), \
+                 patch.object(k.kernel_storage, 'ram_mount', side_effect=lambda p: root / 'ram' in p.parents):
+                with self.assertRaises(KeyboardInterrupt):
+                    with k.storage_session(True, 'linux-selected'):
+                        self.assertNotEqual(k.BUILD_DIR, disk)
+                        self.assertEqual([p.name for p in k.SRC_DIR.iterdir()], ['linux-selected'])
+                        self.assertEqual(k.CCACHE_DIR, k.BUILD_DIR / 'ccache')
+                        self.assertEqual(k.THINLTO_CACHE_DIR, k.BUILD_DIR / 'thinlto-cache')
+                        self.assertEqual(k.RAM_RESERVE_GIB, 8)
+                        (k.SRC_DIR / 'linux-selected/test.o').write_bytes(b'checkpointed')
+                        raise KeyboardInterrupt()
+                self.assertEqual(k.BUILD_DIR, disk)
+                self.assertEqual(k.CCACHE_DIR, cfg['ccache_dir'])
+                self.assertEqual(k.THINLTO_CACHE_DIR, cfg['thinlto_dir'])
+                self.assertEqual(k.RAM_RESERVE_GIB, 0)
+            self.assertEqual((disk / 'src/linux-selected/test.o').read_bytes(), b'checkpointed')
+            self.assertEqual((disk / 'src/linux-other/test.o').read_bytes(), b'linux-other')
+
     def test_ram_choice_always_asks_and_defaults_to_disk(self):
         args = k.build_parser().parse_args(['--yes', '--no-prompt', '--ram-build'])
         with patch.object(k, 'STORAGE', {'zram_dir': Path('/ram/work')}), patch.object(k, 'interactive', return_value=True), patch.object(k, 'ASSUME_YES', True), patch.object(k.kernel_storage, 'ram_mount', return_value=True), patch('builtins.input', return_value='') as prompt:

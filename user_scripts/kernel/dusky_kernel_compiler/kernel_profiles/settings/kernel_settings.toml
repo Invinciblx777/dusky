@@ -8,4 +8,5 @@ thinlto_dir = ""               # Default: persistent_dir/thinlto-cache
 zram_dir = "/mnt/zram1/dusky_kernel"
 ram_reserve_gib = 8             # Reserve for future RAM-filesystem growth when sizing jobs
 # Interactive builds always ask, default No; --yes never opts into RAM storage.
-# RAM work and caches are restored from disk and saved after success/failure/Ctrl-C.
+# Only the selected build tree and shared caches are restored to RAM.
+# Changes are saved to disk after success/failure/Ctrl-C; other disk trees stay intact.
