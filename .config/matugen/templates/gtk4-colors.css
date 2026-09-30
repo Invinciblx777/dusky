@@ -112,6 +112,29 @@
 @define-color active_toggle_fg_color {{colors.on_surface.default.hex}};
 @define-color border_color {{colors.outline_variant.default.hex}};
 
+/* GTK's exported color names are also used by application-owned CSS and
+ * custom drawing. Keep them paired with the same palette as our widget rules. */
+@define-color theme_fg_color @window_fg_color;
+@define-color theme_text_color @view_fg_color;
+@define-color theme_bg_color @window_bg_color;
+@define-color theme_base_color @view_bg_color;
+@define-color theme_selected_bg_color {{colors.primary_container.default.hex}};
+@define-color theme_selected_fg_color {{colors.on_primary_container.default.hex}};
+@define-color insensitive_bg_color {{colors.surface_container_low.default.hex}};
+@define-color insensitive_fg_color alpha(@window_fg_color, 0.45);
+@define-color insensitive_base_color @view_bg_color;
+@define-color theme_unfocused_fg_color alpha(@window_fg_color, 0.7);
+@define-color theme_unfocused_text_color @view_fg_color;
+@define-color theme_unfocused_bg_color @window_bg_color;
+@define-color theme_unfocused_base_color @view_bg_color;
+@define-color theme_unfocused_selected_bg_color @theme_selected_bg_color;
+@define-color theme_unfocused_selected_fg_color @theme_selected_fg_color;
+@define-color unfocused_insensitive_color alpha(@window_fg_color, 0.3);
+@define-color borders @border_color;
+@define-color unfocused_borders @border_color;
+@define-color content_view_bg @view_bg_color;
+@define-color text_view_bg @view_bg_color;
+
 /* GTK 4 and libadwaita use CSS custom properties for current widgets.
  * Named colors above remain available to apps using the older API. */
 :root {
