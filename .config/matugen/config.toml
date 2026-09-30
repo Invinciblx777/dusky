@@ -14,12 +14,12 @@
 [templates.gtk3]
 input_path  = '~/.config/matugen/templates/gtk3-colors.css'
 output_path = '~/.config/matugen/generated/gtk-3.css'
-post_hook   = 'python3 "$HOME/user_scripts/theme_matugen/gtk_colors.py" 3'
+post_hook   = 'python3 "$HOME/user_scripts/theme_matugen/global/gtk_colors.py" 3'
 
 [templates.gtk4]
 input_path  = '~/.config/matugen/templates/gtk4-colors.css'
 output_path = '~/.config/matugen/generated/gtk-4.css'
-post_hook   = 'python3 "$HOME/user_scripts/theme_matugen/gtk_colors.py" 4'
+post_hook   = 'python3 "$HOME/user_scripts/theme_matugen/global/gtk_colors.py" 4'
 
 [templates.gtksourceview]
 input_path  = '~/.config/matugen/templates/gtksourceview.xml'
@@ -84,22 +84,17 @@ post_hook = '''
 [templates.qt5ct]
 input_path  = '~/.config/matugen/templates/qtct-colors.conf'
 output_path = '~/.config/matugen/generated/qt5ct-colors.conf'
-post_hook   = 'python3 "$HOME/user_scripts/theme_matugen/qt_colors.py" qt5ct'
+post_hook   = 'python3 "$HOME/user_scripts/theme_matugen/global/qt_colors.py" qt5ct'
 
 [templates.qt6ct]
 input_path  = '~/.config/matugen/templates/qtct-colors.conf'
 output_path = '~/.config/matugen/generated/qt6ct-colors.conf'
-post_hook   = 'python3 "$HOME/user_scripts/theme_matugen/qt_colors.py" qt6ct'
+post_hook   = 'python3 "$HOME/user_scripts/theme_matugen/global/qt_colors.py" qt6ct'
 
 [templates.kdeglobals]
 input_path  = '~/.config/matugen/templates/Matugen.colors'
 output_path = '~/.config/matugen/generated/kdeglobals'
-post_hook   = '''
-  mkdir -p "$HOME/.local/share/color-schemes"
-  ln -nfs "$HOME/.config/matugen/generated/kdeglobals" "$HOME/.local/share/color-schemes/Matugen.colors"
-  ln -nfs "$HOME/.config/matugen/generated/kdeglobals" "$HOME/.config/kdeglobals"
-  dbus-send --session --type=signal /KGlobalSettings org.kde.KGlobalSettings.notifyChange int32:0 int32:0 || :
-'''
+post_hook   = 'python3 "$HOME/user_scripts/theme_matugen/global/kde_colors.py"'
 
 [templates.kate_syntax]
 input_path  = '~/.config/matugen/templates/kate-syntax.theme'
@@ -128,12 +123,12 @@ post_hook   = '''
 [templates.kvantum_kvconfig]
 input_path  = '~/.config/matugen/templates/kvantum-colors.kvconfig'
 output_path = '~/.config/matugen/generated/kvantum-matugen.kvconfig'
-post_hook   = 'python3 "$HOME/user_scripts/theme_matugen/qt_colors.py" kvantum_kvconfig'
+post_hook   = 'python3 "$HOME/user_scripts/theme_matugen/global/qt_colors.py" kvantum_kvconfig'
 
 [templates.kvantum_svg]
 input_path  = '~/.config/matugen/templates/kvantum-colors.svg'
 output_path = '~/.config/matugen/generated/kvantum-matugen.svg'
-post_hook   = 'python3 "$HOME/user_scripts/theme_matugen/qt_colors.py" kvantum_svg'
+post_hook   = 'python3 "$HOME/user_scripts/theme_matugen/global/qt_colors.py" kvantum_svg'
 
 [templates.gimp]
 input_path  = '~/.config/matugen/templates/gimp.css'

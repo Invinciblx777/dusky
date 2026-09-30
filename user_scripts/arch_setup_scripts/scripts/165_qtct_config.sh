@@ -49,7 +49,7 @@ update_qt_config() {
     # Publish a complete palette; do not point apps at Matugen's in-place writes.
     local gen_colors="$CONFIG_HOME/matugen/generated/$colors_file"
     if [[ -f "$gen_colors" ]]; then
-        python3 "$HOME/user_scripts/theme_matugen/qt_colors.py" "$app_name"
+        python3 "$HOME/user_scripts/theme_matugen/global/qt_colors.py" "$app_name"
     fi
 
     # Retain an existing widget style; a color setup must not replace its layout.

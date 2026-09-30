@@ -45,14 +45,14 @@ BackgroundAlternate={{colors.primary.default.red}},{{colors.primary.default.gree
 BackgroundNormal={{colors.primary.default.red}},{{colors.primary.default.green}},{{colors.primary.default.blue}}
 DecorationFocus={{colors.primary.default.red}},{{colors.primary.default.green}},{{colors.primary.default.blue}}
 DecorationHover={{colors.primary.default.red}},{{colors.primary.default.green}},{{colors.primary.default.blue}}
-ForegroundActive={{colors.primary.default.red}},{{colors.primary.default.green}},{{colors.primary.default.blue}}
-ForegroundInactive={{colors.outline.default.red}},{{colors.outline.default.green}},{{colors.outline.default.blue}}
-ForegroundLink={{colors.primary.default.red}},{{colors.primary.default.green}},{{colors.primary.default.blue}}
-ForegroundNegative={{colors.error.default.red}},{{colors.error.default.green}},{{colors.error.default.blue}}
-ForegroundNeutral={{colors.secondary.default.red}},{{colors.secondary.default.green}},{{colors.secondary.default.blue}}
+ForegroundActive={{colors.on_primary.default.red}},{{colors.on_primary.default.green}},{{colors.on_primary.default.blue}}
+ForegroundInactive={{colors.on_primary.default.red}},{{colors.on_primary.default.green}},{{colors.on_primary.default.blue}}
+ForegroundLink={{colors.on_primary.default.red}},{{colors.on_primary.default.green}},{{colors.on_primary.default.blue}}
+ForegroundNegative={{colors.on_primary.default.red}},{{colors.on_primary.default.green}},{{colors.on_primary.default.blue}}
+ForegroundNeutral={{colors.on_primary.default.red}},{{colors.on_primary.default.green}},{{colors.on_primary.default.blue}}
 ForegroundNormal={{colors.on_primary.default.red}},{{colors.on_primary.default.green}},{{colors.on_primary.default.blue}}
-ForegroundPositive={{colors.tertiary.default.red}},{{colors.tertiary.default.green}},{{colors.tertiary.default.blue}}
-ForegroundVisited={{colors.secondary.default.red}},{{colors.secondary.default.green}},{{colors.secondary.default.blue}}
+ForegroundPositive={{colors.on_primary.default.red}},{{colors.on_primary.default.green}},{{colors.on_primary.default.blue}}
+ForegroundVisited={{colors.on_primary.default.red}},{{colors.on_primary.default.green}},{{colors.on_primary.default.blue}}
 
 [Colors:Tooltip]
 BackgroundAlternate={{colors.surface_container_lowest.default.red}},{{colors.surface_container_lowest.default.green}},{{colors.surface_container_lowest.default.blue}}
@@ -123,13 +123,9 @@ ColorScheme=Matugen
 Name=Matugen
 shadeSortColumn=true
 
-[Icons]
-Theme=Papirus-Dark
-
 [KDE]
 ColorScheme=Matugen
 contrast=4
-widgetStyle=Fusion
 
 [UiSettings]
 ColorScheme=Matugen
@@ -142,3 +138,4 @@ inactiveBackground={{colors.surface_container_lowest.default.red}},{{colors.surf
 inactiveBlend={{colors.outline.default.red}},{{colors.outline.default.green}},{{colors.outline.default.blue}}
 inactiveForeground={{colors.outline.default.red}},{{colors.outline.default.green}},{{colors.outline.default.blue}}
 
+# dusky-kde-complete
