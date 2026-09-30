@@ -109,7 +109,7 @@ CAMEL = {
 class Config:
     colors_path: str = "~/.config/matugen/generated/dusky_sites.css"
     websites_dir: str = "~/.config/dusky_sites"
-    web_theme_enabled: bool = True
+    web_theme_enabled: bool = False
     force_unthemed_websites: bool = False
     disabled_sites: list[str] = field(default_factory=list)
     keep_alive: bool = True
@@ -184,7 +184,10 @@ def parse_colors(path: Path) -> dict[str, str]:
         text = path.read_text(encoding="utf-8")
     except OSError, UnicodeDecodeError:
         return {}
-    return {name: value.strip() for name, value in _COLOR_RE.findall(text)}
+    # CSS uses private names so unrelated userChrome palettes cannot override it.
+    # Keep the existing native-message palette keys consumed by the signed XPI.
+    return {name.replace("--dusky-palette-", "--", 1): value.strip()
+            for name, value in _COLOR_RE.findall(text)}
 
 
 def balanced_block(text: str, start: int) -> str:

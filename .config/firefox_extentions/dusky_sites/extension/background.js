@@ -197,7 +197,7 @@
     const BUILTIN = Object.freeze({
         ecoMode: true,
         browserThemeEnabled: true,
-        webThemeEnabled: true,           // mirror host default; config.json becomes authoritative once connected
+        webThemeEnabled: false,          // webpage theming requires explicit opt-in
         forceUnthemedWebsites: false,    // idem
         fastPaint: true,
         contentColorScheme: 'dark',      // auto | light | dark | system
