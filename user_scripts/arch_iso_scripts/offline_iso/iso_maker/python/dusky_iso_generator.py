@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Dusky Arch ISO Factory — offline official + AUR repositories and an archiso releng ISO (x86_64).
 
-Platform: Arch Linux · Linux 7.2+ · Python 3.14+ · pacman 7.1+ · archiso 88+ · rich 15+.
+Platform: Arch Linux · Linux 7.3+ · Python 3.14.7+ · pacman 7.1+ · archiso 91+ · rich 15+.
 Runs as root (re-execs itself through sudo); git/makepkg run as the invoking user.
 """
 
@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import NoReturn
 
 # ═══════════════════════════════════ configuration ═══════════════════════════════════
-VERSION = "8.0.0-py314-2026.09"
+VERSION = "8.0.2-py314-2026.09"
 REPO_NAME = "archrepo"
 DB_NAME = f"{REPO_NAME}.db.tar.zst"
 FILES_NAME = f"{REPO_NAME}.files.tar.zst"
@@ -365,6 +365,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--aur-repo", type=Path, metavar="DIR", help=f"default: {DEFAULT_AUR}")
     parser.add_argument("--workspace", type=Path, metavar="DIR",
                         help=f"ISO workspace base (default: {ZRAM_CANDIDATE} if mounted, else /tmp)")
+    parser.add_argument("--output-dir", type=Path, metavar="DIR",
+                        help=f"ISO output directory (default: {ZRAM_CANDIDATE} if mounted, else ~/dusky_isos)")
     parser.add_argument("--source-dir", type=Path, metavar="DIR",
                         help="installer payload (default: ~/user_scripts/arch_iso_scripts/offline_iso)")
     parser.add_argument("--auto", action="store_true", help="non-interactive; default action official_iso")
@@ -1039,7 +1041,7 @@ def update_repo_db(repo: Path, want: Collection[str], old: dict[str, DbEntry] | 
             keep[entry.name] = entry
         else:
             fresh.append(path)
-    links_ok = all(os.path.lexists(repo / n) for n in (DB_NAME, FILES_NAME, f"{REPO_NAME}.db", f"{REPO_NAME}.files"))
+    links_ok = all((repo / n).is_file() for n in (DB_NAME, FILES_NAME, f"{REPO_NAME}.db", f"{REPO_NAME}.files"))
     if not force_write and not fresh and len(keep) == len(old) and links_ok:
         ok(f"{repo.name} DB unchanged ({len(keep)} packages)")
         return keep
@@ -1063,7 +1065,8 @@ def ensure_repo_db(repo: Path) -> bool:
         return False
     if (repo / FILES_NAME).is_file():
         old = load_db_by_filename(repo)
-        if set(old) == files:
+        if (set(old) == files and all(file_size(repo / fn) == e.csize for fn, e in old.items())
+                and all((repo / n).is_file() for n in (DB_NAME, f"{REPO_NAME}.db", f"{REPO_NAME}.files"))):
             return True
         warn(f"{repo}: DB out of sync with disk ({len(files)} files on disk, {len(old)} in DB); updating index")
         update_repo_db(repo, files, old, force_write=True)
@@ -1131,7 +1134,8 @@ def host_pacman(*args: str) -> subprocess.CompletedProcess[str]:
     r: subprocess.CompletedProcess[str] | None = None
     for _ in range(3):
         wait_for_host_pacman_lock(warn)
-        r = run(["pacman", "--noconfirm", "--noprogressbar", "--color", "never", *args], capture=True, merge=True)
+        r = run(["pacman", "--noconfirm", "--noprogressbar", "--color", "never", *args],
+                env=os.environ | {"LC_ALL": "C"}, capture=True, merge=True)
         if r.returncode == 0 or "unable to lock database" not in (r.stdout or ""):
             return r
         time.sleep(2)
@@ -1242,7 +1246,8 @@ class IsolatedDB:
 
     def pacman(self, *args: str, capture: bool = True) -> subprocess.CompletedProcess[str]:
         color = "never" if capture else "auto"
-        return run(["pacman", "--config", self.conf, "--noconfirm", "--color", color, *args], capture=capture)
+        return run(["pacman", "--config", self.conf, "--noconfirm", "--color", color, *args],
+                   env=os.environ | {"LC_ALL": "C"}, capture=capture)
 
     def _sync(self) -> None:
         for attempt in range(1, SYNC_ATTEMPTS + 1):
@@ -1375,10 +1380,12 @@ def ingest_host_cache_packages(repo: Path, files: Collection[str]) -> int:
             src = cache_dir / fn
             if src.is_file():
                 try:
-                    shutil.copy2(src, repo / fn)
+                    with atomic_path(repo / fn) as tmp:
+                        shutil.copy2(src, tmp)
                     sig = cache_dir / f"{fn}.sig"
                     if sig.is_file():
-                        shutil.copy2(sig, repo / f"{fn}.sig")
+                        with atomic_path(repo / f"{fn}.sig") as tmp:
+                            shutil.copy2(sig, tmp)
                     copied += 1
                     break
                 except OSError:
@@ -1392,6 +1399,8 @@ def official_phase(db: IsolatedDB, master: Sequence[str], repo: Path, user: Real
     info("=== OFFICIAL REPO BUILD ===")
     require_tool("repo-add", "pacman")
     official, unresolved = db.resolve_names(master)
+    migrated, _ = db.resolve_names(AUR_SEED)
+    official = list(dict.fromkeys([*official, *migrated]))
     if unresolved:
         shown = ", ".join(unresolved[:40]) + ("…" if len(unresolved) > 40 else "")
         warn(f"{len(unresolved)} master names not in official repos (AUR phase candidates): {shown}")
@@ -1416,8 +1425,8 @@ def official_phase(db: IsolatedDB, master: Sequence[str], repo: Path, user: Real
         db.download(official, [repo])
     else:
         step("closure fully cached and indexed: skipping pacman -Sw")
-    prune_repo(repo, files)
     update_repo_db(repo, files, old)
+    prune_repo(repo, files)
     restore_ownership(repo, user)
 
 
@@ -1567,6 +1576,7 @@ class AurBuilder:
         self.clones: dict[str, Path] = {}  # pkgbase -> clone, kept across deferrals
         self.keep_names: set[str] = set()  # requested packages that belong in the repo
         self.built = self.skipped = 0
+        self.rebuilt_files: set[str] = set()
         self.failed: list[str] = []
         self.queue: list[str] = []
 
@@ -1632,6 +1642,9 @@ class AurBuilder:
                         self.keep_names.add(pkg)
                 prog.update(task, completed=i, total=len(queue))
         self.queue = queue
+        if self.failed:
+            shutil.copytree(self.logs, self.repo / "build_logs", dirs_exist_ok=True)
+            warn(f"AUR build logs retained at {self.repo / 'build_logs'}")
         remove_tree(self.work)
 
     def process(self, pkg: str) -> tuple[str, list[str]]:
@@ -1640,10 +1653,12 @@ class AurBuilder:
         if meta is None:
             if self.db.index.has(pkg):
                 step(f"{pkg} is provided by the official repos; skipping AUR")
+                self.keep_names.add(pkg)
                 return "official", []
             die("not found on the AUR")
-        if any(ver == meta.version or pkg.endswith(VCS_SUFFIXES) for ver, _ in self.index.get(pkg, ())):
-            step(f"{pkg} {meta.version} already in the repo")
+        if not pkg.endswith(VCS_SUFFIXES) and any(
+                vercmp(ver, meta.version) >= 0 for ver, _ in self.index.get(pkg, ())):
+            step(f"{pkg} already up to date in the repo")
             self.keep_names.add(pkg)
             return "current", []
 
@@ -1667,6 +1682,8 @@ class AurBuilder:
         unsatisfied: set[str] = set()
         if deps := official_deps + aur_deps:  # one `pacman -T` for all deps (versions/provides aware)
             r = run(["pacman", "-T", "--", *deps], capture=True)
+            if r.returncode not in (0, 127):
+                die(f"host dependency check failed:\n{pacman_errors(r)}")
             unsatisfied = {ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()}
         blocked: list[str] = []
         aur_files: list[Path] = []
@@ -1682,7 +1699,7 @@ class AurBuilder:
             step(f"{pkg}: deferred until AUR deps are built: {', '.join(blocked)}")
             return "deferred", queued
 
-        if need := [dep_name(d) for d in official_deps if d in unsatisfied]:
+        if need := [d for d in official_deps if d in unsatisfied]:
             step(f"installing host build deps: {' '.join(need)}")
             caches = [a for d in conf_values(host_conf().get("options", []), "CacheDir") for a in ("--cachedir", d)]
             if self.official is not None:
@@ -1695,6 +1712,11 @@ class AurBuilder:
             r = host_pacman("-U", "--needed", "--asdeps", "--", *map(os.fspath, aur_files))
             if r.returncode != 0:
                 die(f"AUR build-dependency install failed:\n{pacman_errors(r)}")
+
+        if deps and unsatisfied:
+            r = run(["pacman", "-T", "--", *deps], capture=True)
+            if r.returncode != 0:
+                die(f"build dependencies remain unsatisfied:\n{pacman_errors(r)}")
 
         self._publish(self._build(meta.pkgbase, clone))
         self.keep_names.add(pkg)
@@ -1759,6 +1781,7 @@ class AurBuilder:
             with atomic_path(self.repo / bf.name) as tmp:
                 shutil.copyfile(bf, tmp)  # copy_file_range/sendfile: no userspace buffers
             name, ver, _ = parse_pkg_filename(bf.name)  # type: ignore[misc]
+            self.rebuilt_files.add(bf.name)
             self.index.setdefault(name, []).append((ver, bf.name))
             self.keep_names.add(name)
             ok(f"built: {bf.name}")
@@ -1766,32 +1789,38 @@ class AurBuilder:
         remove_tree(built[0].parent.parent)  # build-<pkgbase>
 
 
-def finalize_aur_repo(db: IsolatedDB, repo: Path, official: Path | None, keep_names: set[str], user: RealUser) -> None:
+def finalize_aur_repo(db: IsolatedDB, repo: Path, official: Path | None, keep_names: set[str], user: RealUser,
+                      rebuilt_files: Collection[str] = ()) -> None:
     """Runtime closure of the kept AUR packages -> fetch missing official deps -> prune -> DB."""
     info("Finalizing AUR repo (runtime closure, prune, DB)")
     old = load_db_by_filename(repo)
+    # VCS pkgver can stay unchanged while its contents change. Even equal-sized replacements
+    # must go through repo-add again to refresh checksums and runtime dependencies.
+    for fn in rebuilt_files:
+        old.pop(fn, None)
     newest = newest_files(package_files(repo))
     aur_names = {n for n in newest if n not in db.index.names}  # official deps kept here are re-resolved
-    if not aur_names:
-        warn("AUR repo holds no AUR-built packages")
+    if not keep_names:
+        warn("no AUR phase packages to retain")
         return
-    update_repo_db(repo, {newest[n] for n in aur_names}, old)  # interim DB: AUR-built packages only
+    indexed = update_repo_db(repo, {newest[n] for n in aur_names}, old)  # interim DB: AUR-built packages only
+    old.update((e.filename, e) for e in indexed.values())
     db.attach_local_repo(repo)
     cachedirs = [repo] + ([official] if official is not None else [])
-    targets = sorted(keep_names & aur_names)
+    targets = sorted(keep_names)
     closure, dropped = db.closure_tolerant(targets, cachedirs)
     needed = {fn for _, fn, sz in closure if sz > 0}
     if needed and ingest_host_cache_packages(repo, needed):
         closure, dropped = db.closure_tolerant(targets, cachedirs)
-    keep = {newest[n] for n in dropped}
+    keep = {newest[n] for n in dropped if n in newest}
     for repo_name, fn, _ in closure:
         if repo_name == REPO_NAME or official is None or not (official / fn).is_file():
             keep.add(fn)
     if sum(size for *_, size in closure):
         ensure_disk_space(repo, 2 << 30, "AUR runtime dependencies")
         db.download([t for t in targets if t not in dropped], cachedirs)
-    prune_repo(repo, keep)
     update_repo_db(repo, keep, old, force_write=True)
+    prune_repo(repo, keep)
     restore_ownership(repo, user)
 
 
@@ -1806,7 +1835,7 @@ def aur_phase(db: IsolatedDB, master: Sequence[str], repo: Path, official: Path,
     seeds = [*AUR_SEED, *(n for n in unresolved if is_aur_candidate(n))]
     builder = AurBuilder(db, repo, official if official.is_dir() else None, user)
     builder.run(seeds)
-    finalize_aur_repo(db, repo, builder.official, builder.keep_names, user)
+    finalize_aur_repo(db, repo, builder.official, builder.keep_names, user, builder.rebuilt_files)
 
     table = Table(title="AUR Summary", box=box.ROUNDED)
     table.add_column("Metric", style="cyan")
@@ -1873,18 +1902,19 @@ def patch_profiledef_compression(profiledef: Path) -> None:
 
 def stage_payloads(cfg: IsoConfig) -> None:
     info("Staging payloads")
+    if not cfg.source_dir.is_dir():
+        die(f"installer payload directory missing: {cfg.source_dir}")
     dest = cfg.profile_dir / "airootfs" / "root" / "arch_install"
     dest.mkdir(parents=True, exist_ok=True)
-    if cfg.source_dir.is_dir():
-        for item in cfg.source_dir.iterdir():
-            if item.name in {".git", ".gitignore"}:
-                continue
-            if item.is_dir():
-                shutil.copytree(item, dest / item.name, symlinks=True, dirs_exist_ok=True)
-            else:
-                shutil.copy2(item, dest / item.name)
-        if not (dest / "000_dusky_arch_install.sh").is_file():
-            warn(f"expected installer missing: {dest / '000_dusky_arch_install.sh'}")
+    for item in cfg.source_dir.iterdir():
+        if item.name in {".git", ".gitignore"}:
+            continue
+        if item.is_dir():
+            shutil.copytree(item, dest / item.name, symlinks=True, dirs_exist_ok=True)
+        else:
+            shutil.copy2(item, dest / item.name)
+    if not (dest / "000_dusky_arch_install.sh").is_file():
+        die(f"expected installer missing: {dest / '000_dusky_arch_install.sh'}")
     releng_pkg = cfg.profile_dir / "packages.x86_64"
     asset_pkg = cfg.source_dir / "assets" / "iso_temp_packages" / "packages.x86_64"
     source = asset_pkg if asset_pkg.is_file() else releng_pkg
@@ -1947,11 +1977,13 @@ def inject_dotfiles(cfg: IsoConfig) -> None:
         pin = os.environ.get("DUSKY_DOTFILES_PIN", "").strip()
         expect_sha = os.environ.get("DUSKY_DOTFILES_SHA", "").strip().lower()
         if pin:
-            run(["git", "-C", repo, "fetch", "--quiet", "--depth", "1", "origin", pin], env=git_env, capture=True)
-            if run(["git", "-C", repo, "checkout", "--quiet", pin], env=git_env, capture=True).returncode != 0:
-                die(f"DUSKY_DOTFILES_PIN checkout failed: {pin}")
-        head_sha = (run(["git", "-C", repo, "rev-parse", "HEAD"], env=git_env, capture=True).stdout or "").strip().lower()
-        if expect_sha and head_sha and not head_sha.startswith(expect_sha):
+            run(["git", "-C", repo, "fetch", "--quiet", "--depth", "1", "origin", pin],
+                env=git_env, capture=True, check=True, timeout=CLONE_TIMEOUT_S)
+            run(["git", "-C", repo, "checkout", "--quiet", "--detach", "FETCH_HEAD"],
+                env=git_env, capture=True, check=True)
+        head_sha = run(["git", "-C", repo, "rev-parse", "HEAD"], env=git_env,
+                       capture=True, check=True).stdout.strip().lower()
+        if expect_sha and not head_sha.startswith(expect_sha):
             die(f"dotfiles SHA mismatch: got {head_sha}, expected {expect_sha}")
         if head_sha:
             step(f"dotfiles HEAD {head_sha[:12]}")
@@ -1979,8 +2011,8 @@ def inject_dotfiles(cfg: IsoConfig) -> None:
     marker = "# --- AUTOMATED ISO INJECTION: EDITOR & YAZI WRAPPER ---"
     yazi_fn = (
         "\ny() {\n"
-        "  local tmp\n"
-        '  tmp="$(mktemp -p "${XDG_RUNTIME_DIR:-/tmp}" -t "yazi-cwd.XXXXXX")"\n'
+        "  local tmp cwd\n"
+        '  tmp="$(mktemp -p "${XDG_RUNTIME_DIR:-/tmp}" "yazi-cwd.XXXXXX")" || return\n'
         '  yazi "$@" --cwd-file="$tmp"\n'
         '  if cwd="$(cat -- "$tmp")" && [ -n "$cwd" ] && [ "$cwd" != "$PWD" ]; then\n'
         '    builtin cd -- "$cwd"\n'
@@ -2037,8 +2069,10 @@ def build_local_packages(cfg: IsoConfig, user: RealUser) -> None:
     names: list[str] = []
     artifacts: list[tuple[str, str]] = []
     if recipes:
+        if user.is_root:
+            die("local ISO packages require a non-root invoking user; run via sudo from your user account")
         require_tool("makepkg", "pacman")
-        require_tool("repo-add", "pacman-contrib")
+        require_tool("repo-add", "pacman")
         info(f"Building {len(recipes)} local ISO package(s)")
     repo = cfg.workspace / "local_repo"
     for recipe in recipes:
@@ -2075,12 +2109,20 @@ def build_local_packages(cfg: IsoConfig, user: RealUser) -> None:
         )
         log = work / "build.log"
         step(f"makepkg {name} (log: {log})")
-        result = run(
-            ["makepkg", "--config", config, "--nodeps", "--noconfirm", "--skippgpcheck", "--cleanbuild"],
-            user=user, env=env, cwd=work / "recipe", log=log, timeout=BUILD_TIMEOUT_S,
-        )
+        try:
+            result = run(
+                ["makepkg", "--config", config, "--nodeps", "--noconfirm", "--skippgpcheck", "--cleanbuild"],
+                user=user, env=env, cwd=work / "recipe", log=log, timeout=BUILD_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            warn(f"makepkg {name} timed out after {BUILD_TIMEOUT_S}s")
+            result = subprocess.CompletedProcess(["makepkg"], 124)
         if result.returncode != 0:
-            die(f"makepkg {name} failed (exit {result.returncode}); tail of {log}:\n{tail_text(log)}")
+            logs = cfg.final_dest / "build_logs"
+            logs.mkdir(parents=True, exist_ok=True)
+            saved_log = logs / f"{name}.log"
+            shutil.copyfile(log, saved_log)
+            die(f"makepkg {name} failed (exit {result.returncode}); log: {saved_log}\n{tail_text(log)}")
         built = [p for p in (work / "packages").iterdir()
                  if (parsed := parse_pkg_filename(p.name)) is not None and parsed[0] == name
                  and parsed[2] == "x86_64"]
@@ -2194,21 +2236,23 @@ def verify_repo_closure(repo: Path, names: Sequence[str]) -> None:
         if r.returncode == 0:
             ok("ISO repository is dependency-closed")
         else:
-            warn("ISO repository is NOT dependency-closed; offline installs of these will fail:")
-            console.print(escape(pacman_errors(r)), markup=True)
+            die(f"ISO repository is NOT dependency-closed; refusing to build an incomplete offline ISO:\n"
+                f"{pacman_errors(r)}")
     finally:
         remove_tree(tmp)
 
 
 def configure_iso_pacman_conf(cfg: IsoConfig) -> None:
-    """[archrepo] -> merged staging repo (the one Server pacman actually syncs). CacheDir order:
-    host cache first (receives network downloads of releng-only packages), staging second (lets
-    pacstrap use repo files in place — nothing is copied)."""
+    """Use workspace storage for new live-package downloads, and reuse staged and host caches
+    in place. A RAM workspace therefore keeps these downloads off persistent storage."""
     info("Patching profile pacman.conf")
     assert_conf_safe(cfg.staging)
     pc = cfg.profile_dir / "pacman.conf"
     if not pc.is_file():
         die("profile pacman.conf missing")
+    cache = cfg.workspace / "pacman_cache"
+    cache.mkdir(exist_ok=True)
+    host_caches = conf_values(host_conf().get("options", []), "CacheDir") or ["/var/cache/pacman/pkg/"]
     drop = re.compile(r"^#?\s*(Color|ILoveCandy|VerbosePkgLists|ParallelDownloads|DownloadUser|CacheDir)\b")
     out: list[str] = []
     section = ""
@@ -2221,7 +2265,8 @@ def configure_iso_pacman_conf(cfg: IsoConfig) -> None:
             out.append(line)
             if section == "options":
                 out += ["Color", "ILoveCandy", "VerbosePkgLists", f"ParallelDownloads = {PARALLEL_DOWNLOADS}",
-                        "CacheDir = /var/cache/pacman/pkg/", f"CacheDir = {cfg.staging}/"]
+                        f"CacheDir = {cache}/", f"CacheDir = {cfg.staging}/"]
+                out += [f"CacheDir = {path}" for path in host_caches]
             continue
         if section == "options" and drop.match(s):
             continue
@@ -2240,9 +2285,16 @@ def sanitize_live_packages(cfg: IsoConfig, entries: dict[str, DbEntry]) -> None:
     universe = set(entries) | {p for e in entries.values() for p in e.provides}
     profile_repos = run(["pacman-conf", "--config", cfg.profile_dir / "pacman.conf", "--repo-list"],
                         capture=True, check=True).stdout.split()
-    dbpath = Path((conf_values(host_conf().get("options", []), "DBPath") or ["/var/lib/pacman/"])[0])
-    host_dbs = [p for r in profile_repos if r != REPO_NAME and (p := dbpath / "sync" / f"{r}.db").is_file()]
-    idx = load_sync_index(host_dbs)
+    # Validate against the same repositories mkarchiso will use, rather than stale host DBs.
+    db = IsolatedDB()
+    try:
+        text = (cfg.profile_dir / "pacman.conf").read_text(encoding="utf-8")
+        text = text.replace("[options]", f"[options]\nDBPath = {db.root}/\nLogFile = {db.root}/pacman.log", 1)
+        db.conf.write_text(text, encoding="utf-8")
+        db._sync()
+        idx = load_sync_index(db.root / "sync" / f"{r}.db" for r in profile_repos if r != REPO_NAME)
+    finally:
+        db.close()
     universe |= idx.names | idx.provides | idx.groups
     sanitized: list[str] = []
     for line in pkg_file.read_text(encoding="utf-8").splitlines():
@@ -2259,6 +2311,12 @@ def sanitize_live_packages(cfg: IsoConfig, entries: dict[str, DbEntry]) -> None:
     sanitized = list(dict.fromkeys(sanitized))
     if not sanitized:
         die("sanitization left packages.x86_64 empty")
+    if "linux" in sanitized and any(p.endswith("-dkms") for p in sanitized):
+        if "linux-headers" not in universe:
+            die("live DKMS packages require linux-headers, but it is unavailable")
+        if "linux-headers" not in sanitized:
+            sanitized.append("linux-headers")
+            step("added linux-headers for live DKMS modules")
     pkg_file.write_text("\n".join(sanitized) + "\n", encoding="utf-8")
     ok(f"live packages validated ({len(sanitized)})")
 
@@ -2266,7 +2324,7 @@ def sanitize_live_packages(cfg: IsoConfig, entries: dict[str, DbEntry]) -> None:
 def build_iso_image(cfg: IsoConfig, user: RealUser) -> tuple[Path, str]:
     info("Building ISO")
     require_tool("mkarchiso", "archiso")
-    mk_text = Path("/usr/bin/mkarchiso").read_text(encoding="utf-8")
+    mk_text = Path(shutil.which("mkarchiso")).read_text(encoding="utf-8")
     marker = "_build_iso_image() {"
     if (count := mk_text.count(marker)) != 1:
         die(f"mkarchiso: expected exactly one {marker!r}, found {count}; archiso layout changed")
@@ -2275,7 +2333,7 @@ def build_iso_image(cfg: IsoConfig, user: RealUser) -> tuple[Path, str]:
     mk.write_text(mk_text.replace(marker, f"{marker}\n{hook}", 1), encoding="utf-8")
     mk.chmod(0o755)
 
-    cmd = [mk, "-v", "-m", "iso", "-w", cfg.work_dir, "-o", cfg.out_dir, cfg.profile_dir]
+    cmd = [mk, "-v", "-r", "-m", "iso", "-w", cfg.work_dir, "-o", cfg.out_dir, cfg.profile_dir]
     info(f"Running mkarchiso: {shlex.join(map(os.fspath, cmd))}")
     if run(cmd).returncode != 0:
         die("mkarchiso failed")
@@ -2408,7 +2466,8 @@ def main(args: argparse.Namespace) -> None:
             source_dir=source_dir,
             official_repo=official_repo,
             aur_repo=aur_repo if aur_repo.is_dir() else None,
-            final_dest=ZRAM_CANDIDATE if zram else user.home / "dusky_isos",
+            final_dest=(args.output_dir or (ZRAM_CANDIDATE if zram else user.home / "dusky_isos"))
+                       .expanduser().resolve(),
         )
         iso = iso_phase(cfg, user)
 
