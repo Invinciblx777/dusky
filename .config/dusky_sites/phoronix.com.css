@@ -6,5 +6,6 @@
     article.full > div.content > blockquote { color: var(--primary_fixed_dim) !important; } /* dusky key=sel%1Farticle.full%20%3E%20div.content%20%3E%20blockquote%1Ftext | text: primary_fixed_dim */
     p { color: var(--on_secondary_container) !important; } /* dusky key=sel%1Fp%1Ftext | text: on_secondary_container */
     header { color: var(--on_tertiary_container) !important; } /* dusky key=sel%1Fheader%1Ftext | text: on_tertiary_container */
+    #main > article { color: var(--secondary) !important; } /* dusky key=sel%1F%23main%20%3E%20article%1Ftext | text: secondary */
     /* <<< dusky:picks */
 }
