@@ -82,6 +82,13 @@ before deploying JavaScript changes; modifying its ZIP contents invalidates its
 signature. The audit reports source/package differences. For development,
 load `extension/manifest.json` as a temporary add-on through `about:debugging`.
 
+Extension 6.2.1 repairs page-overwritten root palette properties and removed
+fallback style elements in the mutation observer, before paint. Deferring this
+repair to another animation frame could briefly expose the white page canvas
+when returning to a themed page such as Discord. Palette revisions still use
+the existing frame scheduler; repeated page mutations retain the repair limit.
+This JavaScript fix requires rebuilding and re-signing the XPI.
+
 The Matugen palette template must remain document-scoped. Regenerate its output
 through the normal wallpaper/color workflow after changing its scope or variable
 names. Setup refuses an unscoped or non-private palette. An alternate `colorsPath`

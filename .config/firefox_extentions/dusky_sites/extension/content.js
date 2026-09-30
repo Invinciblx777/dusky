@@ -1,6 +1,6 @@
 /* =============================================================================
- * Dusky Sites — Content Runtime v6.2
- * Firefox 156+ · document_start · every frame (all_frames + about:blank)
+ * Dusky Sites — Content Runtime v6.2.1
+ * Firefox 157+ · document_start · every frame (all_frames + about:blank)
  *
  * PER-REVISION COST MODEL — the only thing that matters under a matugen burst
  *   palette  ~100 × root.style.setProperty('--x', v, 'important'), diffed against the previous
@@ -40,7 +40,7 @@
     let sheet = null, styleEl = null;
 
     let rootObs = null, headObs = null, observedHead = null;
-    let fights = 0, fightAt = 0, repairQueued = false;
+    let fights = 0, fightAt = 0;
 
     let scanState = null, hints = null;
 
@@ -119,7 +119,7 @@
     /** Single-node attribute observer: fires only when something else rewrites the root's style attribute. */
     function watchRoot() {
         if (rootObs || disposed || !document.documentElement) return;
-        rootObs = new MutationObserver(() => { if (!disposed && palVars && !varsIntact()) queueRepair(); });
+        rootObs = new MutationObserver(() => { if (!disposed && palVars && !varsIntact()) repairTheme(); });
         rootObs.observe(document.documentElement, { attributes: true, attributeFilter: ['style'] });
     }
 
@@ -174,27 +174,24 @@
         if (observedHead) headObs.observe(observedHead, { childList: true });
     }
     function onHeadMutated() {
-        if (disposed || !styleEl || repairQueued) return;
+        if (disposed || !styleEl) return;
         const head = document.head || null;
         if (head === observedHead && styleEl.isConnected && (!head || styleEl.parentNode === head)) return;
-        queueRepair();
+        repairTheme();
     }
     function stopHead() { if (headObs) { headObs.disconnect(); headObs = null; } observedHead = null; }
     function stopRoot() { if (rootObs) { rootObs.disconnect(); rootObs = null; } }
 
-    /** One repair per frame, bounded: a page that insists wins after MAX_FIGHTS. */
-    function queueRepair() {
-        if (repairQueued) return;
-        repairQueued = true;
-        requestAnimationFrame(() => {
-            repairQueued = false;
-            if (disposed) return;
-            const t = Date.now();
-            if (t - fightAt > 5000) { fightAt = t; fights = 0; }
-            if (++fights > MAX_FIGHTS) { stopHead(); stopRoot(); return; }
-            reassertVars();
-            if (mode === 'element' && styleEl) { mountElement(); watchHead(); }
-        });
+    /** Repair in the observer microtask, before paint. rAF can leave a white frame
+     * when the page replaces root styles/head during its own animation frame.
+     * Our writes drain/disconnect their observers; repeated page fights stay bounded. */
+    function repairTheme() {
+        if (disposed) return;
+        const t = Date.now();
+        if (t - fightAt > 5000) { fightAt = t; fights = 0; }
+        if (++fights > MAX_FIGHTS) { stopHead(); stopRoot(); return; }
+        reassertVars();
+        if (mode === 'element' && styleEl) { mountElement(); watchHead(); }
     }
 
     /* ── 3. Flush pipeline ───────────────────────────────────────────────── */
