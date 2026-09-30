@@ -89,6 +89,20 @@ class AuditTests(unittest.TestCase):
                     self.assertEqual(k.choose_release(p, releases).version, '7.2.7')
                 with patch.object(k, 'interactive', return_value=False):
                     self.assertEqual(k.choose_release(p, releases).version, '7.2.7')
+
+    def test_cli_rc_opt_in_selects_latest_without_changing_saved_profile(self):
+        p = profile()
+        args = k.build_parser().parse_args(['--channel', 'mainline', '--allow-rc'])
+        k.apply_overrides(p, k.Overrides.from_env_and_args(args))
+        k.cross_validate(p)
+        releases = [k.Release('7.3-rc4', 'mainline', '', 'rc4', None),
+                    k.Release('7.3-rc5', 'mainline', '', 'rc5', None)]
+        with patch.object(k, 'interactive', return_value=False):
+            self.assertEqual(k.choose_release(p, releases).version, '7.3-rc5')
+        p.set('release', 'pin', '7.3-rc5')
+        k.cross_validate(p)
+        self.assertFalse(profile().g('release', 'allow_rc'))
+
     def test_release_picker_shows_supported_channels_and_profile_default(self):
         releases = [k.Release('7.3-rc4', 'mainline', '2026-09-20', 'rc', None),
                     k.Release('7.2.7', 'stable', '2026-09-21', 'stable', None),
@@ -518,6 +532,52 @@ class AuditTests(unittest.TestCase):
         ops = {o.symbol:o.action for o in mx.ops}
         self.assertEqual(ops['TCP_CONG_CUBIC'], 'n'); self.assertEqual(ops['NET_SCH_CAKE'], 'n')
         self.assertEqual(ops['TCP_CONG_BBR'], 'y'); self.assertEqual(ops['NET_SCH_FQ'], 'y')
+
+    def test_recorded_virtio_mem_retains_hotplug_on_lean_bare_metal(self):
+        with tempfile.TemporaryDirectory() as td:
+            tree = Path(td); (tree / '.config').write_text('CONFIG_VIRTIO_MEM=m\n')
+            p = profile(); mx = k.Matrix(k.KconfigIndex(frozenset(), 4))
+            k._ops_memory(mx, p, derived(p, tree=tree))
+            ops = {o.symbol: o.action for o in mx.ops}
+            self.assertEqual(ops['VIRTIO_MEM'], 'm')
+            self.assertEqual(ops['MEMORY_HOTPLUG'], 'y')
+            self.assertEqual(ops['MEMORY_HOTREMOVE'], 'y')
+
+    def test_network_preserves_recorded_cake_without_changing_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            tree = Path(td)
+            (tree / '.config').write_text('CONFIG_NET_SCH_CAKE=m\n')
+            p = profile(); mx = k.Matrix(k.KconfigIndex(frozenset(), 4))
+            k._ops_network(mx, p, derived(p, tree=tree))
+            ops = {o.symbol: o.action for o in mx.ops}
+            self.assertEqual(ops['NET_SCH_CAKE'], 'm')
+            self.assertEqual(ops['DEFAULT_FQ'], 'y')
+
+    def test_arch_seed_uses_complete_installed_config_when_fetch_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); module = root / 'linux-test'
+            cfg = module / 'build/.config'; cfg.parent.mkdir(parents=True)
+            (module / 'pkgbase').write_text('linux\n')
+            cfg.write_text('CONFIG_X86_64=y\nCONFIG_MODULES=y\n' + '# padding\n' * 2500)
+            original = Path.iterdir
+            def entries(path):
+                return iter([module]) if path == Path('/usr/lib/modules') else original(path)
+            with patch.object(k, 'BUILD_DIR', root), patch.object(Path, 'iterdir', entries), \
+                 patch.object(k, 'http_get', side_effect=k.NetworkError('offline')):
+                self.assertEqual(k.arch_upstream_config(), cfg)
+
+    def test_stream_callback_failure_terminates_child(self):
+        processes = []
+        popen = subprocess.Popen
+        def child(*args, **kwargs):
+            proc = popen(*args, **kwargs); processes.append(proc); return proc
+        def fail(_line):
+            raise ValueError('monitor failed')
+        with patch.object(k.subprocess, 'Popen', side_effect=child):
+            with self.assertRaises(ValueError):
+                k.run_stream([sys.executable, '-u', '-c', 'import time; print("ready"); time.sleep(60)'], on_line=fail)
+        self.assertIsNotNone(processes[0].poll())
+        self.assertNotIn(processes[0].pid, k._CHILD_PGIDS)
 
     def test_active_pstate_maps_dynamic_governor(self):
         p = profile(); p.set('cpu', 'governor', 'schedutil')

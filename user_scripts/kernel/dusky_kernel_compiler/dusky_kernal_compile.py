@@ -1021,6 +1021,7 @@ class Overrides:
     headers: str | None = None
     footprint: str | None = None
     no_rust: bool = False
+    allow_rc: bool = False
 
     @classmethod
     def from_env_and_args(cls, args: argparse.Namespace) -> Self:
@@ -1042,6 +1043,7 @@ class Overrides:
             headers=getattr(args, "headers", None) or env("DUSKY_HEADERS"),
             footprint=getattr(args, "footprint", None) or env("DUSKY_FOOTPRINT"),
             no_rust=bool(getattr(args, "no_rust", False)),
+            allow_rc=bool(getattr(args, "allow_rc", False)),
         )
 
 
@@ -1078,6 +1080,8 @@ def apply_overrides(p: KernelProfile, o: Overrides) -> list[str]:
         put("memory", "footprint", o.footprint)
     if o.no_rust:
         put("compiler", "rust", False)
+    if o.allow_rc:
+        put("release", "allow_rc", True)
     return diff
 
 
@@ -1540,6 +1544,11 @@ def run_stream(cmd: Sequence[str], *, cwd: Path | None = None, env: Mapping[str,
         proc.stdout.close()
         return proc.wait()
     finally:
+        if proc.poll() is None:
+            terminate_process_group(proc.pid)
+            proc.wait()
+        if proc.stdout is not None:
+            proc.stdout.close()
         _unregister(pgid)
 
 
@@ -2870,10 +2879,17 @@ def arch_upstream_config() -> Path | None:
         data = http_get(ARCH_UPSTREAM_CONFIG_URL, timeout=60)
     except NetworkError as e:
         debug(f"arch config fetch failed: {e}")
-        return dest if is_plausible_kernel_config(dest) else None
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(data)
-    return dest if is_plausible_kernel_config(dest) else None
+    else:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+    if is_plausible_kernel_config(dest):
+        return dest
+    # A previously pruned running kernel cannot seed drivers for newly recorded
+    # peripherals. Prefer the installed distribution kernel's complete config.
+    configs = [module / "build/.config" for module in Path("/usr/lib/modules").iterdir()
+               if _read(module / "pkgbase").strip() == "linux"
+               and is_plausible_kernel_config(module / "build/.config")]
+    return max(configs, key=lambda path: path.stat().st_mtime) if configs else None
 
 
 def seed_config(tree: Path, p: KernelProfile, env: Mapping[str, str], override: Path | None) -> str:
@@ -2900,7 +2916,7 @@ def seed_config(tree: Path, p: KernelProfile, env: Mapping[str, str], override: 
                 cfg = arch_upstream_config()
                 if cfg is not None:
                     cfg.copy(dest)
-                    ok("Seeded from Arch Linux packaging config (gitlab.archlinux.org)")
+                    ok(f"Seeded from Arch Linux config: {cfg}")
                     return "arch"
             case "running":
                 gz = Path("/proc/config.gz")
@@ -3612,10 +3628,14 @@ def _ops_memory(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     mx.flag("MEMCG", m["memcg"])
     mx.flag("MEMCG_V1", m["memcg"] and not lean)
     mx.flag("CPUSETS_V1", not lean)
-    hotplug = vm or not lean or bool(set(f.gpus) & {"amd", "nvidia"})
+    retained = parse_dotconfig(_read(d.tree / ".config"))
+    recorded_virtio_mem = retained.get("VIRTIO_MEM") in ("y", "m")
+    hotplug = vm or not lean or bool(set(f.gpus) & {"amd", "nvidia"}) or recorded_virtio_mem
     mx.flag("MEMORY_HOTPLUG", hotplug, why="ZONE_DEVICE/DEVICE_PRIVATE (GPU SVM) and VM balloons need it")
     mx.flag("MEMORY_HOTREMOVE", hotplug)
     mx.flag("ZONE_DEVICE", hotplug and not embedded, optional=True)
+    if recorded_virtio_mem:
+        mx.m("VIRTIO_MEM", why="target census requires memory hotplug")
     log_shift = m["log_buf_shift"] or (15 if minimal else 16 if lean else 17)
     mx.val("LOG_BUF_SHIFT", log_shift)
     mx.val("LOG_CPU_MAX_BUF_SHIFT", 12)
@@ -3892,17 +3912,25 @@ def _ops_power(mx: Matrix, p: KernelProfile, d: Derived) -> None:
 
 def _ops_network(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     n = p.sections["network"]
+    retained = parse_dotconfig(_read(d.tree / ".config"))
+
+    def algorithm(symbol: str, selected: bool) -> None:
+        if not selected and retained.get(symbol) in ("m", "y"):
+            mx.m(symbol, why="retained by target module census")
+        else:
+            mx.flag(symbol, selected)
+
     mx.y("TCP_CONG_ADVANCED")
-    mx.flag("TCP_CONG_CUBIC", n["congestion"] == "cubic")
-    mx.flag("TCP_CONG_BBR", n["congestion"] == "bbr")
+    algorithm("TCP_CONG_CUBIC", n["congestion"] == "cubic")
+    algorithm("TCP_CONG_BBR", n["congestion"] == "bbr")
     mx.flag("TCP_CONG_RENO", n["congestion"] == "reno", optional=True)
     cong = {"bbr": "DEFAULT_BBR", "cubic": "DEFAULT_CUBIC", "reno": "DEFAULT_RENO"}
     mx.choice(cong.values(), cong[n["congestion"]], why=f"congestion={n['congestion']}")
     mx.y("NET_SCHED")
-    mx.flag("NET_SCH_FQ", n["qdisc"] == "fq")
-    mx.flag("NET_SCH_FQ_CODEL", n["qdisc"] in ("fq_codel", "cake"))
-    mx.flag("NET_SCH_CAKE", n["qdisc"] == "cake")
-    mx.flag("NET_SCH_FQ_PIE", n["qdisc"] == "fq_pie" or not p.lean("lean"))
+    algorithm("NET_SCH_FQ", n["qdisc"] == "fq")
+    algorithm("NET_SCH_FQ_CODEL", n["qdisc"] in ("fq_codel", "cake"))
+    algorithm("NET_SCH_CAKE", n["qdisc"] == "cake")
+    algorithm("NET_SCH_FQ_PIE", n["qdisc"] == "fq_pie" or not p.lean("lean"))
     qd = {"fq": "DEFAULT_FQ", "fq_codel": "DEFAULT_FQ_CODEL", "fq_pie": "DEFAULT_FQ_PIE", "pfifo_fast": "DEFAULT_PFIFO_FAST", "cake": "DEFAULT_FQ_CODEL"}
     mx.y("NET_SCH_DEFAULT")
     mx.choice(("DEFAULT_FQ", "DEFAULT_CODEL", "DEFAULT_FQ_CODEL", "DEFAULT_FQ_PIE", "DEFAULT_SFQ", "DEFAULT_PFIFO_FAST"), qd[n["qdisc"]],
@@ -5704,6 +5732,7 @@ def build_parser() -> argparse.ArgumentParser:
     ov.add_argument("--no-headers", action="store_const", dest="headers", const="never")
     ov.add_argument("--footprint", choices=list(FOOTPRINT_CHOICES))
     ov.add_argument("--pin", metavar="VERSION", help="exact kernel version; bypasses the interactive release picker")
+    ov.add_argument("--allow-rc", action="store_true", help="allow release candidates for this run (use --channel mainline for the newest)")
     ov.add_argument("-j", "--jobs", type=int)
     ov.add_argument("--no-rust", action="store_true")
     bh = ap.add_argument_group("build behaviour")

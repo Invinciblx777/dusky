@@ -248,6 +248,8 @@ keep_symbols = [
   "ACPI_BATTERY", "ACPI_AC", "TYPEC", "TYPEC_UCSI", "UCSI_ACPI", "USB4",
   # Touchpad & Inputs
   "HID_MULTITOUCH", "I2C_HID_ACPI",
+  # Intel's prefixed Makefile targets are not recognized by localmodconfig.
+  "INTEL_HID_EVENT",
   # Intel Wi-Fi & Bluetooth
   "IWLWIFI", "IWLMVM", "BT_HCIBTUSB", "BT_INTEL",
   # ASUS Laptop Hotkeys, Backlight & Fan Control

@@ -16,7 +16,7 @@ A build prompts to install missing Arch build dependencies and, when needed, mod
 
 Only TOML files in `kernel_profiles/` and the user's XDG profile directory are selectable. No named preset is embedded in the engine. `kernel_profiles/schema.py` contains field defaults, validation limits and wizard metadata. `--write-default-profiles` creates a new `custom.toml` without overwriting an existing file. `--spec` prints the schema; `--show --dump-toml -p NAME` prints a fully resolved profile.
 
-The battery profile tracks mainline, including release candidates. Select `release.channel = "stable"` or `release.pin` to change that. CPU names accepted by the selected compiler work without updating a script allowlist. Use `cpu.arch = "native"` for a local build. `cpu.march` accepts additional `-march=CPU` and `-mtune=CPU` overrides.
+The battery profile defaults to stable. For the newest release candidate in an unattended build, use `-p battery --channel mainline --allow-rc --yes`; add `--pin VERSION` to select an exact RC. These overrides apply only to this run. CPU names accepted by the selected compiler work without updating a script allowlist. Use `cpu.arch = "native"` for a local build. `cpu.march` accepts additional `-march=CPU` and `-mtune=CPU` overrides.
 
 At each interactive build, the release picker lists the current mainline, stable and longterm entries from kernel.org. All included profiles and new profiles default to the newest stable release, so pressing Enter selects stable; choose an RC explicitly for that build. An explicit RC choice works even when `release.allow_rc = false`; that setting controls automatic selection. `--pin VERSION` bypasses the picker, while `--yes` or unattended builds use the profile's pin or newest allowed release in its channel. Versions below the compiler's 7.2 minimum appear as unavailable, including current older LTS branches. The feed lists current channel releases, not every historical patch release; use `--pin VERSION` for an older supported version.
 
@@ -39,7 +39,7 @@ All four default to **strict target-census pruning**, native local CPU targeting
 
 The three new profiles have no enhancement patches, scheduler daemon/BTF requirement, vendor-specific driver lists or forced PCIe ASPM. They retain the scalable SLUB allocator rather than forcing SLUB_TINY. Native O2 is intentional for performance: O3 is available, but does not universally improve workloads. No measured speed, wattage or idle-RAM targets are implied.
 
-Pruning is not just blindly deleting modules: root filesystem support, essential userspace facilities and explicit profile features remain. Intel i915/xe selection follows the pruned target configuration; a missing census driver requires an explicit keep or a corrected census. Unselected TCP/qdisc implementations are no longer force-enabled. Automatic CPU/NUMA limits follow the target topology.
+Pruning preserves root filesystem support, essential userspace facilities and explicit profile features. When the upstream Arch configuration is unavailable, an installed Arch `linux` headers configuration is preferred over an already-pruned running kernel. Intel i915/xe selection follows the pruned target configuration; a missing census driver requires an explicit keep or a corrected census. Recorded TCP/qdisc implementations remain available as modules while the profile selects the default; unrecorded alternatives are not forced on. Automatic CPU/NUMA limits follow the target topology.
 
 ## Build elsewhere for an older computer
 
@@ -100,4 +100,4 @@ For LLVM/ThinLTO builds, generated headers force `ld.lld` for external modules e
 python -m unittest discover -s tests -v
 ```
 
-See [the audit report](audit/AUDIT.md) for findings, source references, checks performed and remaining limits. Configuration checks do not establish runtime speed, battery life, DKMS compatibility or successful boot on untested hardware.
+See [the audit report](audit/AUDIT.md) and [the RC5 build and guest-boot audit](audit/RC5_AUDIT_2026-09-30.md) for findings, checks performed and remaining limits. Configuration checks do not establish runtime speed, battery life, DKMS compatibility or successful boot on untested hardware.

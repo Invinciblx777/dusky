@@ -1,8 +1,7 @@
 diff --git a/drivers/input/evdev.c b/drivers/input/evdev.c
-index c7325226c..4f18a50ea 100644
 --- a/drivers/input/evdev.c
 +++ b/drivers/input/evdev.c
-@@ -46,6 +46,7 @@ struct evdev_client {
+@@ -47,6 +47,7 @@
  	struct fasync_struct *fasync;
  	struct evdev *evdev;
  	struct list_head node;
@@ -10,7 +9,7 @@ index c7325226c..4f18a50ea 100644
  	enum input_clock_type clk_type;
  	bool revoked;
  	unsigned long *evmasks[EV_CNT];
-@@ -368,13 +369,22 @@ static void evdev_attach_client(struct evdev *evdev,
+@@ -373,13 +374,22 @@
  	spin_unlock(&evdev->client_lock);
  }
  
@@ -34,7 +33,7 @@ index c7325226c..4f18a50ea 100644
  }
  
  static int evdev_open_device(struct evdev *evdev)
-@@ -427,7 +437,6 @@ static int evdev_release(struct inode *inode, struct file *file)
+@@ -432,7 +442,6 @@
  {
  	struct evdev_client *client = file->private_data;
  	struct evdev *evdev = client->evdev;
@@ -42,19 +41,19 @@ index c7325226c..4f18a50ea 100644
  
  	mutex_lock(&evdev->mutex);
  
-@@ -439,11 +448,6 @@ static int evdev_release(struct inode *inode, struct file *file)
+@@ -443,11 +452,6 @@
+ 	mutex_unlock(&evdev->mutex);
  
  	evdev_detach_client(evdev, client);
- 
+-
 -	for (i = 0; i < EV_CNT; ++i)
 -		bitmap_free(client->evmasks[i]);
 -
 -	kvfree(client);
--
+ 
  	evdev_close_device(evdev);
  
- 	return 0;
-@@ -486,7 +490,6 @@ static int evdev_open(struct inode *inode, struct file *file)
+@@ -491,7 +495,6 @@
  
   err_free_client:
  	evdev_detach_client(evdev, client);
@@ -62,3 +61,11 @@ index c7325226c..4f18a50ea 100644
  	return error;
  }
  
+@@ -1443,6 +1446,7 @@
+ static void __exit evdev_exit(void)
+ {
+ 	input_unregister_handler(&evdev_handler);
++	rcu_barrier();
+ }
+ 
+ module_init(evdev_init);

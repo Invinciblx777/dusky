@@ -34,4 +34,4 @@ flowchart TD
 
 Remote hardware decides the kernel configuration; the build machine decides parallelism. Source/configuration checks precede compilation. Explicit configuration requirements fail when unresolved; dependency-gated preferences are reported separately.
 
-See [usage](README.md), [profile fields](kernel_profiles/_SCHEMA_GUIDE.md), and [audit findings](audit/AUDIT.md). No build-speed, battery-life or boot-success guarantees are implied.
+See [usage](README.md), [profile fields](kernel_profiles/_SCHEMA_GUIDE.md), [audit findings](audit/AUDIT.md), and [the RC5 build and guest-boot audit](audit/RC5_AUDIT_2026-09-30.md). No build-speed, battery-life or boot-success guarantees are implied.
