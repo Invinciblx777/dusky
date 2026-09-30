@@ -257,7 +257,8 @@ share a runtime cursor lock. Hook diagnostics are recorded in
 The global icon-theme hook selects `Papirus-Dark`. Matugen compares the primary
 color with the configured Papirus folder palette and selects the closest
 available folder color. The hook runs `papirus-folders` through noninteractive
-sudo and toggles the icon-theme setting to encourage reloads. This chooses a
+sudo and, after recoloring and cache updates finish successfully, toggles the
+icon-theme setting to encourage reloads. This chooses a
 predefined folder color rather than recoloring every icon. The utility and its
 existing sudo permission must be available for that hook to succeed.
 

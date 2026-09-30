@@ -71,11 +71,14 @@ colors_to_compare = [
 compare_to = "{{ colors.primary.default.hex }}"
 post_hook = '''
   if command -v papirus-folders >/dev/null 2>&1; then
-    nohup sudo -n papirus-folders -C {{ closest_color }} --theme Papirus-Dark -u > /dev/null 2>&1 &
-    sleep 0.35
-    # Refresh icon theme to force file managers to reload (Lab-matched folder color)
-    gsettings set org.gnome.desktop.interface icon-theme "Adwaita" 2>/dev/null || :
-    gsettings set org.gnome.desktop.interface icon-theme "Papirus-Dark" 2>/dev/null || :
+    # Refresh only after recoloring and cache updates finish. A fixed delay
+    # races slow machines and can leave applications showing the old icons.
+    if sudo -n papirus-folders -C {{ closest_color }} --theme Papirus-Dark -u > /dev/null; then
+      gsettings set org.gnome.desktop.interface icon-theme "Adwaita" 2>/dev/null || :
+      gsettings set org.gnome.desktop.interface icon-theme "Papirus-Dark" 2>/dev/null || :
+    else
+      echo "[matugen] papirus-folders failed; retaining the current icon theme" >&2
+    fi
   else
     echo "[matugen] papirus-folders not installed — install via: paru -S papirus-folders" >&2
   fi
