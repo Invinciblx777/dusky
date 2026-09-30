@@ -3,9 +3,9 @@
 # ==============================================================================
 #  MASTER GAME RUNNER ENGINE
 # ------------------------------------------------------------------------------
-#  Target platform : Arch Linux (rolling, 2026 spec) / Linux >= 7.1
-#  Interpreter     : CPython >= 3.14.6 (GIL or free-threaded build)
-#  Session         : pure Wayland (Hyprland / wlroots / KWin) -- no X11 session
+#  Target platform : Arch Linux (rolling, 2026 spec) / Linux >= 7.3
+#  Interpreter     : CPython >= 3.14.7 (GIL or free-threaded build)
+#  Session         : Wayland / Hyprland -- no X11 session
 #  Dependencies    : stdlib only.  `rich` is an optional presentation upgrade.
 #
 #  Design rules enforced throughout this file:
@@ -25,6 +25,7 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import resource
@@ -488,21 +489,13 @@ def fuse_alive(path: Path) -> bool:
     is the canonical stale-mount signature and it must be recovered, not ignored.
     A hung daemon is different: abort reconciliation without detaching its mount.
     """
-    try:
-        proc = subprocess.Popen(["stat", "-f", "--", str(path)],
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, start_new_session=True)
-    except OSError as exc:
-        raise ConfigError(f"cannot probe FUSE mount {path}: {exc}") from exc
-    try:
-        return proc.wait(timeout=3.0) == 0
-    except subprocess.TimeoutExpired as exc:
-        with suppress(OSError):
-            os.killpg(proc.pid, signal.SIGKILL)
-        with suppress(subprocess.TimeoutExpired):
-            proc.wait(timeout=0.2)
+    result = run_cmd(["stat", "-f", "--", str(path)], timeout=3.0)
+    if result.rc == 124:
         raise ConfigError(f"FUSE mount {path} did not answer statfs within 3 seconds; "
-                          "leaving it mounted for investigation") from exc
+                          "leaving it mounted for investigation")
+    if result.rc == 127:
+        raise ConfigError(f"cannot probe FUSE mount {path}: {result.message}")
+    return result.ok
 
 
 @dataclass(frozen=True, slots=True)
@@ -1602,7 +1595,7 @@ def _outputs_hyprland() -> list[Output]:
     payload = ""
     if sig:
         # Talk to the Hyprland IPC socket directly: no hyprctl fork, ~0.3 ms.
-        for base in (XDG_RUNTIME_DIR / "hypr", Path("/tmp/hypr")):
+        for base in (XDG_RUNTIME_DIR / "hypr",):
             sock_path = base / sig / ".socket.sock"
             if not sock_path.exists():
                 continue
@@ -1643,85 +1636,15 @@ def _outputs_hyprland() -> list[Output]:
     return outs
 
 
-def _outputs_wlr() -> list[Output]:
-    if not have("wlr-randr"):
-        return []
-    r = run_cmd(["wlr-randr", "--json"], timeout=1.5)
-    if not r.ok:
-        return []
-    try:
-        doc = json.loads(r.out)
-    except ValueError:
-        return []
-    outs: list[Output] = []
-    for mon in doc:
-        cur = next((m for m in mon.get("modes", []) if m.get("current")), None)
-        if not cur:
-            continue
-        outs.append(
-            Output(
-                name=str(mon.get("name", "")),
-                width=int(cur.get("width", 0) or 0),
-                height=int(cur.get("height", 0) or 0),
-                refresh_hz=float(cur.get("refresh", 0) or 0),
-                scale=float(mon.get("scale", 1) or 1),
-                focused=bool(mon.get("focused", False)),
-                vrr=bool(mon.get("adaptive_sync", False)),
-                hdr=False,
-            )
-        )
-    return outs
-
-
-def _outputs_kscreen() -> list[Output]:
-    if not have("kscreen-doctor"):
-        return []
-    r = run_cmd(["kscreen-doctor", "-j"], timeout=2.0)
-    if not r.ok:
-        return []
-    try:
-        doc = json.loads(r.out)
-    except ValueError:
-        return []
-    outs: list[Output] = []
-    for o in doc.get("outputs", []):
-        if not o.get("enabled"):
-            continue
-        mode = next(
-            (m for m in o.get("modes", []) if m.get("id") == o.get("currentModeId")),
-            None,
-        )
-        if not mode:
-            continue
-        size = mode.get("size", {})
-        outs.append(
-            Output(
-                name=str(o.get("name", "")),
-                width=int(size.get("width", 0) or 0),
-                height=int(size.get("height", 0) or 0),
-                refresh_hz=float(mode.get("refreshRate", 0) or 0),
-                scale=float(o.get("scale", 1) or 1),
-                focused=bool(o.get("primary", False)),
-                vrr=str(o.get("vrrPolicy", "")).lower() in ("always", "automatic"),
-                hdr=bool(o.get("hdr", False)),
-            )
-        )
-    return outs
-
-
 @cache
 def outputs() -> tuple[Output, ...]:
     if not os.environ.get("WAYLAND_DISPLAY"):
         Log.debug("no WAYLAND_DISPLAY: display topology unavailable")
-    for probe in (_outputs_hyprland, _outputs_wlr, _outputs_kscreen):
-        try:
-            found = probe()
-        except Exception as exc:  # defensive: never let discovery kill a launch
-            Log.trace(f"output probe {probe.__name__} failed: {exc}")
-            continue
-        if found:
-            return tuple(found)
-    return ()
+    try:
+        return tuple(_outputs_hyprland())
+    except Exception as exc:
+        Log.trace(f"Hyprland output discovery failed: {exc}")
+        return ()
 
 
 def active_output() -> Output:
@@ -2222,8 +2145,8 @@ class ProfileManager:
                     raise ConfigError(f"[{pid}] {field_name} must be a boolean")
                 elif isinstance(expected, int) and not isinstance(expected, bool) and type(value) is not int:
                     raise ConfigError(f"[{pid}] {field_name} must be an integer")
-                elif isinstance(expected, float) and not isinstance(value, (int, float)):
-                    raise ConfigError(f"[{pid}] {field_name} must be a number")
+                elif isinstance(expected, float) and (type(value) not in (int, float) or not math.isfinite(value)):
+                    raise ConfigError(f"[{pid}] {field_name} must be a finite number")
                 elif isinstance(expected, str) and not isinstance(value, str):
                     raise ConfigError(f"[{pid}] {field_name} must be a string")
                 elif isinstance(expected, list) and not isinstance(value, list):
@@ -2386,7 +2309,8 @@ def resolve_paths(prof: Profile) -> GamePaths:
         )
     game_dir = Path(raw_dir).expanduser()
     if not game_dir.is_absolute():
-        game_dir = (prof.path.parent / game_dir).resolve()
+        game_dir = prof.path.parent / game_dir
+    game_dir = game_dir.resolve()
 
     def under(value: str, default: str) -> Path:
         p = Path(str(value or default)).expanduser()
@@ -2405,8 +2329,8 @@ def resolve_paths(prof: Profile) -> GamePaths:
     paths = GamePaths(
         game_dir=game_dir,
         dwarfs_image=image,
-        dwarfs_mount=under(pcfg.get("dwarfs_mount"), ".mnt/dwarfs"),
-        overlay_dir=under(pcfg.get("overlay_dir"), ".mnt/root"),
+        dwarfs_mount=under(pcfg.get("dwarfs_mount"), ".mnt/dwarfs").resolve(),
+        overlay_dir=under(pcfg.get("overlay_dir"), ".mnt/root").resolve(),
         overlay_upper=under(pcfg.get("overlay_storage"), ".mnt/upper"),
         overlay_work=under(pcfg.get("overlay_work"), ".mnt/work"),
         prefix_dir=under(wine_cfg.get("prefix_dir"), "prefix"),
@@ -2414,6 +2338,12 @@ def resolve_paths(prof: Profile) -> GamePaths:
         working_dir=str(pcfg.get("working_dir") or "").strip(),
     )
     if paths.dwarfs_image is not None:
+        storage_dirs = [p.resolve() for p in (paths.dwarfs_mount, paths.overlay_dir,
+                                             paths.overlay_upper, paths.overlay_work)]
+        for i, directory in enumerate(storage_dirs):
+            if any(directory.is_relative_to(other) or other.is_relative_to(directory)
+                   for other in storage_dirs[i + 1:]):
+                raise ConfigError("DwarFS, union, upper and work directories must not overlap")
         work = paths.overlay_work.resolve()
         game = paths.game_dir.resolve()
         protected = (paths.game_dir.resolve(), paths.overlay_upper.resolve(),
@@ -2474,17 +2404,6 @@ def profile_installed(prof: Profile) -> bool:
 # ==============================================================================
 # SECTION 9 -- Mount engine (DwarFS + rootless union)
 # ==============================================================================
-def _fuse_escape(value: str) -> str:
-    """Escape a path for a FUSE `-o` option list.
-
-    `lowerdir` is colon-separated and the whole option string is
-    comma-separated, so an unescaped ':' or ',' in a game path silently mounts
-    the wrong tree (or fails with a confusing EINVAL). Backslash escaping is the
-    documented overlayfs/fuse-overlayfs convention.
-    """
-    return value.replace("\\", "\\\\").replace(":", "\\:").replace(",", "\\,")
-
-
 def _dur_ok(value: str, default: str) -> str:
     return value if re.fullmatch(r"\d+(ms|s|m|h)?", str(value or "")) else default
 
@@ -2540,17 +2459,21 @@ class MountEngine:
             if entry is None:
                 results.append(False)
                 continue
-            expected = MountEngine.FSTYPE_DWARFS if mp == paths.dwarfs_mount else MountEngine.FSTYPE_OVERLAY
-            if entry.fstype not in expected or (entry.fstype == "fuse" and
-                    not any(label in entry.source.lower() for label in
-                            (("dwarfs",) if mp == paths.dwarfs_mount else ("overlay",)))):
-                raise ConfigError(f"refusing foreign mount at {mp}: {entry.fstype} from {entry.source}")
+            MountEngine._check_entry(paths, mp, entry)
             if fuse_alive(mp):
                 results.append(True)
             else:
                 results.append(False)
                 stale.append(mp)
         return MountStatus(results[0], results[1], tuple(stale))
+
+    @staticmethod
+    def _check_entry(paths: GamePaths, mp: Path, entry: MountEntry) -> None:
+        expected = (MountEngine.FSTYPE_DWARFS if mp == paths.dwarfs_mount
+                    else MountEngine.FSTYPE_OVERLAY)
+        if entry.fstype not in expected or (entry.fstype == "fuse" and
+                "dwarfs" not in entry.source.lower()):
+            raise ConfigError(f"refusing foreign mount at {mp}: {entry.fstype} from {entry.source}")
 
     # -- helpers ----------------------------------------------------------
     @staticmethod
@@ -2579,11 +2502,11 @@ class MountEngine:
             args.append("-z")
         args.append(str(mp))
         r = run_cmd(args, timeout=10.0)
-        if r.ok:
+        if not mount_table(force=True).is_mount(mp):
             return True
         # umount(8) works for FUSE mounts owned by the caller on modern util-linux.
         r2 = run_cmd(["umount", *(["-l"] if lazy else []), str(mp)], timeout=10.0)
-        if r2.ok:
+        if not mount_table(force=True).is_mount(mp):
             return True
         Log.debug(f"detach {mp}: {r.message} / {r2.message}")
         return not mount_table(force=True).is_mount(mp)
@@ -2643,17 +2566,15 @@ class MountEngine:
 
     @staticmethod
     def _overlay_argv(paths: GamePaths) -> list[str]:
-        lower = _fuse_escape(str(paths.dwarfs_mount))
-        upper = _fuse_escape(str(paths.overlay_upper))
-        work = _fuse_escape(str(paths.overlay_work))
+        # The caller supplies these temporary relative symlinks. The overlay
+        # parser splits lowerdir on ':' and consumes backslashes twice; quoted
+        # absolute paths cannot represent all valid Linux directory names.
         return [
             "fuse-overlayfs",
-            "-o", f"lowerdir={lower}",
-            "-o", f"upperdir={upper}",
-            "-o", f"workdir={work}",
-            "-o", "noacl",       # avoids EOPNOTSUPP storms on tmpfs/zram uppers
-            "-o", "auto_unmount",
-            "-o", "clone_fd",
+            "-o", "lowerdir=lower",
+            "-o", "upperdir=upper",
+            "-o", "workdir=work",
+            "-o", "noacl",
             str(paths.overlay_dir),
         ]
 
@@ -2661,11 +2582,33 @@ class MountEngine:
     @classmethod
     def mount(cls, prof: Profile, paths: GamePaths, *, dry_run: bool = False) -> bool:
         if not paths.uses_dwarfs:
-            Log.debug(f"[{prof.pid}] no dwarfs image declared -- running from game_dir")
             return True
+        if dry_run:
+            return cls._mount_impl(prof, paths, dry_run=True)
+        # Roll back only layers created by this attempt. This also covers a
+        # helper publishing its mount before failing or being interrupted.
+        before = {mp: mount_table(force=True).get(mp)
+                  for mp in (paths.overlay_dir, paths.dwarfs_mount)}
+        completed = False
+        try:
+            completed = cls._mount_impl(prof, paths)
+            return completed
+        finally:
+            if not completed:
+                with fatal_signal_guard(ignore=True):
+                    for mp, previous in before.items():
+                        entry = mount_table(force=True).get(mp)
+                        if entry is None or (previous and entry.mount_id == previous.mount_id):
+                            continue
+                        cls._check_entry(paths, mp, entry)
+                        if not cls._detach(mp):
+                            Log.error(f"mount rollback could not detach {mp}")
+                            break  # Do not detach a lower still used by its union.
 
+    @classmethod
+    def _mount_impl(cls, prof: Profile, paths: GamePaths, *, dry_run: bool = False) -> bool:
         storage = prof.sect("storage")
-        timeout = float(prof.get("runner.mount_timeout_s", 20.0) or 20.0)
+        timeout = float(prof.get("runner.mount_timeout_s", 20.0))
         st = cls.status(paths, refresh=True)
 
         if dry_run:
@@ -2678,8 +2621,17 @@ class MountEngine:
                 + ", ".join(str(p) for p in st.stale)
                 + " -- recovering"
             )
-            for mp in reversed(st.stale):
-                cls._detach(mp, lazy=True)
+            # A stale lower invalidates the union even if its statfs answers.
+            targets = ([paths.overlay_dir, paths.dwarfs_mount]
+                       if paths.dwarfs_mount in st.stale else list(reversed(st.stale)))
+            for mp in targets:
+                if not cls._detach(mp, lazy=True):
+                    raise ConfigError(f"could not recover stale mount {mp}")
+            st = cls.status(paths, refresh=True)
+
+        if st.overlay and not st.dwarfs:
+            if not cls._detach(paths.overlay_dir):
+                raise ConfigError("cannot rebuild lower while its union is still mounted")
             st = cls.status(paths, refresh=True)
 
         if st.state is MountState.MOUNTED:
@@ -2714,7 +2666,7 @@ class MountEngine:
 
         # A workdir left over from an unclean shutdown makes fuse-overlayfs
         # refuse to mount; it is by definition disposable state.
-        if not st.dwarfs and prof.get("storage.auto_clean_workdir", True):
+        if not st.overlay and prof.get("storage.auto_clean_workdir", True):
             cls._purge_workdir(paths.overlay_work)
 
         if not st.dwarfs:
@@ -2735,25 +2687,26 @@ class MountEngine:
                 return False
             if not cls._wait_ready(paths.dwarfs_mount, timeout):
                 Log.error(f"dwarfs mount did not become ready within {timeout}s")
-                cls._detach(paths.dwarfs_mount)
                 return False
 
         if not st.overlay:
             if not have("fuse-overlayfs"):
                 Log.error("fuse-overlayfs not installed (pacman -S fuse-overlayfs)")
-                cls._detach(paths.dwarfs_mount)
                 return False
             argv = cls._overlay_argv(paths)
             Log.info(f"fuse-overlayfs: union -> {paths.overlay_dir}")
-            r = run_cmd(argv, timeout=30.0)
+            RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="overlay-paths-", dir=RUNTIME_DIR) as tmp:
+                for name, target in (("lower", paths.dwarfs_mount),
+                                     ("upper", paths.overlay_upper),
+                                     ("work", paths.overlay_work)):
+                    (Path(tmp) / name).symlink_to(target, target_is_directory=True)
+                r = run_cmd(argv, cwd=tmp, timeout=30.0)
             if not r.ok:
                 Log.error(f"fuse-overlayfs mount failed: {r.message}")
-                cls._detach(paths.dwarfs_mount)
                 return False
             if not cls._wait_ready(paths.overlay_dir, timeout):
                 Log.error(f"union mount did not become ready within {timeout}s")
-                cls._detach(paths.overlay_dir)
-                cls._detach(paths.dwarfs_mount)
                 return False
 
         Log.ok(f"{prof.name} mounted at {paths.overlay_dir}")
@@ -2770,10 +2723,14 @@ class MountEngine:
         ok = True
         # Strict order: union first (it holds the lower open), then the image.
         for mp in (paths.overlay_dir, paths.dwarfs_mount):
-            if mount_table(force=True).is_mount(mp) and not cls._detach(mp):
+            entry = mount_table(force=True).get(mp)
+            if entry is None:
+                continue
+            cls._check_entry(paths, mp, entry)
+            if not cls._detach(mp):
                 ok = False
-                if not quiet:
-                    Log.warn(f"could not detach {mp}")
+                Log.warn(f"could not detach {mp}; leaving the remaining stack intact")
+                break
         if ok and prof.get("storage.auto_clean_workdir", True):
             if not mount_table(force=True).is_mount(paths.overlay_dir):
                 cls._purge_workdir(paths.overlay_work)
@@ -2879,6 +2836,14 @@ def file_lock(path: Path, *, timeout: float = 120.0) -> Iterator[None]:
         with suppress(OSError):
             fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
+
+
+def mount_lock_keys(paths: GamePaths) -> list[str]:
+    if not paths.uses_dwarfs:
+        return []
+    return sorted({"mount-" + _slug(os.path.realpath(mp)) for mp in
+                   (paths.dwarfs_mount, paths.overlay_dir,
+                    paths.overlay_upper, paths.overlay_work)})
 
 
 class SyncMode(StrEnum):
@@ -3383,7 +3348,13 @@ class WinePrefix:
             self.serverwait(env)
 
     def shutdown(self) -> None:
-        run_cmd([self.server_bin, "-k"], env=self.base_env(), timeout=15.0)
+        env = self.base_env()
+        killed = run_cmd([self.server_bin, "-k"], env=env, timeout=15.0)
+        waited = run_cmd([self.server_bin, "-w"], env=env, timeout=15.0)
+        # -k returns 1 when the server has already exited. The wait is the
+        # authoritative result, including that normal no-server case.
+        if not waited.ok:
+            Log.warn(f"Wine prefix shutdown incomplete: {waited.message}; kill result: {killed.message}")
 
     def set_graphics_driver(self, driver: str, env: Mapping[str, str]) -> None:
         """Select Wine's GDI backend for this prefix when explicitly requested."""
@@ -3678,7 +3649,7 @@ class EnvironmentBuilder:
         self._drop(
             "__NV_PRIME_RENDER_OFFLOAD", "__GLX_VENDOR_LIBRARY_NAME",
             "__VK_LAYER_NV_optimus", "DRI_PRIME", "MESA_LOADER_DRIVER_OVERRIDE",
-            "AMD_VULKAN_ICD",
+            "AMD_VULKAN_ICD", "__NV_PRIME_RENDER_OFFLOAD_PROVIDER",
         )
         match gpu.vendor:
             case "nvidia":
@@ -3690,7 +3661,6 @@ class EnvironmentBuilder:
                     self._set("__NV_PRIME_RENDER_OFFLOAD", "1")
                     self._set("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
                     self._set("__VK_LAYER_NV_optimus", "NVIDIA_only")
-                    self._set("__NV_PRIME_RENDER_OFFLOAD_PROVIDER", "NVIDIA-G0")
                 self._set("__GL_THREADED_OPTIMIZATIONS",
                           "1" if gfx.get("gl_threaded", True) else "0")
                 self._set("__GL_MaxFramesAllowed", "1")   # lower input latency
@@ -3706,7 +3676,6 @@ class EnvironmentBuilder:
                 # DXVK/VKD3D and has no ray-tracing parity on RDNA2/3).
                 if any("amdvlk" in i.library for i in vulkan_icds()):
                     self._set("AMD_VULKAN_ICD", "RADV")
-                self._set("MESA_LOADER_DRIVER_OVERRIDE", "radeonsi")
                 if hybrid:
                     self._set("DRI_PRIME", gpu.dri_prime)
                 self._set("mesa_glthread",
@@ -3718,10 +3687,7 @@ class EnvironmentBuilder:
                 if perftest:
                     self._set("RADV_PERFTEST", perftest)
             case "intel":
-                # There is no `xe` Gallium driver: `iris` is the GL driver for
-                # BOTH the i915 and xe kernel drivers. Forcing
-                # MESA_LOADER_DRIVER_OVERRIDE=xe yields a hard loader failure.
-                self._set("MESA_LOADER_DRIVER_OVERRIDE", "iris")
+                # Let Mesa choose its driver for the discovered hardware.
                 self._set("mesa_glthread",
                           "true" if gfx.get("gl_threaded", True) else "false")
                 self._set("ANV_ENABLE_PIPELINE_CACHE", "1")
@@ -4444,7 +4410,6 @@ class PipelineBuilder:
     # -- sandbox ----------------------------------------------------------
     def bwrap_argv(self, workdir: Path) -> list[str]:
         sb = self.p.sect("sandbox")
-        uid = os.getuid()
         argv: list[str] = [
             "bwrap",
             "--die-with-parent",     # no orphaned sandbox if the runner dies
@@ -4491,29 +4456,36 @@ class PipelineBuilder:
             argv += ["--ro-bind-try", "/sys/dev/char", "/sys/dev/char"]
             argv += ["--ro-bind-try", "/sys/bus/pci/devices", "/sys/bus/pci/devices"]
         if bool(sb.get("bind_audio", True)):
-            for sock in (f"/run/user/{uid}/pipewire-0", f"/run/user/{uid}/pulse"):
-                if os.path.exists(sock):
-                    argv += ["--ro-bind-try", sock, sock]
+            for endpoint in (XDG_RUNTIME_DIR / "pipewire-0", XDG_RUNTIME_DIR / "pulse"):
+                if endpoint.exists():
+                    argv += ["--ro-bind-try", str(endpoint), str(endpoint)]
         if bool(sb.get("bind_wayland", True)):
-            wl = os.environ.get("WAYLAND_DISPLAY", "wayland-1")
-            sock = wl if os.path.isabs(wl) else f"/run/user/{uid}/{wl}"
-            argv += ["--ro-bind-try", sock, sock]
-            argv += ["--ro-bind-try", f"/run/user/{uid}/bus", f"/run/user/{uid}/bus"]
+            wl = os.environ.get("WAYLAND_DISPLAY", "")
+            if wl:
+                sock = Path(wl) if os.path.isabs(wl) else XDG_RUNTIME_DIR / wl
+                argv += ["--ro-bind-try", str(sock), str(sock)]
+            bus = XDG_RUNTIME_DIR / "bus"
+            argv += ["--ro-bind-try", str(bus), str(bus)]
         if not bool(sb.get("bind_network", False)):
             argv.append("--unshare-net")
         argv += ["--chdir", str(workdir), "--"]
         return argv
 
     # -- systemd transient scope ------------------------------------------
+    @property
+    def scope_unit(self) -> str:
+        return f"{ENGINE_SLUG}-{_slug(str(self.p.path.resolve()))}-{os.getpid()}.scope"
+
     def scope_argv(self) -> list[str]:
         if not bool(self.p.get("runner.use_systemd_scope", True)):
             return []
-        if not have("systemd-run") or not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
-            return []
+        if not have("systemd-run"):
+            raise ConfigError("systemd-run is required when runner.use_systemd_scope is enabled")
         perf = self.p.sect("performance")
-        unit = f"{ENGINE_SLUG}-{self.p.pid}-{os.getpid()}"
+        unit = self.scope_unit
         argv = [
             "systemd-run", "--user", "--scope", "--quiet", "--collect",
+            "--expand-environment=no",
             f"--unit={unit}",
             f"--slice={self.p.get('runner.scope_slice', 'app-games.slice')}",
             "-p", "Delegate=yes",
@@ -4652,15 +4624,47 @@ def _cpulist(cpus: Sequence[int]) -> str:
 _FATAL_SIGNALS: Final = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
 
 
+class SessionInterrupted(KeyboardInterrupt):
+    def __init__(self, signum: int) -> None:
+        self.signum = signum
+        super().__init__(f"caught {signal.Signals(signum).name}")
+
+
+@contextmanager
+def fatal_signal_guard(*, ignore: bool = False, defer: bool = False) -> Iterator[None]:
+    """Unwind startup on fatal signals; let teardown finish on repeated ones."""
+    pending = 0
+
+    def handler(signum: int, frame: Any) -> None:
+        nonlocal pending
+        if defer:
+            pending = pending or signum
+        elif not ignore:
+            raise SessionInterrupted(signum)
+
+    previous = {sig: signal.getsignal(sig) for sig in _FATAL_SIGNALS}
+    try:
+        for sig in previous:
+            signal.signal(sig, handler)
+        yield
+    finally:
+        for sig, old in previous.items():
+            signal.signal(sig, old)
+    if pending:
+        raise SessionInterrupted(pending)
+
+
 @dataclass(slots=True)
 class Supervisor:
     proc: subprocess.Popen[bytes]
     grace: float = 8.0
+    scope_unit: str = ""
     interrupted: int = 0
     _own_cgroup: Path | None = None
     _child_cgroup: Path | None = None
     _cgroup_probed: bool = False
     _pgid: int = -1
+    _scope_queried: bool = False
 
     def __post_init__(self) -> None:
         self._own_cgroup = cgroup_of(os.getpid())
@@ -4682,6 +4686,16 @@ class Supervisor:
         """
         if not self._cgroup_probed:
             cg = cgroup_of(self.proc.pid)
+            if self.scope_unit and (cg is None or cg.name != self.scope_unit):
+                cg = None
+                if self.proc.poll() is not None and not self._scope_queried:
+                    self._scope_queried = True
+                    result = run_cmd(["systemctl", "--user", "show", self.scope_unit,
+                                      "--property=ControlGroup", "--value"], timeout=3)
+                    if result.ok and result.out.strip().startswith("/"):
+                        candidate = SYSFS_CGROUP / result.out.strip().lstrip("/")
+                        if candidate.name == self.scope_unit and candidate.is_dir():
+                            cg = candidate
             if cg is not None and cg != self._own_cgroup and (cg / "cgroup.kill").exists():
                 self._child_cgroup = cg
                 Log.debug(f"child confined to delegated cgroup {cg}")
@@ -4734,7 +4748,10 @@ class Supervisor:
 
             leader_exited = False
             while True:
-                for key, _ in sel.select(timeout=0.25):
+                # Capture the scope while the leader exists; short-lived
+                # launchers may otherwise disappear before their children.
+                self.cgroup
+                for key, _ in sel.select(timeout=0.05 if not self._cgroup_probed else 0.25):
                     if key.data == "child":
                         self._reap()
                         sel.unregister(pidfd)
@@ -4768,13 +4785,17 @@ class Supervisor:
 
     def _wait_plain(self) -> int:
         try:
-            rc = self.proc.wait()
-            while self._workload_alive():
-                time.sleep(0.1)
-            return rc
-        except KeyboardInterrupt:
-            self.interrupted = int(signal.SIGINT)
-            return self._teardown()
+            with fatal_signal_guard():
+                while self.proc.poll() is None:
+                    self.cgroup
+                    time.sleep(0.05)
+                while self._workload_alive():
+                    time.sleep(0.1)
+                return self.proc.returncode
+        except KeyboardInterrupt as exc:
+            self.interrupted = int(getattr(exc, "signum", signal.SIGINT))
+            with fatal_signal_guard(ignore=True):
+                return self._teardown()
 
     def _reap(self) -> int:
         with suppress(Exception):
@@ -4881,6 +4902,7 @@ class GameSession:
         self.stack = ExitStack()
         self._stage = "startup"
         self._recorded = False
+        self._cleanup_failed = False
 
     # -- hooks ------------------------------------------------------------
     def hooks(self, phase: str, env: Mapping[str, str] | None = None) -> None:
@@ -4902,15 +4924,40 @@ class GameSession:
     # -- main -------------------------------------------------------------
     def run(self) -> int:
         try:
-            return self._run_impl()
+            with fatal_signal_guard():
+                rc = self._run_impl()
+            return 74 if self._cleanup_failed and rc == 0 else rc
         except BaseException as exc:
             if not self.opts.dry_run and not self._recorded:
-                rc = (130 if isinstance(exc, KeyboardInterrupt) else
+                rc = (128 + int(getattr(exc, "signum", signal.SIGINT)) if isinstance(exc, KeyboardInterrupt) else
                       78 if isinstance(exc, ConfigError) else
                       75 if isinstance(exc, TimeoutError) else 70)
                 self._record_session(rc, 0, stage=self._stage,
                                      error=str(exc) or type(exc).__name__)
+            if isinstance(exc, SessionInterrupted):
+                return 128 + exc.signum
             raise
+
+    @contextmanager
+    def _lifecycle(self) -> Iterator[None]:
+        try:
+            yield
+        finally:
+            with fatal_signal_guard(ignore=True):
+                self.stack.close()
+
+    def _unmount(self) -> None:
+        try:
+            if not MountEngine.unmount(self.p, self.paths, quiet=True):
+                self._cleanup_failed = True
+        except (ConfigError, OSError) as exc:
+            self._cleanup_failed = True
+            Log.error(f"mount cleanup failed: {exc}")
+        if self._cleanup_failed:
+            Log.error("mount cleanup incomplete; inspect the profile with the status command")
+            self._record_session(74, 0, stage="unmount", error="mount cleanup incomplete")
+        else:
+            self.hooks("post_unmount")
 
     def _run_impl(self) -> int:
         prof, opts = self.p, self.opts
@@ -4919,33 +4966,33 @@ class GameSession:
         if opts.reprovision:
             prof.cfg.setdefault("runtime", {}).setdefault("wine", {})["reprovision"] = True
 
-        with self.stack:
+        with self._lifecycle():
             # Profiles can name the same image, overlay and prefix. Serialize
             # ownership for the full launch, including teardown callbacks.
             if not opts.dry_run:
                 self._stage = "lock"
                 lock_keys = ["game-" + _slug(str(self.paths.game_dir.resolve()))]
                 if self.paths.uses_dwarfs:
-                    lock_keys.append("mount-" + _slug(str(self.paths.overlay_dir.resolve())))
+                    lock_keys.extend(mount_lock_keys(self.paths))
                 if prof.runtime in ("wine", "proton", "umu"):
                     lock_keys.append("session-prefix-" + _slug(str(self.paths.prefix_dir.resolve())))
                 for key in sorted(lock_keys):
                     self.stack.enter_context(file_lock(RUNTIME_DIR / f"{key}.lock", timeout=10))
+            # Automatic teardown applies to reused mounts as well. The
+            # explicit keep-mounted option is the way to retain a stack.
+            if (self.paths.uses_dwarfs and not opts.dry_run and
+                    bool(prof.get("runner.auto_unmount_on_exit", True)) and
+                    not opts.keep_mounted):
+                self.stack.callback(self._unmount)
             self._stage = "pre-mount hook"
             self.hooks("pre_mount")
             self._stage = "mount"
             if not opts.no_mount and bool(prof.get("runner.auto_mount", True)):
-                mount_was_ready = MountEngine.status(self.paths, refresh=True).state is MountState.MOUNTED
                 if not MountEngine.mount(prof, self.paths, dry_run=opts.dry_run):
                     Log.error("mount stage failed -- aborting")
                     if not opts.dry_run:
                         self._record_session(74, 0, stage="mount", error="mount stage failed")
                     return 74  # EX_IOERR
-                if bool(prof.get("runner.auto_unmount_on_exit", True)) and \
-                        not opts.keep_mounted and not opts.dry_run and not mount_was_ready:
-                    self.stack.callback(
-                        lambda: MountEngine.unmount(prof, self.paths, quiet=True)
-                    )
             self._stage = "post-mount hook"
             self.hooks("post_mount")
 
@@ -4954,16 +5001,11 @@ class GameSession:
 
             envb = EnvironmentBuilder(prof, self.paths, dry_run=opts.dry_run)
             self._stage = "environment"
-            try:
-                env = envb.build(under_gamescope=under_gs)
-            except (Exception, KeyboardInterrupt) as exc:
-                if envb.prefix is not None and not opts.dry_run:
-                    envb.prefix.shutdown()
-                if not opts.dry_run:
-                    self._record_session(78, 0, stage="environment", error=str(exc))
-                raise
-            if envb.prefix is not None and not opts.dry_run:
-                self.stack.callback(envb.prefix.shutdown)
+            # Register before provisioning can start a Wine server. Looking up
+            # prefix at teardown also covers interruption during env.build().
+            if not opts.dry_run:
+                self.stack.callback(lambda: envb.prefix.shutdown() if envb.prefix is not None else None)
+            env = envb.build(under_gamescope=under_gs)
 
             self._stage = "pipeline"
             try:
@@ -5033,38 +5075,42 @@ class GameSession:
             self._stage = "post-launch hook"
             self.hooks("post_launch", env)
 
-        self._stage = "post-unmount hook"
-        self.hooks("post_unmount")
         return rc
 
     def _spawn(self, argv: Sequence[str], workdir: Path,
                env: Mapping[str, str]) -> tuple[int, float]:
         started = time.monotonic()
-        try:
-            proc = subprocess.Popen(
-                list(argv),
-                cwd=str(workdir),
-                env=dict(env),
-                stdin=subprocess.DEVNULL,
-                # process_group=0 keeps the child in our *session* (so the
-                # terminal keeps working) but in its own process group, which
-                # makes killpg() precise. start_new_session would additionally
-                # detach the controlling terminal and break Ctrl-C reporting.
-                process_group=0,
-                close_fds=True,
-            )
-        except FileNotFoundError:
-            Log.error(f"executable not found: {argv[0]}")
-            return 127, 0.0
-        except PermissionError:
-            Log.error(f"permission denied: {argv[0]}")
-            return 126, 0.0
-        except OSError as exc:
-            Log.error(f"spawn failed: {exc}")
-            return 71, 0.0
+        # Python handlers defer termination until the child's cleanup callback
+        # is registered, without inheriting a blocked signal mask in the game.
+        with fatal_signal_guard(defer=True):
+            try:
+                proc = subprocess.Popen(
+                    list(argv),
+                    cwd=str(workdir),
+                    env=dict(env),
+                    stdin=subprocess.DEVNULL,
+                    # process_group=0 keeps the child in our *session* (so the
+                    # terminal keeps working) but in its own process group, which
+                    # makes killpg() precise. start_new_session would additionally
+                    # detach the controlling terminal and break Ctrl-C reporting.
+                    process_group=0,
+                    close_fds=True,
+                )
+            except FileNotFoundError:
+                Log.error(f"executable not found: {argv[0]}")
+                return 127, 0.0
+            except PermissionError:
+                Log.error(f"permission denied: {argv[0]}")
+                return 126, 0.0
+            except OSError as exc:
+                Log.error(f"spawn failed: {exc}")
+                return 71, 0.0
 
-        sup = Supervisor(proc, grace=float(self.p.get("runner.kill_grace_s", 8.0) or 8.0))
-        self.stack.callback(sup.kill_now)
+            scope_unit = next((token.removeprefix("--unit=") for token in argv
+                               if token.startswith("--unit=")), "") if argv[0] == "systemd-run" else ""
+            sup = Supervisor(proc, grace=float(self.p.get("runner.kill_grace_s", 8.0)),
+                             scope_unit=scope_unit)
+            self.stack.callback(sup.kill_now)
         rc = sup.wait()
         return rc, time.monotonic() - started
 
@@ -5127,7 +5173,7 @@ class GameSession:
 
 def _append_session_record(row: Mapping[str, Any]) -> None:
     """Keep an audit trail bounded without masking launch failures."""
-    with suppress(OSError):
+    with suppress(OSError, TimeoutError):
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         with file_lock(RUNTIME_DIR / "sessions.lock", timeout=5):
             log = STATE_DIR / "sessions.jsonl"
@@ -5198,9 +5244,9 @@ def collect_checks() -> list[Check]:
     krel = kernel_release()
 
     add(Check("kernel", "release",
-              Health.OK if krel >= (7, 1) else Health.WARN,
+              Health.OK if krel >= (7, 3) else Health.WARN,
               f"{uname.sysname} {uname.release} "
-              + ("" if krel >= (7, 1) else "(engine targets >= 7.1)")))
+              + ("" if krel >= (7, 3) else "(engine targets >= 7.3)")))
     gil_probe = getattr(sys, "_is_gil_enabled", None)
     build_kind = "gil" if (gil_probe is None or gil_probe()) else "free-threaded"
     add(Check("python", "interpreter", Health.OK,
@@ -6130,12 +6176,14 @@ def cmd_mount(mgr: ProfileManager, targets: Sequence[str], *, show_all: bool,
             rc = 78
             continue
         fn = MountEngine.unmount if unmount else MountEngine.mount
-        lock = RUNTIME_DIR / f"mount-{_slug(str(paths.overlay_dir.resolve()))}.lock"
+        locks = mount_lock_keys(paths)
         try:
             if dry_run:
                 worked = fn(p, paths, dry_run=True)
             else:
-                with file_lock(lock, timeout=10):
+                with ExitStack() as stack, fatal_signal_guard(defer=unmount):
+                    for key in locks:
+                        stack.enter_context(file_lock(RUNTIME_DIR / f"{key}.lock", timeout=10))
                     worked = fn(p, paths)
             if not worked:
                 rc = 74
@@ -6154,21 +6202,25 @@ def cmd_unmount_all(mgr: ProfileManager, *, dry_run: bool) -> int:
             paths = resolve_paths(p)
         except ConfigError:
             continue
-        lock = RUNTIME_DIR / f"mount-{_slug(str(paths.overlay_dir.resolve()))}.lock"
+        if not paths.uses_dwarfs:
+            continue
+        locks = mount_lock_keys(paths)
         try:
             if dry_run:
-                st = MountEngine.status(paths, refresh=True)
-                if st.state is MountState.UNMOUNTED:
+                table = mount_table(force=True)
+                if not any(table.is_mount(mp) for mp in (paths.overlay_dir, paths.dwarfs_mount)):
                     continue
-                Log.info(f"detaching {p.pid} ({st.state})")
+                Log.info(f"detaching {p.pid}")
                 if not MountEngine.unmount(p, paths, dry_run=True):
                     rc = 74
             else:
-                with file_lock(lock, timeout=10):
-                    st = MountEngine.status(paths, refresh=True)
-                    if st.state is MountState.UNMOUNTED:
+                with ExitStack() as stack, fatal_signal_guard(defer=True):
+                    for key in locks:
+                        stack.enter_context(file_lock(RUNTIME_DIR / f"{key}.lock", timeout=10))
+                    table = mount_table(force=True)
+                    if not any(table.is_mount(mp) for mp in (paths.overlay_dir, paths.dwarfs_mount)):
                         continue
-                    Log.info(f"detaching {p.pid} ({st.state})")
+                    Log.info(f"detaching {p.pid}")
                     if not MountEngine.unmount(p, paths):
                         rc = 74
             n += 1
@@ -6533,7 +6585,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return cmd_env(mgr, ns)
 
             case "run":
-                forwarded = [a for a in (ns.args or []) if a != "--"]
+                forwarded = list(ns.args or [])
                 prof = mgr.load(ns.profile, overrides=overrides_from_args(ns),
                                 use_cache=False)
                 opts = RunOptions(
@@ -6556,9 +6608,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         with suppress(OSError):
             sys.stdout.close()
         return 0
-    except KeyboardInterrupt:
-        Log.warn("interrupted")
-        return 130
+    except KeyboardInterrupt as exc:
+        Log.warn(str(exc) or "interrupted")
+        return 128 + int(getattr(exc, "signum", signal.SIGINT))
     except Exception as exc:
         Log.error(f"fatal: {exc!r}")
         if Log.level >= Verbosity.VERBOSE:
