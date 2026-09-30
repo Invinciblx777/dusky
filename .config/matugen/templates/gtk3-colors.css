@@ -135,10 +135,41 @@
 @define-color panel_bg_color {{colors.surface_container_high.default.hex}};
 @define-color panel_fg_color {{colors.on_surface.default.hex}};
 
-/* adw-gtk3 uses white text here; pair the generated accent with its foreground. */
-button.suggested-action,
-button.suggested-action label,
-button.suggested-action image {
+/* Solid accent buttons need the paired foreground; flat/disabled buttons
+ * retain the base theme's separate state colors. */
+button.suggested-action:not(.flat):not(:disabled),
+button.suggested-action:not(.flat):not(:disabled) label,
+button.suggested-action:not(.flat):not(:disabled) image {
+  color: @accent_fg_color;
+}
+
+/* Thunar paints solid named selection colors itself. adw-gtk3's normal view
+ * foreground is intended for translucent selections, so pair these explicitly. */
+.thunar .standard-view .view:selected {
+  color: @theme_selected_fg_color;
+}
+.thunar .standard-view .view:selected:backdrop {
+  color: @theme_unfocused_selected_fg_color;
+}
+
+/* Legacy custom-drawn widgets (including Disks' volume grid) use the generic
+ * widget node and draw a solid selection separately from their text/icons. */
+widget:selected:not(.view) {
+  color: @theme_selected_fg_color;
+}
+widget:selected:not(.view):backdrop {
+  color: @theme_unfocused_selected_fg_color;
+}
+
+/* These base-theme selections also use an opaque accent background. */
+.content-view .tile:selected,
+.content-view .tile:active,
+.content-view .tile:selected label,
+.content-view .tile:active label,
+.content-view .tile:selected image,
+.content-view .tile:active image,
+.terminal selection,
+.terminal text selection {
   color: @accent_fg_color;
 }
 
