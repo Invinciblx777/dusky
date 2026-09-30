@@ -2358,6 +2358,16 @@ style = "suggested"
 type = "exec"
 command = "kitty --class dusky_tui --title \"Matugen Theme Generator Settings\" --hold python3 $HOME/user_scripts/theme_matugen/config/tui_matugen.py"
 
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Firefox Theme & Websites"
+description = "Configure Firefox colors and opt-in website themes"
+icon = "web-browser-symbolic"
+style = "suggested"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_tui --title \"Firefox Theme & Websites\" --hold python3 $HOME/user_scripts/firefox/theme_matugen/tui_dusky_sites.py"
 
 [[pages.layout.items]]
 type = "navigation"
