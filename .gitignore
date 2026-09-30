@@ -22,3 +22,7 @@ __pycache__/
 *.pyo
 *.pyd
 .pytest_cache/
+
+# User-specific shell customizations 
+.zshrc.local
+.config/zshrc/custom/
