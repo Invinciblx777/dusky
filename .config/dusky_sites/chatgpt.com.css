@@ -9,5 +9,6 @@
     .scrollbar-stable { background-color: var(--surface) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1F.scrollbar-stable%1Fbg | bg: surface */
     div.absolute.inset-0.flex.bg-surface { background-color: var(--surface_dim) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1Fdiv.absolute.inset-0.flex.bg-surface%1Fbg | bg: surface_dim */
     .group\/sidebar-rail { background-color: var(--surface_container_low) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1F.group%5C%2Fsidebar-rail%1Fbg | bg: surface_container_low */
+    .z-20 { background-color: var(--surface_container_lowest) !important; color: var(--on_surface) !important; border-color: var(--outline_variant) !important; } /* dusky key=sel%1F.z-20%1Fbg | bg: surface_container_lowest */
     /* <<< dusky:picks */
 }
