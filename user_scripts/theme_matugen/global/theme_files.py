@@ -4,6 +4,33 @@ import os
 from pathlib import Path
 import tempfile
 import re
+import contextlib
+import fcntl
+
+
+@contextlib.contextmanager
+def publication_lock(kind: str):
+    """Keep process locks in runtime storage, separate from deployed dotfiles."""
+    root = Path(os.environ.get("XDG_RUNTIME_DIR") or
+                os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    directory = root / "dusky-theme"
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / f"{kind}.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def atomic_symlink(path: Path, target: Path) -> bool:
+    """Publish a portable, relative link; report whether its entry changed."""
+    relative = os.path.relpath(target, path.parent)
+    if path.is_symlink() and os.readlink(path) == relative:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f".{path.name}.", dir=path.parent) as temporary:
+        link = Path(temporary) / "link"
+        link.symlink_to(relative)
+        os.replace(link, path)
+    return True
 
 
 def atomic_write(path: Path, content: str) -> None:
@@ -44,6 +71,8 @@ def merge_groups(content: str, entries: dict[str, dict[str, str]]) -> str:
             key, equals, _ = line.partition("=")
             if equals and key.strip() in entries[group]:
                 name = key.strip()
+                if name in written[group]:
+                    continue
                 line = f"{key}={entries[group][name]}\n"
                 written[group].add(name)
         out.append(line if line.endswith("\n") else line + "\n")

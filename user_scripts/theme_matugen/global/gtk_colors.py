@@ -8,14 +8,12 @@ GTK4/libadwaita user CSS is also cached; its new palette applies on app restart.
 
 from __future__ import annotations
 
-import fcntl
 import os
 from pathlib import Path
-import re
 import sys
 
 import gi
-from theme_files import atomic_write
+from theme_files import atomic_write, publication_lock, merge_groups
 
 
 def validate(version: str, palette: str) -> None:
@@ -39,8 +37,7 @@ def publish(version: str) -> None:
     config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     data = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
     # Serialize publication and selection, including simultaneous Matugen hooks.
-    with (config / "matugen" / ".gtk-colors.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with publication_lock("gtk"):
         palette = (config / "matugen/generated" / f"gtk-{version}.css").read_text()
         validate(version, palette)
         gtk = config / f"gtk-{version}.0"
@@ -73,10 +70,7 @@ def publish(version: str) -> None:
         atomic_write(gtk / "gtk.css", "/* Matugen colors live in the reloadable dusky-matugen GTK3 theme. */\n")
         ini = gtk / "settings.ini"
         content = ini.read_text() if ini.exists() else "[Settings]\n"
-        if re.search(r"^gtk-theme-name\s*=", content, re.M):
-            content = re.sub(r"^gtk-theme-name\s*=.*$", f"gtk-theme-name={selected}", content, flags=re.M)
-        else:
-            content = content.replace("[Settings]", f"[Settings]\ngtk-theme-name={selected}", 1)
+        content = merge_groups(content, {"Settings": {"gtk-theme-name": selected}})
         atomic_write(ini, content)
         if not settings.set_string("gtk-theme", selected):
             raise RuntimeError("Cannot update the GTK theme setting")

@@ -2,7 +2,6 @@
 """Validate and atomically publish Matugen's Qt palettes and Kvantum assets."""
 
 import configparser
-import fcntl
 import os
 from pathlib import Path
 import re
@@ -10,14 +9,13 @@ import sys
 import tempfile
 import xml.etree.ElementTree as ET
 
-from theme_files import atomic_write
+from theme_files import atomic_write, atomic_symlink, publication_lock
 
 
 def publish(kind: str) -> None:
     config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     generated = config / "matugen/generated"
-    with (config / "matugen/.qt-colors.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with publication_lock("qt"):
         if kind in ("qt5ct", "qt6ct"):
             text = (generated / f"{kind}-colors.conf").read_text()
             scheme = configparser.ConfigParser(interpolation=None)
@@ -36,7 +34,8 @@ def publish(kind: str) -> None:
                 lines.append(f"{group}=" + ", ".join(colors))
             text = "\n".join(lines) + "\n"
             directory = config / kind
-            target = directory / "colors/matugen.conf"
+            link = directory / "colors/matugen.conf"
+            target = config / "matugen/published" / f"{kind}-colors.conf"
         else:
             suffix = "kvconfig" if kind == "kvantum_kvconfig" else "svg"
             text = (generated / f"kvantum-matugen.{suffix}").read_text()
@@ -57,9 +56,13 @@ def publish(kind: str) -> None:
                             raise ValueError(f"Invalid Kvantum color: {key}")
             target = config / "Kvantum/matugen" / f"matugen.{suffix}"
 
-        if not target.is_symlink() and target.exists() and target.read_text() == text:
+        changed = target.is_symlink() or not target.exists() or target.read_text() != text
+        if changed:
+            atomic_write(target, text)
+        if kind in ("qt5ct", "qt6ct"):
+            changed = atomic_symlink(link, target) or changed
+        if not changed:
             return
-        atomic_write(target, text)
         if kind in ("qt5ct", "qt6ct"):
             # qtct watches this directory, not colors/ or its symlink target.
             # A transient entry triggers its 3-second reload timer

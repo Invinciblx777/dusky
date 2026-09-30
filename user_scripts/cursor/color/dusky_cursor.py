@@ -49,8 +49,8 @@ glibc >= 2.28 (renameat2). Nothing is hardcoded: theme, colors, sizes,
 paths and user are derived from the matugen output, gsettings, Hyprland
 IPC and the XDG base-directory spec.
 
-Exit codes: 0 ok / nothing to do, 1 hard failure (source missing, build
-failed, compositor or persistent Lua layer failed), 2 usage, 130 SIGINT.
+Exit codes: 0 ok / nothing to do, 1 failure (invalid palette, source missing,
+build failed or any apply layer failed), 2 usage, 130 SIGINT.
 
 Usage:
     dusky_cursor.py --apply        # matugen post_hook entrypoint (default)
@@ -83,6 +83,10 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+
+# Share the GTK settings lock with the color publisher. Both update settings.ini.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "theme_matugen/global"))
+from theme_files import publication_lock, merge_groups
 
 try:
     from PIL import Image, ImageMath
@@ -331,11 +335,15 @@ def rel_luma(rgb: RGB) -> float:
 
 
 def read_env_file(path: Path) -> dict[str, str]:
-    out: dict[str, str] = {}
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
-        return out
+        return {}
+    return parse_env_text(text)
+
+
+def parse_env_text(text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
@@ -393,7 +401,16 @@ def load_theme_size() -> tuple[str | None, int | None]:
 
 def load_palette() -> Palette:
     """matugen env > dusky_tui.json > fallback, with optional cursor.conf overrides."""
-    env = read_env_file(MATUGEN_ENV)
+    try:
+        text = MATUGEN_ENV.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        env = {}  # Before the first Matugen run, retain the initial defaults.
+    else:
+        env = parse_env_text(text)
+        if (not text.endswith("# dusky-cursor-complete\n") or
+                not all(valid_hex(env.get(key)) for key in
+                        ("DUSKY_CURSOR_ACCENT", "DUSKY_CURSOR_BACKGROUND"))):
+            raise ValueError("Incomplete or invalid Matugen cursor palette; retaining installed cursors")
     conf = read_env_file(CURSOR_CONF)
 
     # Custom color overrides from cursor.conf (accept valid hex, ignore "default", empty, etc.)
@@ -448,9 +465,10 @@ def load_palette() -> Palette:
 
 def apply_palette_overrides(pal: Palette, args: argparse.Namespace) -> Palette:
     """CLI --base/--border/--accent/--watch-bg overrides."""
-    accent = getattr(args, "accent", None) or pal.accent
-    fill = getattr(args, "base", None) or pal.deep_accent
-    border = getattr(args, "border", None) or pal.outline
+    accent_override = getattr(args, "accent", None)
+    accent = accent_override or pal.accent
+    fill = getattr(args, "base", None) or (derive_deep_accent(accent) if accent_override else pal.deep_accent)
+    border = getattr(args, "border", None) or (accent if accent_override else pal.outline)
     bg = getattr(args, "watch_bg", None) or pal.background
     if (accent, fill, border, bg) == (pal.accent, pal.deep_accent, pal.outline, pal.background):
         return pal
@@ -857,7 +875,7 @@ def apply_gsettings(theme: str, size: int) -> bool:
 
 
 def apply_dbus_env(theme: str, size: int) -> bool:
-    if not have("dbus-update-activation-environment"):
+    if not os.environ.get("DBUS_SESSION_BUS_ADDRESS") or not have("dbus-update-activation-environment"):
         return True
     r = run(["dbus-update-activation-environment", "--systemd",
              f"XCURSOR_SIZE={size}", f"HYPRCURSOR_SIZE={size}",
@@ -954,10 +972,12 @@ def update_default_index(theme: str) -> bool:
         return False
 
 
-_GTK_KEY_RE = re.compile(r"^\s*(gtk-cursor-theme-(?:name|size))\s*=")
-
-
 def update_gtk_settings(theme: str, size: int) -> bool:
+    with publication_lock("gtk"):
+        return _update_gtk_settings(theme, size)
+
+
+def _update_gtk_settings(theme: str, size: int) -> bool:
     ok = True
     values = {"gtk-cursor-theme-name": theme, "gtk-cursor-theme-size": str(size)}
     for name in ("gtk-3.0", "gtk-4.0"):
@@ -966,24 +986,7 @@ def update_gtk_settings(theme: str, size: int) -> bool:
             current = path.read_text(encoding="utf-8") if path.is_file() else ""
         except OSError:
             current = ""
-        lines = current.splitlines()
-        if not any(line.strip() == "[Settings]" for line in lines):
-            lines.insert(0, "[Settings]")
-        seen: set[str] = set()
-        kept: list[str] = []
-        for line in lines:
-            if m := _GTK_KEY_RE.match(line):
-                key = m.group(1)
-                if key in seen:
-                    continue  # drop duplicate keys - GTK's key-file parser would error
-                seen.add(key)
-                line = f"{key}={values[key]}"
-            kept.append(line)
-        idx = next(i for i, line in enumerate(kept) if line.strip() == "[Settings]")
-        for key, val in values.items():
-            if key not in seen:
-                kept.insert(idx + 1, f"{key}={val}")
-        text = "\n".join(kept) + "\n"
+        text = merge_groups(current, {"Settings": values})
         if text == current:
             continue
         try:
@@ -995,15 +998,14 @@ def update_gtk_settings(theme: str, size: int) -> bool:
 
 
 def apply_all(theme: str, size: int, nudge: bool) -> bool:
-    """Apply every layer; returns False only for failures that matter
-    (live compositor inside Hyprland, persistent Lua env)."""
+    """Apply every layer and report partial application as a failure."""
     ok_compositor = apply_compositor(theme, size, nudge)
-    apply_gsettings(theme, size)
-    apply_dbus_env(theme, size)
+    ok_settings = apply_gsettings(theme, size)
+    ok_environment = apply_dbus_env(theme, size)
     ok_persist = persist_lua_env(theme, size)
-    update_default_index(theme)
-    update_gtk_settings(theme, size)
-    return ok_compositor and ok_persist
+    ok_default = update_default_index(theme)
+    ok_gtk = update_gtk_settings(theme, size)
+    return all((ok_compositor, ok_settings, ok_environment, ok_persist, ok_default, ok_gtk))
 
 
 # ---------------------------------------------------------------------------
@@ -1021,7 +1023,6 @@ def _locate_source(source_name: str) -> Path | None:
 
 
 def do_apply(args: argparse.Namespace, source_name: str) -> int:
-    pal = apply_palette_overrides(load_palette(), args)
     conf_theme, conf_size = load_theme_size()
     theme = getattr(args, "theme", None) or conf_theme or THEME_NAME
     size = args.size or conf_size or detect_size()
@@ -1041,6 +1042,7 @@ def do_apply(args: argparse.Namespace, source_name: str) -> int:
         print(f"Applied {theme} cursor @ {size}px")
         return 0
 
+    pal = apply_palette_overrides(load_palette(), args)
     log.info("Dusky Cursor: outline=%s base=%s watch_bg=%s accent=%s mode=%s size=%dpx (%s)",
              pal.outline, pal.deep_accent, pal.background, pal.accent, pal.mode, size, pal.origin)
 
@@ -1176,9 +1178,10 @@ def do_pick(args: argparse.Namespace, source_name: str) -> int:
     base = pick_one("Base fill", pal.deep_accent, pal.accent)
     border = pick_one("Border outline", pal.outline, pal.accent)
     print(f"\nBase: {_swatch(base)}  Border: {_swatch(border)}")
-    set_conf_key("BASE", base)
-    set_conf_key("BORDER", border)
-    set_conf_key("THEME", "Dusky")
+    if not args.dry_run:
+        set_conf_key("BASE", base)
+        set_conf_key("BORDER", border)
+        set_conf_key("THEME", "Dusky")
     args.base = base
     args.border = border
     args.theme = "Dusky"
@@ -1342,7 +1345,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    setup_logging(args.quiet, args.verbose, log_file=args.action not in ("status", "check"))
+    setup_logging(args.quiet, args.verbose,
+                  log_file=not args.dry_run and args.action not in ("status", "check"))
     source_name = args.source or os.environ.get("DUSKY_CURSOR_SOURCE", "").strip() or DEFAULT_SOURCE_THEME
     if not THEME_NAME_RE.fullmatch(source_name):
         log.error("Invalid source theme name %r", source_name)
@@ -1354,21 +1358,21 @@ def main(argv: list[str] | None = None) -> int:
             case "check":
                 return do_check(source_name)
             case "restore":
-                with exclusive_lock(LOCK_FILE):
+                with contextlib.nullcontext() if args.dry_run else exclusive_lock(LOCK_FILE):
                     return do_restore(args, source_name)
             case "pick":
-                with exclusive_lock(LOCK_FILE):
+                with contextlib.nullcontext() if args.dry_run else exclusive_lock(LOCK_FILE):
                     return do_pick(args, source_name)
             case "reset-colors":
-                with exclusive_lock(LOCK_FILE):
+                with contextlib.nullcontext() if args.dry_run else exclusive_lock(LOCK_FILE):
                     return do_reset_colors(args, source_name)
             case _:
-                with exclusive_lock(LOCK_FILE):
+                with contextlib.nullcontext() if args.dry_run else exclusive_lock(LOCK_FILE):
                     return do_apply(args, source_name)
     except TimeoutError as e:
         log.error("%s", e)
         return 1
-    except OSError as e:
+    except (OSError, ValueError) as e:
         log.error("%s", e)
         return 1
     except KeyboardInterrupt:
@@ -1377,4 +1381,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

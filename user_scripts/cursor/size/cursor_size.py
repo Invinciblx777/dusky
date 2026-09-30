@@ -64,6 +64,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "theme_matugen/global"))
+from theme_files import publication_lock, merge_groups
+
 # ---------------------------------------------------------------------------
 # Dynamic, relocatable locations — XDG spec, no hardcoded $HOME / usernames.
 # ---------------------------------------------------------------------------
@@ -92,7 +95,7 @@ CACHE_HOME = _cache_home()
 USER_ENV_LUA = CONFIG_HOME / "hypr" / "edit_here" / "source" / "environment_variables.lua"
 BASE_ENV_LUA = CONFIG_HOME / "hypr" / "source" / "environment_variables.lua"
 STATE_FILE = CACHE_HOME / "hypr-cursor-size"
-LOCK_FILE = CACHE_HOME / "hypr-cursor-size.lock"
+LOCK_FILE = Path(os.environ.get("XDG_RUNTIME_DIR") or CACHE_HOME) / "dusky-cursor.lock"
 CURSOR_CONF = CONFIG_HOME / "dusky" / "settings" / "cursor.conf"
 
 # Sane universal bounds (freedesktop/XCursor convention, not machine-specific).
@@ -512,15 +515,17 @@ def apply_dbus_env(size: int) -> None:
 ENV_KEYS = ("XCURSOR_SIZE", "HYPRCURSOR_SIZE", "XCURSOR_THEME", "HYPRCURSOR_THEME")
 
 
-_GTK_CURSOR_KEY_RE = re.compile(r"^\s*(gtk-cursor-theme-(?:name|size))\s*=")
-
-
 def apply_gtk_settings(theme: str, size: int) -> bool:
     """Sync GTK settings.ini cursor keys (gtk-3.0/gtk-4.0). Best-effort.
 
     Kept in sync with dusky_cursor.update_gtk_settings so keypress steps
     never leave stale values behind for GTK apps.
     """
+    with publication_lock("gtk"):
+        return _apply_gtk_settings(theme, size)
+
+
+def _apply_gtk_settings(theme: str, size: int) -> bool:
     ok = True
     values = {"gtk-cursor-theme-name": theme, "gtk-cursor-theme-size": str(size)}
     for name in ("gtk-3.0", "gtk-4.0"):
@@ -529,29 +534,7 @@ def apply_gtk_settings(theme: str, size: int) -> bool:
             current = path.read_text(encoding="utf-8") if path.is_file() else ""
         except OSError:
             current = ""
-        lines = current.splitlines()
-        if not any(line.strip() == "[Settings]" for line in lines):
-            lines.insert(0, "[Settings]")
-        seen: set[str] = set()
-        kept: list[str] = []
-        for line in lines:
-            m = _GTK_CURSOR_KEY_RE.match(line)
-            if m:
-                key = m.group(1)
-                if key in seen:
-                    continue  # drop duplicates - GTK's key-file parser would error
-                seen.add(key)
-                line = f"{key}={values[key]}"
-            kept.append(line)
-        try:
-            idx = next(i for i, line in enumerate(kept) if line.strip() == "[Settings]")
-        except StopIteration:  # unreachable ([Settings] inserted above), kept for safety
-            kept.insert(0, "[Settings]")
-            idx = 0
-        for key, val in values.items():
-            if key not in seen:
-                kept.insert(idx + 1, f"{key}={val}")
-        text = "\n".join(kept) + "\n"
+        text = merge_groups(current, {"Settings": values})
         if text == current:
             continue
         try:
@@ -770,7 +753,8 @@ def main(argv: list[str] | None = None) -> int:
         print(target)
         return 0
 
-    # Serialize concurrent key-repeat invocations (Linux flock).
+    # Serialize key repeats and color builds, which also publish cursor size
+    # and the same persistent environment/preferences.
     try:
         LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
         lock_fh = LOCK_FILE.open("w")

@@ -6,12 +6,11 @@ pinned KColorScheme still need to reopen; a broadcast cannot clear their cache.
 """
 
 import configparser
-import fcntl
 import os
 from pathlib import Path
 import re
 
-from theme_files import atomic_write, merge_groups
+from theme_files import atomic_write, merge_groups, publication_lock
 
 COLOR_GROUPS = tuple(f"Colors:{name}" for name in
                      ("Button", "Complementary", "Header", "Selection", "Tooltip", "View", "Window"))
@@ -66,8 +65,7 @@ def notify(entries):
 def publish():
     config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     data = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
-    with (config / "matugen/.kde-colors.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with publication_lock("kde"):
         text = (config / "matugen/generated/kdeglobals").read_text()
         entries = read_scheme(text)
         scheme_path = data / "color-schemes/Matugen.colors"
