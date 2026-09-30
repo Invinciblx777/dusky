@@ -34,16 +34,17 @@ import urllib.request
 from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
 from compression import zstd  # noqa: F401  PEP 784: tarfile "w:zst" / "r|*" need it; fail fast if absent
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import NoReturn
 
 # ═══════════════════════════════════ configuration ═══════════════════════════════════
-VERSION = "8.0.2-py314-2026.09"
+VERSION = "8.0.3-py314-2026.09"
 REPO_NAME = "archrepo"
 DB_NAME = f"{REPO_NAME}.db.tar.zst"
 FILES_NAME = f"{REPO_NAME}.files.tar.zst"
+CUSTOM_PACKAGES_FILE = "custom_packages.txt"
 AUR_RPC = "https://aur.archlinux.org/rpc/v5/info"
 AUR_RPC_BATCH = 80
 MAX_RPC_BYTES = 4 << 20
@@ -1095,6 +1096,16 @@ def prune_repo(repo: Path, keep: Collection[str]) -> None:
         ok(f"pruned {removed} file(s) from {repo}, freed {human_bytes(freed)}")
 
 
+def custom_package_names(repo: Path) -> set[str]:
+    manifest = repo / CUSTOM_PACKAGES_FILE
+    if not manifest.is_file():
+        return set()
+    names = set(manifest.read_text(encoding="utf-8").splitlines())
+    if any(not PKGNAME_RE.fullmatch(name) for name in names):
+        die(f"invalid package name in {manifest}")
+    return names
+
+
 # ═══════════════════════════════ pacman helpers ═══════════════════════════════
 type ConfSections = list[tuple[str, list[tuple[str, str]]]]
 
@@ -1835,6 +1846,7 @@ def aur_phase(db: IsolatedDB, master: Sequence[str], repo: Path, official: Path,
     seeds = [*AUR_SEED, *(n for n in unresolved if is_aur_candidate(n))]
     builder = AurBuilder(db, repo, official if official.is_dir() else None, user)
     builder.run(seeds)
+    builder.keep_names.update(custom_package_names(repo) & builder.index.keys())
     finalize_aur_repo(db, repo, builder.official, builder.keep_names, user, builder.rebuilt_files)
 
     table = Table(title="AUR Summary", box=box.ROUNDED)
@@ -2142,6 +2154,44 @@ def build_local_packages(cfg: IsoConfig, user: RealUser) -> None:
         update_repo_db(repo, set(package_files(repo)))
 
 
+def publish_local_packages(cfg: IsoConfig, user: RealUser) -> None:
+    """Persist verified custom builds and their current metadata in the configured AUR repo."""
+    local = cfg.workspace / "local_repo"
+    if not (local / FILES_NAME).is_file():
+        return
+    if cfg.aur_repo is None:
+        die("custom packages require an AUR repository destination")
+    repo = cfg.aur_repo.resolve()
+    assert_conf_safe(repo)
+    repo.mkdir(parents=True, exist_ok=True)
+    entries = read_repo_db(local / FILES_NAME)
+    ensure_disk_space(repo, sum(e.csize for e in entries.values()), "custom package publication")
+    old = load_db_by_filename(repo)
+    names = custom_package_names(repo) | entries.keys()
+    # Record retention before copying so an interrupted publication cannot cause a subsequent
+    # AUR-only run to prune an already published custom build.
+    with atomic_path(repo / CUSTOM_PACKAGES_FILE) as tmp:
+        tmp.write_text("".join(f"{name}\n" for name in sorted(names)), encoding="utf-8")
+    fsync_dir(repo)
+    for entry in entries.values():
+        with atomic_path(repo / entry.filename) as tmp:
+            shutil.copyfile(local / entry.filename, tmp)
+        # These builds are unsigned; an old detached signature must not survive replacement.
+        (repo / f"{entry.filename}.sig").unlink(missing_ok=True)
+        old[entry.filename] = entry  # fresh metadata, even for equal-sized same-version rebuilds
+    winners = newest_files(package_files(repo))
+    winners.update((name, e.filename) for name, e in entries.items())
+    update_repo_db(repo, set(winners.values()), old, force_write=True)
+    # Remove only superseded custom versions, after the new index is durable.
+    for fn in package_files(repo):
+        if (parsed := parse_pkg_filename(fn)) is not None and parsed[0] in entries and fn != winners[parsed[0]]:
+            (repo / fn).unlink()
+            (repo / f"{fn}.sig").unlink(missing_ok=True)
+    fsync_dir(repo)
+    restore_ownership(repo, user)
+    ok(f"published {len(entries)} custom package(s) to {repo}")
+
+
 _copy_buf = threading.local()
 
 
@@ -2193,8 +2243,9 @@ def stage_iso_repo(cfg: IsoConfig) -> dict[str, DbEntry]:
                 merged[name] = (entry, cfg.aur_repo)
     local_repo = cfg.workspace / "local_repo"
     if (local_repo / FILES_NAME).is_file():
+        custom_names = custom_package_names(cfg.aur_repo) if cfg.aur_repo is not None else set()
         for name, entry in read_repo_db(local_repo / FILES_NAME).items():
-            if name in merged:
+            if name in merged and (name not in custom_names or merged[name][1] != cfg.aur_repo):
                 die(f"local ISO package {name} conflicts with an official or AUR package")
             merged[name] = (entry, local_repo)
     if not merged:
@@ -2374,8 +2425,7 @@ def iso_phase(cfg: IsoConfig, user: RealUser) -> tuple[Path, str]:
     if cfg.aur_repo is not None:
         assert_conf_safe(cfg.aur_repo)
         if not ensure_repo_db(cfg.aur_repo):
-            step(f"{cfg.aur_repo} holds no packages; ISO repo = official only")
-            cfg = replace(cfg, aur_repo=None)
+            step(f"{cfg.aur_repo} holds no packages yet")
     try:
         setup_clean_room(cfg)
         stage_payloads(cfg)
@@ -2383,6 +2433,7 @@ def iso_phase(cfg: IsoConfig, user: RealUser) -> tuple[Path, str]:
         inject_dotfiles(cfg)
         build_local_packages(cfg, user)
         entries = stage_iso_repo(cfg)
+        publish_local_packages(cfg, user)
         configure_iso_pacman_conf(cfg)
         sanitize_live_packages(cfg, entries)
         return build_iso_image(cfg, user)
@@ -2465,7 +2516,7 @@ def main(args: argparse.Namespace) -> None:
             workspace=workspace_base.expanduser().resolve() / "dusky_iso",
             source_dir=source_dir,
             official_repo=official_repo,
-            aur_repo=aur_repo if aur_repo.is_dir() else None,
+            aur_repo=aur_repo,
             final_dest=(args.output_dir or (ZRAM_CANDIDATE if zram else user.home / "dusky_isos"))
                        .expanduser().resolve(),
         )
