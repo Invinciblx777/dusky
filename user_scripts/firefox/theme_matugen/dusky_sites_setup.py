@@ -42,6 +42,8 @@ PREFS_TO_SET = [
     ("toolkit.legacyUserProfileCustomizations.stylesheets", "true"),
     ("extensions.autoDisableScopes", "0"),
     ("extensions.enabledScopes", "15"),
+    # Firefox 157 otherwise skips newly copied XPIs after a profile's first run.
+    ("extensions.startupScanScopes", "1"),  # AddonManager.SCOPE_PROFILE
 ]
 
 def atomic_write_text(path: Path, text: str) -> None:
@@ -403,6 +405,10 @@ def setup_user_chrome(home: Path, source_xpi: Path | None = None) -> bool:
     if installed_profiles > 0:
         print_success(f"Context menu styling injected into {installed_profiles} profile(s).")
     else:
+        has_profile_registry = any((base_dir / "profiles.ini").exists() for base_dir in browser_dirs)
+        if not seen_profiles and not has_profile_registry:
+            print_warn("Firefox has no profiles yet; per-profile preferences, stylesheets, and extension setup are deferred. Run this setup again after creating a Firefox profile.")
+            return True
         print_warn("No profile directories found for context menu styling.")
     if installed_xpis > 0:
         print_success(f"Signed XPI copied into {installed_xpis} browser profile(s).")
@@ -851,7 +857,21 @@ def main() -> None:
     if installed_count == 0:
         print_error("No native messaging manifests were installed.")
 
-    if source_xpi and source_xpi.is_file():
+    print_step("Provisioning native context menu, userChrome & profile XPI extensions...")
+    if installed_count != len(targets):
+        print_error("Native messaging registration was incomplete.")
+    if not setup_user_chrome(home, source_xpi):
+        print_error("Profile provisioning was incomplete; see the errors above.")
+
+    has_profiles = any(any(iter_firefox_profiles(base_dir))
+                       for base_dir in _profile_base_dirs(home) if base_dir.is_dir())
+    if not has_profiles:
+        # A first launch without user.js auto-disables global sideloads. Do not
+        # expose our XPI until the profile's autoDisableScopes preference is set.
+        # Remove copies left by an earlier unsuccessful fresh installation too.
+        uninstall_global_xpis(home)
+        print_warn("Global extension installation deferred until a Firefox profile has been provisioned.")
+    elif source_xpi and source_xpi.is_file():
         print_step("Installing signed WebExtension into global extension paths...")
         global_ext_dirs = [root / "extensions" / "{ec8030f7-c20a-464f-9b0e-13a3a9e97384}"
                            for root in _browser_data_dirs(home)]
@@ -865,12 +885,6 @@ def main() -> None:
                 print_warn(f"Could not copy XPI to {g_dir}: {e}")
         if g_count > 0:
             print_success(f"Signed XPI copied into {g_count} global extension path(s).")
-
-    print_step("Provisioning native context menu, userChrome & profile XPI extensions...")
-    if installed_count != len(targets):
-        print_error("Native messaging registration was incomplete.")
-    if not setup_user_chrome(home, source_xpi):
-        print_error("Profile provisioning was incomplete; see the errors above.")
 
     print(f"\n{C_GREEN}[+] Setup finished. Restart Firefox to load profile stylesheets and discover copied extensions.{C_RESET}")
     print("------------------------------------------------------------------")
