@@ -2904,7 +2904,7 @@ class WinePrefix:
 
     def base_env(self, extra: Mapping[str, str] | None = None) -> dict[str, str]:
         env = dict(os.environ)
-        env["WINEPREFIX"] = str(self.path)
+        env["WINEPREFIX"] = str(self.pfx)
         env["WINEARCH"] = self.arch
         env["WINEDEBUG"] = "-all"
         env["DISPLAY"] = env.get("DISPLAY", "")
@@ -3031,6 +3031,9 @@ class WinePrefix:
         syswow = self.drive_c / "windows" / "syswow64"
         if not sys32.is_dir():
             return 0
+        targets = [("x32" if self.arch == "win32" else "x64", sys32)]
+        if self.arch == "win64" and syswow.is_dir():
+            targets.append(("x32", syswow))
         linked = 0
         manifest = self.path / ".master-runner-dlls.json"
         managed: dict[str, str] = {}
@@ -3055,7 +3058,7 @@ class WinePrefix:
                     old_target = Path(os.path.realpath(dst))
                     known = (Path("/usr/share/dxvk"), Path("/usr/share/vkd3d"),
                              Path("/usr/share/vkd3d-proton"),
-                             HOME / ".local/share/lutris/runtime",
+                             XDG_DATA_HOME / "lutris/runtime",
                              HOME / ".local/share/Steam/compatibilitytools.d",
                              *NVIDIA_WINE_DIRS)
                     if not any(old_target.is_relative_to(base) for base in known):
@@ -3067,9 +3070,7 @@ class WinePrefix:
             managed[key] = source
             linked += 1
 
-        def disable(names: Sequence[str], directory: Path | None) -> None:
-            if directory is None:
-                return
+        def disable(names: Sequence[str], directory: Path) -> None:
             for name in names:
                 dst = directory / name
                 key = str(dst)
@@ -3083,8 +3084,8 @@ class WinePrefix:
                     managed.pop(key, None)
 
         def _find_translator_dir(tech: str, arch: str) -> Path | None:
-            # 1. Lutris runtimes (~/.local/share/lutris/runtime/<tech>/<ver>/<arch>)
-            lutris_base = Path(os.path.expanduser(f"~/.local/share/lutris/runtime/{tech}"))
+            # 1. Lutris runtimes ($XDG_DATA_HOME/lutris/runtime/<tech>/<ver>/<arch>)
+            lutris_base = XDG_DATA_HOME / "lutris/runtime" / tech
             if lutris_base.is_dir():
                 dirs = sorted([d for d in lutris_base.iterdir() if d.is_dir()],
                               key=lambda d: [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", d.name)],
@@ -3109,7 +3110,7 @@ class WinePrefix:
                         return cand
 
             # 3. Steam Proton / GE-Proton compatibility tools
-            steam_compat = Path(os.path.expanduser("~/.local/share/Steam/compatibilitytools.d"))
+            steam_compat = HOME / ".local/share/Steam/compatibilitytools.d"
             if steam_compat.is_dir():
                 proton_dirs = sorted([d for d in steam_compat.iterdir() if d.is_dir()],
                                      key=lambda d: [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", d.name)],
@@ -3125,9 +3126,7 @@ class WinePrefix:
 
         # 1. DXVK (D3D9, D3D10, D3D11, DXGI -> Vulkan)
         if want_dxvk:
-            for arch, target_dir in (("x64", sys32), ("x32", syswow if syswow.is_dir() else None)):
-                if not target_dir:
-                    continue
+            for arch, target_dir in targets:
                 dxvk_src = _find_translator_dir("dxvk", arch)
                 if dxvk_src:
                     for dll in ("d3d11.dll", "dxgi.dll", "d3d9.dll", "d3d10core.dll", "d3d8.dll"):
@@ -3135,14 +3134,12 @@ class WinePrefix:
                         if src.is_file():
                             install(src, target_dir / dll)
         else:
-            for directory in (sys32, syswow if syswow.is_dir() else None):
+            for _, directory in targets:
                 disable(("d3d11.dll", "dxgi.dll", "d3d9.dll", "d3d10core.dll", "d3d8.dll"), directory)
 
         # 2. VKD3D (D3D12 -> Vulkan)
         if want_vkd3d:
-            for arch, target_dir in (("x64", sys32), ("x32", syswow if syswow.is_dir() else None)):
-                if not target_dir:
-                    continue
+            for arch, target_dir in targets:
                 vkd3d_src = _find_translator_dir("vkd3d", arch)
                 if vkd3d_src:
                     for dll in ("d3d12.dll", "d3d12core.dll"):
@@ -3150,14 +3147,12 @@ class WinePrefix:
                         if src.is_file():
                             install(src, target_dir / dll)
         else:
-            for directory in (sys32, syswow if syswow.is_dir() else None):
+            for _, directory in targets:
                 disable(("d3d12.dll", "d3d12core.dll"), directory)
 
         # 3. DXVK-NVAPI
         if want_nvapi:
-            for arch, target_dir in (("x64", sys32), ("x32", syswow if syswow.is_dir() else None)):
-                if not target_dir:
-                    continue
+            for arch, target_dir in targets:
                 nvapi_src = _find_translator_dir("dxvk-nvapi", arch)
                 if nvapi_src:
                     for dll in ("nvapi64.dll", "nvofapi64.dll", "nvapi.dll"):
@@ -3165,7 +3160,7 @@ class WinePrefix:
                         if src.is_file():
                             install(src, target_dir / dll)
         else:
-            for directory in (sys32, syswow if syswow.is_dir() else None):
+            for _, directory in targets:
                 disable(("nvapi64.dll", "nvofapi64.dll", "nvapi.dll"), directory)
 
         # 4. NVIDIA DLSS (nvngx.dll / _nvngx.dll)
@@ -3173,13 +3168,18 @@ class WinePrefix:
             for src_dir in NVIDIA_WINE_DIRS:
                 if not src_dir.is_dir():
                     continue
-                dst_dir = syswow if "lib32" in str(src_dir) and syswow.is_dir() else sys32
+                source32 = "lib32" in src_dir.parts
+                if self.arch == "win32" and not source32:
+                    continue
+                dst_dir = (sys32 if self.arch == "win32" else syswow) if source32 else sys32
+                if not dst_dir.is_dir():
+                    continue
                 for dll in NVNGX_DLLS:
                     src = src_dir / dll
                     if src.is_file():
                         install(src, dst_dir / dll)
         else:
-            for directory in (sys32, syswow if syswow.is_dir() else None):
+            for _, directory in targets:
                 disable(NVNGX_DLLS, directory)
 
         if managed != previous_managed:
@@ -3742,7 +3742,7 @@ class EnvironmentBuilder:
         prefix = WinePrefix(self.paths.prefix_dir, wine_bin, str(wcfg.get("arch", "win64")))
         self.prefix = prefix if rt == "wine" else None
 
-        self._set("WINEPREFIX", str(prefix.path))
+        self._set("WINEPREFIX", str(prefix.pfx if rt == "wine" else prefix.path))
         self._set("WINEARCH", prefix.arch)
 
         debug = str(wcfg.get("debug", "-all"))
@@ -4896,12 +4896,12 @@ class RunOptions:
 class GameSession:
     def __init__(self, mgr: ProfileManager, prof: Profile, opts: RunOptions) -> None:
         self.mgr = mgr
-        self.p = prof
+        self.p = (replace(prof, cfg=deep_merge(prof.cfg, {"runtime": {"wine": {"reprovision": True}}}))
+                  if opts.reprovision else prof)
         self.opts = opts
-        self.paths = resolve_paths(prof)
+        self.paths = resolve_paths(self.p)
         self.stack = ExitStack()
         self._stage = "startup"
-        self._recorded = False
         self._cleanup_failed = False
 
     # -- hooks ------------------------------------------------------------
@@ -4928,7 +4928,7 @@ class GameSession:
                 rc = self._run_impl()
             return 74 if self._cleanup_failed and rc == 0 else rc
         except BaseException as exc:
-            if not self.opts.dry_run and not self._recorded:
+            if not self.opts.dry_run:
                 rc = (128 + int(getattr(exc, "signum", signal.SIGINT)) if isinstance(exc, KeyboardInterrupt) else
                       78 if isinstance(exc, ConfigError) else
                       75 if isinstance(exc, TimeoutError) else 70)
@@ -4963,9 +4963,6 @@ class GameSession:
         prof, opts = self.p, self.opts
         Log.info(f"launching {prof.name} [{prof.pid}] runtime={prof.runtime}")
 
-        if opts.reprovision:
-            prof.cfg.setdefault("runtime", {}).setdefault("wine", {})["reprovision"] = True
-
         with self._lifecycle():
             # Profiles can name the same image, overlay and prefix. Serialize
             # ownership for the full launch, including teardown callbacks.
@@ -4975,7 +4972,9 @@ class GameSession:
                 if self.paths.uses_dwarfs:
                     lock_keys.extend(mount_lock_keys(self.paths))
                 if prof.runtime in ("wine", "proton", "umu"):
-                    lock_keys.append("session-prefix-" + _slug(str(self.paths.prefix_dir.resolve())))
+                    prefix_path = (WinePrefix(self.paths.prefix_dir).pfx if prof.runtime == "wine"
+                                   else self.paths.prefix_dir)
+                    lock_keys.append("session-prefix-" + _slug(str(prefix_path.resolve())))
                 for key in sorted(lock_keys):
                     self.stack.enter_context(file_lock(RUNTIME_DIR / f"{key}.lock", timeout=10))
             # Automatic teardown applies to reused mounts as well. The
@@ -5022,18 +5021,13 @@ class GameSession:
                 envb.prefix.clean_stale_crash_markers()
 
             self._stage = "config patch"
-            try:
-                ConfigPatcher.apply(
-                    prof,
-                    self.paths,
-                    env=env,
-                    under_gamescope=under_gs,
-                    dry_run=opts.dry_run,
-                )
-            except Exception as exc:
-                if not opts.dry_run:
-                    self._record_session(78, 0, stage="config patch", error=str(exc))
-                raise
+            ConfigPatcher.apply(
+                prof,
+                self.paths,
+                env=env,
+                under_gamescope=under_gs,
+                dry_run=opts.dry_run,
+            )
 
             if opts.dry_run:
                 Log.ok("dry-run complete; nothing was executed")
@@ -5112,6 +5106,10 @@ class GameSession:
                              scope_unit=scope_unit)
             self.stack.callback(sup.kill_now)
         rc = sup.wait()
+        # Popen uses -signal on POSIX; expose the conventional shell status
+        # consistently with systemd-run and interruptions of the runner itself.
+        if rc < 0:
+            rc = 128 - rc
         return rc, time.monotonic() - started
 
     def _describe(self, argv: Sequence[str], workdir: Path,
@@ -5158,7 +5156,6 @@ class GameSession:
 
     def _record_session(self, rc: int, elapsed: float, *, stage: str = "game",
                         error: str = "") -> None:
-        self._recorded = True
         _append_session_record({
             "t": time.time(),
             "profile": self.p.pid,

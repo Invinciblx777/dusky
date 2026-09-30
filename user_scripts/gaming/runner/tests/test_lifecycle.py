@@ -2,6 +2,7 @@
 """Lifecycle regression tests. RUNNER_INTEGRATION=1 enables real rootless FUSE/scope tests.
 
 Run: RUNNER_INTEGRATION=1 python3.14 -m unittest discover -s tests -v
+Add RUNNER_WINE_INTEGRATION=1 to exercise the disposable Wine prefix as well.
 Integration tests create disposable games/prefixes and never touch installed games.
 """
 import importlib.util
@@ -168,6 +169,144 @@ class MountTransactions(unittest.TestCase):
         self.assertTrue(pipe.scope_unit.endswith('.scope'))
 
 
+class SessionResults(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='runner-results-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.p = profile(self.root)
+
+    def test_child_signal_status_matches_shell_convention(self):
+        session = r.GameSession(r.ProfileManager(self.root), self.p, r.RunOptions())
+        with session._lifecycle():
+            rc, _ = session._spawn([sys.executable, '-c',
+                                   'import os,signal; os.kill(os.getpid(),signal.SIGTERM)'],
+                                  self.root, dict(os.environ))
+        self.assertEqual(rc, 143)
+
+    def test_reprovision_does_not_change_reusable_profile(self):
+        session = r.GameSession(r.ProfileManager(self.root), self.p,
+                                r.RunOptions(dry_run=True, reprovision=True))
+        seen = []
+        def build(builder, **kw):
+            seen.append(builder.p.get('runtime.wine.reprovision'))
+            return {}
+        with patch.object(r.GameSession, '_describe'), \
+             patch.object(r.EnvironmentBuilder, 'build', new=build), \
+             patch.object(r.PipelineBuilder, 'build', return_value=(['true'], self.root)):
+            self.assertEqual(session.run(), 0)
+        self.assertEqual(seen, [True])
+        self.assertFalse(self.p.get('runtime.wine.reprovision'))
+        next_session = r.GameSession(r.ProfileManager(self.root), self.p, r.RunOptions())
+        self.assertFalse(next_session.p.get('runtime.wine.reprovision'))
+
+    def test_nested_wine_prefix_environment_matches_inspected_layout(self):
+        prefix_path = self.root / 'prefix'
+        (prefix_path / 'pfx').mkdir(parents=True)
+        prefix = r.WinePrefix(prefix_path)
+        self.assertEqual(prefix.base_env()['WINEPREFIX'], str(prefix.pfx))
+        p = profile(self.root, paths={'prefix_dir': str(prefix_path)}, runtime={'type': 'wine'})
+        builder = r.EnvironmentBuilder(p, r.resolve_paths(p), dry_run=True)
+        builder.stage_wine(dry_run=True, under_gamescope=False)
+        self.assertEqual(builder.env['WINEPREFIX'], str(prefix.pfx))
+
+    def test_interruption_after_game_success_records_failing_phase(self):
+        session = r.GameSession(r.ProfileManager(self.root), self.p, r.RunOptions())
+        rows = []
+        def fail():
+            session._record_session(0, 1)
+            session._stage = 'post-launch hook'
+            raise r.SessionInterrupted(signal.SIGTERM)
+        with patch.object(session, '_run_impl', side_effect=fail), \
+             patch.object(r, '_append_session_record', side_effect=rows.append):
+            self.assertEqual(session.run(), 143)
+        self.assertEqual([row['rc'] for row in rows], [0, 143])
+        self.assertEqual(rows[-1]['stage'], 'post-launch hook')
+
+    def test_translators_match_prefix_architecture_and_restore_originals(self):
+        for tech, dll in (('dxvk', 'd3d11.dll'), ('vkd3d', 'd3d12.dll'),
+                          ('dxvk-nvapi', 'nvapi.dll')):
+            for arch in ('x32', 'x64'):
+                source = self.root / 'custom-data/lutris/runtime' / tech / 'fixture' / arch
+                source.mkdir(parents=True)
+                (source / dll).write_text(arch)
+        with patch.object(r, 'XDG_DATA_HOME', self.root / 'custom-data'):
+            for arch in ('win32', 'win64'):
+                with self.subTest(arch=arch):
+                    prefix = r.WinePrefix(self.root / arch, arch=arch)
+                    sys32 = prefix.drive_c / 'windows/system32'
+                    sys32.mkdir(parents=True)
+                    syswow = prefix.drive_c / 'windows/syswow64'
+                    if arch == 'win64':
+                        syswow.mkdir()
+                    for dll in ('d3d11.dll', 'd3d12.dll', 'nvapi.dll'):
+                        (sys32 / dll).write_text('original')
+                    prefix.link_translators(want_nvapi=True)
+                    for dll in ('d3d11.dll', 'd3d12.dll', 'nvapi.dll'):
+                        self.assertEqual((sys32 / dll).read_bytes(), b'x32' if arch == 'win32' else b'x64')
+                        if arch == 'win64':
+                            self.assertEqual((syswow / dll).read_bytes(), b'x32')
+                    prefix.link_translators(want_dxvk=False, want_vkd3d=False, want_nvapi=False)
+                    for dll in ('d3d11.dll', 'd3d12.dll', 'nvapi.dll'):
+                        self.assertFalse((sys32 / dll).is_symlink())
+                        self.assertEqual((sys32 / dll).read_text(), 'original')
+                        self.assertFalse((syswow / dll).exists())
+
+    def test_dlss_sources_do_not_cross_architectures(self):
+        sources = []
+        for arch, directory in (('x64', 'lib'), ('x32', 'lib32')):
+            source = self.root / directory / 'nvidia/wine'
+            source.mkdir(parents=True)
+            (source / 'nvngx.dll').write_text(arch)
+            sources.append(source)
+        with patch.object(r, 'NVIDIA_WINE_DIRS', sources):
+            for arch, wow64 in (('win32', False), ('win64', False), ('win64', True)):
+                with self.subTest(arch=arch, wow64=wow64):
+                    prefix = r.WinePrefix(self.root / f'{arch}-{wow64}', arch=arch)
+                    sys32 = prefix.drive_c / 'windows/system32'
+                    sys32.mkdir(parents=True)
+                    syswow = prefix.drive_c / 'windows/syswow64'
+                    if wow64:
+                        syswow.mkdir()
+                    prefix.link_translators(want_dxvk=False, want_vkd3d=False, want_dlss=True)
+                    self.assertEqual((sys32 / 'nvngx.dll').read_text(), 'x32' if arch == 'win32' else 'x64')
+                    if wow64:
+                        self.assertEqual((syswow / 'nvngx.dll').read_text(), 'x32')
+
+
+@unittest.skipUnless(os.environ.get('RUNNER_WINE_INTEGRATION') == '1', 'opt-in disposable Wine prefix')
+class RealWine(unittest.TestCase):
+    def test_nested_prefix_launch_waits_for_child_and_shuts_down_same_server(self):
+        with tempfile.TemporaryDirectory(prefix='runner-wine-integration-') as tmp:
+            root = Path(tmp)
+            outer = root / 'prefix'
+            actual = outer / 'pfx'
+            actual.mkdir(parents=True)
+            done = root / 'done.txt'
+            winpath = 'Z:' + str(done).replace('/', '\\')
+            wine = Path(r.shutil.which('wine')).resolve()
+            candidates = [wine.parent.parent / 'lib/wine/x86_64-windows/cmd.exe',
+                          wine.parent.parent / 'lib64/wine/x86_64-windows/cmd.exe']
+            cmd = next((p for p in candidates if p.is_file()), None)
+            self.assertIsNotNone(cmd, 'installed Wine cmd.exe fixture not found')
+            p = profile(root, paths={'dwarfs_image': '', 'prefix_dir': str(outer),
+                                     'executable': str(cmd),
+                                     'arguments': ['/c', 'start', '/b', 'cmd', '/c',
+                                                   f'ping -n 4 127.0.0.1 >nul & echo done >{winpath}']},
+                        runtime={'type': 'wine', 'wine': {'dxvk': False, 'vkd3d': False}})
+            prefix = r.WinePrefix(outer)
+            try:
+                rc = r.GameSession(r.ProfileManager(root), p, r.RunOptions()).run()
+                self.assertEqual(rc, 0)
+                self.assertTrue(done.is_file(), 'delayed Windows child was stopped before completion')
+                self.assertTrue((actual / 'system.reg').is_file())
+                self.assertTrue((actual / 'user.reg').is_file())
+                self.assertFalse((outer / 'system.reg').exists(), 'Wine initialized the outer directory')
+                self.assertTrue(r.run_cmd([prefix.server_bin, '-w'], env=prefix.base_env(), timeout=3).ok)
+            finally:
+                prefix.shutdown()
+
+
 @unittest.skipUnless(os.environ.get('RUNNER_INTEGRATION') == '1', 'opt-in real FUSE/systemd integration')
 class RealLifecycle(unittest.TestCase):
     @classmethod
@@ -318,6 +457,35 @@ dwarfs_workers = 2
         self.ready()
         proc.send_signal(signal.SIGTERM)
         self.finish(proc, 143)
+
+    def test_stopped_workload_resumes_for_graceful_shutdown(self):
+        proc = self.launch('sleep')
+        self.ready()
+        pid = int((self.root / 'ready').read_text())
+        os.kill(pid, signal.SIGSTOP)
+        proc.send_signal(signal.SIGTERM)
+        self.finish(proc, 143)
+        self.assertFalse(r._pid_running(pid))
+
+    def test_direct_child_signal_records_normalized_status(self):
+        proc = self.launch('sleep', flags=('--set', 'runner.use_systemd_scope=false'))
+        self.ready()
+        os.kill(int((self.root / 'ready').read_text()), signal.SIGTERM)
+        self.finish(proc, 143)
+        rows = [json.loads(line) for line in
+                (self.root / 'state' / 'master-runner' / 'sessions.jsonl').read_text().splitlines()]
+        self.assertEqual(rows[-1]['rc'], 143)
+
+    def test_post_launch_interruption_cleans_and_records_failure(self):
+        hook = f'touch {self.root}/hook-ready; sleep 30'
+        proc = self.launch(flags=('--set', f'hooks.post_launch=["{hook}"]'))
+        self.ready('hook-ready')
+        proc.send_signal(signal.SIGTERM)
+        self.finish(proc, 143)
+        rows = [json.loads(line) for line in
+                (self.root / 'state' / 'master-runner' / 'sessions.jsonl').read_text().splitlines()]
+        self.assertEqual(rows[-1]['rc'], 143)
+        self.assertEqual(rows[-1]['stage'], 'post-launch hook')
 
     def test_keep_mounted_and_no_mount_cleanup(self):
         for flags in (('--keep-mounted',), ('--set', 'runner.auto_unmount_on_exit=false')):

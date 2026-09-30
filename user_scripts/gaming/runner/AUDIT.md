@@ -134,3 +134,84 @@ above. The corresponding upstream sources explain the parser and expansion:
 - [fuse-overlayfs mount interface](https://github.com/containers/fuse-overlayfs/blob/main/fuse-overlayfs.1.md)
 - [Mesa driver selection environment](https://docs.mesa3d.org/envvars.html)
 - [Hyprland window-close dispatcher](https://wiki.hypr.land/Configuring/Basics/Dispatchers/)
+
+## Second pass and Lutris comparison
+
+Reviewed the committed runner (`ff25bce2`) against the downloaded Lutris 0.5.23
+source in `/mnt/zram1/lutris-master`. The comparison covered its game launch,
+stop and post-exit paths, monitored-command wrapper, subreaper/process watcher,
+Wine/UMU command construction, prefix handling, DLL installation/restoration,
+runtime library paths, XDG settings and Steam discovery. Unrelated service,
+GUI, emulator and translation code was outside this launcher comparison.
+
+Useful ideas adopted from Lutris:
+
+- Architecture-aware translator destinations: a win32 prefix needs x32 DLLs in
+  `system32`; win64 uses x64 there and x32 in `syswow64`. The old runner always
+  selected x64 for `system32`. A disposable win32 fixture reproduced this.
+  DXVK, VKD3D and NVAPI now share the correct destination mapping. DLSS no
+  longer falls back to putting a 32-bit library in 64-bit `system32` when
+  `syswow64` is absent. DLL disabling/restoration is tested too.
+- Lutris's data directory follows XDG. Translator discovery and recognition
+  now honor `XDG_DATA_HOME/lutris/runtime`. Steam's existing installation
+  path is retained; its directory layout is independently defined by Steam.
+
+Other reproduced faults corrected:
+
+- A direct child killed by SIGTERM returned Python's -15, which would become
+  shell status 241. The session now records/returns 143, consistent with scope
+  launches and runner interruption. See the documented
+  [Python return-code convention](https://docs.python.org/3.14/library/subprocess.html#subprocess.Popen.returncode).
+- `--reprovision` mutated the shared profile even during a dry-run. It now
+  creates a session-specific profile, so subsequent launches retain their
+  configured provisioning policy.
+- Wine inspected a nested `prefix/pfx` while launching and shutting down at
+  `prefix`. Environment construction, shutdown and the session lock now use
+  the actual Wine prefix. UMU's environment contract is preserved.
+- An interruption after the game succeeded could leave only the successful
+  game record. The interrupted phase now gets its own failure record; config
+  patch errors use the same exception path without duplicate records.
+
+The runner retains cgroup supervision. Lutris's watcher excludes processes by
+name and relies on a subreaper, while its client also searches process command
+lines and UUID environments. Those heuristics are unnecessary for the runner's
+owned systemd scope and could miss legitimate workloads. The delayed Windows
+child fixture verifies that the runner waits for the workload after its first
+launcher exits. No Lutris runtime downloads or legacy platform branches were
+introduced.
+
+Second-pass verification:
+
+- **40 tests passed in 214.523 seconds**, with both FUSE/scope and Wine
+  integration enabled. This includes 20 repeated launches, the prior failure
+  and cleanup cases, stopped-process shutdown, post-launch interruption,
+  normalized direct-child status, win32/win64 DLL wiring/restoration, custom
+  XDG discovery and a real nested Wine prefix with a delayed Windows child.
+- All six new focused regression tests failed against the committed baseline;
+  all six pass against the edited runner. The baseline run used a disposable
+  copy and did not modify the committed source or installed prefixes.
+- **43/43 installed DwarFS profiles** again mounted, exposed a readable game
+  executable and unmounted. The three real native Wayland/Wine Wayland/
+  gamescope window-close checks again returned 0 with both layers gone.
+- All 50 profiles still parse; the same eight remain unavailable. Doctor's
+  39 checks contain no FAIL/WARN results. Installed package versions remain
+  those recorded above; relevant installed command help was rechecked.
+- Compilation, scoped Git whitespace/diff review and final mount/scope
+  inspection passed. The limitations in the first-pass report still apply;
+  DLL placement fixtures do not prove NVIDIA execution or a win32 Wine build.
+
+Run every test from this directory:
+
+```sh
+RUNNER_INTEGRATION=1 RUNNER_WINE_INTEGRATION=1 python3.14 -m unittest discover -s tests -v
+```
+
+Evidence is in `audits/2026-09-30/second-pass/` under the state directory
+documented above. Scores are pass percentages for the named regression groups,
+not an overall quality score or a guarantee about all games.
+
+| Area / probe group | Before | After | Evidence | Result |
+|---|---:|---:|---|---|
+| Session correctness | 0 | 100 | Four reproduced regressions: 0/4 versus 4/4 passing | Better |
+| DLL wiring and XDG discovery | 0 | 100 | Two regression tests: 0/2 versus 2/2 passing | Better |
+| Performance / efficiency | N/A | N/A | No frame-rate or resource-use benchmark | Unverified |
