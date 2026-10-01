@@ -337,7 +337,7 @@ def configure_tailscale_autonomous() -> str | None:
     console.print(f"\n[magenta bold]✦ Tailscale Network Detected[/] : {ip_out}")
     log_success("Autonomous Mode: Tailscale automatically trusted for SSH ingress.")
     
-    # Trust tailscale interface in firewalld if active (UFW is handled natively by 068_ufw_firewall.sh)
+    # Trust tailscale interface in firewalld if active (UFW is handled natively by 068_ufw_firewall.py)
     if shutil.which("firewall-cmd") and run_cmd("systemctl is-active firewalld", check=False).returncode == 0:
         if shutil.which("ip"):
             ts_iface_raw = run_cmd("ip -o link show", check=False).stdout

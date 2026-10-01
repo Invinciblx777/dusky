@@ -72,7 +72,7 @@ INSTALL_SEQUENCE=(
     "S | 055_pacman_reflector.sh"
     "S | 058_aur_paru_fallback_yay.sh"
     "S | 060_package_installation.py"
-    "S | 068_ufw_firewall.sh"
+    "S | 068_ufw_firewall.py"
     "S | 070_openssh_setup.sh"
     "U | 075_changing_shell_zsh.sh"
     "S | 085_warp.py"
