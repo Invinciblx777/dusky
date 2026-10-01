@@ -5,54 +5,73 @@ Run ``orientation portrait`` or ``orientation landscape`` to switch its shape.
 """
 
 import argparse
-import hashlib
-import io
+import http.client
 import ipaddress
 import json
 import os
 from pathlib import Path
 import shutil
-import socket
+import shlex
+import ssl
 import stat
 import subprocess
 import sys
-import tarfile
 import tempfile
 import time
-from urllib.request import urlopen
+import xml.etree.ElementTree as ET
 
 
 HOME = Path.home()
-RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
+RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
 SCRIPT = Path(__file__).resolve()
 UNIT_NAME = "dusky_moonlight_display.service"
-UNIT = HOME / ".config/systemd/user" / UNIT_NAME
-CONFIG = HOME / ".config/sunshine-moonlight/sunshine.conf"
+UNIT = CONFIG_HOME / "systemd/user" / UNIT_NAME
+CONFIG = CONFIG_HOME / "sunshine-moonlight/sunshine.conf"
 STATE = RUNTIME / "dusky-moonlight-display.json"
 OUTPUT = "DUSKY-MOONLIGHT"
 LANDSCAPE_SIZE = (1280, 720)
-PREFERENCES = HOME / ".config/dusky/settings/remote/moonlight_display.json"
+PREFERENCES = CONFIG_HOME / "dusky/settings/remote/moonlight_display.json"
 SUNSHINE_PORT = 47989
-REPO_URL = "https://github.com/LizardByte/pacman-repo/releases/latest/download"
-FIREWALL_PORTS = ("47984/tcp", "47989/tcp", "48010/tcp", "47998:48000/udp")
+FIREWALL_RULES = (
+    ("allow", "47984,47989,48010/tcp", "comment", "Dusky Moonlight display"),
+    ("allow", "47998:48000/udp", "comment", "Dusky Moonlight display"),
+)
 IPHONE_USB_PROFILE = "iPhone USB local"
 
 
 def run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, text=True, capture_output=True, check=check)
+    return subprocess.run(args, text=True, capture_output=True, check=check,
+                          stdin=subprocess.DEVNULL, timeout=15,
+                          env={**os.environ, "LC_ALL": "C"})
+
+
+def message(value: str, *, error: bool = False) -> None:
+    from rich.console import Console
+    Console(stderr=error).print(value, markup=False, highlight=False,
+                                style="red" if error else None)
+
+
+def atomic_write(path: Path, content: str, mode: int = 0o600) -> bool:
+    if path.exists() and path.read_text() == content:
+        path.chmod(mode)
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=path.parent) as directory:
+        replacement = Path(directory) / path.name
+        replacement.write_text(content)
+        replacement.chmod(mode)
+        replacement.replace(path)
+    return True
 
 
 def save_preferences(values: dict) -> None:
-    PREFERENCES.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=PREFERENCES.parent) as directory:
-        replacement = Path(directory) / PREFERENCES.name
-        replacement.write_text(json.dumps(values, indent=2) + "\n")
-        replacement.replace(PREFERENCES)
+    atomic_write(PREFERENCES, json.dumps(values, indent=2) + "\n")
 
 
 def preferences() -> dict:
     if not PREFERENCES.exists():
-        save_preferences({"orientation": "landscape"})
+        return {"orientation": "landscape"}
     try:
         values = json.loads(PREFERENCES.read_text())
     except ValueError as error:
@@ -75,10 +94,18 @@ def session() -> dict | None:
     result = run("hyprctl", "instances", "-j", check=False)
     if result.returncode:
         return None
-    for item in sorted(json.loads(result.stdout), key=lambda value: value.get("time", 0), reverse=True):
+    candidates = sorted(json.loads(result.stdout), key=lambda value: value.get("time", 0), reverse=True)
+    preferred = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    candidates.sort(key=lambda item: item.get("instance") != preferred)
+    for item in candidates:
         name = item.get("wl_socket", "")
-        path = RUNTIME / name
-        if name and path.exists() and stat.S_ISSOCK(path.stat().st_mode) and path.stat().st_uid == os.getuid():
+        if not name:
+            continue
+        try:
+            info = (RUNTIME / name).stat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid():
             return item
     return None
 
@@ -94,43 +121,41 @@ def sunshine_package(package: Path | None) -> None:
         if not package.is_file():
             raise RuntimeError(f"Sunshine package not found: {package}")
         subprocess.run(["sudo", "pacman", "-U", "--needed", "--noconfirm", str(package)], check=True)
+        if not shutil.which("sunshine"):
+            raise RuntimeError("The supplied package did not install the Sunshine executable")
         return
-    try:
-        with urlopen(f"{REPO_URL}/lizardbyte.db", timeout=15) as response:
-            database = response.read()
-        with tarfile.open(fileobj=io.BytesIO(database), mode="r:*") as archive:
-            for entry in archive:
-                if not entry.name.startswith("sunshine-") or not entry.name.endswith("/desc"):
-                    continue
-                description = archive.extractfile(entry)
-                if description is None:
-                    continue
-                lines = description.read().decode().splitlines()
-                candidate = lines[lines.index("%FILENAME%") + 1]
-                if candidate.endswith(f"-{os.uname().machine}.pkg.tar.zst"):
-                    filename = candidate
-                    digest = lines[lines.index("%SHA256SUM%") + 1]
-                    break
-            else:
-                raise RuntimeError(f"Official Sunshine package is unavailable for {os.uname().machine}; use --package")
-        with tempfile.TemporaryDirectory(prefix="dusky-sunshine-") as directory:
-            destination = Path(directory) / filename
-            with urlopen(f"{REPO_URL}/{filename}", timeout=30) as response, destination.open("wb") as output:
-                shutil.copyfileobj(response, output)
-            with destination.open("rb") as downloaded:
-                actual_digest = hashlib.file_digest(downloaded, "sha256").hexdigest()
-            if actual_digest != digest:
-                raise RuntimeError("Downloaded Sunshine package checksum does not match the official repository")
-            subprocess.run(["sudo", "pacman", "-U", "--needed", "--noconfirm", str(destination)], check=True)
-    except (OSError, StopIteration, ValueError, tarfile.TarError) as error:
-        raise RuntimeError("Could not download Sunshine. For offline setup, rerun with --package /path/to/sunshine.pkg.tar.zst") from error
+    raise RuntimeError("Install Sunshine from the ISO or rerun with --package /path/to/sunshine.pkg.tar.zst")
+
+
+def configure_firewall() -> None:
+    if shutil.which("ufw"):
+        subprocess.run(["sudo", "/usr/bin/python3", str(SCRIPT), "firewall"], check=True)
+
+
+def firewall_worker() -> None:
+    if os.geteuid() != 0:
+        raise RuntimeError("Firewall configuration requires sudo")
+
+    def rules() -> list[tuple[str, ...]]:
+        return [tuple(shlex.split(line)[1:]) for line in run("ufw", "show", "added").stdout.splitlines()
+                if line.startswith("ufw ")]
+
+    if rules()[:len(FIREWALL_RULES)] == list(FIREWALL_RULES):
+        return
+    for rule in reversed(FIREWALL_RULES):
+        # Normalize equivalent rules before moving them: UFW skips inserting
+        # duplicates and cannot update their comments through prepend.
+        run("ufw", *rule)
+        run("ufw", "--force", "delete", *rule)
+        run("ufw", "prepend", *rule)
+    if rules()[:len(FIREWALL_RULES)] != list(FIREWALL_RULES):
+        raise RuntimeError("UFW did not prioritize the Moonlight allowances")
 
 
 def setup_iphone_usb() -> None:
     """Keep iPhone USB tethering local, even when the phone has no internet."""
     if not shutil.which("nmcli"):
-        print("iPhone USB routing was not configured: NetworkManager is unavailable", file=sys.stderr)
-        return
+        raise RuntimeError("iPhone USB routing needs NetworkManager")
     settings = (
         "connection.interface-name", "",
         "match.driver", "ipheth",
@@ -165,15 +190,16 @@ def setup_iphone_usb() -> None:
             continue
         active = run("nmcli", "-g", "GENERAL.CONNECTION", "device", "show", device.name).stdout.strip()
         if active != IPHONE_USB_PROFILE or changed:
-            run("nmcli", "connection", "up", IPHONE_USB_PROFILE, "ifname", device.name)
+            run("nmcli", "--wait", "10", "connection", "up", IPHONE_USB_PROFILE, "ifname", device.name)
+    message("iPhone USB profile prepared: local traffic only; Wi-Fi remains the default route")
 
 
-def prefer_vaapi() -> bool:
+def prefer_vaapi() -> str | None:
     if not shutil.which("vainfo"):
-        return False
+        return None
     current = session()
     if not current:
-        return False
+        return None
     active = {item["name"] for item in monitors(current["instance"])}
     for connector in Path("/sys/class/drm").glob("card*-*"):
         if not any(connector.name.endswith(f"-{name}") for name in active):
@@ -186,11 +212,11 @@ def prefer_vaapi() -> bool:
             for render in (vendor.parent / "drm").glob("renderD*"):
                 probe = run("vainfo", "--display", "drm", "--device", f"/dev/dri/{render.name}", check=False)
                 if probe.returncode == 0 and any(
-                    line.strip().startswith("VAProfileH264") and "VAEntrypointEncSlice" in line
+                    line.strip().startswith("VAProfileH264High") and "VAEntrypointEncSlice" in line
                     for line in probe.stdout.splitlines()
                 ):
-                    return True
-    return False
+                    return f"/dev/dri/{render.name}"
+    return None
 
 
 def write_config() -> bool:
@@ -199,7 +225,7 @@ def write_config() -> bool:
     apps = CONFIG.parent / "apps.json"
     apps_created = not apps.exists()
     if apps_created:
-        apps.write_text(json.dumps({"env": {}, "apps": [{"name": "Desktop", "image-path": "desktop.png"}]}, indent=2) + "\n")
+        atomic_write(apps, json.dumps({"env": {}, "apps": [{"name": "Desktop", "image-path": "desktop.png"}]}, indent=2) + "\n")
     wanted = {
         "capture": "wlr",
         "output_name": OUTPUT,
@@ -213,7 +239,9 @@ def write_config() -> bool:
         "pkey": str(CONFIG.parent / "credentials/cakey.pem"),
         "cert": str(CONFIG.parent / "credentials/cacert.pem"),
     }
-    wanted["encoder"] = "vaapi" if prefer_vaapi() else None
+    adapter = prefer_vaapi()
+    wanted["encoder"] = "vaapi" if adapter else None
+    wanted["adapter_name"] = adapter
     current = CONFIG.read_text().splitlines() if CONFIG.exists() else []
     found = set()
     lines = []
@@ -229,10 +257,7 @@ def write_config() -> bool:
         lines.append(line)
     lines.extend(f"{key} = {value}" for key, value in wanted.items() if key not in found and value is not None)
     content = "\n".join(lines) + "\n"
-    changed = apps_created or not CONFIG.exists() or CONFIG.read_text() != content
-    if changed:
-        CONFIG.write_text(content)
-    return changed
+    return atomic_write(CONFIG, content) or apps_created
 
 
 def unit_content() -> str:
@@ -240,25 +265,34 @@ def unit_content() -> str:
         script = f"%h/{SCRIPT.relative_to(HOME).as_posix().replace('%', '%%')}"
     except ValueError:
         script = str(SCRIPT).replace("%", "%%")
-    script = json.dumps(script, ensure_ascii=False)
-    python = json.dumps(sys.executable.replace("%", "%%"), ensure_ascii=False)
+    script = json.dumps(script.replace("$", "$$"), ensure_ascii=False)
+    python = '"/usr/bin/python3"'
     return (
         "[Unit]\nDescription=Phone secondary display over Sunshine/Moonlight\n"
-        "After=graphical-session.target\nPartOf=graphical-session.target\n\n"
+        "After=graphical-session.target\nPartOf=graphical-session.target\n"
+        "StartLimitIntervalSec=0\n\n"
         "[Service]\nType=exec\n"
         f"ExecStart={python} {script} serve\n"
         f"ExecStopPost={python} {script} cleanup\n"
-        "Restart=always\nRestartSec=5\n\n"
+        "Restart=always\nRestartSec=5\nRestartSteps=5\nRestartMaxDelaySec=30\n\n"
         "[Install]\nWantedBy=default.target graphical-session.target\n"
     )
 
 
 def listening() -> bool:
+    connection = http.client.HTTPConnection("127.0.0.1", SUNSHINE_PORT, timeout=1)
     try:
-        with socket.create_connection(("127.0.0.1", SUNSHINE_PORT), timeout=1):
-            return True
-    except OSError:
+        connection.request("GET", "/serverinfo?uniqueid=dusky-status")
+        response = connection.getresponse()
+        if response.status != 200:
+            return False
+        document = ET.fromstring(response.read(65536))
+        return (document.tag == "root" and document.get("status_code") == "200"
+                and document.findtext("state") in {"SUNSHINE_SERVER_FREE", "SUNSHINE_SERVER_BUSY"})
+    except (OSError, http.client.HTTPException, ET.ParseError):
         return False
+    finally:
+        connection.close()
 
 
 def ready() -> bool:
@@ -273,40 +307,83 @@ def ready() -> bool:
 def setup(package: Path | None) -> None:
     if os.geteuid() == 0:
         raise RuntimeError("Run setup as the desktop user, without sudo")
+    missing = [name for name in ("hyprctl", "systemctl", "ip") if not shutil.which(name)]
+    if missing:
+        raise RuntimeError("Missing required commands: " + ", ".join(missing))
     if not session():
         raise RuntimeError("Start a Hyprland desktop session before setup")
     preferences()
-    setup_iphone_usb()
     sunshine_package(package)
-    if shutil.which("ufw"):
-        for port in FIREWALL_PORTS:
-            subprocess.run(["sudo", "ufw", "allow", port, "comment", "Dusky Moonlight display"], check=True)
+    configure_firewall()
     config_changed = write_config()
+    duplicate_pairings = repair_duplicate_pairings(repair=False)
     UNIT.parent.mkdir(parents=True, exist_ok=True)
     content = unit_content()
-    unit_changed = not UNIT.exists() or UNIT.read_text() != content
+    unit_changed = atomic_write(UNIT, content, 0o644)
     if unit_changed:
-        UNIT.write_text(content)
         run("systemctl", "--user", "daemon-reload")
     enabled = run("systemctl", "--user", "is-enabled", UNIT_NAME, check=False).stdout.strip() == "enabled"
     if unit_changed and enabled:
         run("systemctl", "--user", "reenable", UNIT_NAME)
     elif not enabled:
         run("systemctl", "--user", "enable", UNIT_NAME)
-    active = run("systemctl", "--user", "is-active", UNIT_NAME, check=False).stdout.strip() == "active"
+    state = run("systemctl", "--user", "is-active", UNIT_NAME, check=False).stdout.strip() or "inactive"
+    active = state == "active"
     if not active:
         run("systemctl", "--user", "start", UNIT_NAME)
-    elif config_changed or unit_changed or not ready():
+    elif config_changed or unit_changed or duplicate_pairings or not ready():
         run("systemctl", "--user", "restart", UNIT_NAME)
     deadline = time.monotonic() + 15
-    while time.monotonic() < deadline and not ready():
+    while time.monotonic() < deadline:
+        if ready():
+            break
         time.sleep(0.25)
+    else:
+        raise RuntimeError(f"Moonlight display did not start; check journalctl --user -u {UNIT_NAME}")
     status()
+    open_pairing_page(only_unpaired=True)
+
+
+def repair_duplicate_pairings(*, repair: bool = True) -> int:
+    """Inspect legacy duplicates; write repairs only before Sunshine starts."""
+    path = CONFIG.parent / "sunshine_state.json"
+    if not path.exists():
+        return 0
+    original = path.read_text()
+    data = json.loads(original)
+    devices = data.get("root", {}).get("named_devices", [])
+    retained = []
+    identities = {}
+    for device in devices:
+        try:
+            identity = ssl.PEM_cert_to_DER_cert(device["cert"])
+        except (KeyError, ValueError):
+            retained.append(device)
+            continue
+        if identity not in identities:
+            identities[identity] = len(retained)
+            retained.append(device)
+        else:
+            index = identities[identity]
+            previous = retained[index]
+            # A disabled record must not become enabled during maintenance.
+            if str(previous.get("enabled", True)).lower() != "false":
+                retained[index] = device
+    removed = len(devices) - len(retained)
+    if removed and repair:
+        backup = path.with_suffix(".json.before-dedup")
+        if not backup.exists():
+            atomic_write(backup, original)
+        data["root"]["named_devices"] = retained
+        atomic_write(path, json.dumps(data, indent=2) + "\n")
+        message(f"Repaired {removed} duplicate paired-client records; backup: {backup}")
+    return removed
 
 
 def serve() -> None:
     if not CONFIG.is_file():
         raise RuntimeError("Run setup first")
+    repair_duplicate_pairings()
     width, height = display_size()
     while not (current := session()):
         time.sleep(2)
@@ -317,7 +394,7 @@ def serve() -> None:
         if previous.get("instance") != instance:
             raise RuntimeError(f"Output {OUTPUT} already exists and is not owned by this service")
         hypr(instance, "output", "remove", OUTPUT)
-    STATE.write_text(json.dumps({"instance": instance}))
+    atomic_write(STATE, json.dumps({"instance": instance}))
     try:
         hypr(instance, "output", "create", "headless", OUTPUT)
         rule = (f'hl.monitor({{ output = "{OUTPUT}", mode = "{width}x{height}@60", '
@@ -347,59 +424,244 @@ def serve() -> None:
 def cleanup() -> None:
     if not STATE.exists():
         return
-    try:
-        instance = json.loads(STATE.read_text())["instance"]
-        result = hypr(instance, "-j", "monitors", check=False)
-        if result.returncode == 0 and any(item["name"] == OUTPUT for item in json.loads(result.stdout)):
-            hypr(instance, "output", "remove", OUTPUT)
-    finally:
-        STATE.unlink(missing_ok=True)
+    instance = json.loads(STATE.read_text())["instance"]
+    result = hypr(instance, "-j", "monitors", check=False)
+    if result.returncode:
+        instances = json.loads(run("hyprctl", "instances", "-j").stdout)
+        if any(item["instance"] == instance for item in instances):
+            raise RuntimeError("Cannot inspect Moonlight output; ownership record retained for recovery")
+    elif any(item["name"] == OUTPUT for item in json.loads(result.stdout)):
+        hypr(instance, "output", "remove", OUTPUT)
+        if any(item["name"] == OUTPUT for item in monitors(instance)):
+            raise RuntimeError("Moonlight output removal failed; ownership record retained for recovery")
+    STATE.unlink(missing_ok=True)
 
 
-def addresses() -> list[str]:
+def addresses() -> list[tuple[str, str]]:
     result = run("ip", "-j", "-d", "-4", "addr", "show", "scope", "global")
+    routes = json.loads(run("ip", "-j", "-4", "route", "show", "default").stdout)
+    preferred = min(routes, key=lambda item: item.get("metric", 0)).get("dev") if routes else None
     found = []
     for link in json.loads(result.stdout):
-        if ("UP" not in link.get("flags", []) or link.get("ifname") == "CloudflareWARP"
-                or link.get("linkinfo", {}).get("info_kind") == "bridge"):
+        iface = link["ifname"]
+        net = Path("/sys/class/net") / iface
+        physical = (net / "device").exists() or (net / "phy80211").exists()
+        if "UP" not in link.get("flags", []) or not (physical or iface == preferred or iface == "tailscale0"):
             continue
         for address in link.get("addr_info", []):
             ip = ipaddress.ip_address(address["local"])
             if not (ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified):
-                label = "Tailscale" if link["ifname"] == "tailscale0" else link["ifname"]
-                driver = Path("/sys/class/net") / link["ifname"] / "device/driver"
+                label = "Tailscale" if iface == "tailscale0" else iface
+                driver = net / "device/driver"
                 if driver.is_symlink() and driver.resolve().name == "ipheth":
-                    label = "iPhone USB (local only)"
-                found.append(f"{label}: {ip}")
-    return found
+                    label = "iPhone USB"
+                found.append((iface != preferred, label, str(ip)))
+    found.sort()
+    return [(label, ip) for _, label, ip in found]
 
 
 def status() -> None:
-    active = run("systemctl", "--user", "is-active", UNIT_NAME, check=False).stdout.strip() == "active"
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    console = Console()
+    state = run("systemctl", "--user", "is-active", UNIT_NAME, check=False).stdout.strip() or "inactive"
+    active = state == "active"
     working = active and ready()
     value = preferences()["orientation"]
     width, height = display_size(value)
-    print(f"Moonlight display: {'ready' if working else 'off or starting'}")
-    print(f"Orientation: {value} ({width}x{height})")
-    for address in addresses():
-        print(address)
+    label = "Ready" if working else "Off" if state == "inactive" else "Not ready"
+    console.print(Text(f"Moonlight display: {label} ({value}, {width}x{height})", style="bold green" if working else "yellow"))
+    table = Table(title="Moonlight addresses")
+    table.add_column("Network")
+    table.add_column("Address", style="bold cyan")
+    connection_addresses = addresses()
+    for network, ip in connection_addresses:
+        table.add_row(Text(network), Text(ip))
+    console.print(table)
     if working:
-        print("Add one of these IPs in Moonlight. Pair through Sunshine at https://localhost:47990, then stream Desktop.")
-        print(f"The {OUTPUT} monitor is to the right of your other displays.")
-    else:
-        print(f"Check: journalctl --user -u {UNIT_NAME} -n 40 --no-pager")
+        if repair_duplicate_pairings(repair=False):
+            message("Duplicate client certificates detected; rerun setup to repair pairing.", error=True)
+        address = connection_addresses[0][1] if connection_addresses else "an IP from the table (none currently available)"
+        steps = (
+            "1. Install Moonlight Game Streaming: App Store (iPhone) or Google Play (Android).\n"
+            "   Official downloads: https://moonlight-stream.org/\n"
+            "2. Connect phone and PC to the same Wi-Fi; allow Local Network access on iPhone.\n"
+            f"3. In Moonlight, add this PC manually: {address} (IP only).\n"
+            "4. On this PC, open https://localhost:47990; create/sign in with Sunshine's web UI account.\n"
+            "   Proceed past the local certificate warning if the browser shows one.\n"
+            "5. Tap the PC in Moonlight; enter the phone's PIN on Sunshine's PIN page.\n"
+            "6. Launch Desktop in Moonlight. Streaming needs no SIM/mobile data."
+        )
+        console.print(Panel(Text(steps), title="Connect your phone", border_style="cyan"))
+        message("Open the PC pairing page again: --pair")
+        message(f"The {OUTPUT} monitor is to the right of your other displays.")
+        message("An empty workspace may look black; move a window there or run --test-display.")
+    elif state != "inactive":
+        message(f"Check: journalctl --user -u {UNIT_NAME} -n 40 --no-pager")
         raise RuntimeError("Moonlight display is not ready")
+    message(f"Moonlight: systemctl --user {'disable' if active else 'enable'} --now {UNIT_NAME}")
 
 
 def stop() -> None:
     run("systemctl", "--user", "disable", "--now", UNIT_NAME)
-    print("Moonlight display stopped; its virtual monitor was removed")
+    message("Moonlight display stopped; its virtual monitor was removed")
+
+
+def reconnect() -> None:
+    if not UNIT.exists():
+        setup(None)
+        return
+    run("systemctl", "--user", "restart", UNIT_NAME)
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if ready():
+            status()
+            return
+        time.sleep(0.25)
+    raise RuntimeError(f"Reconnect failed; run {SCRIPT.name} --diagnose")
+
+
+def clients() -> None:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.text import Text
+    path = CONFIG.parent / "sunshine_state.json"
+    data = json.loads(path.read_text()) if path.exists() else {}
+    table = Table(title="Paired Moonlight clients")
+    for title in ("Name", "Client ID", "Enabled"):
+        table.add_column(title)
+    devices = data.get("root", {}).get("named_devices", [])
+    for device in devices:
+        enabled = str(device.get("enabled", True)).lower() != "false"
+        table.add_row(Text(device.get("name", "Unnamed")), Text(device.get("uuid", "")), "Yes" if enabled else "No")
+    Console().print(table)
+    if not devices:
+        message("No saved clients. Pair using --pair.")
+    else:
+        message("Remove one: --forget-client CLIENT_ID    Remove all: --forget-all")
+
+
+def forget_clients(identifier: str | None = None) -> None:
+    path = CONFIG.parent / "sunshine_state.json"
+    if not path.exists():
+        raise RuntimeError("No paired-client state exists")
+    devices = json.loads(path.read_text()).get("root", {}).get("named_devices", [])
+    if identifier is not None and not any(item.get("uuid") == identifier for item in devices):
+        raise RuntimeError("Client ID not found; use --clients to list saved IDs")
+    if not devices:
+        message("No saved clients to remove")
+        return
+    # Stop the writer before editing shared pairing/web-credential state.
+    active = run("systemctl", "--user", "is-active", UNIT_NAME, check=False).stdout.strip() in {"active", "activating"}
+    run("systemctl", "--user", "stop", UNIT_NAME)
+    try:
+        original = path.read_text()
+        data = json.loads(original)
+        devices = data.get("root", {}).get("named_devices", [])
+        retained = [item for item in devices if identifier is not None and item.get("uuid") != identifier]
+        removed = len(devices) - len(retained)
+        if identifier is not None and not removed:
+            raise RuntimeError("Client ID not found; use --clients to list saved IDs")
+        if removed:
+            atomic_write(path.with_suffix(".json.before-client-removal"), original)
+            data["root"]["named_devices"] = retained
+            atomic_write(path, json.dumps(data, indent=2) + "\n")
+        message(f"Removed {removed} saved client(s); web UI credentials were preserved")
+    finally:
+        if active:
+            run("systemctl", "--user", "start", UNIT_NAME)
+    message("Forget the old host in the phone app too, then pair again using --pair.")
+
+
+def open_pairing_page(*, only_unpaired: bool = False) -> None:
+    if only_unpaired:
+        path = CONFIG.parent / "sunshine_state.json"
+        if path.exists() and json.loads(path.read_text()).get("root", {}).get("named_devices"):
+            return
+    url = "https://localhost:47990"
+    if shutil.which("xdg-open"):
+        try:
+            result = subprocess.run(["xdg-open", url], stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            if result.returncode == 0:
+                message("Opened Sunshine's pairing page in your PC's browser.")
+                return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    message(f"Open Sunshine's pairing page manually on this PC: {url}")
+
+
+def pair() -> None:
+    if not ready():
+        reconnect()
+    else:
+        status()
+    open_pairing_page()
+
+
+def diagnose() -> None:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.text import Text
+    table = Table(title="Moonlight diagnostics")
+    table.add_column("Check")
+    table.add_column("Result")
+    for label, command in (
+        ("Service", ("systemctl", "--user", "is-active", UNIT_NAME)),
+        ("Startup", ("systemctl", "--user", "is-enabled", UNIT_NAME)),
+        ("Wi-Fi/default route", ("ip", "-4", "route", "show", "default")),
+    ):
+        table.add_row(label, Text(run(*command, check=False).stdout.strip() or "Unavailable"))
+    table.add_row("GameStream", "Responding" if listening() else "Unavailable")
+    current = session()
+    monitor = next((item for item in monitors(current["instance"]) if item["name"] == OUTPUT), None) if current else None
+    table.add_row("Phone monitor", f"{monitor['width']}×{monitor['height']} on workspace {monitor['activeWorkspace']['name']}" if monitor else "Absent")
+    table.add_row("Duplicate identities", str(repair_duplicate_pairings(repair=False)))
+    Console().print(table)
+    clients()
+    message("Pairing failure: forget the affected client on PC and phone, then --pair.")
+    message("Black screen: --test-display distinguishes an empty monitor from a video failure.")
+    message("Timeout: rerun --setup for UFW rules; check Wi-Fi client isolation on the router.")
+    message(f"Detailed logs: journalctl --user -u {UNIT_NAME} -n 40 --no-pager")
+
+
+def test_display() -> None:
+    if not ready():
+        raise RuntimeError("Start Sunshine first using --reconnect")
+    if not shutil.which("kitty"):
+        raise RuntimeError("The visible test requires kitty; alternatively move a window onto the phone monitor")
+    current = session()
+    monitor = next(item for item in monitors(current["instance"]) if item["name"] == OUTPUT)
+    command = shlex.join([
+        "kitty", "--class", "dusky-moonlight-test", "--title", "Moonlight video test",
+        "--override", "background=#ffffff", "--override", "foreground=#000000",
+        "--override", "background_opacity=1", "--override", "font_size=28",
+        "--hold", "/usr/bin/printf", "Moonlight video works!\n\nTry moving the cursor.\n",
+    ])
+    existing = json.loads(hypr(current["instance"], "-j", "clients").stdout)
+    if not any(item.get("class") == "dusky-moonlight-test" for item in existing):
+        hypr(current["instance"], "eval", f"hl.exec_cmd({json.dumps(command)})")
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        windows = json.loads(hypr(current["instance"], "-j", "clients").stdout)
+        tests = [item for item in windows if item.get("class") == "dusky-moonlight-test"]
+        if tests:
+            for window in tests:
+                options = {"workspace": str(monitor["activeWorkspace"]["id"]), "silent": True, "window": "address:" + window["address"]}
+                lua = "{ " + ", ".join(f"{key} = {json.dumps(value)}" for key, value in options.items()) + " }"
+                hypr(current["instance"], "eval", f"hl.dispatch(hl.dsp.window.move({lua}))")
+            message("A white test window is on the phone monitor. Close it normally after testing.")
+            return
+        time.sleep(0.1)
+    raise RuntimeError("The test window did not appear; check kitty and Hyprland logs")
 
 
 def orientation(value: str | None) -> None:
     current = preferences()
     if value is None:
-        print(f"Moonlight display orientation: {current['orientation']} ({PREFERENCES})")
+        message(f"Moonlight display orientation: {current['orientation']} ({PREFERENCES})")
         return
     changed = value != current["orientation"]
     if changed:
@@ -416,34 +678,62 @@ def orientation(value: str | None) -> None:
             time.sleep(0.25)
         else:
             raise RuntimeError(f"Moonlight display did not start in {value}; check journalctl --user -u {UNIT_NAME}")
-    print(f"Moonlight display orientation: {value} ({width}x{height})")
-    print(f"Saved in {PREFERENCES}" + ("" if active else "; takes effect when the service starts"))
+    message(f"Moonlight display orientation: {value} ({width}x{height})")
+    message(f"Saved in {PREFERENCES}" + ("" if active else "; takes effect when the service starts"))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", nargs="?", choices=("setup", "status", "serve", "cleanup", "stop", "orientation"), default="setup")
+    actions = ("setup", "status", "serve", "cleanup", "stop", "orientation", "usb", "firewall", "reconnect", "clients", "pair", "diagnose", "test-display")
+    parser.add_argument("action", nargs="?", choices=actions, help="Action; defaults to setup. Flags below are equivalent shortcuts.")
     parser.add_argument("value", nargs="?", choices=("landscape", "portrait"), help="Display orientation for the orientation action")
     parser.add_argument("--package", type=Path, help="Local Sunshine Arch package for offline setup")
+    group = parser.add_mutually_exclusive_group()
+    for action, help_text in (
+        ("setup", "Configure Sunshine, UFW and service; start if needed"),
+        ("status", "Show readiness and connection addresses"),
+        ("stop", "Disable and stop the entire phone display"),
+        ("reconnect", "Restart Sunshine and repair duplicate pairings"),
+        ("clients", "List saved client names and IDs"),
+        ("pair", "Open the local Sunshine PIN page"),
+        ("diagnose", "Show service, network, display and pairing checks"),
+        ("test-display", "Show a visible test window on the phone monitor"),
+        ("usb", "Prepare optional iPhone USB routing; keep Wi-Fi default"),
+    ):
+        group.add_argument("--" + action, dest="flag_action", action="store_const", const=action, help=help_text)
+    group.add_argument("--orientation", dest="flag_orientation", choices=("landscape", "portrait"), help="Set the phone monitor orientation")
+    group.add_argument("--forget-client", metavar="CLIENT_ID", help="Remove a saved client ID shown by --clients")
+    group.add_argument("--forget-all", action="store_true", help="Remove all saved clients; preserve web UI credentials")
     args = parser.parse_args()
-    if args.action == "setup":
-        if args.value:
-            parser.error("an orientation value requires the orientation action")
+    flag_used = args.flag_action or args.flag_orientation or args.forget_client or args.forget_all
+    if args.action and flag_used:
+        parser.error("choose a positional action or an action flag")
+    action = args.action or args.flag_action or ("orientation" if args.flag_orientation else "forget" if args.forget_client or args.forget_all else "setup")
+    value = args.flag_orientation or args.value
+    if value and action != "orientation":
+        parser.error("an orientation value requires the orientation action")
+    if args.package and action != "setup":
+        parser.error("--package requires setup")
+    if os.geteuid() == 0 and action != "firewall":
+        parser.error("run as the desktop user, without sudo")
+    if action == "setup":
         setup(args.package)
-    elif args.action == "orientation":
-        orientation(args.value)
+    elif action == "orientation":
+        orientation(value)
+    elif action == "forget":
+        forget_clients(args.forget_client)
     else:
-        if args.value:
-            parser.error("an orientation value requires the orientation action")
-        {"status": status, "serve": serve, "cleanup": cleanup, "stop": stop}[args.action]()
+        {"status": status, "serve": serve, "cleanup": cleanup, "stop": stop,
+         "usb": setup_iphone_usb, "firewall": firewall_worker, "reconnect": reconnect,
+         "clients": clients, "pair": pair, "diagnose": diagnose, "test-display": test_display}[action]()
 
 
 if __name__ == "__main__":
     try:
         main()
     except subprocess.CalledProcessError as error:
-        print(f"Error: {error.stderr.strip() or error.stdout.strip() or error}", file=sys.stderr)
+        message(f"Error: {(error.stderr or '').strip() or (error.stdout or '').strip() or error}", error=True)
         sys.exit(1)
-    except (OSError, RuntimeError, ValueError, KeyError) as error:
-        print(f"Error: {error}", file=sys.stderr)
+    except (OSError, RuntimeError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
+        message(f"Error: {error}", error=True)
         sys.exit(1)
