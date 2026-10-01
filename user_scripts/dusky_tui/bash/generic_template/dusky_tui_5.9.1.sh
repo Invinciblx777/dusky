@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # -----------------------------------------------------------------------------
 # Dusky TUI Engine - Generic Configuration Template v5.9.1
-# Target: Generic Linux Configs (/etc, .conf, .ini, host files)
+# Target: Linux flat or sectioned key/value configuration files
 # 
 # AUDIT UPDATE (2026-10-01):
 #   Literal-safe config writes, fresh-cache no-ops, single-stage atomic saves,
@@ -40,6 +40,12 @@ declare -ra TABS=("General" "Network" "Display" "System")
 register_items() {
     # Generic Config Layout: register tab_idx "Label" 'key|type|scope|min|max|step' "default"
     # Note: 'scope' corresponds to [Section] in INI files, leave blank for global scope.
+    # Omit the default argument to make Reset remove a setting; "" is an empty value.
+    # int: decimal integers up to 18 digits, step defaults to 1.
+    # float: finite decimal/exponent values, step defaults to 0.1.
+    # cycle: comma-separated options in the min field; bool: true/false/yes/no/on/off/1/0.
+    # action: define action_KEY(); menu: register before its register_child() entries.
+    # Menus have one level. Reset All applies to the current tab or submenu only.
     register 0 "Enable Service"   'service_enabled|bool||||'              "true"
     register 0 "Timeout (ms)"     'timeout|int||0|1000|50'                "100"
     register 0 "Log Prefix"       'log_prefix|string||||'                 "myapp_"
@@ -109,11 +115,9 @@ action_demo_sudo() {
 }
 
 post_write_action() {
-    # Triggered automatically after successful file writes
-    if command -v systemctl >/dev/null 2>&1; then
-        # systemctl reload my-daemon.service >/dev/null 2>&1 || :
-        :
-    fi
+    # Called after changed saves, once after Reset All. Report hook failures here.
+    # systemctl reload my-daemon.service >/dev/null 2>&1 || set_status "Reload failed."
+    :
 }
 
 # =============================================================================
@@ -421,6 +425,14 @@ is_float_literal() {
 
 number_le() {
     local left=$1 right=$2
+    # AWK floating-point comparisons lose adjacent large integers.
+    if is_int_literal "$left" && is_int_literal "$right"; then
+        local l=$(( 10#${left#-} )) r=$(( 10#${right#-} ))
+        [[ $left == -* ]] && l=$(( -l ))
+        [[ $right == -* ]] && r=$(( -r ))
+        (( l <= r ))
+        return
+    fi
     LC_ALL=C awk -v l="$left" -v r="$right" 'BEGIN { exit (l <= r ? 0 : 1) }'
 }
 
@@ -460,10 +472,8 @@ validate_item_config() {
     if [[ $block != "$REPLY" ]]; then
         log_err "Register Error: Scope must not have outer whitespace for '$label'."; exit 1
     fi
-    # Safe robust regex for blocks: accounts for spaces, quotes, and tildes.
-    local re='^[a-zA-Z0-9_.: =/"~'\''-]+(/[a-zA-Z0-9_.: =/"~'\''-]+)*$'
-    if [[ -n $block && ! $block =~ $re ]]; then
-        log_err "Register Error: Invalid block path for '$label': $block"
+    if [[ $block == *[$'\n\r'\[\]\|]* ]]; then
+        log_err "Register Error: Invalid section for '$label': $block"
         exit 1
     fi
     
@@ -506,6 +516,37 @@ validate_item_config() {
     fi
 }
 
+validate_item_default() {
+    local label=$1 type=$2 min=$3 max=$4 value=$5 option valid=0
+    local -a default_options=()
+    if [[ $value == *$'\n'* || $value == *$'\r'* ]]; then
+        log_err "Register Error: Multiline default for '$label'."; exit 1
+    fi
+    case $type in
+        int|float)
+            if [[ $type == int ]]; then is_int_literal "$value" && valid=1
+            else is_float_literal "$value" && valid=1; fi
+            if (( valid )) && [[ -n $min ]] && ! number_le "$min" "$value"; then valid=0; fi
+            if (( valid )) && [[ -n $max ]] && ! number_le "$value" "$max"; then valid=0; fi
+            ;;
+        bool)
+            case ${value,,} in true|false|yes|no|on|off|1|0) valid=1 ;; esac
+            ;;
+        cycle)
+            cycle_display_value "$value" "$min"; value=$REPLY
+            IFS=',' read -r -a default_options <<< "$min"
+            for option in "${default_options[@]}"; do
+                trim_spaces "$option"
+                if [[ $value == "$REPLY" ]]; then valid=1; break; fi
+            done
+            ;;
+        *) valid=1 ;;
+    esac
+    if (( !valid )); then
+        log_err "Register Error: Invalid or out-of-range default for '$label'."; exit 1
+    fi
+}
+
 register() {
     local -i tab_idx=$1
     local label=$2 config=$3 default_val=${4:-}
@@ -517,6 +558,9 @@ register() {
         exit 1
     fi
     validate_item_config "$label" "$key" "$type" "$block" "$min" "$max" "$step"
+    if (( $# >= 4 )) && [[ $type != menu && $type != action ]]; then
+        validate_item_default "$label" "$type" "$min" "$max" "$default_val"
+    fi
 
     if [[ -n ${ITEM_MAP["${tab_idx}::${label}"]+_} ]]; then
         log_err "Register Error: Duplicate label in tab $tab_idx: $label"
@@ -557,6 +601,9 @@ register_child() {
         exit 1
     fi
     validate_item_config "$label" "$key" "$type" "$block" "$min" "$max" "$step"
+    if (( $# >= 4 )) && [[ $type != action && $type != menu ]]; then
+        validate_item_default "$label" "$type" "$min" "$max" "$default_val"
+    fi
     if [[ $type == menu ]]; then
         log_err "Register Error: Nested menus are not supported for '$label'."
         exit 1
@@ -582,7 +629,7 @@ register_child() {
 populate_config_cache() {
     local target_path=${WRITE_TARGET:-}
     local current_scope="" k v line before after
-    CONFIG_CACHE=()
+    local -A parsed_cache=()
     CONFIG_SIGNATURE=""
 
     if [[ -z $target_path || ! -f $target_path || ! -r $target_path ]]; then
@@ -590,7 +637,7 @@ populate_config_cache() {
         return 1
     fi
 
-    before=$(file_signature "$target_path") || return 1
+    before=$(file_signature "$target_path") || { set_status "Unable to inspect config."; return 1; }
     while IFS= read -r line || [[ -n $line ]]; do
         trim_spaces "$line"; line=$REPLY
         [[ -z $line || $line == \#* || $line == \;* ]] && continue
@@ -606,19 +653,21 @@ populate_config_cache() {
             if [[ $v == \"*\" || $v == \'*\' ]]; then
                 v="${v:1:-1}"
             fi
-            CONFIG_CACHE["${k}|${current_scope}"]=$v
+            parsed_cache["${k}|${current_scope}"]=$v
         elif [[ $line =~ ^([^=[:space:]]+)[[:space:]]+(.*)$ ]]; then
             k=${BASH_REMATCH[1]}; v=${BASH_REMATCH[2]}
             trim_spaces "$v"; v=$REPLY
             if [[ $v == \"*\" || $v == \'*\' ]]; then v="${v:1:-1}"; fi
-            CONFIG_CACHE["${k}|${current_scope}"]=$v
+            parsed_cache["${k}|${current_scope}"]=$v
         fi
-    done < "$target_path"
+    done < "$target_path" || { set_status "Unable to read config."; return 1; }
     if ! after=$(file_signature "$target_path") || [[ $before != "$after" ]]; then
-        CONFIG_CACHE=()
         set_status "Config changed while being read; retry."
         return 1
     fi
+    # Publish only a complete, stable read. Failed reloads retain every view.
+    CONFIG_CACHE=()
+    for k in "${!parsed_cache[@]}"; do CONFIG_CACHE[$k]=${parsed_cache[$k]}; done
     CONFIG_SIGNATURE=$after
     return 0
 }
@@ -677,7 +726,7 @@ write_value_to_file() {
           $new_val == \"*\" || $new_val == \'*\' ]]; then encoded="\"${new_val}\""; fi
     # ENVIRON preserves literal backslashes, unlike awk -v string assignments.
     if ! DUSKY_SCOPE="$target_scope" DUSKY_KEY="$target_key" DUSKY_VALUE="$encoded" \
-         DUSKY_OPERATION="$operation" LC_ALL=C awk '
+         DUSKY_OPERATION="$operation" awk '
         BEGIN {
             scope = ENVIRON["DUSKY_SCOPE"]; key = ENVIRON["DUSKY_KEY"]
             val = ENVIRON["DUSKY_VALUE"]; deleting = ENVIRON["DUSKY_OPERATION"] == "delete"
@@ -701,9 +750,10 @@ write_value_to_file() {
                     if (!found && !deleting) {
                         indent = $0; sub(/[^[:space:]].*$/, "", indent)
                         rest = substr($0, length(indent) + length(key) + 1)
+                        sub(/\r$/, "", rest)
                         # Keep the existing assignment operator and its spacing.
-                        if (match(rest, /^[ \t]*=[ \t]*/)) sep = substr(rest, 1, RLENGTH)
-                        else if (match(rest, /^[ \t]+/)) sep = substr(rest, 1, RLENGTH)
+                        if (match(rest, /^[[:space:]]*=[[:space:]]*/)) sep = substr(rest, 1, RLENGTH)
+                        else if (match(rest, /^[[:space:]]+/)) sep = substr(rest, 1, RLENGTH)
                         else sep = "="
                         print indent key sep val eol; found = 1
                     }
@@ -756,6 +806,7 @@ cycle_display_value() {
         trim_spaces "$opt"
         opts+=("$REPLY")
     done
+    REPLY=$value
     for opt in "${opts[@]}"; do
         if [[ $opt == "$value" ]]; then
             REPLY=$opt
@@ -858,6 +909,10 @@ modify_value() {
                     if (( int_val > max_i )); then int_val=$max_i; fi
                 fi
             fi
+            if ! is_int_literal "$int_val"; then
+                set_status "Integer adjustment exceeds the supported 18-digit range."
+                return 0
+            fi
             new_val=$int_val
             ;;
         float)
@@ -892,7 +947,7 @@ modify_value() {
     esac
 
     if write_value_to_file "$key" "$new_val" "$block"; then
-        VALUE_CACHE["${REPLY_CTX}::${label}"]=$new_val
+        load_active_values
         clear_status
         if (( LAST_WRITE_CHANGED )); then post_write_action; fi
     fi
@@ -917,16 +972,16 @@ reset_current_item() {
     if [[ ${DEFAULTS["${REPLY_CTX}::${label}"]+present} ]]; then
         if write_value_to_file "$key" "$def_val" "$block"; then
             load_active_values
-            if (( LAST_WRITE_CHANGED )); then post_write_action; fi
             set_status "Reset '$label' to default ($def_val)."
+            if (( LAST_WRITE_CHANGED )); then post_write_action; fi
         else
             set_status "Failed to reset '$label'."
         fi
     else
         if write_value_to_file "$key" "" "$block" delete; then
             load_active_values
-            if (( LAST_WRITE_CHANGED )); then post_write_action; fi
             set_status "Reset '$label' to default (UNSET)."
+            if (( LAST_WRITE_CHANGED )); then post_write_action; fi
         else
             set_status "Failed to reset '$label'."
         fi
@@ -969,8 +1024,9 @@ reset_defaults() {
         fi
     done
 
+    if (( !any_failed )); then clear_status; fi
     if (( any_written )); then post_write_action; fi
-    if (( any_failed )); then set_status "Some defaults were not written."; else clear_status; fi
+    if (( any_failed )); then set_status "Some defaults were not written.${STATUS_MESSAGE:+ $STATUS_MESSAGE}"; fi
     return 0
 }
 
@@ -1082,6 +1138,9 @@ render_item_list() {
         IFS='|' read -r dummy_key type dummy_block dummy_min dummy_max dummy_step <<< "$config"
         
         def_val=${DEFAULTS["${ctx}::${item}"]:-}
+        if [[ $type == cycle && ${DEFAULTS["${ctx}::${item}"]+present} ]]; then
+            cycle_display_value "$def_val" "$dummy_min"; def_val=$REPLY
+        fi
         def_marker="  "
         if [[ ${DEFAULTS["${ctx}::${item}"]+present} ]]; then
             if [[ ${VALUE_CACHE["${ctx}::${item}"]+present} && $val != "$def_val" ]]; then
@@ -1881,6 +1940,9 @@ parse_args() {
 main() {
     parse_args "$@"
 
+    if (( TAB_COUNT == 0 || MAX_DISPLAY_ROWS < 1 )); then
+        log_err "Configure at least one tab and one display row."; exit 1
+    fi
     if (( BASH_VERSINFO[0] < 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] < 3) )); then log_err "Bash 5.3+ required"; exit 1; fi
     if [[ ! -t 0 || ! -t 1 ]]; then log_err "Interactive TTY stdin/stdout required"; exit 1; fi
 
@@ -1891,7 +1953,7 @@ main() {
 
     resolve_write_target || exit 1
     register_items
-    populate_config_cache || exit 1
+    populate_config_cache || { log_err "$STATUS_MESSAGE"; exit 1; }
 
     ORIGINAL_STTY=$(stty -g < /dev/tty 2>/dev/null) || ORIGINAL_STTY=""
     if [[ -z $ORIGINAL_STTY ]]; then log_err "Failed to read terminal settings. A controlling TTY is required."; exit 1; fi
