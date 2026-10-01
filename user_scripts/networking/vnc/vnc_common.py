@@ -235,6 +235,7 @@ def addresses() -> list[tuple[str, str]]:
 
 def show_status(unit: str, port: int, control: Path, ready: bool, description: str) -> None:
     from rich.console import Console
+    from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
     console = Console()
@@ -251,7 +252,23 @@ def show_status(unit: str, port: int, control: Path, ready: bool, description: s
     console.print(table)
     if not ips:
         console.print(Text("No usable IPv4 network address. Connect to Wi-Fi or Ethernet and rerun status."))
-    console.print(Text(f"Login: {pwd.getpwuid(os.getuid()).pw_name} · your Linux password · RVNC Viewer or VeNCrypt viewer"))
+    username = pwd.getpwuid(os.getuid()).pw_name
+    address = f"{ips[0][1]}:{port}" if ips else "an address from the table after connecting to Wi-Fi"
+    guide = (
+        "1. Install RealVNC Viewer (RVNC Viewer) from the iPhone App Store or Android Google Play.\n"
+        "   Official downloads: https://www.realvnc.com/en/connect/download/viewer/\n"
+        "2. Keep phone and PC on the same Wi-Fi; allow Local Network access on iPhone.\n"
+        f"3. In the viewer, add a manual connection with address: {address}\n"
+        "   Include the port shown above. If the app has a separate Port field, enter it there.\n"
+        f"4. Connect and sign in as {username} with your Linux account password.\n"
+        "   Confirm this PC's server identity if the viewer asks. No browser/PIN setup is needed.\n"
+        "5. Local Wi-Fi streaming needs no SIM/mobile data; downloading the app needs internet."
+    )
+    if port == PHONE_PORT:
+        guide += "\nThis is a separate monitor: an empty workspace may look black. Move a window onto it."
+    else:
+        guide += "\nThis shares your desktop. For a separate phone monitor, run phone_display.py."
+    console.print(Panel(Text(guide), title="Connect your phone (when Ready)", border_style="cyan"))
     if ready and state == "active":
         clients = control_data(control, "client-list")
         console.print(Text(f"Connected viewers: {len(clients)}" if clients is not None else "Connected viewers: unavailable"))
