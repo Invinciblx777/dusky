@@ -105,18 +105,18 @@ hl.config({
         groupbar = {
             enabled = true, -- Enables groupbars
             font_family = "", -- Font for groupbar titles (falls back to misc.font_family)
-            font_size = 10, -- Font size of title -> bigger for readability
+            font_size = 16, -- Font size of title -> bigger for readability
             font_weight_active = "bold", -- Font weight of active title -> bolder
             font_weight_inactive = "bold", -- Font weight of inactive title -> bold for readability
             gradients = true, -- Enables gradients -> squircle pill background for each title
-            height = 20, -- Height of groupbar (taller = gradients)
+            height = 17, -- Height of groupbar (taller = gradients)
             indicator_gap = 2, -- Gap between indicator and title
             indicator_height = 0, -- Hide indicator bar, keep only gradients
             stacked = false, -- Render as vertical stack
             priority = 3, -- Decoration priority
             render_titles = true, -- Render titles in decoration
             text_offset = 0, -- Vertical position adjust for titles
-            text_padding = 10, -- Horizontal padding for titles -> space inside pill
+            text_padding = 4, -- Horizontal padding for titles -> space inside pill
             rounding = 10, -- Round indicator (unused now)
             rounding_power = 4.0, -- Curve used for rounding indicator -> squircle (4.0)
             gradient_rounding = 12, -- Round gradients -> squircle pill radius (squircle)
@@ -131,8 +131,8 @@ hl.config({
             ["col.inactive"] = inverse_on_surface, -- Inactive background color (#2f312a dark)
             ["col.locked_active"] = tertiary, -- Active locked background color
             ["col.locked_inactive"] = tertiary_container, -- Inactive locked background color
-            gaps_in = 6, -- Gap between gradients
-            gaps_out = 4, -- Gap between gradients and window
+            gaps_in = 2, -- Gap between gradients
+            gaps_out = 0, -- Gap between gradients and window
             keep_upper_gap = true, -- Add/remove upper gap
             blur = false -- Apply blur to indicators and gradients
         }
