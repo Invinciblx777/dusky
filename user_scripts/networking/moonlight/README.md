@@ -1,8 +1,10 @@
-# Moonlight phone display
+# Moonlight secondary display
 
 This script uses **Sunshine**, not the separate Moonshine project. It creates
 the `DUSKY-MOONLIGHT` Hyprland monitor to the right of the desktop and streams
-it to a Moonlight client. Landscape is 1280×720; portrait is 720×1280. Audio
+it to a Moonlight client on a phone, tablet or another PC.
+Run setup on the Linux/Hyprland server; the receiving device can use iOS,
+Android, Windows, macOS or Linux. Landscape is 1280×720; portrait is 720×1280. Audio
 streaming stays disabled, matching the existing display-only workflow.
 
 ```sh
@@ -34,7 +36,7 @@ Sunshine to avoid concurrent state writes, preserves web UI credentials and
 other clients, saves a backup, and resumes only if it was already running.
 Also remove the old host in Moonlight before fresh pairing. `--forget-all`
 explicitly removes every saved client. These controls affect the PC's Sunshine
-state; they cannot delete entries inside the phone app.
+state; they cannot delete entries inside the receiving device's Moonlight client.
 
 `--diagnose` reports service state, default route, protocol response, monitor
 workspace and duplicate pairings, with specific next steps. `--test-display`
@@ -58,22 +60,34 @@ Automatic downloads require working repositories/AUR and internet access.
 Setup uses existing pacman databases; it does not refresh them or perform a
 system upgrade. An offline ISO should still include packages and dependencies.
 
-Add the displayed computer IP in Moonlight on the same Wi-Fi. No SIM, mobile
-data or internet is needed. On this computer, open `https://localhost:47990`,
-set up/sign in to Sunshine's web UI, and enter the PIN shown by Moonlight.
+Install Moonlight on the receiving device, using the
+[official downloads page](https://moonlight-stream.org/): **Moonlight Game
+Streaming** from App Store/Google Play for iPhone/Android, or the Moonlight
+desktop client for Windows/macOS/Linux. Connect the server and receiving device
+to the same Wi-Fi or Ethernet network, then add the server IP displayed by
+`--status` in Moonlight, with no port suffix. On the **streaming server**, open
+`https://localhost:47990`, set up/sign in to Sunshine's web UI, and enter the PIN
+shown by the receiving device's Moonlight client. Local streaming needs no SIM,
+mobile data or internet connection.
 Launch **Desktop**. The separate monitor can initially be empty.
 An empty workspace may be entirely black. Move a window there or use
 `--test-display`; this streams a secondary display rather than mirroring the
-laptop screen.
+server's physical screen.
 Automatic discovery requires the system's Avahi infrastructure; adding the
 IP manually works without it. Setup does not enable an extra discovery daemon.
 
-The Rich connection guide names **Moonlight Game Streaming** for iPhone
-(App Store) and Android (Google Play), linked from the official
-[Moonlight downloads page](https://moonlight-stream.org/). It shows the
-current computer IP, local-network permission on iPhone, web UI account/PIN
-steps, and the separate-monitor behavior. Downloading the phone app needs
+The Rich "Connect another device" guide includes mobile and desktop clients.
+It shows the current server IP, local-network permission on iPhone, web UI
+account/PIN steps, and the separate-monitor behavior. Downloading the client needs
 internet access; local streaming afterwards does not.
+
+For remote access, install/sign in to Tailscale on the server and receiving
+device, join the same tailnet, and allow the connection in its access rules.
+Add the **server's Tailscale IP** in Moonlight; `--status` shows it when available.
+Moonlight setup does not install or configure Tailscale automatically.
+Remote access requires internet. A working local Wi-Fi, Ethernet, hotspot or
+tethering network can carry streaming without internet. The same setup handles
+PC-to-PC connections; desktop-client and remote streaming remain untested here.
 
 When setup finishes with no saved clients, it automatically opens Sunshine's
 local web UI in the PC's default browser. `--pair` always opens it and shows

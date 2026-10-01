@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Use a phone as a separate Hyprland display through WayVNC on port 5901.
+"""Stream a separate Hyprland display to another device through WayVNC on port 5901.
 
 Run ``orientation portrait`` or ``orientation landscape`` to switch its shape.
 """
@@ -65,7 +65,7 @@ def monitors(instance: str) -> list[dict]:
 
 def unit_content() -> str:
     return (
-        "[Unit]\nDescription=Phone secondary display over WayVNC\n"
+        "[Unit]\nDescription=Secondary display over WayVNC\n"
         f"After=graphical-session.target {MASTER}\n"
         f"BindsTo={MASTER}\nPartOf=graphical-session.target {MASTER}\n"
         "StartLimitIntervalSec=0\n\n"
@@ -102,7 +102,7 @@ def display_ready() -> bool:
 def install() -> None:
     prepare()
     preferences()
-    # Desktop service is the master switch, even for a phone-only setup.
+    # Desktop service is the master switch, even for a secondary-display-only setup.
     import vnc_setup
     vnc_setup.install(show=False)
     config_changed = configure(CONFIG, KEY, CERT, PORT)
@@ -141,7 +141,7 @@ def serve() -> None:
                 break
             time.sleep(0.1)
         else:
-            raise RuntimeError(f"Hyprland did not configure the {width}x{height} phone output")
+            raise RuntimeError(f"Hyprland did not configure the {width}x{height} secondary output")
         # Keep the saved dimensions when clients request desktop resizing.
         exec_wayvnc(current, CONFIG, CONTROL, "-o", OUTPUT, "-R")
     except Exception:
@@ -158,24 +158,24 @@ def cleanup() -> None:
         # An exited compositor no longer owns any virtual monitor.
         instances = json.loads(run("hyprctl", "instances", "-j").stdout)
         if any(item["instance"] == instance for item in instances):
-            raise RuntimeError("Cannot inspect phone output; ownership record retained for recovery")
+            raise RuntimeError("Cannot inspect secondary output; ownership record retained for recovery")
     elif any(item["name"] == OUTPUT for item in json.loads(result.stdout)):
         hypr(instance, "output", "remove", OUTPUT)
         if any(item["name"] == OUTPUT for item in monitors(instance)):
-            raise RuntimeError("Phone output removal failed; ownership record retained for recovery")
+            raise RuntimeError("Secondary output removal failed; ownership record retained for recovery")
     STATE.unlink(missing_ok=True)
 
 
 def status() -> None:
     value = preferences()["orientation"]
     width, height = display_size(value)
-    show_status(UNIT_NAME, PORT, CONTROL, ready(), "Separate phone display")
-    message(f"Orientation: {value} ({width}x{height}); the phone monitor is to the right of your desktop.")
+    show_status(UNIT_NAME, PORT, CONTROL, ready(), "Secondary display")
+    message(f"Orientation: {value} ({width}x{height}); the virtual monitor is to the right of your desktop.")
 
 
 def stop() -> None:
     run("systemctl", "--user", "disable", "--now", UNIT_NAME)
-    message("Phone display stopped; the virtual monitor was removed")
+    message("Secondary display stopped; the virtual monitor was removed")
 
 
 def reconnect() -> None:

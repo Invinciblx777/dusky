@@ -166,7 +166,7 @@ def show_clients(control: Path) -> None:
         table.add_row(Text(str(client.get("id", ""))), Text(str(client.get("address", ""))), Text(str(client.get("username", ""))))
     Console().print(table)
     message("Disconnect one: --disconnect CLIENT_ID    Disconnect all: --disconnect-all")
-    message("Saved connection entries live in your phone viewer; remove them there if needed.")
+    message("Saved connection entries live in the receiving device's viewer; remove them there if needed.")
 
 
 def disconnect_clients(control: Path, identifier: str | None = None) -> None:
@@ -178,7 +178,7 @@ def disconnect_clients(control: Path, identifier: str | None = None) -> None:
         raise RuntimeError("Viewer ID not found; use --clients")
     for client in selected:
         run("wayvncctl", "-S", str(control), "client-disconnect", str(client["id"]))
-    message(f"Disconnected {len(selected)} viewer(s). Reopen the connection in your phone app.")
+    message(f"Disconnected {len(selected)} viewer(s). Reopen the connection in the receiving device's viewer.")
 
 
 def show_diagnostics(unit: str, port: int, control: Path) -> None:
@@ -330,7 +330,7 @@ def addresses() -> list[tuple[str, str]]:
     found = []
     for link in links:
         iface = link["ifname"]
-        # VM/container bridges do not give phones a directly usable LAN address.
+        # VM/container bridges do not give other devices a directly usable LAN address.
         net = Path("/sys/class/net") / iface
         physical = (net / "device").exists() or (net / "phy80211").exists()
         if "UP" not in link.get("flags", []) or not (physical or iface == preferred or iface == "tailscale0"):
@@ -353,7 +353,7 @@ def show_status(unit: str, port: int, control: Path, ready: bool, description: s
     enabled = run("systemctl", "--user", "is-enabled", unit, check=False).stdout.strip()
     label = "Ready" if state == "active" and ready else "Off" if state == "inactive" else "Not ready"
     console.print(Text(f"{description}: {label} ({state}, {enabled})", style="bold green" if label == "Ready" else "yellow"))
-    table = Table(title="Connect over the same Wi-Fi")
+    table = Table(title="Connection addresses (LAN or Tailscale)")
     table.add_column("Network")
     table.add_column("Address", style="bold cyan")
     ips = addresses()
@@ -364,21 +364,25 @@ def show_status(unit: str, port: int, control: Path, ready: bool, description: s
         console.print(Text("No usable IPv4 network address. Connect to Wi-Fi or Ethernet and rerun status."))
     username = pwd.getpwuid(os.getuid()).pw_name
     address = f"{ips[0][1]}:{port}" if ips else "an address from the table after connecting to Wi-Fi"
+    tiger_address = f"{ips[0][1]}::{port}" if ips else f"SERVER_IP::{port}"
     guide = (
-        "1. Install RealVNC Viewer (RVNC Viewer) from the iPhone App Store or Android Google Play.\n"
-        "   Official downloads: https://www.realvnc.com/en/connect/download/viewer/\n"
-        "2. Keep phone and PC on the same Wi-Fi; allow Local Network access on iPhone.\n"
-        f"3. In the viewer, add a manual connection with address: {address}\n"
-        "   Include the port shown above. If the app has a separate Port field, enter it there.\n"
-        f"4. Connect and sign in as {username} with your Linux account password.\n"
-        "   Confirm this PC's server identity if the viewer asks. No browser/PIN setup is needed.\n"
-        "5. Local Wi-Fi streaming needs no SIM/mobile data; downloading the app needs internet."
+        "1. Install a VNC viewer on the receiving phone, tablet or PC.\n"
+        "   iPhone/Android: RealVNC Viewer (RVNC Viewer), from App Store/Google Play.\n"
+        "   Linux/Windows/macOS PC: TigerVNC, or another RSA-AES/VeNCrypt viewer.\n"
+        "   Downloads: https://www.realvnc.com/en/connect/download/viewer/ or https://tigervnc.org/\n"
+        "2. Use the same Wi-Fi/Ethernet network, or connect both devices to the same Tailscale tailnet.\n"
+        "   On iPhone, allow Local Network access. For remote access, choose the Tailscale address.\n"
+        f"3. Add the server manually in the viewer: {address}\n"
+        f"   TigerVNC uses {tiger_address}; a separate Port field should contain {port}.\n"
+        f"4. Sign in as {username} with this Linux server's account password.\n"
+        "   Confirm the server identity if asked. No browser/PIN setup is needed.\n"
+        "5. Local streaming needs no internet; downloads and remote Tailscale access need internet."
     )
     if port == PHONE_PORT:
         guide += "\nThis is a separate monitor: an empty workspace may look black. Move a window onto it."
     else:
-        guide += "\nThis shares your desktop. For a separate phone monitor, run phone_display.py."
-    console.print(Panel(Text(guide), title="Connect your phone (when Ready)", border_style="cyan"))
+        guide += "\nThis shares your desktop. For a separate virtual monitor, run second_display.py."
+    console.print(Panel(Text(guide), title="Connect another device (when Ready)", border_style="cyan"))
     if ready and state == "active":
         clients = control_data(control, "client-list")
         console.print(Text(f"Connected viewers: {len(clients)}" if clients is not None else "Connected viewers: unavailable"))

@@ -1,19 +1,22 @@
 # Dusky VNC
 
 `vnc_setup.py` shares a physical Hyprland screen on TCP **5902**.
-`phone_display.py` creates a separate 1280×720 screen on TCP **5901**,
+`second_display.py` creates a separate 1280×720 screen on TCP **5901**,
 to the right of the other displays. Portrait mode uses 720×1280.
+Both displays accept clients on phones, tablets and other PCs. Run these scripts
+on the Linux/Hyprland server; install a viewer on the receiving device.
+The `second_display.py` filename identifies the secondary-display script.
 Port 5900 is deliberately avoided because local QEMU consoles commonly use it.
 
 Run setup as the desktop user in a running Hyprland session:
 
 ```sh
 ./vnc_setup.py
-./phone_display.py             # optional separate screen
+./second_display.py             # optional separate screen
 ./vnc_setup.py status
-./phone_display.py status
-./phone_display.py orientation portrait
-./phone_display.py orientation landscape
+./second_display.py status
+./second_display.py orientation portrait
+./second_display.py orientation landscape
 ```
 
 Setup creates the configuration and user units, prioritizes a UFW allowance for
@@ -33,16 +36,31 @@ firewall's policies are preserved; an inactive firewall stays inactive. Custom
 UFW before-rules, independent nftables/firewalld rules, and router isolation
 are outside this automatic UFW configuration. Setup does not reset firewalls.
 
-Keep the phone and computer on the same Wi-Fi. Enter the address shown by
-`status` and the appropriate port in RVNC Viewer, then sign in with the Linux
-account's username and password. No SIM, mobile data, DNS lookup, Tailscale,
+Keep the server and receiving device on the same Wi-Fi or Ethernet network.
+Install [RealVNC/RVNC Viewer](https://www.realvnc.com/en/connect/download/viewer/)
+on iPhone/Android, or [TigerVNC](https://tigervnc.org/) on a Linux, Windows or
+macOS PC. Other viewers must support RSA-AES or VeNCrypt.
+Enter the address shown by `status` and sign in with the **server's** Linux
+username and password. RVNC uses `SERVER_IP:5902` for desktop sharing or
+`SERVER_IP:5901` for the secondary display. TigerVNC uses an explicit port after
+two colons: `SERVER_IP::5902` or `SERVER_IP::5901`, as documented in its
+[viewer manual](https://tigervnc.org/doc/vncviewer.html). A viewer with separate
+address/port fields takes the IP and port separately.
+No SIM, mobile data, DNS lookup, Tailscale,
 or internet connection is required for local VNC. RVNC Viewer on iOS was
-confirmed working on this machine. Other viewers must support RSA-AES or
-VeNCrypt; password-only legacy VNC authentication is not enabled.
+confirmed working on this machine; desktop viewers have not been exercised.
+Password-only legacy VNC authentication is not enabled.
 
-Setup and status show a numbered Rich guide with the RealVNC/RVNC Viewer
-download link, exact address/port, current Linux username, iPhone local-network
+Setup and status show a numbered Rich "Connect another device" guide with
+mobile/desktop viewer download links, exact address/port, server Linux username, iPhone local-network
 permission and login steps. There is no web UI or PIN pairing for this VNC setup.
+
+For remote access, sign in to Tailscale on the server and receiving device,
+use the same tailnet, and select the server's Tailscale address from `status`.
+Tailnet access rules must permit the connection. `--remote` prepares Tailscale
+on the server. Remote access needs internet; local streaming over an existing
+Wi-Fi, Ethernet, hotspot or tethering network does not. This does not require a
+separate PC-to-PC script.
 
 Recovery controls work in both scripts:
 
@@ -52,17 +70,17 @@ Recovery controls work in both scripts:
 ./vnc_setup.py --clients
 ./vnc_setup.py --disconnect CLIENT_ID
 ./vnc_setup.py --disconnect-all
-./phone_display.py --diagnose
-./phone_display.py --reconnect
+./second_display.py --diagnose
+./second_display.py --reconnect
 ```
 
 `--reconnect` restarts the selected display and disconnects its viewers.
-Restarting the master also restores an enabled phone display; a disabled phone
-display stays disabled. Reconnecting the phone display restarts only that display
+Restarting the master also restores an enabled secondary display; a disabled secondary
+display stays disabled. Reconnecting the secondary display restarts only that display
 when the master is healthy. `--disconnect`/`--disconnect-all` leave the server
 running and drop only the selected display's sessions. Reopen the connection
 in the viewer afterwards. WayVNC has no saved-pairing database; delete saved
-addresses inside the phone app. Existing positional actions remain supported.
+addresses inside the receiving device's viewer. Existing positional actions remain supported.
 
 The main switch controls both Dusky VNC services:
 
@@ -73,17 +91,17 @@ systemctl --user disable --now dusky_vnc.service
 
 The service TUI already uses `--now`. Plain `enable`/`disable` controls automatic
 startup only; `--now` also starts/stops the running services. Disabling the main
-service stops both servers and removes the phone monitor. The phone service
+service stops both servers and removes the secondary monitor. The secondary service
 keeps its enablement preference, so it returns with the main service next time.
-The main service checks its enabled state at startup, so starting the phone
+The main service checks its enabled state at startup, so starting the secondary
 service cannot implicitly start a disabled VNC system.
-To turn off only the separate screen, use `./phone_display.py stop`.
+To turn off only the separate screen, use `./second_display.py stop`.
 
 The units own the WayVNC processes. There is no persistent Python supervisor
 after startup, no periodic CLI status polling, and no VNC process when stopped.
 Failures restart with a delay increasing from 5 to 30 seconds. Each server has
 its own control socket, and status checks both capture state and the RFB greeting.
-Saved phone dimensions are preserved when viewers request resizing.
+Saved secondary-display dimensions are preserved when viewers request resizing.
 
 `offline` requires a disconnected, AP-capable second Wi-Fi adapter and dnsmasq.
 The optional actions install missing NetworkManager/dnsmasq or Tailscale packages.
@@ -96,7 +114,7 @@ routing/DNS preferences are preserved; the remote workflow was not activated
 during this audit.
 
 If a connection times out, inspect the relevant service journal and verify the
-phone is using the displayed address/port. An active listener and local RFB
+receiving device is using the displayed address/port. An active listener and local RFB
 check do not prove that a router permits traffic between Wi-Fi clients. Guest
 networks/client isolation can still block access. IPv6-only networks and
 cross-subnet router configurations were not tested; these scripts listen on IPv4.
@@ -113,12 +131,12 @@ package set with those fixes when finalizing the ISO. The installed repository
 metadata currently offers 0.10.1; no package upgrade was performed.
 
 - Three main-service off/on cycles: both PIDs became zero, both listeners closed,
-  and the owned phone output/state were removed; both servers returned on enable.
-- A final off/on cycle confirmed that attempting to start the phone service
+  and the owned secondary output/state were removed; both servers returned on enable.
+- A final off/on cycle confirmed that attempting to start the secondary service
   while the master was disabled left both services inactive with zero PIDs;
   enabling the master restored both servers.
 - Forced crash of each server: automatic recovery; a main-server crash also
-  stopped/recreated the phone display.
+  stopped/recreated the secondary display.
 - Portrait and landscape: expected monitor dimensions and capture readiness.
 - Both servers: successful TLS/PAM authentication and a complete 1280×720 raw
   framebuffer update (3,686,400 bytes each).
@@ -127,7 +145,7 @@ metadata currently offers 0.10.1; no package upgrade was performed.
   user confirmed the desktop displayed correctly. Port 5901 was also confirmed
   to show the separate monitor with working cursor control. Android testing is
   deferred.
-- Thirty-second sample: idle phone server used 0 measured CPU seconds and
+- Thirty-second sample: idle secondary-display server used 0 measured CPU seconds and
   22.12 MiB in its service cgroup. Desktop VNC with an iPhone connected used
   0.468375 CPU seconds (1.56% of one core) and 28.29 MiB. These are short
   observations on this machine, not throughput or latency benchmarks.
@@ -143,7 +161,7 @@ metadata currently offers 0.10.1; no package upgrade was performed.
   so isolated loopback ingress was evaluated through the UFW user chain.
 - Second pass: repeated setup through both `python` and `python3` preserved
   server PIDs; one additional complete master off/on cycle passed, including
-  the disabled-master/phone-start check. Wi-Fi and routes remained unchanged.
+  the disabled-master/secondary-start check. Wi-Fi and routes remained unchanged.
 - Existing offline profiles must be inactive AP profiles before reuse;
   connected client profiles and active hotspots are rejected before modification.
 - Removed ignored `deny`/`unlock_time` options from this machine's existing
@@ -162,7 +180,7 @@ atomic writes, cleanup ownership recovery, firewall idempotence/error reporting,
 offline profile reuse, stable service commands across Python aliases, batched
 dependency installation, installation failures, targeted viewer disconnection,
 reconnect service preferences, recovering a disabled master without reconfiguring
-a healthy one, and flag dispatch. Diagnostics, master and phone reconnect
+a healthy one, and flag dispatch. Diagnostics, master and secondary reconnect
 and empty-session disconnect were exercised live; individual viewer disconnect
 was checked with fixtures rather than disconnecting an authenticated phone.
 Unit syntax also passed

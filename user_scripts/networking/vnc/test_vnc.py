@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import phone_display as phone
+import second_display as phone
 import vnc_common as common
 import vnc_setup as desktop
 

@@ -1411,16 +1411,16 @@ scope = "user"
 [[pages.layout.items.layout.items]]
 type = "service"
 [pages.layout.items.layout.items.properties]
-title = "WayVNC Phone Display"
-description = "Virtual secondary monitor for phone (TCP 5901)"
-icon = "phone-symbolic"
+title = "WayVNC Secondary Display"
+description = "Virtual secondary monitor (TCP 5901)"
+icon = "video-joined-displays-symbolic"
 service = "dusky_phone_display.service"
 scope = "user"
 
 [[pages.layout.items.layout.items]]
 type = "service"
 [pages.layout.items.layout.items.properties]
-title = "Moonlight Phone Display"
+title = "Moonlight Secondary Display"
 description = "Hardware-accelerated Sunshine stream (Port 47989)"
 icon = "preferences-desktop-remote-desktop-symbolic"
 service = "dusky_moonlight_display.service"
@@ -1430,7 +1430,7 @@ scope = "user"
 type = "section"
 [pages.layout.items.layout.properties]
 title = "WayVNC Desktop Sharing (TCP 5902)"
-description = "Mirror desktop display to RealVNC / RVNC Viewer over local Wi-Fi"
+description = "Mirror desktop display to RealVNC / TigerVNC viewer over network"
 icon = "video-display-symbolic"
 
 [[pages.layout.items.layout.items]]
@@ -1451,7 +1451,7 @@ type = "button"
 [pages.layout.items.layout.items.properties]
 title = "Connection Status & Guide"
 button_text = "Status"
-description = "View network IPs, port 5902, and phone setup guide"
+description = "View network IPs, port 5902, and connection guide"
 icon = "dialog-information-symbolic"
 [pages.layout.items.layout.items.on_press]
 type = "exec"
@@ -1536,7 +1536,7 @@ type = "button"
 [pages.layout.items.layout.items.properties]
 title = "Stop All VNC Displays"
 button_text = "Stop All"
-description = "Disable and stop both desktop and phone VNC services"
+description = "Disable and stop both desktop and secondary VNC services"
 icon = "process-stop-symbolic"
 style = "destructive"
 [pages.layout.items.layout.items.on_press]
@@ -1547,14 +1547,14 @@ terminal = false
 [[pages.layout.items.layout]]
 type = "section"
 [pages.layout.items.layout.properties]
-title = "WayVNC Phone Display (TCP 5901)"
+title = "WayVNC Secondary Display (TCP 5901)"
 description = "Headless secondary display positioned right of the desktop"
-icon = "phone-symbolic"
+icon = "video-joined-displays-symbolic"
 
 [[pages.layout.items.layout.items]]
 type = "selection"
 [pages.layout.items.layout.items.properties]
-title = "Phone Screen Orientation"
+title = "Display Orientation"
 description = "Landscape (1280x720) or Portrait (720x1280)"
 icon = "view-refresh-symbolic"
 value_command = "jq -r '.orientation // \"landscape\"' ~/.config/dusky/settings/remote/vnc_display.json 2>/dev/null || echo landscape"
@@ -1563,104 +1563,104 @@ options = ["Landscape", "Portrait"]
 options_map = { "landscape" = "Landscape", "portrait" = "Portrait" }
 [pages.layout.items.layout.items.on_change.Landscape]
 type = "exec"
-command = "python3 $HOME/user_scripts/networking/vnc/phone_display.py orientation landscape"
+command = "python3 $HOME/user_scripts/networking/vnc/second_display.py orientation landscape"
 terminal = false
 [pages.layout.items.layout.items.on_change.Portrait]
 type = "exec"
-command = "python3 $HOME/user_scripts/networking/vnc/phone_display.py orientation portrait"
+command = "python3 $HOME/user_scripts/networking/vnc/second_display.py orientation portrait"
 terminal = false
 
 [[pages.layout.items.layout.items]]
 type = "button"
 [pages.layout.items.layout.items.properties]
-title = "Setup Phone Display"
+title = "Setup Secondary Display"
 button_text = "Setup"
 description = "Create virtual DUSKY-PHONE monitor and start VNC service"
 icon = "preferences-system-symbolic"
 style = "suggested"
 [pages.layout.items.layout.items.on_press]
 type = "exec"
-command = "kitty --class dusky_vnc_phone --title \"WayVNC Phone Display Setup\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/phone_display.py --setup\""
+command = "kitty --class dusky_vnc_second --title \"WayVNC Secondary Display Setup\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/second_display.py --setup\""
 terminal = false
 
 [[pages.layout.items.layout.items]]
 type = "button"
 [pages.layout.items.layout.items.properties]
-title = "Phone Connection Status"
+title = "Connection Status & Guide"
 button_text = "Status"
 description = "View port 5901 IP address, orientation, and instructions"
 icon = "dialog-information-symbolic"
 [pages.layout.items.layout.items.on_press]
 type = "exec"
-command = "kitty --class dusky_vnc_phone --title \"WayVNC Phone Display Status\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/phone_display.py --status\""
+command = "kitty --class dusky_vnc_second --title \"WayVNC Secondary Display Status\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/second_display.py --status\""
 terminal = false
 
 [[pages.layout.items.layout.items]]
 type = "button"
 [pages.layout.items.layout.items.properties]
-title = "Phone Display Diagnostics"
+title = "Secondary Display Diagnostics"
 button_text = "Diagnose"
 description = "Inspect master service, port 5901 RFB greeting, and monitor"
 icon = "utilities-system-monitor-symbolic"
 [pages.layout.items.layout.items.on_press]
 type = "exec"
-command = "kitty --class dusky_vnc_phone --title \"WayVNC Phone Diagnostics\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/phone_display.py --diagnose\""
+command = "kitty --class dusky_vnc_second --title \"WayVNC Secondary Diagnostics\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/second_display.py --diagnose\""
 terminal = false
 
 [[pages.layout.items.layout.items]]
 type = "button"
 [pages.layout.items.layout.items.properties]
-title = "Reconnect Phone Display"
+title = "Reconnect Secondary Display"
 button_text = "Reconnect"
 description = "Restart service and re-create virtual DUSKY-PHONE monitor"
 icon = "view-refresh-symbolic"
 [pages.layout.items.layout.items.on_press]
 type = "exec"
-command = "kitty --class dusky_vnc_phone --title \"WayVNC Phone Reconnect\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/phone_display.py --reconnect\""
+command = "kitty --class dusky_vnc_second --title \"WayVNC Secondary Reconnect\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/second_display.py --reconnect\""
 terminal = false
 
 [[pages.layout.items.layout.items]]
 type = "button"
 [pages.layout.items.layout.items.properties]
-title = "Connected Phone Viewers"
+title = "Connected Viewers"
 button_text = "Viewers"
 description = "List viewers connected to port 5901"
 icon = "system-users-symbolic"
 [pages.layout.items.layout.items.on_press]
 type = "exec"
-command = "kitty --class dusky_vnc_phone --title \"WayVNC Phone Viewers\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/phone_display.py --clients\""
+command = "kitty --class dusky_vnc_second --title \"WayVNC Secondary Viewers\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/second_display.py --clients\""
 terminal = false
 
 [[pages.layout.items.layout.items]]
 type = "button"
 [pages.layout.items.layout.items.properties]
-title = "Disconnect Phone Viewers"
+title = "Disconnect Viewers"
 button_text = "Disconnect"
-description = "Drop active phone display viewer sessions"
+description = "Drop active secondary display viewer sessions"
 icon = "network-offline-symbolic"
 style = "destructive"
 [pages.layout.items.layout.items.on_press]
 type = "exec"
-command = "kitty --class dusky_vnc_phone --title \"Disconnect Phone Viewers\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/phone_display.py --disconnect-all\""
+command = "kitty --class dusky_vnc_second --title \"Disconnect Secondary Viewers\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/second_display.py --disconnect-all\""
 terminal = false
 
 [[pages.layout.items.layout.items]]
 type = "button"
 [pages.layout.items.layout.items.properties]
-title = "Stop Phone Display"
+title = "Stop Secondary Display"
 button_text = "Stop"
-description = "Stop phone service and remove virtual DUSKY-PHONE monitor"
+description = "Stop secondary service and remove virtual DUSKY-PHONE monitor"
 icon = "process-stop-symbolic"
 style = "destructive"
 [pages.layout.items.layout.items.on_press]
 type = "exec"
-command = "kitty --class dusky_vnc_phone --title \"Stop Phone Display\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/phone_display.py --stop\""
+command = "kitty --class dusky_vnc_second --title \"Stop Secondary Display\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/second_display.py --stop\""
 terminal = false
 
 [[pages.layout.items.layout]]
 type = "section"
 [pages.layout.items.layout.properties]
-title = "Moonlight (Sunshine) Phone Display (Port 47989)"
+title = "Moonlight (Sunshine) Secondary Display (Port 47989)"
 description = "Low-latency hardware-accelerated video streaming to Moonlight clients"
 icon = "preferences-desktop-remote-desktop-symbolic"
 
@@ -1701,7 +1701,7 @@ type = "button"
 [pages.layout.items.layout.items.properties]
 title = "Pair Moonlight Client"
 button_text = "Pair"
-description = "Open Sunshine web UI (https://localhost:47990) to enter phone PIN"
+description = "Open Sunshine web UI (https://localhost:47990) to enter client PIN"
 icon = "network-wireless-symbolic"
 style = "suggested"
 [pages.layout.items.layout.items.on_press]
@@ -1726,7 +1726,7 @@ type = "button"
 [pages.layout.items.layout.items.properties]
 title = "Test Display Video"
 button_text = "Test Video"
-description = "Show a high-contrast test window on the streamed phone monitor"
+description = "Show a high-contrast test window on the streamed virtual monitor"
 icon = "video-display-symbolic"
 style = "suggested"
 [pages.layout.items.layout.items.on_press]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Set up a standalone Hyprland phone display streamed through Sunshine/Moonlight.
+"""Stream a separate Hyprland display to another device through Sunshine/Moonlight.
 
 Run ``orientation portrait`` or ``orientation landscape`` to switch its shape.
 """
@@ -316,7 +316,7 @@ def unit_content() -> str:
     script = json.dumps(script.replace("$", "$$"), ensure_ascii=False)
     python = '"/usr/bin/python3"'
     return (
-        "[Unit]\nDescription=Phone secondary display over Sunshine/Moonlight\n"
+        "[Unit]\nDescription=Secondary display over Sunshine/Moonlight\n"
         "After=graphical-session.target\nPartOf=graphical-session.target\n"
         "StartLimitIntervalSec=0\n\n"
         "[Service]\nType=exec\n"
@@ -531,16 +531,19 @@ def status() -> None:
             message("Duplicate client certificates detected; rerun setup to repair pairing.", error=True)
         address = connection_addresses[0][1] if connection_addresses else "an IP from the table (none currently available)"
         steps = (
-            "1. Install Moonlight Game Streaming: App Store (iPhone) or Google Play (Android).\n"
+            "1. Install Moonlight on the receiving phone, tablet or PC.\n"
+            "   iPhone/Android: Moonlight Game Streaming from App Store/Google Play.\n"
+            "   Windows/macOS/Linux PC: download the Moonlight desktop client.\n"
             "   Official downloads: https://moonlight-stream.org/\n"
-            "2. Connect phone and PC to the same Wi-Fi; allow Local Network access on iPhone.\n"
-            f"3. In Moonlight, add this PC manually: {address} (IP only).\n"
-            "4. On this PC, open https://localhost:47990; create/sign in with Sunshine's web UI account.\n"
+            "2. Use the same Wi-Fi/Ethernet network, or connect both devices to the same Tailscale tailnet.\n"
+            "   On iPhone, allow Local Network access. For remote access, choose the Tailscale address.\n"
+            f"3. In Moonlight, add the server manually: {address} (IP only).\n"
+            "4. On the streaming server, open https://localhost:47990; create/sign in with Sunshine's web UI account.\n"
             "   Proceed past the local certificate warning if the browser shows one.\n"
-            "5. Tap the PC in Moonlight; enter the phone's PIN on Sunshine's PIN page.\n"
-            "6. Launch Desktop in Moonlight. Streaming needs no SIM/mobile data."
+            "5. Select the server in Moonlight; enter the receiving device's PIN on Sunshine's PIN page.\n"
+            "6. Launch Desktop. Local streaming needs no internet; downloads and remote Tailscale access do."
         )
-        console.print(Panel(Text(steps), title="Connect your phone", border_style="cyan"))
+        console.print(Panel(Text(steps), title="Connect another device", border_style="cyan"))
         message("Open the PC pairing page again: --pair")
         message(f"The {OUTPUT} monitor is to the right of your other displays.")
         message("An empty workspace may look black; move a window there or run --test-display.")
@@ -618,7 +621,7 @@ def forget_clients(identifier: str | None = None) -> None:
     finally:
         if active:
             run("systemctl", "--user", "start", UNIT_NAME)
-    message("Forget the old host in the phone app too, then pair again using --pair.")
+    message("Forget the old host in the receiving device's Moonlight client too, then pair again using --pair.")
 
 
 def open_pairing_page(*, only_unpaired: bool = False) -> None:
@@ -663,11 +666,11 @@ def diagnose() -> None:
     table.add_row("GameStream", "Responding" if listening() else "Unavailable")
     current = session()
     monitor = next((item for item in monitors(current["instance"]) if item["name"] == OUTPUT), None) if current else None
-    table.add_row("Phone monitor", f"{monitor['width']}×{monitor['height']} on workspace {monitor['activeWorkspace']['name']}" if monitor else "Absent")
+    table.add_row("Virtual monitor", f"{monitor['width']}×{monitor['height']} on workspace {monitor['activeWorkspace']['name']}" if monitor else "Absent")
     table.add_row("Duplicate identities", str(repair_duplicate_pairings(repair=False)))
     Console().print(table)
     clients()
-    message("Pairing failure: forget the affected client on PC and phone, then --pair.")
+    message("Pairing failure: forget the affected client on the server and receiving device, then --pair.")
     message("Black screen: --test-display distinguishes an empty monitor from a video failure.")
     message("Timeout: rerun --setup for UFW rules; check Wi-Fi client isolation on the router.")
     message(f"Detailed logs: journalctl --user -u {UNIT_NAME} -n 40 --no-pager")
@@ -677,7 +680,7 @@ def test_display() -> None:
     if not ready():
         raise RuntimeError("Start Sunshine first using --reconnect")
     if not shutil.which("kitty"):
-        raise RuntimeError("The visible test requires kitty; alternatively move a window onto the phone monitor")
+        raise RuntimeError("The visible test requires kitty; alternatively move a window onto the virtual monitor")
     current = session()
     monitor = next(item for item in monitors(current["instance"]) if item["name"] == OUTPUT)
     command = shlex.join([
@@ -698,7 +701,7 @@ def test_display() -> None:
                 options = {"workspace": str(monitor["activeWorkspace"]["id"]), "silent": True, "window": "address:" + window["address"]}
                 lua = "{ " + ", ".join(f"{key} = {json.dumps(value)}" for key, value in options.items()) + " }"
                 hypr(current["instance"], "eval", f"hl.dispatch(hl.dsp.window.move({lua}))")
-            message("A white test window is on the phone monitor. Close it normally after testing.")
+            message("A white test window is on the virtual monitor. Close it normally after testing.")
             return
         time.sleep(0.1)
     raise RuntimeError("The test window did not appear; check kitty and Hyprland logs")
@@ -738,16 +741,16 @@ def main() -> None:
     for action, help_text in (
         ("setup", "Configure Sunshine, UFW and service; start if needed"),
         ("status", "Show readiness and connection addresses"),
-        ("stop", "Disable and stop the entire phone display"),
+        ("stop", "Disable and stop the entire secondary display"),
         ("reconnect", "Restart Sunshine and repair duplicate pairings"),
         ("clients", "List saved client names and IDs"),
         ("pair", "Open the local Sunshine PIN page"),
         ("diagnose", "Show service, network, display and pairing checks"),
-        ("test-display", "Show a visible test window on the phone monitor"),
+        ("test-display", "Show a visible test window on the virtual monitor"),
         ("usb", "Prepare optional iPhone USB routing; keep Wi-Fi default"),
     ):
         group.add_argument("--" + action, dest="flag_action", action="store_const", const=action, help=help_text)
-    group.add_argument("--orientation", dest="flag_orientation", choices=("landscape", "portrait"), help="Set the phone monitor orientation")
+    group.add_argument("--orientation", dest="flag_orientation", choices=("landscape", "portrait"), help="Set the virtual monitor orientation")
     group.add_argument("--forget-client", metavar="CLIENT_ID", help="Remove a saved client ID shown by --clients")
     group.add_argument("--forget-all", action="store_true", help="Remove all saved clients; preserve web UI credentials")
     args = parser.parse_args()

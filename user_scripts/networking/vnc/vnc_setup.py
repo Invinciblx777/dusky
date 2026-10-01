@@ -3,7 +3,7 @@
 
 Run without arguments once to install and start the user service. Use ``status``
 for connection addresses, ``remote`` to set up Tailscale, and ``stop`` to disable
-VNC and the optional phone display. ``offline`` needs a spare Wi-Fi adapter;
+VNC and the optional secondary display. ``offline`` needs a spare Wi-Fi adapter;
 the existing Wi-Fi connection is preserved. Desktop sharing uses port 5902.
 """
 
@@ -119,7 +119,7 @@ def offline() -> None:
     ensure_dependencies({"networkmanager": ("nmcli",), "dnsmasq": ("dnsmasq",)})
     device = wifi_device()
     if not device:
-        raise RuntimeError("Offline hotspot needs an unused second Wi-Fi adapter. Keep both phones on your existing Wi-Fi and use status.")
+        raise RuntimeError("Offline hotspot needs an unused second Wi-Fi adapter. Keep both devices on your existing network and use status.")
     setup_offline_wifi(device)
     credentials = offline_credentials()
     if not credentials:
@@ -135,7 +135,7 @@ def offline() -> None:
     if wifi_device() != device:
         raise RuntimeError("The spare adapter is no longer idle; hotspot was not activated")
     run("nmcli", "--wait", "10", "connection", "up", OFFLINE_PROFILE, "ifname", device)
-    message(f"Connect your phone to Wi-Fi {credentials[0]} with password {credentials[1]}")
+    message(f"Connect the receiving device to Wi-Fi {credentials[0]} with password {credentials[1]}")
     status()
 
 
@@ -160,7 +160,7 @@ def rfb_ready() -> bool:
 def status() -> None:
     show_status(UNIT_NAME, PORT, CONTROL, ready(), "Desktop sharing")
     enabled = run("systemctl", "--user", "is-enabled", PHONE, check=False).stdout.strip()
-    message(f"Separate phone display: port 5901 ({enabled}); run phone_display.py status for details.")
+    message(f"Secondary display: port 5901 ({enabled}); run second_display.py status for details.")
 
 
 def remote() -> None:
@@ -187,7 +187,7 @@ def remote() -> None:
 
 def stop() -> None:
     run("systemctl", "--user", "disable", "--now", UNIT_NAME)
-    message("All Dusky VNC stopped and disabled; the optional phone monitor is removed")
+    message("All Dusky VNC stopped and disabled; the optional secondary monitor is removed")
 
 
 def reconnect() -> None:
@@ -198,9 +198,9 @@ def reconnect() -> None:
         run("systemctl", "--user", "restart", UNIT_NAME)
         wait_ready(ready, UNIT_NAME)
     if run("systemctl", "--user", "is-enabled", PHONE, check=False).stdout.strip() == "enabled":
-        import phone_display
+        import second_display
         run("systemctl", "--user", "start", PHONE)
-        wait_ready(phone_display.ready, PHONE)
+        wait_ready(second_display.ready, PHONE)
     status()
 
 
