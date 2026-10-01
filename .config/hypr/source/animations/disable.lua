@@ -8,4 +8,3 @@ hl.config({
         enabled = false
     }
 })
-
