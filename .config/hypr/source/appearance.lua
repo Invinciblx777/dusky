@@ -14,10 +14,7 @@ hl.config({
         gaps_workspaces = 50, -- Gaps between workspaces (stacks with gaps_out)
 
         ["col.inactive_border"] = inverse_on_surface, -- Border color for inactive windows
-        ["col.active_border"] = {
-            colors = { primary, primary },
-            angle = 45
-        }, -- Border color for the active window (supports solid or multi-color gradients)
+        ["col.active_border"] = primary, -- Border color for the active window
         ["col.nogroup_border"] = inverse_on_surface, -- Inactive border color for window that cannot be added to a group
         ["col.nogroup_border_active"] = secondary, -- Active border color for window that cannot be added to a group
 
@@ -213,10 +210,30 @@ hl.window_rule({
     -- using override here so it doesn't compound with the global value
     -- opacity       = "0.85 override 0.85 override 1.0 override",
     opacity       = 1.0,
+
+    -- BLUR
+    -- false = keep blur enabled (matches your global blur.enabled = true)
+    -- set to true to disable blur for this window only
     no_blur       = false,
-    animation     = "", -- Custom opening animation style ("popin 80%", "slide", "gnomed", or "" for default)
+
+    -- BORDER COLOR
+    -- leave unset to inherit global col.active_border / col.inactive_border
+    -- uncomment to override, e.g. a gradient:
+    -- border_color = "rgb(ffffff) rgb(000000) 45deg",
+
+    -- ANIMATION
+    -- override the open/close animation for this window
+    -- options: "popin", "popin 80%", "slide", "gnomed", or unset ("") to inherit global
+    -- animation     = "popin 80%",
+    -- no_anim       = false,
+
+    -- DIMMING
     dim_around    = false, -- Dims everything around single windows
-    no_anim       = false, -- Disables animations specifically for single windows
+
+    -- TEARING
+    -- allow this window to request tearing (reduce latency)
+    -- matches your global allow_tearing = true, but this is per-window opt-in
+    -- immediate = false,
 })
 
 -- Maximized window (f[1] = workspace has a maximized window)
@@ -227,9 +244,19 @@ hl.window_rule({
     rounding      = 10,
     opacity       = 1.0, -- override 0.85 override 1.0 override"
     no_blur       = true,
-    animation     = "", -- Custom animation style ("popin 80%", "slide", "gnomed", or "" for default)
+
+    -- BORDER COLOR
+    -- border_color = "rgb(ffffff) rgb(000000) 45deg",
+
+    -- ANIMATION
+    -- animation     = "popin 80%",
+    -- no_anim       = false,
+
+    -- DIMMING
     dim_around    = false, -- Dims everything around maximized windows
-    no_anim       = false, -- Disables animations specifically for maximized windows
+
+    -- TEARING
+    -- immediate = false,
 })
 
 -- -------------------------------------------------------------------------------------------------
@@ -280,39 +307,5 @@ hl.window_rule({
 
 -- Sourcing active animations
 require("source.animations.active.active")
-
--- -------------------------------------------------------------------------------------------------
--- BORDER ANIMATION (Configured via Dusky Appearance TUI)
--- -------------------------------------------------------------------------------------------------
-hl.animation({
-    leaf = "borderangle",
-    enabled = false,
-    speed = 30,
-    bezier = "linear",
-    style = "loop"
-})
-
-hl.animation({
-    leaf = "border",
-    enabled = false,
-    speed = 10,
-    bezier = "linear"
-})
-
-hl.animation({
-    leaf = "shadowangle",
-    enabled = false,
-    speed = 30,
-    bezier = "linear",
-    style = "loop"
-})
-
-hl.animation({
-    leaf = "glowangle",
-    enabled = false,
-    speed = 30,
-    bezier = "linear",
-    style = "loop"
-})
 
 
