@@ -11,6 +11,7 @@
 # 7. Prompt & Tool Initialization
 # 8. Plugins (Syntax Highlighting MUST be last)
 # 9. TTY Auto-Login
+# 10. User Customizations (Immune to Updates)
 # =============================================================================
 
 # Exit early if not interactive (prevents breaking SCP/SFTP/rsync)
@@ -328,6 +329,23 @@ fi
 # Native variable check avoids expensive $(tty) subshells
 if [[ -z "$DISPLAY" && -z "$WAYLAND_DISPLAY" && "$TTY" == "/dev/tty1" ]]; then
   exec start-hyprland
+fi
+
+
+# -----------------------------------------------------------------------------
+# [10] USER CUSTOMIZATIONS
+# -----------------------------------------------------------------------------
+# Put your personal aliases, functions, and exports into ~/.zshrc.local
+# This file is not tracked by Dusky and will not be overwritten on update.
+if [[ -f "$HOME/.zshrc.local" ]]; then
+  source "$HOME/.zshrc.local"
+fi
+
+if [[ -d "$HOME/.config/zshrc/custom" ]]; then
+  for _user_mod in "$HOME/.config/zshrc/custom"/*.zsh(N); do
+    [[ -r "$_user_mod" ]] && source "$_user_mod"
+  done
+  unset _user_mod
 fi
 
 # =============================================================================
