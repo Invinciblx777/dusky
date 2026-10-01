@@ -1,29 +1,8 @@
 #!/usr/bin/env python3
-"""
-===============================================================================
-DUSKY TUI: UFW FIREWALL MANAGER
-===============================================================================
-Bleeding-edge Terminal User Interface for Arch Linux UFW firewall administration.
-Features:
-- Live status dashboard with rich reactive cards and system metrics.
-- Port Inspector: inspects all listening TCP/UDP sockets, probes reachability, and
-  classifies each port as EXPOSED, ALLOWED, BLOCKED, PROTECTED, or FILTERED.
-- Fast Port Opener & Closer: instant 1-click port opening, closing, or rejecting
-  (TCP, UDP, both; anywhere or local LAN RFC1918 subnets).
-- Common Service Switches: instant toggles for SSH, HTTP, HTTPS, FTP, DNS,
-  WireGuard, Tailscale, Moonlight, Plex, Minecraft, Samba, VNC, and Syncthing.
-- Full numbered rules inspector and instant rule deletion/reordering.
-- Interactive OpenBSD PF / UFW rule constructor (actions, protocols, ports, CIDRs,
-  interfaces, rate-limiting, and per-rule logging).
-- Exclusive Website / Domain Whitelist Lockdown Mode with automatic IPv4/IPv6
-  DNS resolution and loopback/DNS/DHCP preservation.
-- Active connection monitor (conntrack/ss established states) with instant IP banning.
-- Panic network killswitch (instant total network drop & restore).
-- Stealth ICMP Ping response toggling (drop ping sweeps).
-- Port forwarding / NAT redirection (PREROUTING DNAT).
-- Kernel sysctl forwarding, Waydroid container NAT, and Docker mitigation management.
-- Hardened presets (Dusky Full, Workstation, Dev LAN, Stealth, Moonlight, Reset).
-===============================================================================
+"""Dusky UFW manager: CLI rules, sockets, resolved IP lists and framework controls.
+
+Socket views show rule hints, not remote exposure. Default policies preserve
+existing allowances. Domain entries filter IPs and selected TCP ports.
 """
 
 from __future__ import annotations
@@ -45,7 +24,7 @@ from rich.panel import Panel
 from rich.console import Group
 
 from python.frontend.core_types import ConfigItem
-from python.engines.ufw import UfwEngine, RuleRecord, COMMON_SERVICES
+from python.engines.ufw import UfwEngine
 
 # =============================================================================
 # 1. CORE APPLICATION ROUTING & METADATA
@@ -107,7 +86,7 @@ SCHEMA[1] = [
         default=False,
         options=["trigger:Reload"],
         group="Power",
-        extended_help="**Reload Firewall**\n\nForces UFW to flush and re-read all rules and kernel drop-in tables immediately without dropping active sessions.",
+        extended_help="**Reload Firewall**\n\nReloads the UFW framework. This may interrupt connections; ordinary CLI rule edits apply immediately and do not need a reload.",
     ),
     ConfigItem(
         label="Reset All",
@@ -121,15 +100,15 @@ SCHEMA[1] = [
         extended_help="**Factory Reset**\n\nUnloads UFW and restores all rules to default installation state.",
     ),
     ConfigItem(
-        label="Panic Lockdown",
+        label="Deny All Default Policies",
         key="action_panic_lockdown",
         scope="actions",
         type_="bool",
         default=False,
-        options=["trigger:Panic Drop"],
-        confirm_message="PANIC LOCKDOWN: Drop ALL incoming, outgoing, and routed traffic immediately?",
+        options=["trigger:Deny Defaults"],
+        confirm_message="Set incoming, outgoing and routed defaults to deny? Existing rules and established sessions remain allowed.",
         group="Panic Controls",
-        extended_help="**Panic Lockdown Killswitch**\n\nInstantly drops all inbound, outbound, and forwarded network traffic across all network adapters.",
+        extended_help="**Deny Default Policies**\n\nSets incoming, outgoing and routed defaults to deny. Existing user rules, framework allowances and established sessions remain. This does not disconnect all traffic.",
     ),
     ConfigItem(
         label="Restore Traffic",
@@ -149,7 +128,7 @@ SCHEMA[1] = [
         default="low",
         options=["off", "low", "medium", "high", "full"],
         group="Policies",
-        extended_help="**Kernel Logging Verbosity**\n\n- `off`: disables logging\n- `low`: rate-limited blocked packets\n- `medium`: low + invalid packets & new connections\n- `high`: all packets with rate limit\n- `full`: all packets without rate limit (warning: high disk I/O)",
+        extended_help="**Kernel Logging Verbosity**\n\n- `off`: disables logging\n- `low`: rate-limited blocked packets and explicitly logged rules\n- `medium`: low plus invalid/new connections and allowed packets differing from policy, rate-limited\n- `high`: medium without rate limiting plus all packets with rate limiting\n- `full`: all logging without rate limiting",
     ),
     ConfigItem(
         label="Default Incoming",
@@ -212,7 +191,7 @@ SCHEMA[3] = [
         label="Ingress Scope",
         key="quick_scope",
         scope="ports",
-        type_="cycle",
+        type_="string",
         default="any",
         options=["any", "lan", "127.0.0.1", "192.168.0.0/16", "10.0.0.0/8"],
         group="Quick Port Tool",
@@ -225,7 +204,7 @@ SCHEMA[3] = [
         type_="bool",
         default=False,
         options=["trigger:Open Port"],
-        popup_message="Port opened in firewall.",
+
         group="Quick Port Tool",
         extended_help="**Open Port**\n\nCreates an explicit `ufw allow` rule for the target port and protocol.",
     ),
@@ -236,9 +215,9 @@ SCHEMA[3] = [
         type_="bool",
         default=False,
         options=["trigger:Close Port"],
-        popup_message="Port closed and blocked.",
+
         group="Quick Port Tool",
-        extended_help="**Close Port**\n\nScrubs existing allow rules and creates an explicit `ufw deny` rule.",
+        extended_help="**Close Port**\n\nPrepends an ingress deny rule for the selected protocol. Existing rules are retained. Framework allowances and established sessions may still pass traffic.",
     ),
     ConfigItem(
         label="Reject Port",
@@ -258,7 +237,7 @@ SCHEMA[3] = [
         default=False,
         options=["trigger:Delete Rules"],
         group="Quick Port Tool",
-        extended_help="**Delete Rules for Port**\n\nRemoves all existing rules matching this port number.",
+        extended_help="**Delete Rules for Port**\n\nDeletes ingress rules whose complete destination port specification and protocol match the input. Retains broader port lists/ranges, mixed-protocol rules, source-port rules and outgoing/routed rules.",
     ),
     # Port Prober
     ConfigItem(
@@ -425,7 +404,7 @@ SCHEMA[5] = [
         default="allow",
         options=["allow", "deny", "reject", "limit"],
         group="Rule Parameters",
-        extended_help="**Rule Action**\n\n- `allow`: Permit matching traffic\n- `deny`: Silently drop packet\n- `reject`: Refuse with ICMP unreachable reply\n- `limit`: Rate-limit connections (denies IP if >6 connections within 30s; ideal for SSH)",
+        extended_help="**Rule Action**\n\n- `allow`: Permit matching traffic\n- `deny`: Silently drop packet\n- `reject`: Refuse with ICMP unreachable reply\n- `limit`: Rate-limit connections (denies IP if 6 or more new connections within 30s; ideal for SSH)",
     ),
     ConfigItem(
         label="Direction",
@@ -475,22 +454,22 @@ SCHEMA[5] = [
         extended_help="**Destination IP Address**\n\nTarget destination. `any`, or host IP, or CIDR network.",
     ),
     ConfigItem(
-        label="Interface (In)",
+        label="Interface (Host / Route In)",
         key="interface",
         scope="builder",
-        type_="cycle",
+        type_="string",
         default="any",
-        options=["any", "wlan0", "eth0", "tailscale0", "docker0", "waydroid0", "virbr0", "lo"],
+        options=["any", *UfwEngine.get_network_interfaces()],
         group="Interfaces & Logging",
-        extended_help="**Ingress Interface**\n\nHardware or virtual interface where packet enters.",
+        extended_help="**Ingress Interface**\n\nHost rule interface (in or out according to direction), or routed ingress interface. Enter a name or select a discovered interface.",
     ),
     ConfigItem(
         label="Interface (Out / Routed)",
         key="out_interface",
         scope="builder",
-        type_="cycle",
+        type_="string",
         default="any",
-        options=["any", "wlan0", "eth0", "tailscale0", "docker0", "waydroid0", "virbr0"],
+        options=["any", *UfwEngine.get_network_interfaces()],
         group="Interfaces & Logging",
         extended_help="**Egress Interface (Routed Only)**\n\nDestination interface for forwarded traffic traversing the host.",
     ),
@@ -542,9 +521,9 @@ SCHEMA[5] = [
         type_="bool",
         default=False,
         options=["trigger:Commit Rule"],
-        popup_message="Firewall rule created and applied successfully.",
+
         group="Placement & Execution",
-        extended_help="**Commit Rule**\n\nExecutes the compiled UFW rule command and reloads netfilter.",
+        extended_help="**Commit Rule**\n\nExecutes the compiled UFW command. UFW applies the rule immediately when active and stores it for later when inactive.",
     ),
     ConfigItem(
         label="Target Rule Number",
@@ -567,7 +546,7 @@ SCHEMA[5] = [
         options=["trigger:Delete Rule"],
         confirm_message="Delete the selected rule number from the active firewall?",
         group="Manage Rules",
-        extended_help="**Delete Numbered Rule**\n\nPermanently removes the rule matching the specified index and reloads netfilter.",
+        extended_help="**Delete Numbered Rule**\n\nPermanently removes the rule matching the specified active index. UFW applies the deletion immediately.",
     ),
     ConfigItem(
         label="Reload Ruleset",
@@ -577,7 +556,7 @@ SCHEMA[5] = [
         default=False,
         options=["trigger:Reload"],
         group="Manage Rules",
-        extended_help="**Synchronize Rules**\n\nReloads active netfilter rules.",
+        extended_help="**Synchronize Rules**\n\nReloads the UFW framework.",
     ),
     ConfigItem(
         label="Clear Domain Rules",
@@ -597,13 +576,13 @@ SCHEMA[5] = [
 # TAB 6: 'Domains' is a full-height Rich live registered domains view (show_options=False)
 SCHEMA[7] = [
     ConfigItem(
-        label="Whitelist Mode (Lockdown)",
+        label="Domain Allowlist Defaults",
         key="whitelist_mode",
         scope="domains",
         type_="bool",
         default=False,
         group="Lockdown Mode",
-        extended_help="**Exclusive Whitelist / Lockdown Mode**\n\nWhen enabled, all inbound and outbound internet traffic is BLOCKED except:\n1. Core system loopback (lo)\n2. Local DNS resolution (port 53)\n3. Local DHCP (ports 67,68)\n4. Specifically registered whitelisted domains and their resolved IPs!\n\nInstantly turns this machine into a secure locked-down workstation.",
+        extended_help="**Domain Allowlist Defaults**\n\nResolves registered addresses, adds selected TCP port rules and DNS/DHCP support, then sets all default policies to deny and enables UFW. Existing user/framework allowances and established sessions remain. Rules match IP addresses, not website names: shared hosting, DNS changes and QUIC can behave differently. Disabling restores deny incoming/routed and allow outgoing defaults; registered IP rules remain.",
     ),
     ConfigItem(
         label="Sync All Domain IPs",
@@ -632,7 +611,7 @@ SCHEMA[7] = [
         default="allow",
         options=["allow", "deny"],
         group="Register Domain",
-        extended_help="**Domain Action**\n\n- `allow`: Permit traffic (essential in Whitelist Mode)\n- `deny`: Block traffic to this domain's resolved IPs",
+        extended_help="**Domain Action**\n\n- `allow`: Add outbound rules for resolved addresses\n- `deny`: Prepend outbound blocks for resolved addresses\nRules with selected ports use TCP; `any` covers all protocols. Shared IPs affect other domains too. Existing sessions and framework rules still apply.",
     ),
     ConfigItem(
         label="Ports",
@@ -684,7 +663,7 @@ SCHEMA[8] = [
         key="forward_dest_ip",
         scope="nat",
         type_="string",
-        default="192.168.240.2",
+        default="",
         group="Port Forwarding (DNAT)",
         extended_help="**Internal IP**\n\nTarget IP address (e.g. Waydroid Android container, Docker container, or Libvirt VM).",
     ),
@@ -705,7 +684,7 @@ SCHEMA[8] = [
         default="tcp",
         options=["tcp", "udp"],
         group="Port Forwarding (DNAT)",
-        extended_help="**Protocol**\n\nTCP or UDP forwarding.",
+        extended_help="**Protocol**\n\nTCP or UDP forwarding. DNAT supports IPv4 destinations and single numeric ports.",
     ),
     ConfigItem(
         label="Add Port Forward",
@@ -744,7 +723,7 @@ SCHEMA[8] = [
         type_="bool",
         default=True,
         group="Routing & Containers",
-        extended_help="**Waydroid NAT Integration**\n\nInjects `*nat POSTROUTING` rules for Waydroid subnets `192.168.240.0/24` and `192.168.250.0/24` in `/etc/ufw/before.rules`.",
+        extended_help="**Container NAT Integration**\n\nDiscovers IPv4 subnets on the configured container interface and masquerades through the selected egress interface. Uses an owned NAT chain and the UFW after.init hook. Forwarding and route allowances are also required. Existing manual NAT is retained.",
     ),
     ConfigItem(
         label="Docker Daemon Mitigation",
@@ -753,7 +732,7 @@ SCHEMA[8] = [
         type_="bool",
         default=True,
         group="Routing & Containers",
-        extended_help="**Docker Firewall Bypass Mitigation**\n\nInjects a hardened `DOCKER-USER` chain into `/etc/ufw/after.rules` to prevent Docker from exposing ports directly to WAN.",
+        extended_help="**Docker iptables Guard**\n\nRequires Docker's iptables backend and an existing DOCKER-USER chain. Adds an owned chain that retains established sessions and drops new ingress on the selected egress interface. Other DOCKER-USER rules are retained. The hook attaches only when Docker's chain exists; restart/reload UFW after Docker recreates its rules. Docker's native nftables backend is unsupported.",
     ),
     ConfigItem(
         label="Reload Framework",
@@ -790,7 +769,7 @@ SCHEMA[10] = [
         options=["trigger:Ban IP"],
         confirm_message="Prepend top-priority DROP rule for this IP address?",
         group="IP Blacklisting",
-        extended_help="**Instant IP Ban**\n\nInserts a rule at position #1 (`ufw prepend deny from <IP>`) so all packets from this host are immediately dropped.",
+        extended_help="**Ingress IP Ban**\n\nPrepends a managed source deny rule. Framework allowances and established sessions can still pass traffic. This does not disconnect all traffic from that host.",
     ),
     ConfigItem(
         label="Unban IP",
@@ -800,7 +779,7 @@ SCHEMA[10] = [
         default=False,
         options=["trigger:Unban IP"],
         group="IP Blacklisting",
-        extended_help="**Unban IP**\n\nSearches and removes deny rules for this IP address.",
+        extended_help="**Unban IP**\n\nRemoves only rules with this exact managed ban tag. Other deny rules are retained.",
     ),
     ConfigItem(
         label="Stealth ICMP Ping Mode",
@@ -809,18 +788,18 @@ SCHEMA[10] = [
         type_="bool",
         default=False,
         group="Stealth & Defenses",
-        extended_help="**Stealth ICMP Mode (Drop Ping)**\n\nWhen enabled, all ICMP echo-request packets are silently DROPPED in `/etc/ufw/before.rules`. Your machine becomes invisible to standard ping scans.",
+        extended_help="**Input ICMP Echo**\n\nChanges standard IPv4/IPv6 input echo-request rules to DROP. Routed ping rules and other network discovery traffic are retained.",
     ),
     ConfigItem(
-        label="Panic Lockdown",
+        label="Deny All Default Policies",
         key="action_panic_lockdown",
         scope="actions",
         type_="bool",
         default=False,
-        options=["trigger:Panic Drop All"],
-        confirm_message="PANIC LOCKDOWN: Sever all incoming and outgoing connections immediately?",
+        options=["trigger:Deny Defaults"],
+        confirm_message="Set all default policies to deny? Existing allowances and established sessions remain.",
         group="Stealth & Defenses",
-        extended_help="**Panic Lockdown**\n\nInstantly severs all network traffic.",
+        extended_help="**Deny Default Policies**\n\nSets incoming, outgoing and routed defaults to deny. Existing allowances and established sessions remain.",
     ),
     ConfigItem(
         label="Restore Traffic",
@@ -843,7 +822,8 @@ SCHEMA[11] = [
         key="target_app",
         scope="app",
         type_="string",
-        default="OpenSSH",
+        default="",
+        options=[],
         group="Application Control",
         extended_help="**UFW Application Name**\n\nName of application profile from `/etc/ufw/applications.d` (e.g. `OpenSSH`, `Samba`, `DNS`, `NFS`, `WWW Full`).",
     ),
@@ -890,9 +870,9 @@ SCHEMA[12] = [
         type_="bool",
         default=False,
         options=["trigger:Apply Dusky Full"],
-        confirm_message="Apply Dusky Full Provisioning (Strict routing, SSH, Tailscale, Waydroid NAT, Docker mitigation)?",
+        confirm_message="Apply Dusky defaults, present trusted interfaces, discovered SSH ports and container NAT? Existing rules remain.",
         group="System Profiles",
-        extended_help="**Dusky Full Setup**\n\nProvisions standard battle-tested ISO firewall configuration:\n- Default deny incoming, allow outgoing, deny routed\n- Auto-detected SSH port\n- Tailscale direct P2P port 41641/udp\n- Trusted virtual interfaces (tailscale0, waydroid0, virbr0, docker0, wg0, tun0, tap0)\n- Forwarding to WAN interface\n- Kernel IP forwarding\n- Waydroid NAT masquerading\n- Docker bypass mitigation",
+        extended_help="**Dusky Full Setup**\n\nApplies deny incoming/routed and allow outgoing defaults, configured SSH ports when sshd -T succeeds, Tailscale 41641/udp, configured trusted interfaces that are currently present, forwarding to the selected egress interface, and discovered container NAT when available. Existing rules are retained. Docker guard is configured separately.",
     ),
     ConfigItem(
         label="Strict Workstation",
@@ -903,18 +883,18 @@ SCHEMA[12] = [
         options=["trigger:Apply Strict"],
         confirm_message="Apply Strict Workstation profile?",
         group="System Profiles",
-        extended_help="**Strict Workstation**\n\nStandard hardened personal computer profile: Ingress deny, Egress allow, Forward deny, SSH allowed.",
+        extended_help="**Strict Workstation**\n\nSets deny incoming/routed and allow outgoing defaults, adds SSH 22/tcp and enables UFW. Existing rules remain.",
     ),
     ConfigItem(
-        label="Lockdown / Whitelist",
+        label="Domain Allowlist Defaults",
         key="action_preset_lockdown_whitelist",
         scope="actions",
         type_="bool",
         default=False,
         options=["trigger:Activate Lockdown"],
-        confirm_message="Activate Lockdown Whitelist mode? Outbound web access will be restricted strictly to registered domains!",
+        confirm_message="Enable UFW with deny defaults and registered IP allowances? Existing rules and established sessions remain.",
         group="System Profiles",
-        extended_help="**Lockdown Whitelist**\n\nRestricts all inbound AND outbound network traffic strictly to whitelisted domains, DNS, and DHCP.",
+        extended_help="**Domain Allowlist Defaults**\n\nAdds resolved IP rules and DNS/DHCP support, sets deny defaults and enables UFW. Preserves existing allowances and established sessions. This is IP filtering, not exclusive website filtering.",
     ),
     ConfigItem(
         label="Developer & Local LAN",
@@ -986,6 +966,51 @@ SCHEMA[13] = [
     ),
 ]
 
+# Controls for runtime-discovered hardware and configurable integration.
+SCHEMA[8].extend([
+    ConfigItem(label="Egress Interface", key="wan_interface", scope="framework", type_="string", default="",
+               options=["", *UfwEngine.get_network_interfaces()], group="Integration Parameters",
+               extended_help="Blank uses the lowest-metric default route. Set explicitly for container NAT, Docker guard and provisioning. Reapply integrations after changing it."),
+    ConfigItem(label="Container Interface", key="waydroid_interface", scope="framework", type_="string", default="waydroid0",
+               options=UfwEngine.get_network_interfaces(), group="Integration Parameters",
+               extended_help="Interface whose IPv4 subnet is discovered for NAT. Reapply NAT after changes."),
+    ConfigItem(label="Trusted Interfaces", key="trusted_interfaces", scope="framework", type_="string",
+               default="tailscale0,waydroid0,virbr0,docker0,wg0,tun0,tap0", group="Integration Parameters",
+               extended_help="Comma-separated interfaces trusted by Dusky Full Setup. Only interfaces present at apply time receive rules."),
+])
+for item in SCHEMA[3]:
+    if item.scope == "services":
+        item.default = False
+
+SCHEMA[3].insert(3, ConfigItem(label="Rule Comment", key="quick_comment", scope="ports", type_="string",
+                             default="Custom Port Rule", group="Quick Port Tool",
+                             extended_help="Comment attached to quick allow, deny and reject rules."))
+SCHEMA[5].insert(6, ConfigItem(label="Source Port(s)", key="source_port", scope="builder", type_="string", default="",
+                             group="Addressing", extended_help="Optional source port, comma list or colon range. Multiport rules require tcp or udp."))
+def discover_ufw_choices():
+    engine = UfwEngine._instance
+    if engine is None:
+        return []
+    interfaces = engine.get_network_interfaces()
+    for item in SCHEMA[5]:
+        if item.key in {"interface", "out_interface"}:
+            item.options = ["any", *interfaces]
+    for item in SCHEMA[8]:
+        if item.key in {"wan_interface", "waydroid_interface"}:
+            item.options = ["", *interfaces]
+    SCHEMA[11][0].options = ["", *engine.get_app_profile_names()]
+    return [5, 8, 11]
+
+
+DEFERRED_LOAD = discover_ufw_choices
+
+TAB_NOTICES = {
+    2: {"level": "info", "message": "UFW rule hints exclude framework and other firewalls. Remote reachability requires a test from another host."},
+    3: {"level": "info", "message": "Service switches show their own tagged allow rules. Disable removes only their tagged rules; existing rules and defaults remain."},
+    7: {"level": "info", "message": "Resolved IP rules affect shared hosts. Deny defaults preserve existing rules, framework allowances and established sessions."},
+    12: {"level": "info", "message": "Presets add rules and set policies; existing rules remain unless Factory Reset is selected."},
+}
+
 # =============================================================================
 # 4. RICH CUSTOM VIEWS
 # =============================================================================
@@ -1010,6 +1035,7 @@ def collect_ufw_view(prepared):
                 "domains": eng._read_domain_registry(), "forward": eng.get_sysctl_forwarding(),
                 "waydroid": eng.get_waydroid_nat(), "docker": eng.get_docker_mitigation(),
                 "stealth": eng.get_icmp_ping_stealth(), "banned": eng.get_banned_ips(rules=rules),
+                "probe": eng.cache.get("ports/probe_result", "Not run"),
                 "listening": eng.get_listening_ports(),
             }
         case "ports":
@@ -1042,10 +1068,10 @@ def render_ufw_dashboard_view(snapshot: dict) -> Any:
     t_power.add_row("Logging:", Text(status.get("logging", "off").upper(), style="bold cyan"))
     t_power.add_row("Active Rules:", Text(str(len(rules)), style="bold yellow"))
     t_power.add_row("WAN Interface:", Text(wan, style="bold magenta"))
-    t_power.add_row("IP Forward:", Text("ENABLED" if snapshot["forward"] else "DISABLED", style="green" if snapshot["forward"] else "dim"))
-    t_power.add_row("Waydroid NAT:", Text("ACTIVE" if snapshot["waydroid"] else "OFF", style="green" if snapshot["waydroid"] else "dim"))
-    t_power.add_row("Docker Guard:", Text("ENFORCED" if snapshot["docker"] else "OFF", style="green" if snapshot["docker"] else "dim"))
-    t_power.add_row("Ping Stealth:", Text("STEALTH (DROPPED)" if snapshot["stealth"] else "STANDARD (REPLY)", style="bold yellow" if snapshot["stealth"] else "dim"))
+    t_power.add_row("Stored IP Forward:", Text("ENABLED" if snapshot["forward"] else "DISABLED", style="green" if snapshot["forward"] else "dim"))
+    t_power.add_row("Waydroid NAT:", Text("CONFIGURED" if snapshot["waydroid"] else "OFF", style="green" if snapshot["waydroid"] else "dim"))
+    t_power.add_row("Docker Guard:", Text("CONFIGURED" if snapshot["docker"] else "OFF", style="green" if snapshot["docker"] else "dim"))
+    t_power.add_row("Stored Input Ping:", Text("DROP" if snapshot["stealth"] else "ACCEPT", style="bold yellow" if snapshot["stealth"] else "dim"))
     p_power = Panel(t_power, title="[bold cyan] 󰒃 FIREWALL STATUS [/bold cyan]", border_style="cyan", expand=True)
 
     # Card 2: Traffic Policies
@@ -1057,8 +1083,11 @@ def render_ufw_dashboard_view(snapshot: dict) -> Any:
     t_policy.add_row("Incoming Default:", Text(status.get("default_incoming", "deny").upper(), style=inc_style))
     t_policy.add_row("Outgoing Default:", Text(status.get("default_outgoing", "allow").upper(), style=out_style))
     t_policy.add_row("Routed Default:", Text(status.get("default_routed", "deny").upper(), style="bold yellow"))
+    if status.get("routing_disabled"):
+        t_policy.add_row("Runtime Routing:", Text("DISABLED", style="dim"))
     wl_style = "bold green" if whitelist_active else "dim"
-    t_policy.add_row("Whitelist Mode:", Text("ACTIVE (LOCKDOWN)" if whitelist_active else "DISABLED (STANDARD)", style=wl_style))
+    t_policy.add_row("Whitelist Mode:", Text("DENY DEFAULTS + IP RULES" if whitelist_active else "DISABLED (STANDARD)", style=wl_style))
+    t_policy.add_row("Last Local Probe:", Text(snapshot.get("probe", "Not run")))
     t_policy.add_row("Banned IPs:", Text(str(len(snapshot["banned"])), style="bold red" if snapshot["banned"] else "dim"))
     p_policy = Panel(t_policy, title="[bold green] 󰈀 DEFAULT POLICIES [/bold green]", border_style="green", expand=True)
 
@@ -1100,21 +1129,9 @@ def render_ports_view(port_map: list) -> Any:
 
     for item in port_map:
         fw_status = item["fw_status"]
-        if fw_status == "EXPOSED":
-            status_style = "bold red"
-            tag = "⚠ EXPOSED"
-        elif fw_status == "ALLOWED":
-            status_style = "bold green"
-            tag = "✔ ALLOWED"
-        elif fw_status == "BLOCKED":
-            status_style = "bold red"
-            tag = "✖ BLOCKED"
-        elif fw_status == "PROTECTED":
-            status_style = "bold cyan"
-            tag = "🔒 LOCALHOST"
-        else:
-            status_style = "dim"
-            tag = "🛡 FILTERED"
+        status_style = "bold cyan" if fw_status == "PROTECTED" else (
+            "bold green" if fw_status == "RULE ALLOW" else "bold yellow")
+        tag = "LOCALHOST" if fw_status == "PROTECTED" else fw_status
 
         proc_str = f"{item['process']} ({item['pid']})" if item["pid"] else item["process"]
         t.add_row(
@@ -1128,7 +1145,7 @@ def render_ports_view(port_map: list) -> Any:
 
     return Panel(
         t,
-        title=f"[bold cyan] 󰒋 LIVE LISTENING SOCKETS & FIREWALL STATUS ({len(port_map)} Ports) [/bold cyan]",
+        title=f"[bold cyan] 󰒋 LISTENING SOCKETS & UFW RULE HINTS ({len(port_map)} Ports) [/bold cyan]",
         border_style="cyan",
         expand=True,
     )
@@ -1176,7 +1193,7 @@ def render_domains_view(data: dict) -> Any:
             ips_str,
         )
 
-    mode_text = "[bold green]ACTIVE (LOCKDOWN)[/bold green]" if wl else "[bold red]DISABLED (STANDARD)[/bold red]"
+    mode_text = "[bold green]DENY DEFAULTS + IP RULES[/bold green]" if wl else "[bold red]DISABLED (STANDARD)[/bold red]"
     return Panel(
         t,
         title=f"[bold cyan] 󰖟 REGISTERED DOMAIN WHITELIST / BLOCKLIST — Mode: {mode_text} [/bold cyan]",
