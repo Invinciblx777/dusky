@@ -52,6 +52,273 @@ type GitResult = tuple[int, str, str]
 
 ANSI_RE: re.Pattern[str] = re.compile(r"\x1b\[[0-9;]*m")
 
+SETTINGS_DIR: Path = HOME / ".config" / "dusky" / "settings"
+LAYOUT_FILE: Path = SETTINGS_DIR / "git_preview_layout"
+LAST_LAYOUT_FILE: Path = SETTINGS_DIR / "git_preview_last"
+VIM_MODE_FILE: Path = SETTINGS_DIR / "git_vim_mode"
+
+VIM_KEYS: str = "j,k,g,G,J,K,v,V,q,ctrl-a,ctrl-d,ctrl-u,/"
+PROMPT_VIM: str = " 🅝 q:quit /:search ❯ "
+
+
+def get_preview_layout() -> tuple[str, int, str]:
+    """Retrieves current preview layout preference (edge, percentage, rest)."""
+    cur = "right,70%,border-left,wrap"
+    if LAYOUT_FILE.is_file():
+        try:
+            val = LAYOUT_FILE.read_text(encoding="utf-8").strip()
+            if val and (val == "hidden" or "," in val):
+                cur = val
+        except OSError:
+            pass
+    if cur == "hidden":
+        return "hidden", 70, "wrap"
+    parts = cur.split(",")
+    edge = parts[0] if parts else "right"
+    pct = 70
+    if len(parts) > 1 and parts[1].endswith("%"):
+        try:
+            pct = int(parts[1][:-1])
+        except ValueError:
+            pct = 70
+    rest = ",".join(parts[2:]) if len(parts) > 2 else "border-left,wrap"
+    return edge, pct, rest
+
+
+def handle_fzf_resize(direction: str) -> None:
+    """Synchronous transform callback for Alt-Left/Right/Up/Down preview resizing."""
+    edge, pct, _ = get_preview_layout()
+    if edge == "hidden":
+        return
+
+    try:
+        if edge in ("right", "left"):
+            pc = int(os.environ.get("FZF_PREVIEW_COLUMNS", 0))
+            tc = int(os.environ.get("FZF_COLUMNS", 0))
+            if tc > 0 and 0 < pc < tc:
+                pct = int((pc * 100 + tc // 2) / tc)
+        else:
+            pl = int(os.environ.get("FZF_PREVIEW_LINES", 0))
+            tl = int(os.environ.get("FZF_LINES", 0))
+            if tl > 0 and 0 < pl < tl:
+                pct = int((pl * 100 + tl // 2) / tl)
+    except (ValueError, TypeError):
+        pass
+
+    new_pct = pct
+    match (edge, direction):
+        case ("right", "left") | ("left", "right") | ("up", "down") | ("down", "up"):
+            new_pct += 5
+        case ("right", "right") | ("left", "left") | ("up", "up") | ("down", "down"):
+            new_pct -= 5
+
+    new_pct = max(10, min(90, new_pct))
+    border = {"left": "border-right", "right": "border-left", "up": "border-bottom", "down": "border-top"}.get(edge, "border-left")
+    next_layout = f"{edge},{new_pct}%,{border},wrap"
+    try:
+        SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+        LAYOUT_FILE.write_text(next_layout, encoding="utf-8")
+        LAST_LAYOUT_FILE.write_text(next_layout, encoding="utf-8")
+    except OSError:
+        pass
+    print(f"change-preview-window({next_layout})+refresh-preview")
+
+
+def handle_fzf_move(direction: str) -> None:
+    """Synchronous transform callback for Alt-H/J/K/L/V preview relocation & toggle."""
+    edge, pct, _ = get_preview_layout()
+    try:
+        SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    if direction == "hidden":
+        if edge == "hidden":
+            last = "right,70%,border-left,wrap"
+            if LAST_LAYOUT_FILE.is_file():
+                try:
+                    val = LAST_LAYOUT_FILE.read_text(encoding="utf-8").strip()
+                    if val and val != "hidden":
+                        last = val
+                except OSError:
+                    pass
+            next_layout = last
+        else:
+            if edge != "hidden":
+                border = {"left": "border-right", "right": "border-left", "up": "border-bottom", "down": "border-top"}.get(edge, "border-left")
+                try:
+                    LAST_LAYOUT_FILE.write_text(f"{edge},{pct}%,{border},wrap", encoding="utf-8")
+                except OSError:
+                    pass
+            next_layout = "hidden"
+    else:
+        border = {"left": "border-right", "right": "border-left", "up": "border-bottom", "down": "border-top"}.get(direction, "border-left")
+        default_pct = 50 if direction in ("up", "down") else 70
+        next_layout = f"{direction},{default_pct}%,{border},wrap"
+        try:
+            LAST_LAYOUT_FILE.write_text(next_layout, encoding="utf-8")
+        except OSError:
+            pass
+
+    try:
+        LAYOUT_FILE.write_text(next_layout, encoding="utf-8")
+    except OSError:
+        pass
+    print(f"change-preview-window({next_layout})+refresh-preview")
+
+
+def handle_fzf_toggle_vim(default_prompt: str = "Select") -> None:
+    """Toggles modal Vim navigation keys (Alt-M) in FZF."""
+    try:
+        SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    is_vim = True
+    if VIM_MODE_FILE.is_file():
+        try:
+            is_vim = VIM_MODE_FILE.read_text(encoding="utf-8").strip() != "false"
+        except OSError:
+            pass
+    next_vim = not is_vim
+    try:
+        VIM_MODE_FILE.write_text("true" if next_vim else "false", encoding="utf-8")
+    except OSError:
+        pass
+
+    if next_vim:
+        print(f"rebind({VIM_KEYS})+disable-search+change-prompt({PROMPT_VIM})+refresh-preview")
+    else:
+        prompt_str = default_prompt if default_prompt.endswith("❯ ") else f"{default_prompt} ❯ "
+        print(f"unbind(j,k,g,G,J,K,v,V,q,/)+enable-search+change-prompt({prompt_str})+refresh-preview")
+
+
+def handle_fzf_vim_init(default_prompt: str = "") -> None:
+    """Initializes FZF binding state according to user's saved Vim mode preference."""
+    is_vim = True
+    if VIM_MODE_FILE.is_file():
+        try:
+            is_vim = VIM_MODE_FILE.read_text(encoding="utf-8").strip() != "false"
+        except OSError:
+            pass
+    if is_vim:
+        print(f"rebind({VIM_KEYS})+disable-search+change-prompt({PROMPT_VIM})+refresh-preview")
+    else:
+        prompt_act = f"+change-prompt({default_prompt})" if default_prompt else ""
+        print(f"unbind(j,k,g,G,J,K,v,V,q,/)+enable-search{prompt_act}+refresh-preview")
+
+
+def handle_fzf_escape() -> None:
+    """Context-sensitive Esc handling: leaves search mode back to Vim, or aborts."""
+    prompt = os.environ.get("FZF_PROMPT", "")
+    input_state = os.environ.get("FZF_INPUT_STATE", "")
+    if "󰍉" in prompt:
+        print(f"rebind({VIM_KEYS})+disable-search+change-prompt({PROMPT_VIM})")
+    elif "🅝" in prompt or input_state == "disabled":
+        print("ignore")
+    else:
+        print("abort")
+
+
+def handle_diff_preview(target: str, cur: str, selected: list[str]) -> None:
+    """Renders live diff preview for hovered or selected files with Delta integration."""
+    if not cur and not selected:
+        return
+
+    # If hovering over an unselected file, display that hovered file.
+    # If hovering over a selected file (or if nothing hovered), display all selected files.
+    if selected and cur and cur not in selected:
+        files = [cur]
+    elif selected:
+        files = selected
+    elif cur:
+        files = [cur]
+    else:
+        return
+
+    # Normalize file paths, stripping whitespace
+    files = [f.strip() for f in files if f.strip()]
+    if not files:
+        return
+
+    git_bin = "/usr/bin/git"
+    base_cmd = [git_bin, "-C", str(HOME), f"--git-dir={GIT_DIR}", f"--work-tree={WORK_TREE}"]
+
+    diff_outputs: list[str] = []
+    if target:
+        cmd = base_cmd + ["show", "--color=always", "--patch", "--format=", target, "--"] + files
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.stdout:
+            diff_outputs.append(res.stdout)
+    else:
+        has_head = subprocess.run(
+            base_cmd + ["rev-parse", "--verify", "HEAD"],
+            capture_output=True
+        ).returncode == 0
+
+        for f in files:
+            full_path = HOME / f
+            if has_head:
+                in_head = subprocess.run(
+                    base_cmd + ["cat-file", "-e", f"HEAD:{f}"],
+                    capture_output=True
+                ).returncode == 0
+                if in_head:
+                    cmd = base_cmd + ["diff", "--color=always", "--patch", "HEAD", "--", f]
+                    res = subprocess.run(cmd, capture_output=True, text=True)
+                    if res.stdout:
+                        diff_outputs.append(res.stdout)
+                else:
+                    if full_path.exists():
+                        cmd = base_cmd + ["diff", "--color=always", "--no-index", "/dev/null", str(full_path)]
+                        res = subprocess.run(cmd, capture_output=True, text=True)
+                        if res.stdout:
+                            diff_outputs.append(res.stdout)
+            else:
+                cmd = base_cmd + ["diff", "--color=always", "--cached", "--", f]
+                res = subprocess.run(cmd, capture_output=True, text=True)
+                if res.stdout:
+                    diff_outputs.append(res.stdout)
+
+    raw_diff = "".join(diff_outputs)
+    if not raw_diff:
+        return
+
+    delta_bin = shutil.which("delta")
+    if delta_bin:
+        cols = os.environ.get("FZF_PREVIEW_COLUMNS")
+        delta_cmd = [delta_bin, "--paging=never"]
+        if cols and cols.isdigit():
+            delta_cmd.append(f"--width={cols}")
+        subprocess.run(delta_cmd, input=raw_diff, text=True)
+    else:
+        sys.stdout.write(raw_diff)
+        sys.stdout.flush()
+
+
+if len(sys.argv) > 1 and sys.argv[1].startswith("--"):
+    _act = sys.argv[1]
+    if _act == "--resize-preview":
+        handle_fzf_resize(sys.argv[2] if len(sys.argv) > 2 else "left")
+        sys.exit(0)
+    elif _act == "--move-preview":
+        handle_fzf_move(sys.argv[2] if len(sys.argv) > 2 else "right")
+        sys.exit(0)
+    elif _act == "--toggle-vim":
+        handle_fzf_toggle_vim(sys.argv[2] if len(sys.argv) > 2 else "Select")
+        sys.exit(0)
+    elif _act == "--vim-init":
+        handle_fzf_vim_init(sys.argv[2] if len(sys.argv) > 2 else "")
+        sys.exit(0)
+    elif _act == "--key-escape":
+        handle_fzf_escape()
+        sys.exit(0)
+    elif _act == "--diff-preview":
+        target = sys.argv[2] if len(sys.argv) > 2 else ""
+        cur = sys.argv[3] if len(sys.argv) > 3 else ""
+        selected = sys.argv[4:] if len(sys.argv) > 4 else []
+        handle_diff_preview(target, cur, selected)
+        sys.exit(0)
+
 
 def strip_ansi(text: str) -> str:
     """Removes SGR escape sequences from fzf-bound display strings."""
@@ -489,32 +756,12 @@ def sync_single() -> None:
         choices[path] = entry
         displays.append(f"{path}\t{display}")
 
-    delta_bin = shutil.which("delta")
-    delta_filter = (
-        f" | {shlex.quote(delta_bin)} --paging=never ${{FZF_PREVIEW_COLUMNS:+--width=$FZF_PREVIEW_COLUMNS}}"
-        if delta_bin else ""
-    )
-
-    preview_cmd = (
-        'sh -c \''
-        'for f in "$@"; do '
-        '  if git rev-parse --verify HEAD >/dev/null 2>&1; then '
-        '    if git cat-file -e "HEAD:$f" 2>/dev/null; then '
-        '      git diff HEAD -- "$f"; '
-        '    else '
-        '      git diff --no-index /dev/null "$f" 2>/dev/null || true; '
-        '    fi; '
-        '  else '
-        '    git diff --cached -- "$f" 2>/dev/null || true; '
-        '  fi; '
-        'done\''
-        f' _ {{+1}}{delta_filter}'
-    )
+    self_bin = shlex.quote(str(Path(__file__).resolve()))
+    preview_cmd = f"{self_bin} --diff-preview '' {{1}} {{+1}}"
 
     header = (
-        " \033[90m[TAB]\033[0m Mark  \033[90m[Ctrl-A]\033[0m All  \033[90m[Ctrl-D]\033[0m Clear  "
-        "\033[90m[ENTER]\033[0m Confirm  \033[90m[Alt-P]\033[0m Layout  \033[90m[Ctrl-/]\033[0m Preview  "
-        "\033[90m[Ctrl-U]\033[0m Scroll │  "
+        " \033[90m[TAB]\033[0m Mark  \033[90m[Alt-M]\033[0m Vim  \033[90m[Alt-←/→]\033[0m Resize  "
+        "\033[90m[Alt-H/J/K/L]\033[0m Move  \033[90m[Alt-V]\033[0m View  \033[90m[Shift-↑/↓]\033[0m Scroll │  "
         "\033[33m[ M]\033[0m Mod  \033[32m[M ]\033[0m Staged  \033[35m[MM]\033[0m Both  "
         "\033[31m[ D]\033[0m Del  \033[36m[A ]\033[0m Add  \033[90m[??]\033[0m New"
     )
@@ -574,6 +821,9 @@ def fzf_select(
     if not choices:
         return []
 
+    self_bin = shlex.quote(str(Path(__file__).resolve()))
+    prompt_escaped = shlex.quote(prompt + " ❯ ")
+
     fzf_colors = (
         f"bg+:{COLORS['muted']},bg:{COLORS['bg']},"
         f"fg:{COLORS['fg']},fg+:{COLORS['fg']},"
@@ -610,31 +860,58 @@ def fzf_select(
         fzf_cmd.append(f"--header={header}")
     elif multi:
         default_header = (
-            " \033[90m[TAB]\033[0m Mark  \033[90m[Ctrl-A]\033[0m All  \033[90m[Ctrl-D]\033[0m Clear  \033[90m[ENTER]\033[0m Confirm  │  "
-            "\033[33m[ M]\033[0m Mod  \033[32m[M ]\033[0m Staged  \033[35m[MM]\033[0m Both  \033[31m[ D]\033[0m Del  \033[36m[A ]\033[0m Add  \033[90m[??]\033[0m New"
+            " \033[90m[TAB]\033[0m Mark  \033[90m[Alt-M]\033[0m Vim  \033[90m[Alt-←/→]\033[0m Resize  "
+            "\033[90m[Alt-H/J/K/L]\033[0m Move  \033[90m[Alt-V]\033[0m View  \033[90m[ENTER]\033[0m Confirm"
         )
         fzf_cmd.append(f"--header={default_header}")
 
-    bind_actions: list[str] = []
+    bind_actions: list[str] = [
+        f"alt-m:transform:{self_bin} --toggle-vim {prompt_escaped}",
+        f"esc:transform:{self_bin} --key-escape",
+        f"start:transform:{self_bin} --vim-init {prompt_escaped}",
+        "j:down", "k:up", "g:first", "G:last",
+        "ctrl-u:half-page-up",
+        "q:abort",
+        f"/:change-prompt( 󰍉 search ❯ )+enable-search+unbind({VIM_KEYS})",
+    ]
+
     if multi:
         fzf_cmd.append("--multi")
-        bind_actions.extend(["ctrl-a:select-all", "ctrl-d:deselect-all"])
+        bind_actions.extend([
+            "ctrl-a:select-all", "ctrl-d:deselect-all",
+            "J:toggle+down", "K:toggle+up", "v:toggle", "V:toggle"
+        ])
+    else:
+        bind_actions.append("ctrl-d:half-page-down")
 
     if preview:
         fzf_cmd.extend(["--preview", preview])
-        win = preview_window or "right:65%:border-left:wrap"
+        if not preview_window:
+            edge, pct, _ = get_preview_layout()
+            border = {"left": "border-right", "right": "border-left", "up": "border-bottom", "down": "border-top"}.get(edge, "border-left")
+            win = f"{edge}:{pct}%:{border}:wrap" if edge != "hidden" else "hidden"
+        else:
+            win = preview_window
         fzf_cmd.append(f"--preview-window={win}")
         if preview_label:
             fzf_cmd.extend([f"--preview-label={preview_label}", "--preview-label-pos=center"])
         bind_actions.extend([
+            f"alt-left:transform:{self_bin} --resize-preview left",
+            f"alt-right:transform:{self_bin} --resize-preview right",
+            f"alt-up:transform:{self_bin} --resize-preview up",
+            f"alt-down:transform:{self_bin} --resize-preview down",
+            f"alt-h:transform:{self_bin} --move-preview left",
+            f"alt-j:transform:{self_bin} --move-preview down",
+            f"alt-k:transform:{self_bin} --move-preview up",
+            f"alt-l:transform:{self_bin} --move-preview right",
+            f"alt-v:transform:{self_bin} --move-preview hidden",
+            "shift-up:preview-up", "shift-down:preview-down",
+            "shift-scroll-up:preview-up", "shift-scroll-down:preview-down",
+            "scroll-up:up", "scroll-down:down",
+            "preview-scroll-up:preview-up", "preview-scroll-down:preview-down",
             "ctrl-/:toggle-preview",
-            "ctrl-u:preview-page-up",
-            "shift-down:preview-down",
-            "shift-up:preview-up",
-            "alt-p:change-preview-window(down,50%,border-top|right,65%,border-left)",
+            "alt-p:change-preview-window(down,50%,border-top|right,70%,border-left)",
         ])
-        if not multi:
-            bind_actions.append("ctrl-d:preview-page-down")
 
     if bind_actions:
         fzf_cmd.append(f"--bind={','.join(bind_actions)}")

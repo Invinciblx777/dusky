@@ -444,6 +444,11 @@ function _gitdelta_browse() {
     preview+=' --stat --patch {5}'
     (( $+commands[delta] )) && preview+=' | delta --paging=never ${FZF_PREVIEW_COLUMNS:+--width=$FZF_PREVIEW_COLUMNS}'
 
+    local helper="${HOME}/user_scripts/git/git_dusky.py"
+    local cur_layout="right,70%,border-left,wrap"
+    [[ -f "$HOME/.config/dusky/settings/git_preview_layout" ]] && cur_layout=$(< "$HOME/.config/dusky/settings/git_preview_layout")
+    [[ $cur_layout == "hidden" ]] && cur_layout="hidden"
+
     sel=$(git_dusky log --color=always \
             --date=format-local:'%Y-%m-%d %H:%M' \
             --format="%C(yellow)%<(48,trunc)%s%C(reset)${TAB}%C(green)%<(14,trunc)%cr%C(reset)${TAB}%C(dim)%ad%C(reset)${TAB}%C(bold green)%<(8,trunc)%an%C(reset)${TAB}%C(bold cyan)%h%C(reset)${TAB}%C(auto)%d%C(reset)" \
@@ -465,12 +470,26 @@ function _gitdelta_browse() {
             --border=rounded \
             --border-label=' 󰏖 dusky commit browser ' \
             --border-label-pos=2 \
-            --preview-window='right,70%,border-left,wrap' \
+            --preview-window="$cur_layout" \
             --preview-label=' commit diff ' \
             --preview-label-pos=center \
             --preview="$preview" \
-            --header='[ENTER] full diff   [ctrl-u/d] scroll preview   [alt-p] toggle layout   [ctrl-/] toggle preview   [q/ESC] quit' \
-            --bind='q:abort,ctrl-/:toggle-preview,ctrl-u:preview-page-up,ctrl-d:preview-page-down,alt-p:change-preview-window(down,50%,border-top|right,70%,border-left),alt-w:change-preview-window(down,50%,border-top|right,70%,border-left)' \
+            --header='[ENTER] diff   [Alt-M] vim   [Alt-←/→] resize   [Alt-H/J/K/L] move   [Alt-V] view   [Shift-↑/↓] scroll   [q/ESC] quit' \
+            --bind="alt-left:transform:${helper} --resize-preview left" \
+            --bind="alt-right:transform:${helper} --resize-preview right" \
+            --bind="alt-up:transform:${helper} --resize-preview up" \
+            --bind="alt-down:transform:${helper} --resize-preview down" \
+            --bind="alt-h:transform:${helper} --move-preview left" \
+            --bind="alt-j:transform:${helper} --move-preview down" \
+            --bind="alt-k:transform:${helper} --move-preview up" \
+            --bind="alt-l:transform:${helper} --move-preview right" \
+            --bind="alt-v:transform:${helper} --move-preview hidden" \
+            --bind="alt-m:transform:${helper} --toggle-vim '󰏖 commits ❯ '" \
+            --bind="esc:transform:${helper} --key-escape" \
+            --bind="start:transform:${helper} --vim-init '󰏖 commits ❯ '" \
+            --bind='j:down,k:up,g:first,G:last,ctrl-d:half-page-down,ctrl-u:half-page-up,q:abort' \
+            --bind='/:change-prompt( 󰍉 search ❯ )+enable-search+unbind(j,k,g,G,J,K,v,V,q,ctrl-a,ctrl-d,ctrl-u,/)' \
+            --bind='shift-up:preview-up,shift-down:preview-down,shift-scroll-up:preview-up,shift-scroll-down:preview-down,scroll-up:up,scroll-down:down,preview-scroll-up:preview-up,preview-scroll-down:preview-down,ctrl-/:toggle-preview,alt-p:change-preview-window(down,50%,border-top|right,70%,border-left)' \
             --color="bg:$c_bg,bg+:$c_mut,fg:$c_fg,fg+:$c_fg" \
             --color="hl:$c_acc,hl+:$c_acc,pointer:$c_ok,marker:$c_ok" \
             --color="prompt:$c_acc,info:$c_acc,border:$c_mut,label:$c_acc,scrollbar:$c_acc,separator:$c_mut")
@@ -530,20 +549,18 @@ function _gitdelta_select() {
     _gitdelta_matugen muted   '#55433b'; c_mut=$REPLY
     _gitdelta_matugen success '#f0be79'; c_ok=$REPLY
 
-    local preview
-    preview="/usr/bin/git -C ${(q)HOME} --git-dir=${(q)DUSKY_GIT_DIR} --work-tree=${(q)HOME}"
-    if [[ -n $target ]]; then
-        preview+=" show --color=always --patch --format='' ${(q)target} -- {+1}"
-    else
-        preview+=" diff --color=always --patch HEAD -- {+1}"
-    fi
-    (( $+commands[delta] )) && preview+=' | delta --paging=never ${FZF_PREVIEW_COLUMNS:+--width=$FZF_PREVIEW_COLUMNS}'
+    local helper="${HOME}/user_scripts/git/git_dusky.py"
+    local preview="${helper} --diff-preview ${(q)target} {1} {+1}"
 
     lines=( ${(f)"$(_gitdelta_render_stream "$target" "fzf_items")"} )
     if (( $#lines == 0 )); then
         print -ru2 -- 'gitdelta: no changed files to select.'
         return 0
     fi
+
+    local cur_layout="right,70%,border-left,wrap"
+    [[ -f "$HOME/.config/dusky/settings/git_preview_layout" ]] && cur_layout=$(< "$HOME/.config/dusky/settings/git_preview_layout")
+    [[ $cur_layout == "hidden" ]] && cur_layout="hidden"
 
     sel=$(printf '%s\n' "${lines[@]}" \
         | fzf --ansi \
@@ -564,12 +581,27 @@ function _gitdelta_select() {
             --border=rounded \
             --border-label=' 󰏖 dusky file diff browser ' \
             --border-label-pos=2 \
-            --preview-window='right,70%,border-left,wrap' \
+            --preview-window="$cur_layout" \
             --preview-label=' file diff ' \
             --preview-label-pos=center \
             --preview="$preview" \
-            --header='[TAB] select   [ctrl-a] all   [ctrl-d] clear   [ENTER] view diff   [ctrl-e] edit   [ctrl-u/d] scroll   [alt-p] layout   [ctrl-/] preview   [q] quit' \
-            --bind='q:abort,ctrl-/:toggle-preview,ctrl-u:preview-page-up,ctrl-d:preview-page-down,alt-p:change-preview-window(down,50%,border-top|right,70%,border-left),alt-w:change-preview-window(down,50%,border-top|right,70%,border-left),ctrl-a:select-all,ctrl-d:deselect-all' \
+            --header='[TAB] mark   [Alt-M] vim   [Alt-←/→] resize   [Alt-H/J/K/L] move   [Alt-V] view   [Shift-↑/↓] scroll   [ctrl-e] edit   [ENTER] diff   [q] quit' \
+            --bind="alt-left:transform:${helper} --resize-preview left" \
+            --bind="alt-right:transform:${helper} --resize-preview right" \
+            --bind="alt-up:transform:${helper} --resize-preview up" \
+            --bind="alt-down:transform:${helper} --resize-preview down" \
+            --bind="alt-h:transform:${helper} --move-preview left" \
+            --bind="alt-j:transform:${helper} --move-preview down" \
+            --bind="alt-k:transform:${helper} --move-preview up" \
+            --bind="alt-l:transform:${helper} --move-preview right" \
+            --bind="alt-v:transform:${helper} --move-preview hidden" \
+            --bind="alt-m:transform:${helper} --toggle-vim '󰏖 files ❯ '" \
+            --bind="esc:transform:${helper} --key-escape" \
+            --bind="start:transform:${helper} --vim-init '󰏖 files ❯ '" \
+            --bind='j:down,k:up,g:first,G:last,J:toggle+down,K:toggle+up,v:toggle,V:toggle,ctrl-d:half-page-down,ctrl-u:half-page-up,q:abort' \
+            --bind='ctrl-a:select-all,ctrl-d:deselect-all' \
+            --bind='/:change-prompt( 󰍉 search ❯ )+enable-search+unbind(j,k,g,G,J,K,v,V,q,ctrl-a,ctrl-d,ctrl-u,/)' \
+            --bind='shift-up:preview-up,shift-down:preview-down,shift-scroll-up:preview-up,shift-scroll-down:preview-down,scroll-up:up,scroll-down:down,preview-scroll-up:preview-up,preview-scroll-down:preview-down,ctrl-/:toggle-preview,alt-p:change-preview-window(down,50%,border-top|right,70%,border-left)' \
             --color="bg:$c_bg,bg+:$c_mut,fg:$c_fg,fg+:$c_fg" \
             --color="hl:$c_acc,hl+:$c_acc,pointer:$c_ok,marker:$c_ok" \
             --color="prompt:$c_acc,info:$c_acc,border:$c_mut,label:$c_acc,scrollbar:$c_acc,separator:$c_mut")
