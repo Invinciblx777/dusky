@@ -2,8 +2,8 @@
 """
 Dusky Btrfs and Snapper controller.
 
-Target: Arch Linux, kernel >= 7.2, Python >= 3.14, btrfs-progs >= 7.1,
-snapper >= 0.13.2, util-linux >= 2.42, systemd >= 261 and fzf >= 0.74.
+Target: Arch Linux, kernel >= 7.3, Python >= 3.14.7, btrfs-progs >= 7.1,
+snapper >= 0.13.2, util-linux >= 2.42.4, systemd >= 262 and fzf >= 0.74.4.
 Subvolume commands use the installed btrfs text interface; these commands do
 not support --format=json. Snapper and findmnt use their JSON interfaces.
 
@@ -46,7 +46,7 @@ from typing import Any, Final, NoReturn
 
 type JSONDict = dict[str, Any]
 
-DUSKY_VERSION: Final = "3.3.1"
+DUSKY_VERSION: Final = "3.3.2"
 JOURNAL_FORMAT: Final = 2
 
 SCRIPT_PATH: Final = (
@@ -559,14 +559,16 @@ def btrfs_records(*argv: str, check: bool = True) -> Any:
         for line in stdout.splitlines():
             if not line:
                 continue
-            m_id = re.search(r"\bID\s+(\d+)\b", line)
-            m_gen = re.search(r"\bgen\s+(\d+)\b", line)
-            m_top = re.search(r"\btop level\s+(\d+)\b", line)
-            m_uuid = re.search(r"\buuid\s+([0-9a-fA-F-]{36})\b", line)
-            m_puuid = re.search(r"\bparent_uuid\s+([0-9a-fA-F-]{36})\b", line)
-            m_ruuid = re.search(r"\breceived_uuid\s+([0-9a-fA-F-]{36})\b", line)
-            m_path = re.search(r"\bpath\s+(.+)$", line)
-            if not all((m_id, m_gen, m_top, m_path)) or ("-u" in argv and not m_uuid):
+            # Paths are arbitrary names, not metadata. A name containing
+            # 'parent_uuid ...' must never supply a missing UUID column.
+            metadata, separator, path = line.partition(" path ")
+            m_id = re.search(r"\bID\s+(\d+)\b", metadata)
+            m_gen = re.search(r"\bgen\s+(\d+)\b", metadata)
+            m_top = re.search(r"\btop level\s+(\d+)\b", metadata)
+            m_uuid = re.search(r"\buuid\s+([0-9a-fA-F-]{36})\b", metadata)
+            m_puuid = re.search(r"\bparent_uuid\s+([0-9a-fA-F-]{36})\b", metadata)
+            m_ruuid = re.search(r"\breceived_uuid\s+([0-9a-fA-F-]{36})\b", metadata)
+            if not all((m_id, m_gen, m_top, separator, path)) or ("-u" in argv and not m_uuid):
                 die(f"[!] Unrecognised btrfs subvolume list record: {line!r}")
             if m_id:
                 row = {
@@ -576,7 +578,7 @@ def btrfs_records(*argv: str, check: bool = True) -> Any:
                     "uuid": m_uuid.group(1) if m_uuid else "",
                     "parent_uuid": m_puuid.group(1) if m_puuid else "",
                     "received_uuid": m_ruuid.group(1) if m_ruuid else "",
-                    "path": m_path.group(1) if m_path else "",
+                    "path": path,
                 }
                 rows.append(row)
         return {"subvolumes": rows}
@@ -584,7 +586,11 @@ def btrfs_records(*argv: str, check: bool = True) -> Any:
     if "subvolume" in argv and "show" in argv:
         kv: dict[str, str] = {}
         for line in stdout.splitlines():
-            if ":" in line:
+            # The first line and deeper-indented snapshot paths can contain
+            # colons and field names too. Only parse metadata at one tab.
+            if line.startswith("\tSnapshot(s):"):
+                break
+            if line.startswith("\t") and not line.startswith("\t\t") and ":" in line:
                 k, v = line.split(":", 1)
                 k_norm = _norm_key(k.strip())
                 v_val = v.strip()
@@ -1164,7 +1170,7 @@ def btrfs_filesystems() -> dict[str, tuple[Filesystem, str]]:
 
     def build() -> dict[str, tuple[Filesystem, str]]:
         result: dict[str, tuple[Filesystem, str]] = {}
-        for entry in findmnt_entries():
+        for entry in cached("mount_entries", findmnt_entries):
             if str(entry.get("fstype")) != "btrfs":
                 continue
             target = str(entry.get("target") or "")
@@ -1187,7 +1193,7 @@ def mounted_subvol_paths() -> dict[tuple[str, str], str]:
 
     def build() -> dict[tuple[str, str], str]:
         mapping: dict[tuple[str, str], str] = {}
-        for entry in findmnt_entries():
+        for entry in cached("mount_entries", findmnt_entries):
             if str(entry.get("fstype")) != "btrfs":
                 continue
             fs_uuid = str(entry.get("uuid") or "")
@@ -1435,27 +1441,6 @@ def parse_userdata(raw: object) -> dict[str, str]:
     return data
 
 
-def _snapper_records(payload: Any, depth: int = 0) -> list[JSONDict]:
-    """Locate the snapshot array in snapper --jsonout output."""
-    if depth > 6:
-        return []
-    if isinstance(payload, list):
-        rows = [r for r in payload if isinstance(r, dict)]
-        if rows and any(_pick(r, "number", "id", "num") is not None for r in rows):
-            return rows
-        for item in payload:
-            found = _snapper_records(item, depth + 1)
-            if found:
-                return found
-        return []
-    if isinstance(payload, dict):
-        for value in payload.values():
-            found = _snapper_records(value, depth + 1)
-            if found:
-                return found
-    return []
-
-
 def snapshot_rows(config: str) -> list[dict[str, Any]]:
     """
     Snapshot rows for one snapper config.
@@ -1472,10 +1457,15 @@ def snapshot_rows(config: str) -> list[dict[str, Any]]:
             LOG.error("snapper list failed for %s: %s", config, proc.message)
             die(f"[!] snapper could not list config {config!r}:\n    {proc.message}")
         try:
-            payload = json.loads(proc.stdout or "{}")
-        except json.JSONDecodeError as exc:
-            die(f"[!] snapper --jsonout returned invalid JSON for {config!r}: {exc}")
-        records = _snapper_records(payload)
+            payload = json.loads(proc.stdout)
+            records = payload[config]
+            if not isinstance(records, list) or any(
+                not isinstance(row, dict) or _as_int(row.get("number")) is None
+                for row in records
+            ):
+                raise ValueError("expected a snapshot array with numeric snapshot numbers")
+        except (ValueError, TypeError, KeyError) as exc:
+            die(f"[!] snapper --jsonout returned invalid snapshot data for {config!r}: {exc}")
         target = snapper_config_subvolume(config)
         snaps_mnt = snapshots_mountpoint(target)
         snaps_live = Path(snaps_mnt).is_mount()
@@ -3094,7 +3084,7 @@ def cmd_create_pair(left: str, right: str, description: str) -> None:
     good(f"[+] Coordinated snapshots created (dusky_pair={pair_id}).")
 
 
-_SNAPPER_META_ALLOWED = re.compile(r"\A(?:info\.xml|filelist-\d+\.txt)\Z")
+_SNAPPER_META_ALLOWED = re.compile(r"\A(?:info\.xml|filelist-\d+\.txt(?:\.(?:gz|zst))?)\Z")
 
 
 def cmd_delete(config: str, snap_id: str) -> None:
@@ -3104,6 +3094,10 @@ def cmd_delete(config: str, snap_id: str) -> None:
         result = run("snapper", "-c", config, "delete", snap_id, timeout=NO_TIMEOUT)
         invalidate_cache()
         if result.ok:
+            # Snapper filters active/default snapshots out of the delete set
+            # and can still exit zero. Verify the requested postcondition.
+            if any(row["id"] == snap_id for row in snapshot_rows(config)):
+                die(f"[!] Snapper left snapshot {snap_id} of {config!r} intact: {result.message}")
             good(f"[+] Deleted snapshot {snap_id} of {config!r}.")
             return
 
@@ -3114,17 +3108,19 @@ def cmd_delete(config: str, snap_id: str) -> None:
         meta_dir = Path(snaps_mnt) / snap_id
         subvol = meta_dir / "snapshot"
         if meta_dir.is_dir() and not os.path.lexists(subvol):
-            # snapper writes info.xml plus filelist-<pre-number>.txt; v3.0.0's
-            # allowlist only knew filelist-0.txt and therefore refused to purge
-            # the metadata of any pre/post pair.
-            leftovers = {p.name for p in meta_dir.iterdir()}
+            # Snapper comparison caches may be plain, gzip or zstd files.
+            metadata = list(meta_dir.iterdir())
+            leftovers = {p.name for p in metadata}
             unexpected = {n for n in leftovers if not _SNAPPER_META_ALLOWED.fullmatch(n)}
-            if unexpected:
+            if unexpected or any(not p.is_file() for p in metadata):
                 die(f"[!] Refusing to purge {meta_dir}: unexpected content {sorted(unexpected)}")
-            shutil.rmtree(meta_dir, ignore_errors=True)
-            if not meta_dir.exists():
-                good(f"[+] Purged dead snapshot metadata {snap_id} of {config!r}.")
-                return
+            for path in metadata:
+                path.unlink()
+            # Keep the number reserved, as Snapper does for UNIQUE_NUMBERS.
+            # Removing the highest numbered directory permits ID reuse.
+            fsync_path(meta_dir, is_dir=True)
+            good(f"[+] Purged dead snapshot metadata {snap_id} of {config!r} (number reserved).")
+            return
         die(f"[!] Failed to delete snapshot {snap_id} of {config!r}:\n    {result.message}")
 
 
@@ -3307,7 +3303,7 @@ def cmd_doctor() -> int:
 
     kernel = run("uname", "-r").text
     ktuple = _kernel_tuple()
-    say(f"  kernel           {C_DIM}{kernel}{C_RESET}" + ("" if ktuple >= (7, 2) else f"  {C_WARN}(< 7.2){C_RESET}"))
+    say(f"  kernel           {C_DIM}{kernel}{C_RESET}" + ("" if ktuple >= (7, 3) else f"  {C_WARN}(< 7.3){C_RESET}"))
     say(f"  btrfs-progs      {C_DIM}{run('btrfs', '--version').text}{C_RESET}")
     snap_version = run("snapper", "--version")
     say(f"  snapper          {C_DIM}{snap_version.text.splitlines()[0] if snap_version.ok and snap_version.text else 'unknown'}{C_RESET}")
@@ -3317,7 +3313,7 @@ def cmd_doctor() -> int:
     metadata_ok = btrfs_records("subvolume", "get-default", "/", check=False) is not None
     say(f"  btrfs metadata   {(C_OK + 'readable') if metadata_ok else (C_ERR + 'unreadable')}{C_RESET}")
     problems += 0 if metadata_ok else 1
-    problems += int(ktuple < (7, 2))
+    problems += int(ktuple < (7, 3))
 
     say()
     for fs_uuid, (fs, mount_target) in btrfs_filesystems().items():
