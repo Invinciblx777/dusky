@@ -45,9 +45,18 @@ Run as the desktop user in Hyprland. Required packages are Sunshine,
 python-rich, Hyprland, systemd and iproute2, plus the GPU drivers/encoding
 libraries and input-device access supplied by the Sunshine package. Include
 Sunshine and its dependencies in the offline ISO payload. When Sunshine is
-missing, use `--package /path/to/sunshine.pkg.tar.zst`; setup no longer downloads
-a changing online package automatically. Existing credentials and pairings
+missing, setup installs it from a configured pacman repository, or falls back
+to AUR `sunshine-bin` using Paru/Yay as the normal user. If neither helper is
+installed, setup installs Git/base-devel with sudo and builds/installs Paru
+using unprivileged `makepkg -si`. Only package installation uses elevated
+privileges; the script and Sunshine stay owned by the desktop user.
+Use `--package /path/to/sunshine.pkg.tar.zst` for a local Sunshine package.
+Missing Hyprland/systemd/iproute2, Rich, VA-API tools and browser-opening tools
+are installed with `sudo pacman -S --needed`. Existing credentials and pairings
 are retained. The generated config/settings honor `XDG_CONFIG_HOME`.
+Automatic downloads require working repositories/AUR and internet access.
+Setup uses existing pacman databases; it does not refresh them or perform a
+system upgrade. An offline ISO should still include packages and dependencies.
 
 Add the displayed computer IP in Moonlight on the same Wi-Fi. No SIM, mobile
 data or internet is needed. On this computer, open `https://localhost:47990`,
@@ -116,14 +125,17 @@ development checkout was not built or installed.
 
 ## Audit verification, 2026-10-01
 
-- Twenty-two focused regressions passed: GameStream responses/errors/timeouts,
+- Thirty focused regressions passed: GameStream responses/errors/timeouts,
   settings reads, cleanup recovery, config preservation/idempotence, firewall
   idempotence, setup leaving USB profiles alone, and duplicate certificate
   repair preserving credentials, backups and disabled clients, and setup
   restarting only when that repair is needed, client removal preserving state
   and service state, recovery after a failed write, action-flag dispatch,
   first-setup browser launch, skipping it for saved clients, and browser-failure
-  fallback to manual pairing.
+  fallback to manual pairing, repository/AUR installation selection, batched
+  dependency installation, unprivileged helper bootstrap and install failures.
+  Package installation paths were tested with fixtures; installed dependencies
+  were preserved on this machine rather than removed/reinstalled for testing.
 - Live portrait and landscape dimensions, complete service off/on, and forced
   SIGKILL recovery passed. Off left zero main PID, no HTTP listener, and no
   owned monitor/state file.

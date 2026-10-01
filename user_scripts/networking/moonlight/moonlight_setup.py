@@ -6,6 +6,7 @@ Run ``orientation portrait`` or ``orientation landscape`` to switch its shape.
 
 import argparse
 import http.client
+import importlib.util
 import ipaddress
 import json
 import os
@@ -47,7 +48,11 @@ def run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
 
 
 def message(value: str, *, error: bool = False) -> None:
-    from rich.console import Console
+    try:
+        from rich.console import Console
+    except ModuleNotFoundError:
+        print(value, file=sys.stderr if error else sys.stdout)
+        return
     Console(stderr=error).print(value, markup=False, highlight=False,
                                 style="red" if error else None)
 
@@ -114,6 +119,38 @@ def monitors(instance: str) -> list[dict]:
     return json.loads(hypr(instance, "-j", "monitors").stdout)
 
 
+def ensure_dependencies() -> None:
+    requirements = {"hyprland": "hyprctl", "systemd": "systemctl", "iproute2": "ip",
+                    "libva-utils": "vainfo", "xdg-utils": "xdg-open"}
+    missing = [package for package, command in requirements.items() if not shutil.which(command)]
+    if importlib.util.find_spec("rich") is None:
+        missing.append("python-rich")
+    if missing:
+        message("Installing missing packages: " + ", ".join(missing))
+        subprocess.run(["sudo", "pacman", "-S", "--needed", "--noconfirm", *missing], check=True)
+    unavailable = [command for command in requirements.values() if not shutil.which(command)]
+    if unavailable or importlib.util.find_spec("rich") is None:
+        raise RuntimeError("Dependency installation incomplete: " + ", ".join(unavailable or ["python-rich"]))
+
+
+def aur_helper() -> str:
+    helper = shutil.which("paru") or shutil.which("yay")
+    if helper:
+        if run("pacman", "-Q", "base-devel", check=False).returncode or not shutil.which("git"):
+            subprocess.run(["sudo", "pacman", "-S", "--needed", "--noconfirm", "git", "base-devel"], check=True)
+        return helper
+    message("Installing Paru for the missing AUR package; builds run as your desktop user")
+    subprocess.run(["sudo", "pacman", "-S", "--needed", "--noconfirm", "git", "base-devel"], check=True)
+    with tempfile.TemporaryDirectory(prefix="dusky-paru-") as directory:
+        source = Path(directory) / "paru"
+        subprocess.run(["git", "clone", "https://aur.archlinux.org/paru.git", str(source)], check=True)
+        subprocess.run(["makepkg", "-si", "--needed", "--noconfirm"], cwd=source, check=True)
+    helper = shutil.which("paru")
+    if not helper:
+        raise RuntimeError("Paru installation did not provide its executable")
+    return helper
+
+
 def sunshine_package(package: Path | None) -> None:
     if shutil.which("sunshine"):
         return
@@ -124,7 +161,16 @@ def sunshine_package(package: Path | None) -> None:
         if not shutil.which("sunshine"):
             raise RuntimeError("The supplied package did not install the Sunshine executable")
         return
-    raise RuntimeError("Install Sunshine from the ISO or rerun with --package /path/to/sunshine.pkg.tar.zst")
+    if run("pacman", "-Si", "sunshine", check=False).returncode == 0:
+        message("Installing Sunshine from the configured pacman repository")
+        subprocess.run(["sudo", "pacman", "-S", "--needed", "--noconfirm", "sunshine"], check=True)
+    else:
+        helper = aur_helper()
+        # The binary package includes upstream-built encoders without a CUDA build toolchain.
+        message("Installing Sunshine using the AUR sunshine-bin package")
+        subprocess.run([helper, "-S", "--needed", "--noconfirm", "sunshine-bin"], check=True)
+    if not shutil.which("sunshine"):
+        raise RuntimeError("Sunshine installation did not provide its executable")
 
 
 def configure_firewall() -> None:
@@ -155,7 +201,9 @@ def firewall_worker() -> None:
 def setup_iphone_usb() -> None:
     """Keep iPhone USB tethering local, even when the phone has no internet."""
     if not shutil.which("nmcli"):
-        raise RuntimeError("iPhone USB routing needs NetworkManager")
+        if os.geteuid() == 0:
+            raise RuntimeError("Run USB setup as the desktop user, without sudo")
+        subprocess.run(["sudo", "pacman", "-S", "--needed", "--noconfirm", "networkmanager"], check=True)
     settings = (
         "connection.interface-name", "",
         "match.driver", "ipheth",
@@ -307,9 +355,7 @@ def ready() -> bool:
 def setup(package: Path | None) -> None:
     if os.geteuid() == 0:
         raise RuntimeError("Run setup as the desktop user, without sudo")
-    missing = [name for name in ("hyprctl", "systemctl", "ip") if not shutil.which(name)]
-    if missing:
-        raise RuntimeError("Missing required commands: " + ", ".join(missing))
+    ensure_dependencies()
     if not session():
         raise RuntimeError("Start a Hyprland desktop session before setup")
     preferences()

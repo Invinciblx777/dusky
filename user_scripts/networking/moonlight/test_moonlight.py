@@ -98,7 +98,8 @@ class MoonlightTests(unittest.TestCase):
             moon.firewall_worker()
             self.assertEqual(run.call_count, 1)
 
-    def test_setup_does_not_configure_usb_network(self):
+    @patch.object(moon, "ensure_dependencies")
+    def test_setup_does_not_configure_usb_network(self, _dependencies):
         with tempfile.TemporaryDirectory() as directory, patch.object(moon, "UNIT", Path(directory) / "test.service"), patch.object(moon, "session", return_value={"instance":"session"}), patch.object(moon, "sunshine_package"), patch.object(moon, "configure_firewall"), patch.object(moon, "write_config", return_value=False), patch.object(moon, "repair_duplicate_pairings", return_value=0), patch.object(moon, "atomic_write", return_value=False), patch.object(moon, "run", side_effect=[result("enabled"), result("active")]), patch.object(moon, "ready", return_value=True), patch.object(moon, "status"), patch.object(moon, "open_pairing_page") as browser, patch.object(moon, "setup_iphone_usb") as usb:
             moon.setup(None)
             usb.assert_not_called()
@@ -108,7 +109,7 @@ class MoonlightTests(unittest.TestCase):
         for duplicates in (0, 2):
             with self.subTest(duplicates=duplicates), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
                 stack.enter_context(patch.object(moon, "UNIT", Path(directory) / "test.service"))
-                for name in ("sunshine_package", "configure_firewall", "status", "open_pairing_page"):
+                for name in ("ensure_dependencies", "sunshine_package", "configure_firewall", "status", "open_pairing_page"):
                     stack.enter_context(patch.object(moon, name))
                 for name, value in {"session": {"instance": "session"}, "preferences": {}, "write_config": False, "atomic_write": False, "ready": True, "repair_duplicate_pairings": duplicates}.items():
                     stack.enter_context(patch.object(moon, name, return_value=value))
@@ -222,6 +223,55 @@ class MoonlightTests(unittest.TestCase):
                 moon.open_pairing_page()
                 self.assertIn("manually", message.call_args.args[0])
                 self.assertIn("https://localhost:47990", message.call_args.args[0])
+
+    def test_installed_dependencies_do_not_invoke_sudo(self):
+        with patch.object(moon.shutil, "which", return_value="/usr/bin/tool"), patch.object(moon.importlib.util, "find_spec", return_value=object()), patch.object(moon.subprocess, "run") as installer:
+            moon.ensure_dependencies()
+            installer.assert_not_called()
+
+    def test_missing_dependencies_are_batched_and_verified(self):
+        installed = set()
+        def install(*args, **kwargs):
+            installed.update({"hyprctl", "systemctl", "ip", "vainfo", "xdg-open"})
+            return result()
+        with patch.object(moon.shutil, "which", side_effect=lambda command: "/usr/bin/" + command if command in installed else None), patch.object(moon.importlib.util, "find_spec", return_value=object()), patch.object(moon.subprocess, "run", side_effect=install) as installer, patch.object(moon, "message"):
+            moon.ensure_dependencies()
+            self.assertEqual(installer.call_args.args[0], ["sudo", "pacman", "-S", "--needed", "--noconfirm", "hyprland", "systemd", "iproute2", "libva-utils", "xdg-utils"])
+
+    def test_sunshine_uses_configured_repository_before_aur(self):
+        with patch.object(moon.shutil, "which", side_effect=[None, "/usr/bin/sunshine"]), patch.object(moon, "run", return_value=result()), patch.object(moon.subprocess, "run", return_value=result()) as installer, patch.object(moon, "aur_helper") as aur, patch.object(moon, "message"):
+            moon.sunshine_package(None)
+            installer.assert_called_once_with(["sudo", "pacman", "-S", "--needed", "--noconfirm", "sunshine"], check=True)
+            aur.assert_not_called()
+
+    def test_sunshine_aur_helper_runs_without_sudo(self):
+        with patch.object(moon.shutil, "which", side_effect=[None, "/usr/bin/sunshine"]), patch.object(moon, "run", return_value=result(code=1)), patch.object(moon, "aur_helper", return_value="/usr/bin/paru"), patch.object(moon.subprocess, "run", return_value=result()) as installer, patch.object(moon, "message"):
+            moon.sunshine_package(None)
+            installer.assert_called_once_with(["/usr/bin/paru", "-S", "--needed", "--noconfirm", "sunshine-bin"], check=True)
+
+    def test_bootstrap_build_is_unprivileged_and_install_uses_makepkg(self):
+        with patch.object(moon.shutil, "which", side_effect=[None, None, "/usr/bin/paru"]), patch.object(moon.subprocess, "run", return_value=result()) as installer, patch.object(moon, "message"):
+            self.assertEqual(moon.aur_helper(), "/usr/bin/paru")
+            commands = [call.args[0] for call in installer.call_args_list]
+            self.assertEqual(commands[0], ["sudo", "pacman", "-S", "--needed", "--noconfirm", "git", "base-devel"])
+            self.assertEqual(commands[1][:3], ["git", "clone", "https://aur.archlinux.org/paru.git"])
+            self.assertEqual(commands[2], ["makepkg", "-si", "--needed", "--noconfirm"])
+
+    def test_sunshine_failed_installation_is_reported(self):
+        with patch.object(moon.shutil, "which", return_value=None), patch.object(moon, "run", return_value=result()), patch.object(moon.subprocess, "run", return_value=result()), patch.object(moon, "message"):
+            with self.assertRaisesRegex(RuntimeError, "did not provide"):
+                moon.sunshine_package(None)
+
+    def test_existing_sunshine_is_not_reinstalled(self):
+        with patch.object(moon.shutil, "which", return_value="/usr/bin/sunshine"), patch.object(moon, "run") as query, patch.object(moon.subprocess, "run") as installer:
+            moon.sunshine_package(None)
+            query.assert_not_called()
+            installer.assert_not_called()
+
+    def test_missing_rich_is_installed_before_guidance(self):
+        with patch.object(moon.shutil, "which", return_value="/usr/bin/tool"), patch.object(moon.importlib.util, "find_spec", side_effect=[None, object()]), patch.object(moon.subprocess, "run", return_value=result()) as installer, patch.object(moon, "message"):
+            moon.ensure_dependencies()
+            installer.assert_called_once_with(["sudo", "pacman", "-S", "--needed", "--noconfirm", "python-rich"], check=True)
 
 
 if __name__ == "__main__":

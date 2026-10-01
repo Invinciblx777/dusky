@@ -80,7 +80,7 @@ class SetupTests(unittest.TestCase):
                 desktop.setup_offline_wifi("wlan1")
 
     def test_offline_refuses_to_displace_wifi(self):
-        with patch.object(desktop, "wifi_device", return_value=None), patch.object(desktop, "run") as run:
+        with patch.object(desktop, "ensure_dependencies"), patch.object(desktop, "wifi_device", return_value=None), patch.object(desktop, "run") as run:
             with self.assertRaisesRegex(RuntimeError, "unused second"):
                 desktop.offline()
             run.assert_not_called()
@@ -135,6 +135,79 @@ class SetupTests(unittest.TestCase):
             self.assertTrue(common.atomic_write(path, "two"))
             self.assertEqual(path.read_text(), "two")
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_dependency_installation_is_batched_and_only_pacman_is_elevated(self):
+        available = set()
+        def install(*args, **kwargs):
+            available.update({"wayvnc", "wayvncctl", "openssl"})
+            return completed()
+        with patch.object(common.shutil, "which", side_effect=lambda name: "/usr/bin/" + name if name in available else None), patch.object(common.importlib.util, "find_spec", return_value=object()), patch.object(common.subprocess, "run", side_effect=install) as installer, patch.object(common, "message"):
+            requirements = {"wayvnc": ("wayvnc", "wayvncctl"), "openssl": ("openssl",)}
+            common.ensure_dependencies(requirements)
+            self.assertEqual(installer.call_args.args[0], ["sudo", "pacman", "-S", "--needed", "--noconfirm", "wayvnc", "openssl"])
+            common.ensure_dependencies(requirements)
+            self.assertEqual(installer.call_count, 1)
+
+    def test_failed_dependency_installation_cannot_continue(self):
+        with patch.object(common.shutil, "which", return_value=None), patch.object(common.importlib.util, "find_spec", return_value=object()), patch.object(common.subprocess, "run", return_value=completed()), patch.object(common, "message"):
+            with self.assertRaisesRegex(RuntimeError, "incomplete"):
+                common.ensure_dependencies({"wayvnc": ("wayvnc",)})
+
+    def test_disconnect_only_targets_requested_viewer(self):
+        clients = [{"id": 1}, {"id": "2"}]
+        with patch.object(common, "control_data", return_value=clients), patch.object(common, "run", return_value=completed()) as run, patch.object(common, "message"):
+            common.disconnect_clients(Path("/test.sock"), "2")
+            run.assert_called_once_with("wayvncctl", "-S", "/test.sock", "client-disconnect", "2")
+            run.reset_mock()
+            common.disconnect_clients(Path("/test.sock"))
+            self.assertEqual(run.call_count, 2)
+
+    def test_invalid_disconnect_id_does_not_reset_server(self):
+        with patch.object(common, "control_data", return_value=[{"id": 1}]), patch.object(common, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "not found"):
+                common.disconnect_clients(Path("/test.sock"), "999")
+            run.assert_not_called()
+
+    def test_unavailable_control_cannot_claim_disconnect_success(self):
+        with patch.object(common, "control_data", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                common.disconnect_clients(Path("/test.sock"))
+
+    def test_reconnect_restores_enabled_phone_service(self):
+        with patch.object(desktop, "prepare"), patch.object(desktop, "UNIT") as unit, patch.object(desktop, "run", side_effect=[completed("enabled"), completed(), completed("enabled"), completed()]) as run, patch.object(desktop, "wait_ready") as wait, patch.object(desktop, "status"):
+            unit.exists.return_value = True
+            desktop.reconnect()
+            self.assertIn(unittest.mock.call("systemctl", "--user", "restart", common.MASTER), run.call_args_list)
+            self.assertIn(unittest.mock.call("systemctl", "--user", "start", common.PHONE), run.call_args_list)
+            self.assertEqual(wait.call_count, 2)
+
+    def test_reconnect_keeps_disabled_phone_service_off(self):
+        with patch.object(desktop, "prepare"), patch.object(desktop, "UNIT") as unit, patch.object(desktop, "run", side_effect=[completed("enabled"), completed(), completed("disabled")]) as run, patch.object(desktop, "wait_ready"), patch.object(desktop, "status"):
+            unit.exists.return_value = True
+            desktop.reconnect()
+            self.assertFalse(any(call.args == ("systemctl", "--user", "start", common.PHONE) for call in run.call_args_list))
+
+    def test_flags_keep_legacy_actions_and_target_correct_control(self):
+        for module in (desktop, phone):
+            for flag, name in (("--reconnect", "reconnect"), ("--diagnose", "show_diagnostics"), ("--clients", "show_clients"), ("status", "status")):
+                with self.subTest(module=module.__name__, flag=flag), patch.object(common.sys, "argv", [module.__name__, flag]), patch.object(module, name) as action:
+                    module.main()
+                    action.assert_called_once()
+            with patch.object(common.sys, "argv", [module.__name__, "--disconnect", "2"]), patch.object(module, "disconnect_clients") as disconnect:
+                module.main()
+                disconnect.assert_called_once_with(module.CONTROL, "2")
+
+    def test_phone_reconnect_does_not_reconfigure_healthy_master(self):
+        with patch.object(phone, "UNIT") as unit, patch.object(phone, "prepare"), patch.object(phone, "run", side_effect=[completed("enabled"), completed(), completed()]), patch.object(phone, "wait_ready"), patch.object(phone, "status"), patch.object(desktop, "ready", return_value=True), patch.object(desktop, "install") as install:
+            unit.exists.return_value = True
+            phone.reconnect()
+            install.assert_not_called()
+
+    def test_phone_reconnect_recovers_disabled_master(self):
+        with patch.object(phone, "UNIT") as unit, patch.object(phone, "prepare"), patch.object(phone, "run", side_effect=[completed("disabled"), completed(), completed()]), patch.object(phone, "wait_ready"), patch.object(phone, "status"), patch.object(desktop, "install") as install:
+            unit.exists.return_value = True
+            phone.reconnect()
+            install.assert_called_once_with(show=False)
 
 
 if __name__ == "__main__":

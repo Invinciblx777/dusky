@@ -19,8 +19,12 @@ Run setup as the desktop user in a running Hyprland session:
 Setup creates the configuration and user units, prioritizes a UFW allowance for
 TCP ports 5901 and 5902 when UFW is installed, and enables/starts the services. It requires
 `wayvnc` (including `wayvncctl` and PAM support), `python-rich`, `openssl`,
-`hyprland`, and `iproute2` to be installed. Include these and their dependencies
-in the offline ISO payload; setup does not download packages. WayVNC is included
+`hyprland`, systemd, and `iproute2`. Setup detects missing tools and Rich,
+then installs only missing package targets through `sudo pacman -S --needed`.
+Only pacman runs with elevated privileges; configuration and services remain
+owned by the desktop user. Include packages in the offline ISO payload to avoid
+downloads; otherwise repositories must be reachable and the pacman databases
+usable. Setup does not refresh databases or initiate a system upgrade. WayVNC is included
 in both the ISO generator and offline installer's network package lists.
 
 The VNC allowance precedes UFW user rules, including existing VNC or broad deny
@@ -35,6 +39,30 @@ account's username and password. No SIM, mobile data, DNS lookup, Tailscale,
 or internet connection is required for local VNC. RVNC Viewer on iOS was
 confirmed working on this machine. Other viewers must support RSA-AES or
 VeNCrypt; password-only legacy VNC authentication is not enabled.
+
+Setup and status show a numbered Rich guide with the RealVNC/RVNC Viewer
+download link, exact address/port, current Linux username, iPhone local-network
+permission and login steps. There is no web UI or PIN pairing for this VNC setup.
+
+Recovery controls work in both scripts:
+
+```sh
+./vnc_setup.py --diagnose
+./vnc_setup.py --reconnect
+./vnc_setup.py --clients
+./vnc_setup.py --disconnect CLIENT_ID
+./vnc_setup.py --disconnect-all
+./phone_display.py --diagnose
+./phone_display.py --reconnect
+```
+
+`--reconnect` restarts the selected display and disconnects its viewers.
+Restarting the master also restores an enabled phone display; a disabled phone
+display stays disabled. Reconnecting the phone display restarts only that display
+when the master is healthy. `--disconnect`/`--disconnect-all` leave the server
+running and drop only the selected display's sessions. Reopen the connection
+in the viewer afterwards. WayVNC has no saved-pairing database; delete saved
+addresses inside the phone app. Existing positional actions remain supported.
 
 The main switch controls both Dusky VNC services:
 
@@ -58,6 +86,7 @@ its own control socket, and status checks both capture state and the RFB greetin
 Saved phone dimensions are preserved when viewers request resizing.
 
 `offline` requires a disconnected, AP-capable second Wi-Fi adapter and dnsmasq.
+The optional actions install missing NetworkManager/dnsmasq or Tailscale packages.
 It refuses to replace an active Wi-Fi connection, creates a manual hotspot, and
 keeps it from becoming the IPv4 default route. Spare-adapter hotspot activation
 has not been exercised on this machine. `remote` separately enables Tailscale
@@ -127,8 +156,14 @@ Focused, non-mutating regressions:
 python -m unittest discover -s user_scripts/networking/vnc -p 'test_*.py'
 ```
 
-Nineteen tests cover fragmented/wrong/closed/timed-out RFB responses, malformed
+Twenty-nine tests cover fragmented/wrong/closed/timed-out RFB responses, malformed
 control replies, active/idle Wi-Fi selection, offline refusal, settings reads,
 atomic writes, cleanup ownership recovery, firewall idempotence/error reporting,
-offline profile reuse, and stable service commands across Python aliases. Unit syntax also passed
+offline profile reuse, stable service commands across Python aliases, batched
+dependency installation, installation failures, targeted viewer disconnection,
+reconnect service preferences, recovering a disabled master without reconfiguring
+a healthy one, and flag dispatch. Diagnostics, master and phone reconnect
+and empty-session disconnect were exercised live; individual viewer disconnect
+was checked with fixtures rather than disconnecting an authenticated phone.
+Unit syntax also passed
 `systemd-analyze --user verify`.

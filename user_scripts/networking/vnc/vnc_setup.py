@@ -7,7 +7,6 @@ VNC and the optional phone display. ``offline`` needs a spare Wi-Fi adapter;
 the existing Wi-Fi connection is preserved. Desktop sharing uses port 5902.
 """
 
-import argparse
 import json
 import os
 from pathlib import Path
@@ -22,6 +21,7 @@ from vnc_common import (
     CONFIG_HOME, RUNTIME, MASTER, DESKTOP_PORT, PHONE,
     configure_firewall, control_data, exec_wayvnc, install_unit, message, prepare, rfb_ready as probe_rfb,
     run, script_command, show_status, wait_ready, wait_session, write_config as configure,
+    ensure_dependencies, show_clients, disconnect_clients, show_diagnostics, parse_action,
 )
 
 CONFIG_DIR = CONFIG_HOME / "wayvnc"
@@ -116,6 +116,7 @@ def setup_offline_wifi(device: str) -> None:
 
 
 def offline() -> None:
+    ensure_dependencies({"networkmanager": ("nmcli",), "dnsmasq": ("dnsmasq",)})
     device = wifi_device()
     if not device:
         raise RuntimeError("Offline hotspot needs an unused second Wi-Fi adapter. Keep both phones on your existing Wi-Fi and use status.")
@@ -165,8 +166,7 @@ def status() -> None:
 def remote() -> None:
     if os.geteuid() == 0:
         raise RuntimeError("Run setup as the desktop user, without sudo")
-    if not Path("/usr/bin/tailscale").exists():
-        raise RuntimeError("Install tailscale from the ISO or distribution repository, then rerun remote")
+    ensure_dependencies({"tailscale": ("tailscale",)})
     enabled = run("systemctl", "is-enabled", "tailscaled.service", check=False).stdout.strip() == "enabled"
     active = run("systemctl", "is-active", "tailscaled.service", check=False).stdout.strip() == "active"
     if not (enabled and active):
@@ -190,11 +190,26 @@ def stop() -> None:
     message("All Dusky VNC stopped and disabled; the optional phone monitor is removed")
 
 
+def reconnect() -> None:
+    prepare()
+    if not UNIT.exists() or run("systemctl", "--user", "is-enabled", UNIT_NAME, check=False).stdout.strip() != "enabled":
+        install(show=False)
+    else:
+        run("systemctl", "--user", "restart", UNIT_NAME)
+        wait_ready(ready, UNIT_NAME)
+    if run("systemctl", "--user", "is-enabled", PHONE, check=False).stdout.strip() == "enabled":
+        import phone_display
+        run("systemctl", "--user", "start", PHONE)
+        wait_ready(phone_display.ready, PHONE)
+    status()
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", nargs="?", choices=("setup", "status", "serve", "stop", "offline", "remote"), default="setup")
-    action = parser.parse_args().action
-    {"setup": install, "status": status, "serve": serve, "stop": stop, "offline": offline, "remote": remote}[action]()
+    action, _, identifier = parse_action(__doc__, ("setup", "status", "serve", "stop", "offline", "remote", "reconnect", "clients", "diagnose"))
+    {"setup": install, "status": status, "serve": serve, "stop": stop, "offline": offline, "remote": remote,
+     "reconnect": reconnect, "clients": lambda: show_clients(CONTROL),
+     "disconnect": lambda: disconnect_clients(CONTROL, identifier),
+     "diagnose": lambda: show_diagnostics(UNIT_NAME, PORT, CONTROL)}[action]()
 
 
 if __name__ == "__main__":

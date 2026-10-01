@@ -1,6 +1,7 @@
 """Shared setup and on-demand diagnostics for the two WayVNC services."""
 
 import ipaddress
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -32,7 +33,11 @@ def run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
 
 def message(value: str, *, error: bool = False) -> None:
     # The service replaces Python with WayVNC; Rich is only needed by the CLI.
-    from rich.console import Console
+    try:
+        from rich.console import Console
+    except ModuleNotFoundError:
+        print(value, file=sys.stderr if error else sys.stdout)
+        return
     Console(stderr=error).print(value, markup=False, highlight=False,
                                 style="red" if error else None)
 
@@ -121,18 +126,123 @@ def script_command(script: Path, action: str) -> str:
                     for part in ("/usr/bin/python3", name, action))
 
 
+def ensure_dependencies(requirements: dict[str, tuple[str, ...]]) -> None:
+    if os.geteuid() == 0:
+        raise RuntimeError("Run setup as the desktop user, without sudo")
+    missing = [package for package, commands in requirements.items()
+               if any(not shutil.which(command) for command in commands)]
+    if importlib.util.find_spec("rich") is None:
+        missing.append("python-rich")
+    if missing:
+        message("Installing missing packages: " + ", ".join(missing))
+        subprocess.run(["sudo", "pacman", "-S", "--needed", "--noconfirm", *missing], check=True)
+    unavailable = [command for commands in requirements.values() for command in commands if not shutil.which(command)]
+    if unavailable or importlib.util.find_spec("rich") is None:
+        raise RuntimeError("Dependency installation incomplete: " + ", ".join(unavailable or ["python-rich"]))
+
+
 def prepare() -> None:
     if os.geteuid() == 0:
         raise RuntimeError("Run setup as the desktop user, without sudo")
-    if not Path("/usr/bin/wayvnc").is_file():
-        raise RuntimeError("Install wayvnc from the ISO or distribution repository, then rerun setup")
+    ensure_dependencies({"wayvnc": ("wayvnc", "wayvncctl"), "hyprland": ("hyprctl",),
+                         "openssl": ("openssl",), "systemd": ("systemctl",), "iproute2": ("ip",)})
     if not Path("/etc/pam.d/wayvnc").is_file():
         raise RuntimeError("WayVNC PAM profile is missing; reinstall the wayvnc package")
-    missing = [name for name in ("wayvncctl", "hyprctl", "openssl", "systemctl", "ip") if not shutil.which(name)]
-    if missing:
-        raise RuntimeError("Missing required commands: " + ", ".join(missing))
     if not session():
         raise RuntimeError("Start a Hyprland desktop session before setup")
+
+
+def show_clients(control: Path) -> None:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.text import Text
+    clients = control_data(control, "client-list")
+    if clients is None:
+        raise RuntimeError("WayVNC control is unavailable; use --diagnose or --reconnect")
+    table = Table(title="Connected VNC viewers")
+    for title in ("ID", "Address", "User"):
+        table.add_column(title)
+    for client in clients:
+        table.add_row(Text(str(client.get("id", ""))), Text(str(client.get("address", ""))), Text(str(client.get("username", ""))))
+    Console().print(table)
+    message("Disconnect one: --disconnect CLIENT_ID    Disconnect all: --disconnect-all")
+    message("Saved connection entries live in your phone viewer; remove them there if needed.")
+
+
+def disconnect_clients(control: Path, identifier: str | None = None) -> None:
+    clients = control_data(control, "client-list")
+    if clients is None:
+        raise RuntimeError("WayVNC control is unavailable; use --diagnose or --reconnect")
+    selected = [client for client in clients if identifier is None or str(client.get("id")) == identifier]
+    if identifier is not None and not selected:
+        raise RuntimeError("Viewer ID not found; use --clients")
+    for client in selected:
+        run("wayvncctl", "-S", str(control), "client-disconnect", str(client["id"]))
+    message(f"Disconnected {len(selected)} viewer(s). Reopen the connection in your phone app.")
+
+
+def show_diagnostics(unit: str, port: int, control: Path) -> None:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.text import Text
+    table = Table(title="VNC diagnostics")
+    table.add_column("Check")
+    table.add_column("Result")
+    for label, command in (
+        ("Master service", ("systemctl", "--user", "is-active", MASTER)),
+        ("Master startup", ("systemctl", "--user", "is-enabled", MASTER)),
+        ("Selected service", ("systemctl", "--user", "is-active", unit)),
+        ("Wi-Fi/default route", ("ip", "-4", "route", "show", "default")),
+    ):
+        table.add_row(label, Text(run(*command, check=False).stdout.strip() or "Unavailable"))
+    table.add_row(f"RFB handshake ({port})", "Responding" if rfb_ready(port) else "Unavailable")
+    outputs = control_data(control, "output-list")
+    captured = [item.get("name", "Unknown") for item in outputs or [] if item.get("captured")]
+    table.add_row("WayVNC control", "Responding" if outputs is not None else "Unavailable")
+    table.add_row("Captured monitor", Text(", ".join(captured) or "None"))
+    clients = control_data(control, "client-list")
+    table.add_row("Connected viewers", str(len(clients)) if clients is not None else "Unavailable")
+    table.add_row("Linux login", Text(pwd.getpwuid(os.getuid()).pw_name))
+    Console().print(table)
+    message("Stuck session: --reconnect restarts this display; --disconnect-all only disconnects its viewers.")
+    message("Timeout: rerun --setup to repair UFW allowances; check Wi-Fi client isolation on the router.")
+    message("Login failure: use the displayed Linux username and Linux account password.")
+    message("Separate display looks black: move a window onto its active workspace.")
+    message(f"Detailed logs: journalctl --user -u {unit} -n 40 --no-pager")
+
+
+def parse_action(description: str, actions: tuple[str, ...], *, orientation: bool = False):
+    import argparse
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("action", nargs="?", choices=actions)
+    parser.add_argument("value", nargs="?", choices=("landscape", "portrait"))
+    group = parser.add_mutually_exclusive_group()
+    help_text = {"setup": "Install missing packages, configure and start VNC",
+                 "status": "Show readiness and connection instructions",
+                 "stop": "Disable and stop this display",
+                 "reconnect": "Restart this display and restore its capture",
+                 "clients": "List connected viewers and their IDs",
+                 "diagnose": "Check services, protocol, capture and network route",
+                 "offline": "Prepare a hotspot on an unused second Wi-Fi adapter",
+                 "remote": "Install/configure optional Tailscale access"}
+    for name in actions:
+        if name not in {"serve", "cleanup", "orientation"}:
+            group.add_argument("--" + name, dest="flag_action", action="store_const", const=name, help=help_text.get(name))
+    group.add_argument("--disconnect", metavar="CLIENT_ID", help="Disconnect a viewer ID from --clients")
+    group.add_argument("--disconnect-all", action="store_true", help="Disconnect every viewer of this display")
+    if orientation:
+        group.add_argument("--orientation", dest="flag_orientation", choices=("landscape", "portrait"))
+    args = parser.parse_args()
+    value = getattr(args, "flag_orientation", None) or args.value
+    flagged = args.flag_action or getattr(args, "flag_orientation", None) or args.disconnect is not None or args.disconnect_all
+    if args.action and flagged:
+        parser.error("choose a positional action or an action flag")
+    action = args.action or args.flag_action or ("orientation" if getattr(args, "flag_orientation", None) else "disconnect" if args.disconnect is not None or args.disconnect_all else "setup")
+    if value and action != "orientation":
+        parser.error("an orientation value requires orientation")
+    if os.geteuid() == 0:
+        parser.error("run as the desktop user, without sudo")
+    return action, value, args.disconnect
 
 
 def configure_firewall() -> None:

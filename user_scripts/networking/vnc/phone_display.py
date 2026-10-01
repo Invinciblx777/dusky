@@ -4,7 +4,6 @@
 Run ``orientation portrait`` or ``orientation landscape`` to switch its shape.
 """
 
-import argparse
 import json
 from pathlib import Path
 import subprocess
@@ -17,6 +16,7 @@ from vnc_common import (
     control_data, exec_wayvnc, install_unit, message, prepare, run, session,
     script_command, show_status, wait_ready, wait_session, write_config as configure,
     rfb_ready as probe_rfb,
+    show_clients, disconnect_clients, show_diagnostics, parse_action,
 )
 
 CONFIG_DIR = CONFIG_HOME / "wayvnc"
@@ -178,6 +178,21 @@ def stop() -> None:
     message("Phone display stopped; the virtual monitor was removed")
 
 
+def reconnect() -> None:
+    if not UNIT.exists():
+        install()
+        return
+    prepare()
+    import vnc_setup
+    master_enabled = run("systemctl", "--user", "is-enabled", MASTER, check=False).stdout.strip() == "enabled"
+    if not master_enabled or not vnc_setup.ready():
+        vnc_setup.install(show=False)
+    run("systemctl", "--user", "enable", UNIT_NAME)
+    run("systemctl", "--user", "restart", UNIT_NAME)
+    wait_ready(ready, UNIT_NAME)
+    status()
+
+
 def orientation(value: str | None) -> None:
     current = preferences()
     if value is None:
@@ -197,17 +212,14 @@ def orientation(value: str | None) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", nargs="?", choices=("setup", "status", "serve", "cleanup", "stop", "orientation"), default="setup")
-    parser.add_argument("value", nargs="?", choices=("landscape", "portrait"), help="Display orientation for the orientation action")
-    args = parser.parse_args()
-    if args.action == "orientation":
-        orientation(args.value)
-    elif args.value:
-        parser.error("an orientation value requires the orientation action")
+    action, value, identifier = parse_action(__doc__, ("setup", "status", "serve", "cleanup", "stop", "orientation", "reconnect", "clients", "diagnose"), orientation=True)
+    if action == "orientation":
+        orientation(value)
     else:
         {"setup": install, "status": status, "serve": serve, "cleanup": cleanup,
-         "stop": stop}[args.action]()
+         "stop": stop, "reconnect": reconnect, "clients": lambda: show_clients(CONTROL),
+         "disconnect": lambda: disconnect_clients(CONTROL, identifier),
+         "diagnose": lambda: show_diagnostics(UNIT_NAME, PORT, CONTROL)}[action]()
 
 
 if __name__ == "__main__":
