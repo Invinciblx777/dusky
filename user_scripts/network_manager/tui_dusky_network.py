@@ -29,7 +29,7 @@ SCHEMA[0] = [
     ConfigItem(label="Rescan", key="rescan", scope="network", type_="bool", default=False,
                group="Actions", options=["trigger"], extended_help="Scan for nearby Wi-Fi networks."),
     ConfigItem(label="Loading networks…", key="loading_networks", scope="network", type_="action",
-               default=None, read_only=True, group="Networks"),
+               default=":", read_only=True, group="Networks"),
 ]
 
 # ============================================================================
@@ -40,7 +40,7 @@ SCHEMA[1].append(ConfigItem(
     key="loading_saved",
     scope="saved",
     type_="action",
-    default=None, read_only=True,
+    default=":", read_only=True,
     group="Saved"
 ))
 
@@ -356,7 +356,7 @@ SCHEMA[3].extend([
         key="loading_devices",
         scope="devices",
         type_="action",
-        default=None, read_only=True,
+        default=":", read_only=True,
         group="Devices"
     )
 ])
@@ -398,7 +398,7 @@ SCHEMA[4].extend([
         key="speedtest_status",
         scope="speedtest_info",
         type_="action",
-        default=None, read_only=True,
+        default=":", read_only=True,
         group="Results"
     ),
     ConfigItem(
@@ -498,7 +498,7 @@ SCHEMA[5].extend([
         key="hotspot_status_info",
         scope="hotspot",
         type_="action",
-        default=None, read_only=True,
+        default=":", read_only=True,
         group="Status"
     ),
     ConfigItem(
@@ -506,7 +506,7 @@ SCHEMA[5].extend([
         key="hotspot_clients_info",
         scope="hotspot",
         type_="action",
-        default=None, read_only=True,
+        default=":", read_only=True,
         group="Status"
     ),
     ConfigItem(
@@ -514,7 +514,7 @@ SCHEMA[5].extend([
         key="hotspot_address_info",
         scope="hotspot",
         type_="action",
-        default=None, read_only=True,
+        default=":", read_only=True,
         group="Status",
         extended_help="Use this address from the connected phone for SSH, FTP, or other local services."
     )
@@ -524,11 +524,8 @@ SCHEMA[5].extend([
 # DIRECT EXECUTION HANDLER
 # =============================================================================
 if __name__ == "__main__":
-    import subprocess
-    from pathlib import Path
-
     script_path = Path(__file__).resolve()
-    main_router = Path.home() / "user_scripts" / "dusky_tui" / "python" / "main" / "main.py"
+    main_router = _DUSKY_TUI_ROOT / "python" / "main" / "main.py"
 
     if main_router.exists():
         sys.exit(subprocess.run([sys.executable, str(main_router), str(script_path)] + sys.argv[1:]).returncode)

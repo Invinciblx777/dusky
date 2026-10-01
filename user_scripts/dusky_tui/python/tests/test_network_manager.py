@@ -195,14 +195,99 @@ class NetworkManagerTests(unittest.TestCase):
                 return "Friendly name:00000000-0000-0000-0000-000000000001:802-11-wireless:wlan0\n"
             if any("AUTOCONNECT" in arg for arg in args):
                 return "Friendly name:00000000-0000-0000-0000-000000000001:802-11-wireless:yes\n"
-            if "802-11-wireless.mode" in args:
-                return "802-11-wireless.mode:infra\n"
+            if "802-11-wireless.mode,802-11-wireless.ssid" in args:
+                return "802-11-wireless.mode:infrastructure\n802-11-wireless.ssid:Actual SSID\n"
             return "Actual SSID\n"
 
         engine._run_cmd = output
         self.assertEqual(engine._get_saved_wifi()[0]["ssid"], "Actual SSID")
         self.assertEqual(engine._get_saved_wifi()[0]["name"], "Friendly name")
         self.assertEqual(engine._get_active_wifi_connection()["ssid"], "Actual SSID")
+
+    def test_resetting_action_buttons_never_executes_them(self):
+        engine = self.engine()
+        actions = [
+            ("rescan", "network"), ("restart_nm", "status_action"),
+            ("speedtest_full", "speedtest_action"), ("stop_hotspot", "hotspot"),
+            ("start_hotspot_24", "hotspot"), ("start_hotspot_5", "hotspot"),
+            ("qr_hotspot", "hotspot"), ("cn__Example", "network"),
+            ("qr_net__Example", "network"), ("dc__uuid", "saved_action"),
+            ("rc__uuid", "active_wifi_action"), ("fg__uuid", "saved_action"),
+            ("automatic", "route"), ("use__uuid", "route"), ("status_ip", "clipboard"),
+        ]
+        with patch.object(engine, "_write_value", side_effect=AssertionError("action executed")):
+            for key, scope in actions:
+                with self.subTest(key=key, scope=scope):
+                    self.assertTrue(engine.write_value(key, scope, "false", "bool")[0])
+                    self.assertFalse(engine.write_value(key, scope, "nil", "bool")[0])
+        self.assertFalse(engine.rescan_event.is_set())
+
+    def test_write_reports_command_errors_without_timeout_arguments(self):
+        engine = self.engine()
+        for error in (FileNotFoundError("nmcli unavailable"), RuntimeError("profile unavailable"),
+                      nm.subprocess.TimeoutExpired(["nmcli", "password", "secret123"], 10)):
+            with self.subTest(error=type(error).__name__), patch.object(engine, "_write_value", side_effect=error):
+                ok, message, _ = engine.write_value("hotspot_ssid", "hotspot", "Example")
+                self.assertFalse(ok)
+                self.assertNotIn("secret123", message)
+                self.assertTrue(engine.rescan_event.is_set())
+
+    def test_invalid_radio_value_does_not_turn_wifi_off(self):
+        engine = self.engine()
+        with patch.object(nm.subprocess, "run") as run:
+            self.assertFalse(engine.write_value("wifi_radio", "status", "nil", "bool")[0])
+            run.assert_not_called()
+
+    def test_active_profile_properties_use_one_query_and_preserve_escapes(self):
+        engine = self.engine()
+        def output(args, **kwargs):
+            if "--active" in args:
+                return "Friendly:uuid:802-11-wireless:wlan1\nHotspot:ap-id:802-11-wireless:wlan0\n"
+            if args[-1] == "ap-id":
+                return "802-11-wireless.mode:ap\n802-11-wireless.ssid:Hotspot\n"
+            return "802-11-wireless.mode:infrastructure\n802-11-wireless.ssid: Office\\: Wi-Fi\\\\ \n"
+        with patch.object(engine, "_run_cmd", side_effect=output) as run:
+            connection, = engine._get_active_wifi_connections()
+        self.assertEqual(connection["ssid"], " Office: Wi-Fi\\ ")
+        self.assertEqual(connection["device"], "wlan1")
+        self.assertEqual(run.call_count, 3)
+
+    def test_scan_collects_and_caches_the_forced_scan_in_one_command(self):
+        engine = nm.NetworkManagerEngine()
+        with tempfile.TemporaryDirectory() as directory:
+            engine.cache_dir = Path(directory)
+            with patch.object(nm.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stderr="", stdout="*:Example:WPA2:70:wlan0:00\\:11\\:22\\:33\\:44\\:55\n"
+            )) as run:
+                engine._async_rescan_wifi()
+            run.assert_called_once()
+            self.assertEqual(run.call_args.args[0][-2:], ["--rescan", "yes"])
+            self.assertEqual(run.call_args.kwargs["timeout"], 15)
+            self.assertEqual(json.loads((engine.cache_dir / "wifi_cache.json").read_text()), engine._cached_scans)
+            self.assertEqual(engine._cached_scans[0]["ssid"], "Example")
+
+    def test_status_uses_current_device_snapshot_on_first_poll(self):
+        engine = nm.NetworkManagerEngine()
+        engine._run_cmd = lambda args, **kwargs: (
+            '[{"dev":"usb0","gateway":"192.0.2.1"}]' if args[:3] == ["ip", "-j", "-4"] else ""
+        )
+        status = engine._enrich_network_status(
+            {"router_ping_ms": "1", "internet_ping_ms": "1"}, None,
+            devices=[{"device": "usb0", "type": "ethernet", "connection": "Wired connection 1"}],
+            uplinks=[{"device": "usb0", "display_name": "USB Ethernet"}],
+        )
+        self.assertEqual((status["type"], status["ssid"]), ("ethernet", "USB Ethernet"))
+        self.assertEqual(engine._devices_cache, [])
+
+    def test_dynamic_info_rows_use_noop_action_defaults(self):
+        engine = nm.NetworkManagerEngine()
+        app = SimpleNamespace(schema={i: [] for i in range(6)}, tabs={3: "Devices"})
+        app._replace_dynamic_tabs = lambda items: app.schema.update(items) or True
+        engine.app = app
+        engine._rebuild_schema()
+        rows = [item for tab in app.schema.values() for item in tab if item.type_ == "action"]
+        self.assertTrue(rows)
+        self.assertTrue(all(item.read_only and item.default == ":" for item in rows))
 
     def test_qr_credentials_preserve_significant_spaces(self):
         engine = self.engine()

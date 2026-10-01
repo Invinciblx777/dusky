@@ -907,6 +907,29 @@ class NetworkManagerEngine(BaseEngine):
         return state
 
     def write_value(self, target_key: str, target_scope: str, new_value: str, item_type: str = "string") -> tuple[bool, str, str]:
+        # Resetting a momentary button must not execute its action.
+        trigger = (
+            target_key == "rescan"
+            or target_scope in {"status_action", "speedtest_action", "clipboard", "route"}
+            or (target_scope in {"saved_action", "active_wifi_action"} and not target_key.startswith("band__"))
+            or (target_scope == "network" and target_key.startswith(("cn__", "qr_net__")))
+            or (target_scope == "hotspot" and target_key in {
+                "start_hotspot_24", "start_hotspot_5", "stop_hotspot", "qr_hotspot",
+            })
+        )
+        if trigger and new_value != "true":
+            if new_value == "false":
+                return True, "Action reset.", ""
+            return False, "Action requires true or false.", ""
+        if target_key == "wifi_radio" and new_value not in {"true", "false"}:
+            return False, "Wi-Fi radio requires true or false.", ""
+        try:
+            return self._write_value(target_key, target_scope, new_value, item_type)
+        except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
+            self.rescan_event.set()
+            return False, f"Network action failed: {command_failure(exc)}", ""
+
+    def _write_value(self, target_key: str, target_scope: str, new_value: str, item_type: str) -> tuple[bool, str, str]:
         logger.info("write_value: key=%s, scope=%s, val=%s", target_key, target_scope,
                     "[hidden]" if target_key == "hotspot_password" or target_key.startswith("pw__") else new_value)
 
@@ -1728,13 +1751,7 @@ class NetworkManagerEngine(BaseEngine):
         try:
             if hasattr(self.app, "notify_status"):
                 self._safe_call_from_thread(self.app.notify_status, "Scanning WiFi networks...")
-            result = subprocess.run(
-                ["nmcli", "device", "wifi", "list", "--rescan", "yes"],
-                capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=15, env=self._get_exec_env(),
-            )
-            if result.returncode:
-                raise RuntimeError(result.stderr.strip() or f"Scan exited with status {result.returncode}")
-            scans = self._get_scanned_wifi()
+            scans = self._get_scanned_wifi(rescan="yes")
             if self.shutdown_event.is_set():
                 return
             self._cached_scans = scans
@@ -1753,8 +1770,15 @@ class NetworkManagerEngine(BaseEngine):
         finally:
             self._scan_running = False
 
-    def _enrich_network_status(self, verb: dict[str, str], active_wifi: dict[str, Any] | None, active_connections: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    def _enrich_network_status(
+        self, verb: dict[str, str], active_wifi: dict[str, Any] | None,
+        active_connections: list[dict[str, Any]] | None = None, *,
+        devices: list[dict[str, str]] | None = None,
+        uplinks: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
         enriched = dict(verb)
+        devices = self._devices_cache if devices is None else devices
+        uplinks = self._uplinks_cache if uplinks is None else uplinks
 
         # Keep the displayed profile, address, and gateway on the same route.
         route = None
@@ -1774,7 +1798,7 @@ class NetworkManagerEngine(BaseEngine):
             except (TypeError, ValueError):
                 pass
         preferred = self._route_choice().get("uuid") if not route else None
-        preferred_link = next((item for item in self._uplinks_cache if item.get("uuid") == preferred), {})
+        preferred_link = next((item for item in uplinks if item.get("uuid") == preferred), {})
         iface = route.get("dev", "") if route else preferred_link.get("device", "") or (active_wifi or {}).get("device", "")
         active_wifi = next((connection for connection in active_connections or [] if connection.get("device") == iface), active_wifi)
         if iface:
@@ -1787,14 +1811,14 @@ class NetworkManagerEngine(BaseEngine):
             if Path(f"/sys/class/net/{iface}/wireless").exists() or Path(f"/sys/class/net/{iface}/phy80211").exists():
                 enriched["type"] = "wifi"
             else:
-                enriched["type"] = next((item.get("type", "unknown") for item in self._devices_cache
+                enriched["type"] = next((item.get("type", "unknown") for item in devices
                                          if item.get("device") == iface), "unknown")
-            device = next((item for item in self._devices_cache if item.get("device") == iface), {})
+            device = next((item for item in devices if item.get("device") == iface), {})
             profile_name = device.get("connection", "")
             if active_wifi and active_wifi.get("device") == iface:
                 enriched["ssid"] = active_wifi.get("ssid", "")
             else:
-                source = next((item for item in self._uplinks_cache if item.get("device") == iface), {})
+                source = next((item for item in uplinks if item.get("device") == iface), {})
                 enriched["ssid"] = source.get("display_name") or (profile_name if profile_name and profile_name != "--" else iface)
 
         # 2. IP address & prefix fallback
@@ -1899,14 +1923,6 @@ class NetworkManagerEngine(BaseEngine):
                 active = active_connections[0] if active_connections else None
                 saved = self._get_saved_wifi()
 
-                # Enrich status with physical interface & real gateway detection & live throughput natively
-                enriched_info = self._enrich_network_status({}, active, active_connections)
-                active = next((connection for connection in active_connections if connection["device"] == enriched_info.get("iface")), active)
-                throughput = throughput_state(self._tp_state, enriched_info, enriched_info.get("counter_time", time.monotonic()))
-                ping = ping_latency_state(self._ping_state, enriched_info, limit=24, average_limit=5)
-                dns = self._get_active_dns_provider(enriched_info.get("iface", ""), enriched_info.get("gateway", ""))
-
-                # Refresh device cache (filtered, non-verbose) for Devices tab
                 devices = self._get_nmcli_devices()
                 details = self._get_device_details_map()
                 if now - self._last_uplink_refresh >= 10:
@@ -1915,6 +1931,13 @@ class NetworkManagerEngine(BaseEngine):
                     self._last_uplink_refresh = now
                 else:
                     uplinks, hotspot_devices = self._uplinks_cache, self._hotspot_devices_cache
+
+                # Enrich status with physical interface & real gateway detection & live throughput natively
+                enriched_info = self._enrich_network_status({}, active, active_connections, devices=devices, uplinks=uplinks)
+                active = next((connection for connection in active_connections if connection["device"] == enriched_info.get("iface")), active)
+                throughput = throughput_state(self._tp_state, enriched_info, enriched_info.get("counter_time", time.monotonic()))
+                ping = ping_latency_state(self._ping_state, enriched_info, limit=24, average_limit=5)
+                dns = self._get_active_dns_provider(enriched_info.get("iface", ""), enriched_info.get("gateway", ""))
 
                 bands = []
                 pinned_band = "Auto"
@@ -2298,7 +2321,7 @@ class NetworkManagerEngine(BaseEngine):
         if not radio:
             t0.append(self._make_item(
                 label="Wi-Fi Off",
-                key="wifi_off_notice", scope="network", type_="action", default=None, read_only=True,
+                key="wifi_off_notice", scope="network", type_="action", default=":", read_only=True,
                 group="Networks"
             ))
         else:
@@ -2322,7 +2345,7 @@ class NetworkManagerEngine(BaseEngine):
             if not sorted_rows:
                 t0.append(self._make_item(
                     label="No visible networks; use Rescan", key="empty_scan", scope="network",
-                    type_="action", default=None, read_only=True, group="Networks",
+                    type_="action", default=":", read_only=True, group="Networks",
                     extended_help="No access points were returned. Check radio availability or rescan. Hidden-network setup requires a profile editor."
                 ))
 
@@ -2401,7 +2424,7 @@ class NetworkManagerEngine(BaseEngine):
                     if "802.1X" in security.upper() or "802-1X" in security.upper():
                         t0.append(self._make_item(
                             label="Enterprise setup requires a profile editor", key=f"enterprise__{ssid}",
-                            scope="network", type_="action", default=None, read_only=True, parent_ref=parent_uid,
+                            scope="network", type_="action", default=":", read_only=True, parent_ref=parent_uid,
                             extended_help="Configure the enterprise authentication method and credentials in a NetworkManager profile editor, then activate its saved profile here."
                         ))
                     elif is_protected(security):
@@ -2516,10 +2539,10 @@ class NetworkManagerEngine(BaseEngine):
         current_device = default_v4.split(" via ", 1)[0]
         t_devices.append(self._make_item(
             label=f"IPv4 default: {default_v4}", key="default_ipv4", scope="route_info",
-            type_="action", default=None, read_only=True, group="Internet Source"))
+            type_="action", default=":", read_only=True, group="Internet Source"))
         t_devices.append(self._make_item(
             label=f"IPv6 default: {default_v6}", key="default_ipv6", scope="route_info",
-            type_="action", default=None, read_only=True, group="Internet Source"))
+            type_="action", default=":", read_only=True, group="Internet Source"))
         t_devices.append(self._make_item(
             label="● System priorities" if not choice else "○ System priorities", key="automatic", scope="route",
             type_="bool", default=False, options=["trigger"], group="Internet Source",
@@ -2539,7 +2562,7 @@ class NetworkManagerEngine(BaseEngine):
         if not self._uplinks_cache:
             t_devices.append(self._make_item(
                 label="No active selectable connections", key="no_uplinks", scope="route_info",
-                type_="action", default=None, read_only=True, group="Internet Source"))
+                type_="action", default=":", read_only=True, group="Internet Source"))
         # Show each device as parent menu
         for d in self._devices_cache:
             dev_name = d.get("device", "")
@@ -2594,7 +2617,7 @@ class NetworkManagerEngine(BaseEngine):
                 ))
 
         if not self._devices_cache:
-            t_devices.append(self._make_item(label="No Devices", key="no_devices", scope="devices", type_="action", default=None, read_only=True, group="Devices"))
+            t_devices.append(self._make_item(label="No Devices", key="no_devices", scope="devices", type_="action", default=":", read_only=True, group="Devices"))
 
         # Status actions retain the displayed profile identity across dialogs and refreshes.
         status_items = [item for item in self.app.schema.get(2, []) if item.scope != "active_wifi_action"]
@@ -2797,14 +2820,17 @@ class NetworkManagerEngine(BaseEngine):
             parts = _split_nmcli_line(line)
             if len(parts) >= 4 and parts[2] == "802-11-wireless":
                 uuid = parts[1]
-                mode_out = self._run_cmd(["nmcli", "-t", "-f", "802-11-wireless.mode", "connection", "show", uuid], required=True)
-                mode = "ap" if "mode:ap" in mode_out.replace(" ", "") else "infra"
+                properties = self._run_cmd([
+                    "nmcli", "-t", "-f", "802-11-wireless.mode,802-11-wireless.ssid",
+                    "connection", "show", "uuid", uuid,
+                ], required=True)
+                values = dict(_split_nmcli_line(line) for line in properties.splitlines())
+                if not {"802-11-wireless.mode", "802-11-wireless.ssid"} <= values.keys():
+                    raise RuntimeError("Incomplete active Wi-Fi profile readback")
+                mode = "ap" if values["802-11-wireless.mode"] == "ap" else "infra"
                 if mode == "ap":
                     continue
-                ssid = self._run_cmd([
-                    "nmcli", "-e", "no", "-g", "802-11-wireless.ssid",
-                    "connection", "show", "uuid", uuid,
-                ], required=True).rstrip("\n")
+                ssid = values["802-11-wireless.ssid"]
                 connections.append({"ssid": ssid, "name": parts[0], "uuid": uuid, "device": parts[3], "mode": mode})
         return connections
 
@@ -2837,12 +2863,12 @@ class NetworkManagerEngine(BaseEngine):
             self._profile_ssids = {conn["uuid"]: self._profile_ssids[conn["uuid"]] for conn in conns}
             return conns
 
-    def _get_scanned_wifi(self) -> list[dict[str, Any]]:
+    def _get_scanned_wifi(self, rescan: str = "no") -> list[dict[str, Any]]:
         groups: dict[str, dict[str, Any]] = {}
         output = self._run_cmd([
             "nmcli", "-t", "-f", "IN-USE,SSID,SECURITY,SIGNAL,DEVICE,BSSID",
-            "device", "wifi", "list", "--rescan", "no",
-        ], required=True)
+            "device", "wifi", "list", "--rescan", rescan,
+        ], timeout=15 if rescan == "yes" else 5, required=True)
         for line in output.splitlines():
             parts = _split_nmcli_line(line)
             if len(parts) < 6 or not parts[1]:
