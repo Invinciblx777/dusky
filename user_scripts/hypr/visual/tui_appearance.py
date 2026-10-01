@@ -99,11 +99,7 @@ SCHEMA = {
                 "general.gaps_out": 10,
                 "general.float_gaps": 0,
                 "general.gaps_workspaces": 0,
-                "general/col.active_border/colors.1": "outline",
-                "general/col.active_border/colors.2": "outline",
-                "general/col.active_border.angle": 45,
-                "animation/borderangle.enabled": False,
-                "animation/border.enabled": False,
+                "general.col.active_border": "outline",
                 "general.col.inactive_border": "inverse_on_surface",
                 "general.col.nogroup_border_active": "secondary",
                 "general.col.nogroup_border": "inverse_on_surface",
@@ -179,11 +175,7 @@ SCHEMA = {
                 "general.gaps_out": 6,
                 "general.float_gaps": 0,
                 "general.gaps_workspaces": 0,
-                "general/col.active_border/colors.1": "primary",
-                "general/col.active_border/colors.2": "primary",
-                "general/col.active_border.angle": 45,
-                "animation/borderangle.enabled": False,
-                "animation/border.enabled": False,
+                "general.col.active_border": "primary",
                 "general.col.inactive_border": "inverse_on_surface",
                 "general.col.nogroup_border_active": "secondary",
                 "general.col.nogroup_border": "inverse_on_surface",
@@ -267,11 +259,7 @@ SCHEMA = {
                 "general.gaps_out": 2,
                 "general.float_gaps": 0,
                 "general.gaps_workspaces": 0,
-                "general/col.active_border/colors.1": "primary",
-                "general/col.active_border/colors.2": "primary",
-                "general/col.active_border.angle": 45,
-                "animation/borderangle.enabled": False,
-                "animation/border.enabled": False,
+                "general.col.active_border": "primary",
                 "general.col.inactive_border": "inverse_on_surface",
                 "general.col.nogroup_border_active": "secondary",
                 "general.col.nogroup_border": "inverse_on_surface",
@@ -347,11 +335,7 @@ SCHEMA = {
                 "general.gaps_out": 8,
                 "general.float_gaps": 0,
                 "general.gaps_workspaces": 0,
-                "general/col.active_border/colors.1": "primary",
-                "general/col.active_border/colors.2": "primary",
-                "general/col.active_border.angle": 45,
-                "animation/borderangle.enabled": False,
-                "animation/border.enabled": False,
+                "general.col.active_border": "primary",
                 "general.col.inactive_border": "inverse_on_surface",
                 "general.col.nogroup_border_active": "secondary",
                 "general.col.nogroup_border": "inverse_on_surface",
@@ -427,11 +411,7 @@ SCHEMA = {
                 "general.gaps_out": 10,
                 "general.float_gaps": 0,
                 "general.gaps_workspaces": 0,
-                "general/col.active_border/colors.1": "primary",
-                "general/col.active_border/colors.2": "primary",
-                "general/col.active_border.angle": 45,
-                "animation/borderangle.enabled": False,
-                "animation/border.enabled": False,
+                "general.col.active_border": "primary",
                 "general.col.inactive_border": "inverse_on_surface",
                 "general.col.nogroup_border_active": "secondary",
                 "general.col.nogroup_border": "inverse_on_surface",
@@ -507,11 +487,7 @@ SCHEMA = {
                 "general.gaps_out": 0,
                 "general.float_gaps": 0,
                 "general.gaps_workspaces": 0,
-                "general/col.active_border/colors.1": "primary",
-                "general/col.active_border/colors.2": "primary",
-                "general/col.active_border.angle": 45,
-                "animation/borderangle.enabled": False,
-                "animation/border.enabled": False,
+                "general.col.active_border": "primary",
                 "general.col.inactive_border": "inverse_on_surface",
                 "general.col.nogroup_border_active": "secondary",
                 "general.col.nogroup_border": "inverse_on_surface",
@@ -587,11 +563,7 @@ SCHEMA = {
                 "general.gaps_out": 0,
                 "general.float_gaps": 0,
                 "general.gaps_workspaces": 0,
-                "general/col.active_border/colors.1": "primary",
-                "general/col.active_border/colors.2": "primary",
-                "general/col.active_border.angle": 45,
-                "animation/borderangle.enabled": False,
-                "animation/border.enabled": False,
+                "general.col.active_border": "primary",
                 "general.col.inactive_border": "inverse_on_surface",
                 "general.col.nogroup_border_active": "secondary",
                 "general.col.nogroup_border": "inverse_on_surface",
@@ -714,11 +686,7 @@ SCHEMA = {
                 "general.border_size": 1,
                 "general.gaps_in": 3,
                 "general.gaps_out": 6,
-                "general/col.active_border/colors.1": "outline",
-                "general/col.active_border/colors.2": "outline",
-                "general/col.active_border.angle": 45,
-                "animation/borderangle.enabled": False,
-                "animation/border.enabled": False,
+                "general.col.active_border": "outline",
                 "general.col.inactive_border": "primary_container",
                 "decoration.rounding": 28,
                 "decoration.rounding_power": 1,
@@ -785,11 +753,7 @@ SCHEMA = {
                 "general.gaps_out": 6,
                 "general.float_gaps": 0,
                 "general.gaps_workspaces": 0,
-                "general/col.active_border/colors.1": "primary",
-                "general/col.active_border/colors.2": "primary",
-                "general/col.active_border.angle": 45,
-                "animation/borderangle.enabled": False,
-                "animation/border.enabled": False,
+                "general.col.active_border": "primary",
                 "general.col.inactive_border": "inverse_on_surface",
                 "general.col.nogroup_border_active": "secondary",
                 "general.col.nogroup_border": "inverse_on_surface",
@@ -921,45 +885,19 @@ SCHEMA = {
     ],
 
     # -------------------------------------------------------------------------
-    # -------------------------------------------------------------------------
     # TAB 2: COLORS
     # -------------------------------------------------------------------------
     2: [
-        # --- ACTIVE BORDER (GRADIENT / SOLID) ---
         ConfigItem(
-            label="Active Border Color 1",
-            key="1",
-            scope="general/col.active_border/colors",
+            label="Active Border",
+            key="col.active_border",
+            scope="general",
             type_="color",
             default="primary",
             options=COLOR_ALIASES,
-            group="Active Border",
-            extended_help="**Active Border Color 1**\n\nThe primary highlight color surrounding the window currently receiving keyboard input. Set Color 2 to the same value for a solid border, or choose a distinct accent for a gradient."
+            group="Borders",
+            extended_help="**Active Border**\n\nThe highlight color surrounding the window currently receiving keyboard input."
         ),
-        ConfigItem(
-            label="Active Border Color 2 (Gradient)",
-            key="2",
-            scope="general/col.active_border/colors",
-            type_="color",
-            default="primary",
-            options=COLOR_ALIASES,
-            group="Active Border",
-            extended_help="**Active Border Color 2 (Gradient)**\n\nThe secondary gradient color for the active window border. When matching Color 1, the border renders as a solid color. Selecting another color creates a multi-color gradient."
-        ),
-        ConfigItem(
-            label="Active Border Angle",
-            key="angle",
-            scope="general/col.active_border",
-            type_="int",
-            default=45,
-            min_val=0,
-            max_val=360,
-            step=15,
-            group="Active Border",
-            extended_help="**Active Border Angle**\n\nThe angle (in degrees, 0 to 360) of the active window border gradient. Default is 45°."
-        ),
-
-        # --- INACTIVE & NOGROUP BORDERS ---
         ConfigItem(
             label="Inactive Border",
             key="col.inactive_border",
@@ -967,7 +905,7 @@ SCHEMA = {
             type_="color",
             default="inverse_on_surface",
             options=COLOR_ALIASES,
-            group="Inactive & Special Borders",
+            group="Borders",
             extended_help="**Inactive Border**\n\nThe color applied to all background windows that do not have focus."
         ),
         ConfigItem(
@@ -977,7 +915,7 @@ SCHEMA = {
             type_="color",
             default="secondary",
             options=COLOR_ALIASES,
-            group="Inactive & Special Borders",
+            group="Borders",
             extended_help="**No-Group Active Border**\n\nSpecialized active border color for windows that explicitly deny being added to a tabbed group layout."
         ),
         ConfigItem(
@@ -987,62 +925,8 @@ SCHEMA = {
             type_="color",
             default="inverse_on_surface",
             options=COLOR_ALIASES,
-            group="Inactive & Special Borders",
+            group="Borders",
             extended_help="**No-Group Inactive Border**\n\nSpecialized inactive border color for windows that explicitly deny being added to a tabbed group layout."
-        ),
-
-        # --- BORDER ANIMATIONS ---
-        ConfigItem(
-            label="Border Angle Animation",
-            key="enabled",
-            scope="animation/borderangle",
-            type_="bool",
-            default=False,
-            group="Border Animation",
-            extended_help="**Border Angle Animation**\n\nToggles continuous rotation of the gradient angle on window borders. Disabled by default to preserve battery and GPU render cycles."
-        ),
-        ConfigItem(
-            label="Border Angle Speed",
-            key="speed",
-            scope="animation/borderangle",
-            type_="int",
-            default=30,
-            min_val=5,
-            max_val=100,
-            step=5,
-            group="Border Animation",
-            extended_help="**Border Angle Speed**\n\nRotation speed in deciseconds (1/10 second). Lower values rotate faster (e.g. 10 = 1.0s full turn), higher values rotate slower (e.g. 50 = 5.0s full turn). Default is 30 (3.0s)."
-        ),
-        ConfigItem(
-            label="Border Angle Style",
-            key="style",
-            scope="animation/borderangle",
-            type_="cycle",
-            default="loop",
-            options=["loop", "once"],
-            group="Border Animation",
-            extended_help="**Border Angle Style**\n\nAnimation style for borderangle. 'loop' spins continuously; 'once' animates the angle only once when the window appears."
-        ),
-        ConfigItem(
-            label="Border Transition Animation",
-            key="enabled",
-            scope="animation/border",
-            type_="bool",
-            default=False,
-            group="Border Animation",
-            extended_help="**Border Focus Transition**\n\nToggles smooth animation when window border colors transition between active and inactive focus states."
-        ),
-        ConfigItem(
-            label="Border Transition Speed",
-            key="speed",
-            scope="animation/border",
-            type_="int",
-            default=10,
-            min_val=1,
-            max_val=50,
-            step=1,
-            group="Border Animation",
-            extended_help="**Border Focus Transition Speed**\n\nTransition speed in deciseconds (1/10 second) for focus color blending. Default is 10 (1.0s)."
         ),
     ],
 
@@ -1476,15 +1360,6 @@ SCHEMA = {
             parent_ref="decoration/shadow.enabled",
             extended_help="**Scale**\n\nMultiplies the physical size footprint of the shadow geometry."
         ),
-        ConfigItem(
-            label="Shadow Angle Animation",
-            key="enabled",
-            scope="animation/shadowangle",
-            type_="bool",
-            default=False,
-            parent_ref="decoration/shadow.enabled",
-            extended_help="**Shadow Angle Animation**\n\nToggles continuous rotation of the shadow gradient angle."
-        ),
 
         # --- GLOW HYBRID FOLDER ---
         ConfigItem(
@@ -1531,15 +1406,6 @@ SCHEMA = {
             options=COLOR_ALIASES,
             parent_ref="decoration/glow.enabled",
             extended_help="**Color**\n\nThe distinct color of the glow emission."
-        ),
-        ConfigItem(
-            label="Glow Angle Animation",
-            key="enabled",
-            scope="animation/glowangle",
-            type_="bool",
-            default=False,
-            parent_ref="decoration/glow.enabled",
-            extended_help="**Glow Angle Animation**\n\nToggles continuous rotation of the glow gradient angle."
         ),
     ],
 
@@ -1629,34 +1495,6 @@ SCHEMA = {
             group="Single",
             extended_help="**Single Disable Blur**\n\nDisables the background blur effect for the window when it is the only one on the screen to save GPU resources."
         ),
-        ConfigItem(
-            label="Single Animation Style",
-            key="animation",
-            scope="window_rule/single_window_style",
-            type_="cycle",
-            default="",
-            options=["", "popin 80%", "popin", "slide", "gnomed"],
-            group="Single",
-            extended_help="**Single Animation Style**\n\nForces a custom open/close animation style specifically when only one tiled window is present. Empty string inherits global animation."
-        ),
-        ConfigItem(
-            label="Single Dim Around",
-            key="dim_around",
-            scope="window_rule/single_window_style",
-            type_="bool",
-            default=False,
-            group="Single",
-            extended_help="**Single Dim Around**\n\nDynamically dims the screen background around the window when exactly one tiled window is present."
-        ),
-        ConfigItem(
-            label="Single Disable Animation",
-            key="no_anim",
-            scope="window_rule/single_window_style",
-            type_="bool",
-            default=False,
-            group="Single",
-            extended_help="**Single Disable Animation**\n\nDisables all animations specifically for single windows to deliver maximum instant responsiveness."
-        ),
 
         # --- MAXIMIZED EXCLUSIONS ---
         ConfigItem(
@@ -1727,34 +1565,6 @@ SCHEMA = {
             default=True,
             group="Maximized",
             extended_help="**Maximized Disable Blur**\n\nDisables the background blur effect entirely for maximized windows to maximize performance."
-        ),
-        ConfigItem(
-            label="Maximized Animation Style",
-            key="animation",
-            scope="window_rule/maximized_window_style",
-            type_="cycle",
-            default="",
-            options=["", "popin 80%", "popin", "slide", "gnomed"],
-            group="Maximized",
-            extended_help="**Maximized Animation Style**\n\nForces a custom open/close animation style specifically for maximized windows. Empty string inherits global animation."
-        ),
-        ConfigItem(
-            label="Maximized Dim Around",
-            key="dim_around",
-            scope="window_rule/maximized_window_style",
-            type_="bool",
-            default=False,
-            group="Maximized",
-            extended_help="**Maximized Dim Around**\n\nDynamically dims the screen background around maximized windows."
-        ),
-        ConfigItem(
-            label="Maximized Disable Animation",
-            key="no_anim",
-            scope="window_rule/maximized_window_style",
-            type_="bool",
-            default=False,
-            group="Maximized",
-            extended_help="**Maximized Disable Animation**\n\nDisables all animations specifically for maximized windows to maximize performance."
         ),
     ],
 
