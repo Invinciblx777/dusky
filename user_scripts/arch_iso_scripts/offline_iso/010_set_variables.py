@@ -82,8 +82,10 @@ def create_wizard(preset_encrypt: bool | None):
         Input:focus { border: solid $accent; }
         #hint { height: auto; color: $foreground; text-opacity: 70%; margin-top: 1; }
         #error { height: auto; min-height: 1; color: $error; }
-        #actions { height: 3; }
-        Button { min-width: 14; margin-right: 1; }
+        #actions { height: 3; align-horizontal: center; }
+        Button { width: auto; min-width: 20; border: solid $foreground; }
+        Button:focus { border: solid $accent; }
+        #continue { margin-left: 2; }
         #defaults { height: auto; margin-top: 1; color: $foreground; text-opacity: 70%; }
         #review { height: auto; margin-bottom: 1; }
         RadioSet { height: auto; border: none; padding: 0; }
@@ -118,7 +120,7 @@ def create_wizard(preset_encrypt: bool | None):
                         yield Static("", id="error", markup=False)
                         with Horizontal(id="actions"):
                             yield Button("Back", id="back")
-                            yield Button("Continue", id="continue", variant="primary")
+                            yield Button("Continue", id="continue")
                         yield Static("", id="defaults")
             yield Static("Enter: continue   Tab: move   Esc: back   Ctrl+C: cancel", id="controls")
 
@@ -138,8 +140,11 @@ def create_wizard(preset_encrypt: bool | None):
             self.query_one("#review").display = review
             self.query_one("#label").display = not review
             self.query_one("#error", Static).update("")
-            self.query_one("#back", Button).disabled = self.step == 0
-            self.query_one("#continue", Button).label = "Use these details" if review else "Continue"
+            back_button = self.query_one("#back", Button)
+            continue_button = self.query_one("#continue", Button)
+            back_button.display = self.step > 0
+            continue_button.styles.margin = (0, 0, 0, 2 if self.step > 0 else 0)
+            continue_button.label = "Confirm" if review else "Continue"
             encryption_text = "on / LUKS2" if self.encrypt else "off / plain Btrfs"
             self.query_one("#defaults", Static).update(f"Encryption: {encryption_text}")
             if self.step < 3:
