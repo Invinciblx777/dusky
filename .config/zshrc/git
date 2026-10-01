@@ -225,156 +225,177 @@ function _gitdelta_matugen() {
 # -----------------------------------------------------------------------------
 function _gitdelta_render_stream() {
     emulate -L zsh
-    setopt localoptions extendedglob
+    setopt localoptions extendedglob no_auto_pushd
+    local cwd=$PWD
+    local -i rc=0
 
-    local target=${1-} mode=${2-}
-    shift 2 2>/dev/null || shift $#
-    local -a file_filters=( "$@" )
-    local -a filter_arg=()
-    (( $#file_filters )) && filter_arg=( -- "${file_filters[@]}" )
+    builtin cd -q -- $HOME || return 1
+    {
+        () {
+            local target=${1-} mode=${2-}
+            shift 2 2>/dev/null || shift $#
+            local -a file_filters=( "$@" )
+            local -a filter_arg=()
+            (( $#file_filters )) && filter_arg=( -- "${(@)file_filters/#/:(literal,top)}" )
 
-    local -a stat_lines numstat_lines
-    local C_DIM=$'\e[38;5;242m' C_GREEN=$'\e[32m' C_RED=$'\e[31m' C_RESET=$'\e[0m'
-    local TAB=$'\t'
+            local -a stat_lines numstat_lines
+            local C_DIM=$'\e[38;5;242m' C_GREEN=$'\e[32m' C_RED=$'\e[31m' C_RESET=$'\e[0m'
+            local TAB=$'\t'
 
-    if [[ -n $target ]]; then
-        local header
-        if [[ $mode != "fzf_items" ]]; then
-            header="$(git_dusky show --color=always --decorate=short \
-                --date=format-local:'%Y-%m-%d %H:%M' \
-                --format='%C(bold blue)󰏖 %h%C(reset) %C(bold green)%an%C(reset) %C(dim)%ad%C(reset)%d%n%C(bold yellow)%s%C(reset)' \
-                --no-patch "$target")"
-        fi
-        stat_lines=( ${(f)"$(git_dusky show --color=always --stat-width=1000 --stat-name-width=1000 --stat-graph-width=20 --format='' "$target" "${filter_arg[@]}")"} )
-        numstat_lines=( ${(f)"$(git_dusky show --numstat --format='' "$target" "${filter_arg[@]}")"} )
-        if [[ $#stat_lines -eq 0 ]]; then
-            [[ -n $header ]] && print -r -- "$header"
-            return 0
-        fi
-        [[ -n $header ]] && print -r -- "$header"$'\n'
-    else
-        stat_lines=( ${(f)"$(git_dusky diff --color=always --stat-width=1000 --stat-name-width=1000 --stat-graph-width=20 HEAD "${filter_arg[@]}")"} )
-        numstat_lines=( ${(f)"$(git_dusky diff --numstat HEAD "${filter_arg[@]}")"} )
-        if [[ $#stat_lines -eq 0 ]]; then
-            return 0
-        fi
-    fi
-
-    typeset -A num_add num_del det_map det_len dir_color
-    local line a d p rest det det_pad formatted
-    integer max_det_w=0 w pad_det next_color_idx=0
-    local base_dir sub_dir file_p lead trail c_base C_DIM_CODE=$'\e[2m'
-    local -a parts
-    local -a dir_colors=(
-        $'\e[38;5;111m' # sky blue
-        $'\e[38;5;176m' # lavender
-        $'\e[38;5;215m' # peach / orange
-        $'\e[38;5;114m' # sage green
-        $'\e[38;5;221m' # warm yellow
-        $'\e[38;5;116m' # mint teal
-        $'\e[38;5;211m' # soft rose
-        $'\e[38;5;147m' # periwinkle
-        $'\e[38;5;180m' # sand
-        $'\e[38;5;152m' # ice blue
-        $'\e[38;5;182m' # mauve
-        $'\e[38;5;186m' # light olive
-    )
-
-    for line in "${numstat_lines[@]}"; do
-        [[ -z $line ]] && continue
-        a=${line%%$TAB*}
-        rest=${line#*$TAB}
-        d=${rest%%$TAB*}
-        p=${rest#*$TAB}
-        num_add[$p]=$a
-        num_del[$p]=$d
-        if [[ $a == "-" && $d == "-" ]]; then
-            det="${C_DIM}(binary)${C_RESET}"
-            w=8
-        else
-            det="${C_DIM}(${C_GREEN}+${a}${C_DIM}, ${C_RED}-${d}${C_DIM})${C_RESET}"
-            w=$(( 6 + ${#a} + ${#d} ))
-        fi
-        det_map[$p]=$det
-        det_len[$p]=$w
-        (( w > max_det_w )) && max_det_w=$w
-    done
-
-    local raw_p clean_p after_pipe clean_after clean_after_trim cnt cnt_part gr
-    for line in "${stat_lines[@]}"; do
-        if [[ $line == *"|"* ]]; then
-            raw_p=${line%%|*}
-            clean_p=${${raw_p## #}%% #}
-            clean_p=${clean_p//(#b)$'\e'\[[0-9;]#m/}
-            after_pipe=${line#*|}
-            clean_after=${after_pipe//(#b)$'\e'\[[0-9;]#m/}
-            clean_after_trim=${clean_after## #}
-            cnt=${clean_after_trim%% *}
-            if [[ -n ${det_map[$clean_p]-} ]]; then
-                if [[ $clean_p == */* ]]; then
-                    parts=( ${(s:/:)clean_p} )
-                    if (( $#parts <= 2 )); then
-                        base_dir="${clean_p%/*}/"
-                        sub_dir=""
-                        file_p="${clean_p##*/}"
-                    else
-                        base_dir="${parts[1]}/${parts[2]}/"
-                        file_p="${parts[-1]}"
-                        sub_dir="${clean_p#$base_dir}"
-                        sub_dir="${sub_dir%$file_p}"
-                    fi
-
-                    if [[ -z ${dir_color[$base_dir]-} ]]; then
-                        next_color_idx=$(( next_color_idx + 1 ))
-                        dir_color[$base_dir]=${dir_colors[ (( (next_color_idx - 1) % #dir_colors ) + 1) ]}
-                    fi
-                    c_base=${dir_color[$base_dir]}
-                    lead=${raw_p%%${clean_p}*}
-                    trail=${raw_p#*${clean_p}}
-                    if [[ -n $sub_dir ]]; then
-                        raw_p="${lead}${c_base}${base_dir}${C_DIM_CODE}${sub_dir}${C_RESET}${file_p}${trail}"
-                    else
-                        raw_p="${lead}${c_base}${base_dir}${C_RESET}${file_p}${trail}"
-                    fi
+            if [[ -n $target ]]; then
+                local header
+                if [[ $mode != "fzf_items" ]]; then
+                    header="$(git_dusky show --color=always --decorate=short \
+                        --date=format-local:'%Y-%m-%d %H:%M' \
+                        --format='%C(bold blue)󰏖 %h%C(reset) %C(bold green)%an%C(reset) %C(dim)%ad%C(reset)%d%n%C(bold yellow)%s%C(reset)' \
+                        --no-patch "$target")"
                 fi
-
-                det=${det_map[$clean_p]}
-                w=${det_len[$clean_p]}
-                pad_det=$(( max_det_w - w ))
-                det_pad=${(l:pad_det:: :)}
-                if [[ $cnt == <-> ]]; then
-                    cnt_part=${after_pipe%%${cnt}*}${cnt}
-                    gr=${after_pipe#*${cnt}}
-                    gr=${gr## #}
-                    if [[ -n $gr ]]; then
-                        formatted="${raw_p}|${cnt_part}  ${det}${det_pad}  ${gr}"
-                    else
-                        formatted="${raw_p}|${cnt_part}  ${det}"
-                    fi
-                else
-                    formatted="${raw_p}|${after_pipe}  ${det}"
+                stat_lines=( ${(f)"$(git_dusky show --color=always --stat-width=1000 --stat-name-width=1000 --stat-graph-width=20 --format='' "$target" "${filter_arg[@]}")"} )
+                numstat_lines=( ${(f)"$(git_dusky show --numstat --format='' "$target" "${filter_arg[@]}")"} )
+                if [[ $#stat_lines -eq 0 ]]; then
+                    [[ -n $header ]] && print -r -- "$header"
+                    return 0
                 fi
-
-                if [[ $mode == "fzf_items" ]]; then
-                    print -r -- "${clean_p}${TAB}${formatted}" 2>/dev/null || break
-                else
-                    print -r -- "${formatted}" 2>/dev/null || break
+                [[ -n $header ]] && print -r -- "$header"$'\n'
+            else
+                stat_lines=( ${(f)"$(git_dusky diff --color=always --stat-width=1000 --stat-name-width=1000 --stat-graph-width=20 HEAD "${filter_arg[@]}")"} )
+                numstat_lines=( ${(f)"$(git_dusky diff --numstat HEAD "${filter_arg[@]}")"} )
+                if [[ $#stat_lines -eq 0 ]]; then
+                    return 0
                 fi
-                continue
             fi
-        fi
-        [[ $mode != "fzf_items" ]] && print -r -- "$line" 2>/dev/null || break
-    done
 
-    [[ $mode == "fzf_items" ]] && return 0
+            typeset -A num_add num_del det_map det_len dir_color
+            local line a d p rest det det_pad formatted
+            integer max_det_w=0 w pad_det next_color_idx=0
+            local base_dir sub_dir file_p lead trail c_base C_DIM_CODE=$'\e[2m'
+            local -a parts
+            local -a dir_colors=(
+                $'\e[38;5;111m' # sky blue
+                $'\e[38;5;176m' # lavender
+                $'\e[38;5;215m' # peach / orange
+                $'\e[38;5;114m' # sage green
+                $'\e[38;5;221m' # warm yellow
+                $'\e[38;5;116m' # mint teal
+                $'\e[38;5;211m' # soft rose
+                $'\e[38;5;147m' # periwinkle
+                $'\e[38;5;180m' # sand
+                $'\e[38;5;152m' # ice blue
+                $'\e[38;5;182m' # mauve
+                $'\e[38;5;186m' # light olive
+            )
 
-    print -r -- "" 2>/dev/null || true
+            for line in "${numstat_lines[@]}"; do
+                [[ -z $line ]] && continue
+                a=${line%%$TAB*}
+                rest=${line#*$TAB}
+                d=${rest%%$TAB*}
+                p=${rest#*$TAB}
+                num_add[$p]=$a
+                num_del[$p]=$d
+                if [[ $a == "-" && $d == "-" ]]; then
+                    det="${C_DIM}(binary)${C_RESET}"
+                    w=8
+                else
+                    det="${C_DIM}(${C_GREEN}+${a}${C_DIM}, ${C_RED}-${d}${C_DIM})${C_RESET}"
+                    w=$(( 6 + ${#a} + ${#d} ))
+                fi
+                det_map[$p]=$det
+                det_len[$p]=$w
+                (( w > max_det_w )) && max_det_w=$w
+            done
 
-    if [[ -n $target ]]; then
-        git_dusky show --patch --format="" "$target" "${filter_arg[@]}"
-    else
-        git_dusky diff --patch HEAD "${filter_arg[@]}"
-    fi
+            local raw_p clean_p after_pipe clean_after clean_after_trim cnt cnt_part gr fzf_p
+            for line in "${stat_lines[@]}"; do
+                if [[ $line == *"|"* ]]; then
+                    raw_p=${line%%|*}
+                    clean_p=${${raw_p## #}%% #}
+                    clean_p=${clean_p//(#b)$'\e'\[[0-9;]#m/}
+                    after_pipe=${line#*|}
+                    clean_after=${after_pipe//(#b)$'\e'\[[0-9;]#m/}
+                    clean_after_trim=${clean_after## #}
+                    cnt=${clean_after_trim%% *}
+                    if [[ -n ${det_map[$clean_p]-} ]]; then
+                        if [[ $clean_p == */* ]]; then
+                            parts=( ${(s:/:)clean_p} )
+                            if (( $#parts <= 2 )); then
+                                base_dir="${clean_p%/*}/"
+                                sub_dir=""
+                                file_p="${clean_p##*/}"
+                            else
+                                base_dir="${parts[1]}/${parts[2]}/"
+                                file_p="${parts[-1]}"
+                                sub_dir="${clean_p#$base_dir}"
+                                sub_dir="${sub_dir%$file_p}"
+                            fi
+
+                            if [[ -z ${dir_color[$base_dir]-} ]]; then
+                                next_color_idx=$(( next_color_idx + 1 ))
+                                dir_color[$base_dir]=${dir_colors[ (( (next_color_idx - 1) % #dir_colors ) + 1) ]}
+                            fi
+                            c_base=${dir_color[$base_dir]}
+                            lead=${raw_p%%${clean_p}*}
+                            trail=${raw_p#*${clean_p}}
+                            if [[ -n $sub_dir ]]; then
+                                raw_p="${lead}${c_base}${base_dir}${C_DIM_CODE}${sub_dir}${C_RESET}${file_p}${trail}"
+                            else
+                                raw_p="${lead}${c_base}${base_dir}${C_RESET}${file_p}${trail}"
+                            fi
+                        fi
+
+                        det=${det_map[$clean_p]}
+                        w=${det_len[$clean_p]}
+                        pad_det=$(( max_det_w - w ))
+                        det_pad=${(l:pad_det:: :)}
+                        if [[ $cnt == <-> ]]; then
+                            cnt_part=${after_pipe%%${cnt}*}${cnt}
+                            gr=${after_pipe#*${cnt}}
+                            gr=${gr## #}
+                            if [[ -n $gr ]]; then
+                                formatted="${raw_p}|${cnt_part}  ${det}${det_pad}  ${gr}"
+                            else
+                                formatted="${raw_p}|${cnt_part}  ${det}"
+                            fi
+                        else
+                            formatted="${raw_p}|${after_pipe}  ${det}"
+                        fi
+
+                        if [[ $mode == "fzf_items" ]]; then
+                            fzf_p=$clean_p
+                            if [[ $fzf_p == *"=>"* ]]; then
+                                if [[ $fzf_p == (#b)(*)\{([^\}]#)\=\>([^\}]#)\}(*) ]]; then
+                                    local pre=$match[1] new_p=${${match[3]## #}%% #} post=$match[4]
+                                    fzf_p="${pre}${new_p}${post}"
+                                    fzf_p=${fzf_p//\/\///}
+                                elif [[ $fzf_p == (#b)(*)[[:space:]]##\=\>[[:space:]]##(*) ]]; then
+                                    fzf_p=${match[2]}
+                                fi
+                            fi
+                            print -r -- "${fzf_p}${TAB}${formatted}" 2>/dev/null || break
+                        else
+                            print -r -- "${formatted}" 2>/dev/null || break
+                        fi
+                        continue
+                    fi
+                fi
+                [[ $mode != "fzf_items" ]] && print -r -- "$line" 2>/dev/null || break
+            done
+
+            [[ $mode == "fzf_items" ]] && return 0
+
+            print -r -- "" 2>/dev/null || true
+
+            if [[ -n $target ]]; then
+                git_dusky show --patch --format="" "$target" "${filter_arg[@]}"
+            else
+                git_dusky diff --patch HEAD "${filter_arg[@]}"
+            fi
+        } "$@"
+        rc=$?
+    } always {
+        builtin cd -q -- $cwd
+    }
+    return $rc
 }
 
 function _gitdelta_show() {
@@ -417,11 +438,11 @@ function _gitdelta_browse() {
 
     # fzf runs previews through $SHELL, where zsh functions do not exist, so
     # git is inlined with both paths baked in at build time via (q) quoting.
-    preview="/usr/bin/git --git-dir=${(q)DUSKY_GIT_DIR} --work-tree=${(q)HOME}"
+    preview="/usr/bin/git -C ${(q)HOME} --git-dir=${(q)DUSKY_GIT_DIR} --work-tree=${(q)HOME}"
     preview+=" show --color=always --decorate=short --date=format-local:'%Y-%m-%d %H:%M'"
     preview+=" --format='%C(bold blue)󰏖 %h%C(reset) %C(bold green)%an%C(reset) %C(dim)%ad%C(reset)%d%n%C(bold yellow)%s%C(reset)'"
     preview+=' --stat --patch {5}'
-    (( $+commands[delta] )) && preview+=' | delta --paging=never --width=$FZF_PREVIEW_COLUMNS'
+    (( $+commands[delta] )) && preview+=' | delta --paging=never ${FZF_PREVIEW_COLUMNS:+--width=$FZF_PREVIEW_COLUMNS}'
 
     sel=$(git_dusky log --color=always \
             --date=format-local:'%Y-%m-%d %H:%M' \
@@ -510,13 +531,13 @@ function _gitdelta_select() {
     _gitdelta_matugen success '#f0be79'; c_ok=$REPLY
 
     local preview
-    preview="/usr/bin/git --git-dir=${(q)DUSKY_GIT_DIR} --work-tree=${(q)HOME}"
+    preview="/usr/bin/git -C ${(q)HOME} --git-dir=${(q)DUSKY_GIT_DIR} --work-tree=${(q)HOME}"
     if [[ -n $target ]]; then
-        preview+=" show --color=always --patch --format='' ${(q)target} -- {1}"
+        preview+=" show --color=always --patch --format='' ${(q)target} -- {+1}"
     else
-        preview+=" diff --color=always --patch HEAD -- {1}"
+        preview+=" diff --color=always --patch HEAD -- {+1}"
     fi
-    (( $+commands[delta] )) && preview+=' | delta --paging=never --width=$FZF_PREVIEW_COLUMNS'
+    (( $+commands[delta] )) && preview+=' | delta --paging=never ${FZF_PREVIEW_COLUMNS:+--width=$FZF_PREVIEW_COLUMNS}'
 
     lines=( ${(f)"$(_gitdelta_render_stream "$target" "fzf_items")"} )
     if (( $#lines == 0 )); then
@@ -526,16 +547,18 @@ function _gitdelta_select() {
 
     sel=$(printf '%s\n' "${lines[@]}" \
         | fzf --ansi \
+            --multi \
             --delimiter="$TAB" \
             --with-nth=2 \
             --expect='ctrl-e,enter' \
+            --ellipsis='' \
             --highlight-line \
             --scrollbar='│' \
             --separator='─' \
             --info=right \
             --prompt='󰏖 files ❯ ' \
             --pointer='▶' \
-            --marker='▶' \
+            --marker='✔ ' \
             --height=100% \
             --layout=reverse \
             --border=rounded \
@@ -545,8 +568,8 @@ function _gitdelta_select() {
             --preview-label=' file diff ' \
             --preview-label-pos=center \
             --preview="$preview" \
-            --header='[ENTER] view diff   [ctrl-e] edit file   [ctrl-u/d] scroll preview   [alt-p] toggle layout   [ctrl-/] toggle preview   [q/ESC] quit' \
-            --bind='q:abort,ctrl-/:toggle-preview,ctrl-u:preview-page-up,ctrl-d:preview-page-down,alt-p:change-preview-window(down,50%,border-top|right,70%,border-left),alt-w:change-preview-window(down,50%,border-top|right,70%,border-left)' \
+            --header='[TAB] select   [ctrl-a] all   [ctrl-d] clear   [ENTER] view diff   [ctrl-e] edit   [ctrl-u/d] scroll   [alt-p] layout   [ctrl-/] preview   [q] quit' \
+            --bind='q:abort,ctrl-/:toggle-preview,ctrl-u:preview-page-up,ctrl-d:preview-page-down,alt-p:change-preview-window(down,50%,border-top|right,70%,border-left),alt-w:change-preview-window(down,50%,border-top|right,70%,border-left),ctrl-a:select-all,ctrl-d:deselect-all' \
             --color="bg:$c_bg,bg+:$c_mut,fg:$c_fg,fg+:$c_fg" \
             --color="hl:$c_acc,hl+:$c_acc,pointer:$c_ok,marker:$c_ok" \
             --color="prompt:$c_acc,info:$c_acc,border:$c_mut,label:$c_acc,scrollbar:$c_acc,separator:$c_mut")
@@ -555,48 +578,62 @@ function _gitdelta_select() {
     [[ -n $sel ]] || return 0
 
     sel_lines=( ${(f)sel} )
-    if (( $#sel_lines >= 2 )); then
-        key=${sel_lines[1]}
-        file=${sel_lines[2]%%$TAB*}
-    elif (( $#sel_lines == 1 )); then
-        key=""
-        file=${sel_lines[1]%%$TAB*}
-    fi
-    [[ -n $file ]] || return 0
+    (( $#sel_lines )) || return 0
+
+    key=${sel_lines[1]}
+    local -a files
+    local l item_f
+    for l in "${sel_lines[@]:1}"; do
+        [[ -z $l ]] && continue
+        item_f=${l%%$TAB*}
+        [[ -n $item_f ]] && files+=( "$item_f" )
+    done
+    (( $#files )) || return 0
 
     if [[ $key == 'ctrl-e' ]]; then
         local editor=${EDITOR:-nvim}
-        local filepath="$HOME/$file"
-        if [[ ! -f $filepath ]]; then
-            print -ru2 -- "gitdelta: cannot edit '$filepath' (file not found on disk)."
-            return 1
-        fi
-        line_num=0
-        local h match mbegin mend
-        if [[ -n $target ]]; then
-            for h in ${(f)"$(git_dusky show -U0 --format='' "$target" -- "$file" 2>/dev/null)"}; do
-                if [[ $h == (#b)@@\ -[0-9]#(,[0-9]#)#\ \+([0-9]##)* ]]; then
-                    line_num=$match[2]
-                    break
-                fi
-            done
+        local -a existing_paths
+        local f fp
+        for f in "${files[@]}"; do
+            fp="$HOME/$f"
+            if [[ -f $fp ]]; then
+                existing_paths+=( "$fp" )
+            else
+                print -ru2 -- "gitdelta: cannot edit '$fp' (file not found on disk)."
+            fi
+        done
+        (( $#existing_paths )) || return 1
+
+        if (( $#existing_paths == 1 )); then
+            line_num=0
+            local h match mbegin mend
+            if [[ -n $target ]]; then
+                for h in ${(f)"$(git_dusky show -U0 --format='' "$target" -- ":(literal,top)${files[1]}" 2>/dev/null)"}; do
+                    if [[ $h == (#b)@@\ -[0-9]#(,[0-9]#)#\ \+([0-9]##)* ]]; then
+                        line_num=$match[2]
+                        break
+                    fi
+                done
+            else
+                for h in ${(f)"$(git_dusky diff -U0 HEAD -- ":(literal,top)${files[1]}" 2>/dev/null)"}; do
+                    if [[ $h == (#b)@@\ -[0-9]#(,[0-9]#)#\ \+([0-9]##)* ]]; then
+                        line_num=$match[2]
+                        break
+                    fi
+                done
+            fi
+            if (( line_num > 0 )); then
+                "$editor" "+$line_num" "${existing_paths[1]}"
+            else
+                "$editor" "${existing_paths[1]}"
+            fi
         else
-            for h in ${(f)"$(git_dusky diff -U0 HEAD -- "$file" 2>/dev/null)"}; do
-                if [[ $h == (#b)@@\ -[0-9]#(,[0-9]#)#\ \+([0-9]##)* ]]; then
-                    line_num=$match[2]
-                    break
-                fi
-            done
-        fi
-        if (( line_num > 0 )); then
-            "$editor" "+$line_num" "$filepath"
-        else
-            "$editor" "$filepath"
+            "$editor" "${existing_paths[@]}"
         fi
         return $?
     fi
 
-    _gitdelta_show "$target" "" "$file"
+    _gitdelta_show "$target" "" "${files[@]}"
 }
 
 # -----------------------------------------------------------------------------
@@ -627,10 +664,10 @@ function gitdelta() {
         -h|--help)
             print -rl -- \
                 'gitdelta            uncommitted work-tree changes vs HEAD (stages the manifest first)' \
-                'gitdelta select [N] interactive fzf file diff browser (N = optional commit number)' \
-                'gitdelta FILE       show diff for a specific file (full path or partial name)' \
+                'gitdelta select [N] interactive multi-file fzf diff browser (N = optional commit number)' \
+                'gitdelta FILE...    show diff for specific file(s) (full path or partial name)' \
                 'gitdelta N          Nth most recent commit, 1 = HEAD' \
-                'gitdelta N FILE     show diff for FILE in Nth commit' \
+                'gitdelta N FILE...  show diff for FILE(s) in Nth commit' \
                 'gitdelta list       fzf commit browser with live delta preview'
             return 0 ;;
         list)
@@ -659,8 +696,7 @@ function gitdelta() {
     fi
 
     # Handle file path or pattern arguments
-    local query=$1
-    local -a changed_files matches
+    local -a changed_files matched_files matches
     if [[ -n $target ]]; then
         changed_files=( ${(f)"$(git_dusky show --name-only --format='' "$target")"} )
     else
@@ -671,30 +707,39 @@ function gitdelta() {
         return 0
     fi
 
-    # 1. Exact match
-    if (( ${changed_files[(I)$query]} )); then
-        _gitdelta_show "$target" "" "$query"
-        return $?
-    fi
-
-    # 2. Path relative to $HOME
-    local abs REPLY
-    abs=${query:a}
-    if _git_dusky_relpath "$abs"; then
-        if (( ${changed_files[(I)$REPLY]} )); then
-            _gitdelta_show "$target" "" "$REPLY"
-            return $?
+    local query abs REPLY
+    for query in "$@"; do
+        # 1. Exact match
+        if (( ${changed_files[(I)$query]} )); then
+            matched_files+=( "$query" )
+            continue
         fi
-    fi
 
-    # 3. Substring / pattern match against changed files
-    matches=( ${(M)changed_files:#*$query*} )
-    if (( $#matches >= 1 )); then
-        _gitdelta_show "$target" "" "${matches[@]}"
+        # 2. Path relative to $HOME
+        abs=${query:a}
+        if _git_dusky_relpath "$abs"; then
+            if (( ${changed_files[(I)$REPLY]} )); then
+                matched_files+=( "$REPLY" )
+                continue
+            fi
+        fi
+
+        # 3. Substring / pattern match against changed files
+        matches=( ${(M)changed_files:#*$query*} )
+        if (( $#matches >= 1 )); then
+            matched_files+=( "${matches[@]}" )
+            continue
+        fi
+
+        print -ru2 -- "gitdelta: no changed file matching '$query'."
+    done
+
+    matched_files=( ${(u)matched_files} )
+    if (( $#matched_files >= 1 )); then
+        _gitdelta_show "$target" "" "${matched_files[@]}"
         return $?
     fi
 
-    print -ru2 -- "gitdelta: no changed file matching '$query'."
     return 1
 }
 
