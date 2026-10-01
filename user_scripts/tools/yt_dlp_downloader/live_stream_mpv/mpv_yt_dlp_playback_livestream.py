@@ -33,8 +33,10 @@ Live travel keys: Ctrl+Left/Right = ±60s, Shift+Left/Right = ±10min.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 import fcntl
+import http.client
 import json
 import math
 import os
@@ -43,12 +45,14 @@ import shlex
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import tomllib
+import urllib.request
 
 PROG = os.path.basename(sys.argv[0]) or "mpv_yt_dlp_playback_livestream.py"
 CANDIDATE_TMPFS = ["/dev/shm", "/tmp"]
@@ -514,6 +518,171 @@ CODEC_ALIASES = {
     "hevc": "hevc", "h265": "hevc", "h.265": "hevc",
     "avc": "avc", "h264": "avc", "h.264": "avc",
 }
+
+
+def mp4_codec_header(url: str, headers: dict, deadline: float) -> bytes:
+    """Fetch MP4 sample descriptions, skipping potentially huge sample indexes.
+
+    ffprobe interprets codec configuration from a compact reconstructed header.
+    Range support is required; other layouts fall back to ordinary ffprobe.
+    """
+    children = {
+        b"moov": {b"mvhd", b"trak"}, b"trak": {b"tkhd", b"mdia"},
+        b"mdia": {b"mdhd", b"hdlr", b"minf"},
+        b"minf": {b"vmhd", b"smhd", b"dinf", b"stbl"}, b"stbl": {b"stsd"},
+    }
+    cache = {}
+    boxes = 0
+
+    def read(offset: int, length: int) -> bytes:
+        parts = []
+        while length:
+            base = offset // 32768 * 32768
+            if base not in cache:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or len(cache) >= 32:
+                    raise ValueError("MP4 header probe budget exhausted")
+                request = urllib.request.Request(url, headers={
+                    **headers, "Range": f"bytes={base}-{base + 32767}",
+                    "Accept-Encoding": "identity",
+                })
+                with urllib.request.urlopen(request, timeout=min(5, remaining)) as response:
+                    if (response.status != 206 or not response.headers.get(
+                            "Content-Range", "").startswith(f"bytes {base}-")):
+                        raise ValueError("Server does not support byte ranges")
+                    cache[base] = response.read(32768)
+            chunk = cache[base][offset - base:offset - base + length]
+            if not chunk:
+                raise ValueError("Truncated MP4 header")
+            parts.append(chunk)
+            offset += len(chunk)
+            length -= len(chunk)
+        return b"".join(parts)
+
+    def box(offset: int) -> tuple[int, bytes, int]:
+        nonlocal boxes
+        boxes += 1
+        if boxes > 128:
+            raise ValueError("Too many MP4 header boxes")
+        size, kind = struct.unpack(">I4s", read(offset, 8))
+        header_size = 8
+        if size == 1:
+            size = struct.unpack(">Q", read(offset + 8, 8))[0]
+            header_size = 16
+        if size < header_size:
+            raise ValueError("Invalid MP4 box size")
+        return size, kind, header_size
+
+    def retain(offset: int, size: int, kind: bytes, header_size: int) -> bytes:
+        if kind in children:
+            parts = []
+            child, end = offset + header_size, offset + size
+            while child < end:
+                child_size, child_kind, child_header = box(child)
+                if child + child_size > end:
+                    raise ValueError("MP4 box exceeds its container")
+                if child_kind in children[kind]:
+                    parts.append(retain(child, child_size, child_kind, child_header))
+                # Sample descriptions carry the codecs; indexes are unnecessary.
+                if kind == b"stbl" and child_kind == b"stsd":
+                    break
+                child += child_size
+            payload = b"".join(parts)
+        else:
+            if size > 131072:
+                raise ValueError("Oversized MP4 codec description")
+            payload = read(offset + header_size, size - header_size)
+        return struct.pack(">I4s", len(payload) + 8, kind) + payload
+
+    parts, offset = [], 0
+    for _ in range(8):
+        size, kind, header_size = box(offset)
+        if kind in (b"ftyp", b"moov"):
+            parts.append(retain(offset, size, kind, header_size))
+        if kind == b"moov":
+            return b"".join(parts)
+        offset += size
+    raise ValueError("MP4 codec header not found")
+
+
+def probe_missing_codecs(info: dict, *, env: dict | None = None) -> None:
+    """Fill missing extractor metadata from stream headers; never guess from the container.
+
+    Known codecs and explicit 'none' values remain authoritative. Only format
+    listing/interactive selection/codec preferences need this extra network work.
+    At most four probes run together, with a shared 20-second probe budget.
+    """
+    formats = info.get("formats") or ([info] if info.get("url") else [])
+    unknown = [f for f in formats if f.get("url") and
+               any(f.get(key) in (None, "", "?") for key in ("vcodec", "acodec"))]
+    if not unknown:
+        return
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        print("NOTE: codec metadata is missing; install ffprobe to detect it.", file=sys.stderr)
+        return
+    print(f"Detecting missing codecs for {len(unknown)} formats...", file=sys.stderr)
+    deadline = time.monotonic() + 20
+
+    def probe(fmt: dict) -> dict:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {}
+        cmd = [ffprobe, "-v", "error", "-probesize", "262144",
+               "-analyzeduration", "1000000",
+               "-show_entries", "stream=codec_type,codec_name", "-of", "json"]
+        header = None
+        if fmt["url"].startswith(("http://", "https://")):
+            cmd += ["-rw_timeout", "5000000"]
+            headers = dict(info.get("http_headers") or {})
+            headers.update(fmt.get("http_headers") or {})
+            if headers:
+                cmd += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())]
+            cookies = fmt.get("cookies") or info.get("cookies")
+            if cookies:
+                cmd += ["-cookies", cookies]
+            elif fmt.get("ext") == "mp4" and fmt.get("protocol") in (None, "http", "https"):
+                try:
+                    header = mp4_codec_header(fmt["url"], headers, deadline)
+                except (OSError, ValueError, http.client.HTTPException):
+                    pass  # Unsupported range/layout: let ffprobe open the original.
+        if header is not None:
+            cmd = [ffprobe, "-v", "error", "-nofind_stream_info",
+                   "-show_entries", "stream=codec_type,codec_name", "-of", "json", "-i", "pipe:0"]
+        else:
+            cmd += ["-i", fmt["url"]]
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {}
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=header is None,
+                                    input=header, timeout=remaining, env=env)
+            if result.returncode:
+                return {}
+            streams = json.loads(result.stdout).get("streams") or []
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return {}
+        codecs = {}
+        for kind, key in (("video", "vcodec"), ("audio", "acodec")):
+            matches = [s for s in streams if s.get("codec_type") == kind]
+            # A partial/unsupported codec stays unknown, rather than being
+            # mistaken for an absent track and changing format selection.
+            if matches and matches[0].get("codec_name"):
+                codecs[key] = matches[0]["codec_name"]
+            elif streams and not matches:
+                codecs[key] = "none"
+        return codecs
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for fmt, codecs in zip(unknown, executor.map(probe, unknown)):
+            for key, value in codecs.items():
+                if fmt.get(key) in (None, "", "?"):
+                    fmt[key] = value
+    remaining = sum(any(f.get(key) in (None, "", "?")
+                        for key in ("vcodec", "acodec")) for f in unknown)
+    if remaining:
+        print(f"NOTE: codec detection unavailable for {remaining} formats; shown as ?. "
+              "Playback can still detect their codecs.", file=sys.stderr)
 
 
 def fmt_list(info: dict) -> list[dict]:
@@ -1163,6 +1332,10 @@ def main() -> int:
         raw_opts = build_raw_opts(mpv_cookie_opt, ignore_cfg, args.ytdlp_option)
         info = run_yt_dlp_json(url, yt_extra + yt_cookie_flags + ["--format", DEFAULT_FORMAT],
                               executable=ytdlp, env=env)
+        codec_choice = str(args.format or "").strip().lower() in CODEC_ALIASES
+        if (args.list_formats or codec_choice or (args.prefer_codec and not args.format)
+                or (args.format is None and sys.stdin.isatty())):
+            probe_missing_codecs(info, env=env)
         fmts = fmt_list(info)
         print(f"Title: {info.get('title') or '?'} | uploader: {info.get('uploader') or '?'} | "
               f"live: {info.get('live_status') or info.get('is_live') or '?'}", file=sys.stderr)
