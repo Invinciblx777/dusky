@@ -700,8 +700,11 @@ write_value_to_file() {
                 if (k == key && line ~ /[=[:space:]]/) {
                     if (!found && !deleting) {
                         indent = $0; sub(/[^[:space:]].*$/, "", indent)
-                        rest = substr(line, length(key) + 1)
-                        sep = (rest ~ /^[[:space:]]*=/ ? "=" : " ")
+                        rest = substr($0, length(indent) + length(key) + 1)
+                        # Keep the existing assignment operator and its spacing.
+                        if (match(rest, /^[ \t]*=[ \t]*/)) sep = substr(rest, 1, RLENGTH)
+                        else if (match(rest, /^[ \t]+/)) sep = substr(rest, 1, RLENGTH)
+                        else sep = "="
                         print indent key sep val eol; found = 1
                     }
                     next
@@ -1272,7 +1275,7 @@ draw_main_view() {
     render_scroll_indicator buf below "$count" "$_vis_end"
 
     buf+=$'\n'"${C_CYAN} [Tab] Category   [r] Reset Item   [R] Reset All   [←/→ h/l] Adjust${C_RESET}${CLR_EOL}"$'\n'
-    buf+="${C_CYAN} [Enter] Action   [q] Quit   ${C_YELLOW}●${C_CYAN} Default  ${C_RED}●${C_CYAN} Modified${C_RESET}${CLR_EOL}"$'\n'
+    buf+="${C_CYAN} [Enter] Action   [F5] Reload   [q] Quit   ${C_YELLOW}●${C_CYAN} Default  ${C_RED}●${C_CYAN} Modified${C_RESET}${CLR_EOL}"$'\n'
     render_footer buf " File: $WRITE_TARGET"
     printf '%s' "$buf" || true
 }
@@ -1315,7 +1318,7 @@ draw_detail_view() {
     render_scroll_indicator buf below "$count" "$_vis_end"
     
     buf+=$'\n'"${C_CYAN} [Esc/Sh+Tab] Back   [r] Reset Item   [R] Reset All   [←/→ h/l] Adjust${C_RESET}${CLR_EOL}"$'\n'
-    buf+="${C_CYAN} [Enter] Toggle/Action   [q] Quit   ${C_YELLOW}●${C_CYAN} Default  ${C_RED}●${C_CYAN} Modified${C_RESET}${CLR_EOL}"$'\n'
+    buf+="${C_CYAN} [Enter] Action   [F5] Reload   [q] Quit   ${C_YELLOW}●${C_CYAN} Default  ${C_RED}●${C_CYAN} Modified${C_RESET}${CLR_EOL}"$'\n'
     render_footer buf " Submenu: $CURRENT_MENU_ID"
     printf '%s' "$buf" || true
 }
@@ -1833,6 +1836,15 @@ handle_input_router() {
     if [[ $key == '[200~' ]]; then discard_bracketed_paste; return 0; fi
     if ! terminal_size_ok; then
         case $key in q|Q|$'\x03') exit 0 ;; esac
+        return 0
+    fi
+    if [[ $key == '[15~' ]]; then
+        # Reload on demand without polling or disturbing navigation state.
+        # Keep displayed values if the read fails; the next save revalidates.
+        if populate_config_cache; then
+            if (( CURRENT_VIEW != 2 )); then load_active_values; fi
+            set_status "Configuration refreshed."
+        fi
         return 0
     fi
     case $CURRENT_VIEW in
