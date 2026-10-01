@@ -100,7 +100,7 @@ hl.config({
             font_family = "", -- Font for groupbar titles (falls back to misc.font_family)
             font_size = 10, -- Font size of title -> bigger for readability
             font_weight_active = "bold", -- Font weight of active title -> bolder
-            font_weight_inactive = "normal", -- Font weight of inactive title
+            font_weight_inactive = "bold", -- Font weight of inactive title -> bold for readability
             gradients = true, -- Enables gradients -> squircle pill background for each title
             height = 20, -- Height of groupbar (taller = gradients)
             indicator_gap = 2, -- Gap between indicator and title
