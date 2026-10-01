@@ -1323,9 +1323,9 @@ command = "kitty --class dusky_tui --title \"Network Manager\" --hold python3 $H
 [[pages.layout]]
 type = "section"
 [pages.layout.properties]
-title = "Remote"
-icon = ""
-description = ""
+title = "Remote Access & SSH"
+icon = "network-vpn-symbolic"
+description = "Configure Tailscale mesh VPN, OpenSSH server, and remote filesystem mounts"
 
 [[pages.layout.items]]
 type = "button"
@@ -1366,20 +1366,6 @@ style = "suggested"
 type = "exec"
 command = "kitty --class dusky_sshfs --title \"SSH Remote Filesystem Mounter\" --hold python3 $HOME/user_scripts/networking/dusky_ssh_filesystem.py"
 
-
-[[pages.layout.items]]
-type = "button"
-[pages.layout.items.properties]
-title = "Step 3: VNC / iOS Remote"
-button_text = "Setup"
-description = "WayVNC + Sunshine remote control setup"
-icon = "preferences-desktop-remote-desktop-symbolic"
-style = "suggested"
-[pages.layout.items.on_press]
-type = "exec"
-command = "kitty --class vnc_setup.py --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/vnc_setup.py\""
-terminal = false
-
 [[pages.layout.items]]
 type = "button"
 [pages.layout.items.properties]
@@ -1390,6 +1376,438 @@ icon = "user-trash-symbolic"
 type = "exec"
 command = "kitty --class tailscale_uninstall --hold sh -c \"$HOME/user_scripts/networking/uninstall_tailscale.sh\""
 terminal = false
+
+
+[[pages.layout]]
+type = "section"
+[pages.layout.properties]
+title = "Remote Displays & Streaming"
+icon = "preferences-desktop-remote-desktop-symbolic"
+description = "WayVNC desktop/phone display and Sunshine/Moonlight streaming"
+
+[[pages.layout.items]]
+type = "navigation"
+[pages.layout.items.properties]
+title = "Remote Displays & Streaming"
+description = "WayVNC (desktop/phone) & Sunshine/Moonlight streaming"
+icon = "preferences-desktop-remote-desktop-symbolic"
+
+[[pages.layout.items.layout]]
+type = "section"
+[pages.layout.items.layout.properties]
+title = "Remote Display Services"
+description = "Manage WayVNC and Moonlight background services"
+icon = "system-run-symbolic"
+
+[[pages.layout.items.layout.items]]
+type = "service"
+[pages.layout.items.layout.items.properties]
+title = "WayVNC Desktop Sharing"
+description = "Mirror primary desktop screen (TCP 5902)"
+icon = "video-display-symbolic"
+service = "dusky_vnc.service"
+scope = "user"
+
+[[pages.layout.items.layout.items]]
+type = "service"
+[pages.layout.items.layout.items.properties]
+title = "WayVNC Phone Display"
+description = "Virtual secondary monitor for phone (TCP 5901)"
+icon = "phone-symbolic"
+service = "dusky_phone_display.service"
+scope = "user"
+
+[[pages.layout.items.layout.items]]
+type = "service"
+[pages.layout.items.layout.items.properties]
+title = "Moonlight Phone Display"
+description = "Hardware-accelerated Sunshine stream (Port 47989)"
+icon = "preferences-desktop-remote-desktop-symbolic"
+service = "dusky_moonlight_display.service"
+scope = "user"
+
+[[pages.layout.items.layout]]
+type = "section"
+[pages.layout.items.layout.properties]
+title = "WayVNC Desktop Sharing (TCP 5902)"
+description = "Mirror desktop display to RealVNC / RVNC Viewer over local Wi-Fi"
+icon = "video-display-symbolic"
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Setup Desktop Sharing"
+button_text = "Setup"
+description = "Install dependencies, configure firewall, and start service"
+icon = "preferences-system-symbolic"
+style = "suggested"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_vnc --title \"WayVNC Desktop Setup\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/vnc_setup.py --setup\""
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Connection Status & Guide"
+button_text = "Status"
+description = "View network IPs, port 5902, and phone setup guide"
+icon = "dialog-information-symbolic"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_vnc --title \"WayVNC Desktop Status\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/vnc_setup.py --status\""
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Desktop VNC Diagnostics"
+button_text = "Diagnose"
+description = "Check services, port 5902 RFB greeting, route, and capture"
+icon = "utilities-system-monitor-symbolic"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_vnc --title \"WayVNC Desktop Diagnostics\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/vnc_setup.py --diagnose\""
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Reconnect Desktop Sharing"
+button_text = "Reconnect"
+description = "Restart service and restore desktop display capture"
+icon = "view-refresh-symbolic"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_vnc --title \"WayVNC Desktop Reconnect\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/vnc_setup.py --reconnect\""
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Connected Viewers"
+button_text = "Viewers"
+description = "List active VNC viewer IDs and addresses"
+icon = "system-users-symbolic"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_vnc --title \"WayVNC Connected Viewers\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/vnc_setup.py --clients\""
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Disconnect All Viewers"
+button_text = "Disconnect"
+description = "Drop all active desktop VNC sessions without stopping service"
+icon = "network-offline-symbolic"
+style = "destructive"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_vnc --title \"Disconnect VNC Viewers\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/vnc_setup.py --disconnect-all\""
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Tailscale Remote Access"
+button_text = "Tailscale"
+description = "Enable Tailscale VPN for secure access away from home Wi-Fi"
+icon = "network-vpn-symbolic"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_vnc --title \"WayVNC Tailscale Setup\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/vnc_setup.py --remote\""
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Offline Wi-Fi Hotspot"
+button_text = "Hotspot"
+description = "Create direct AP on a spare Wi-Fi adapter without displacing LAN"
+icon = "network-wireless-symbolic"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_vnc --title \"WayVNC Offline Hotspot\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/vnc_setup.py --offline\""
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Stop All VNC Displays"
+button_text = "Stop All"
+description = "Disable and stop both desktop and phone VNC services"
+icon = "process-stop-symbolic"
+style = "destructive"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_vnc --title \"Stop WayVNC Services\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/vnc_setup.py --stop\""
+terminal = false
+
+[[pages.layout.items.layout]]
+type = "section"
+[pages.layout.items.layout.properties]
+title = "WayVNC Phone Display (TCP 5901)"
+description = "Headless secondary display positioned right of the desktop"
+icon = "phone-symbolic"
+
+[[pages.layout.items.layout.items]]
+type = "selection"
+[pages.layout.items.layout.items.properties]
+title = "Phone Screen Orientation"
+description = "Landscape (1280x720) or Portrait (720x1280)"
+icon = "view-refresh-symbolic"
+value_command = "jq -r '.orientation // \"landscape\"' ~/.config/dusky/settings/remote/vnc_display.json 2>/dev/null || echo landscape"
+interval = 2
+options = ["Landscape", "Portrait"]
+options_map = { "landscape" = "Landscape", "portrait" = "Portrait" }
+[pages.layout.items.layout.items.on_change.Landscape]
+type = "exec"
+command = "python3 $HOME/user_scripts/networking/vnc/phone_display.py orientation landscape"
+terminal = false
+[pages.layout.items.layout.items.on_change.Portrait]
+type = "exec"
+command = "python3 $HOME/user_scripts/networking/vnc/phone_display.py orientation portrait"
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Setup Phone Display"
+button_text = "Setup"
+description = "Create virtual DUSKY-PHONE monitor and start VNC service"
+icon = "preferences-system-symbolic"
+style = "suggested"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_vnc_phone --title \"WayVNC Phone Display Setup\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/phone_display.py --setup\""
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Phone Connection Status"
+button_text = "Status"
+description = "View port 5901 IP address, orientation, and instructions"
+icon = "dialog-information-symbolic"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_vnc_phone --title \"WayVNC Phone Display Status\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/phone_display.py --status\""
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Phone Display Diagnostics"
+button_text = "Diagnose"
+description = "Inspect master service, port 5901 RFB greeting, and monitor"
+icon = "utilities-system-monitor-symbolic"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_vnc_phone --title \"WayVNC Phone Diagnostics\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/phone_display.py --diagnose\""
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Reconnect Phone Display"
+button_text = "Reconnect"
+description = "Restart service and re-create virtual DUSKY-PHONE monitor"
+icon = "view-refresh-symbolic"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_vnc_phone --title \"WayVNC Phone Reconnect\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/phone_display.py --reconnect\""
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Connected Phone Viewers"
+button_text = "Viewers"
+description = "List viewers connected to port 5901"
+icon = "system-users-symbolic"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_vnc_phone --title \"WayVNC Phone Viewers\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/phone_display.py --clients\""
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Disconnect Phone Viewers"
+button_text = "Disconnect"
+description = "Drop active phone display viewer sessions"
+icon = "network-offline-symbolic"
+style = "destructive"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_vnc_phone --title \"Disconnect Phone Viewers\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/phone_display.py --disconnect-all\""
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Stop Phone Display"
+button_text = "Stop"
+description = "Stop phone service and remove virtual DUSKY-PHONE monitor"
+icon = "process-stop-symbolic"
+style = "destructive"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_vnc_phone --title \"Stop Phone Display\" --hold sh -c \"python3 $HOME/user_scripts/networking/vnc/phone_display.py --stop\""
+terminal = false
+
+[[pages.layout.items.layout]]
+type = "section"
+[pages.layout.items.layout.properties]
+title = "Moonlight (Sunshine) Phone Display (Port 47989)"
+description = "Low-latency hardware-accelerated video streaming to Moonlight clients"
+icon = "preferences-desktop-remote-desktop-symbolic"
+
+[[pages.layout.items.layout.items]]
+type = "selection"
+[pages.layout.items.layout.items.properties]
+title = "Moonlight Screen Orientation"
+description = "Landscape (1280x720) or Portrait (720x1280)"
+icon = "view-refresh-symbolic"
+value_command = "jq -r '.orientation // \"landscape\"' ~/.config/dusky/settings/remote/moonlight_display.json 2>/dev/null || echo landscape"
+interval = 2
+options = ["Landscape", "Portrait"]
+options_map = { "landscape" = "Landscape", "portrait" = "Portrait" }
+[pages.layout.items.layout.items.on_change.Landscape]
+type = "exec"
+command = "python3 $HOME/user_scripts/networking/moonlight/moonlight_setup.py orientation landscape"
+terminal = false
+[pages.layout.items.layout.items.on_change.Portrait]
+type = "exec"
+command = "python3 $HOME/user_scripts/networking/moonlight/moonlight_setup.py orientation portrait"
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Setup Sunshine & Service"
+button_text = "Setup"
+description = "Install Sunshine, configure UFW firewall rules, and start service"
+icon = "preferences-system-symbolic"
+style = "suggested"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_moonlight --title \"Moonlight Setup\" --hold sh -c \"python3 $HOME/user_scripts/networking/moonlight/moonlight_setup.py --setup\""
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Pair Moonlight Client"
+button_text = "Pair"
+description = "Open Sunshine web UI (https://localhost:47990) to enter phone PIN"
+icon = "network-wireless-symbolic"
+style = "suggested"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_moonlight --title \"Moonlight Client Pairing\" --hold sh -c \"python3 $HOME/user_scripts/networking/moonlight/moonlight_setup.py --pair\""
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Moonlight Connection Status"
+button_text = "Status"
+description = "Show IP addresses, streaming readiness, and connection steps"
+icon = "dialog-information-symbolic"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_moonlight --title \"Moonlight Status\" --hold sh -c \"python3 $HOME/user_scripts/networking/moonlight/moonlight_setup.py --status\""
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Test Display Video"
+button_text = "Test Video"
+description = "Show a high-contrast test window on the streamed phone monitor"
+icon = "video-display-symbolic"
+style = "suggested"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "python3 $HOME/user_scripts/networking/moonlight/moonlight_setup.py --test-display"
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Moonlight Diagnostics"
+button_text = "Diagnose"
+description = "Check GameStream HTTP listener, monitor, and duplicate identities"
+icon = "utilities-system-monitor-symbolic"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_moonlight --title \"Moonlight Diagnostics\" --hold sh -c \"python3 $HOME/user_scripts/networking/moonlight/moonlight_setup.py --diagnose\""
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Reconnect Moonlight Stream"
+button_text = "Reconnect"
+description = "Restart Sunshine and repair duplicate client certificates"
+icon = "view-refresh-symbolic"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_moonlight --title \"Moonlight Reconnect\" --hold sh -c \"python3 $HOME/user_scripts/networking/moonlight/moonlight_setup.py --reconnect\""
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Paired Moonlight Clients"
+button_text = "Clients"
+description = "List paired client devices and UUIDs"
+icon = "system-users-symbolic"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_moonlight --title \"Moonlight Paired Clients\" --hold sh -c \"python3 $HOME/user_scripts/networking/moonlight/moonlight_setup.py --clients\""
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Forget All Paired Clients"
+button_text = "Forget All"
+description = "Remove saved client certificates while preserving web UI credentials"
+icon = "user-trash-symbolic"
+style = "destructive"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_moonlight --title \"Forget Moonlight Clients\" --hold sh -c \"python3 $HOME/user_scripts/networking/moonlight/moonlight_setup.py --forget-all\""
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "iPhone USB Local Tethering"
+button_text = "Setup USB"
+description = "Configure USB tethering profile keeping Wi-Fi as default route"
+icon = "phone-apple-iphone-symbolic"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_moonlight --title \"iPhone USB Tethering Setup\" --hold sh -c \"python3 $HOME/user_scripts/networking/moonlight/moonlight_setup.py --usb\""
+terminal = false
+
+[[pages.layout.items.layout.items]]
+type = "button"
+[pages.layout.items.layout.items.properties]
+title = "Stop Moonlight Display"
+button_text = "Stop"
+description = "Disable and stop Sunshine; remove DUSKY-MOONLIGHT monitor"
+icon = "process-stop-symbolic"
+style = "destructive"
+[pages.layout.items.layout.items.on_press]
+type = "exec"
+command = "kitty --class dusky_moonlight --title \"Stop Moonlight Display\" --hold sh -c \"python3 $HOME/user_scripts/networking/moonlight/moonlight_setup.py --stop\""
+terminal = false
+
 
 [[pages.layout]]
 type = "section"
