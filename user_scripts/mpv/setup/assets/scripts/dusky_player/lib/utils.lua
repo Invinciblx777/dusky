@@ -525,7 +525,7 @@ end
 
 ---@param delta number
 function navigate_item(delta)
-	if state.has_playlist then return navigate_playlist(delta) else return navigate_directory(delta) end
+	if mp.get_property_number('playlist-count', 0) > 1 then return navigate_playlist(delta) else return navigate_directory(delta) end
 end
 
 -- trash-cli is optional when use_trash is enabled.
