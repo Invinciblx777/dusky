@@ -230,12 +230,8 @@ hl.window_rule({
 
     -- ANIMATION
     -- override the open/close animation for this window
-    -- options: "popin", "popin 80%", "slide", "gnomed", or unset ("") to inherit global
-    -- animation     = "popin 80%",
-    -- no_anim       = false,
-
-    -- DIMMING
-    dim_around    = false, -- Dims everything around single windows
+    -- options: "popin", "popin 80%", "slide", "gnomed", or unset to inherit global
+    -- animation = "popin 80%",
 
     -- TEARING
     -- allow this window to request tearing (reduce latency)
@@ -252,17 +248,8 @@ hl.window_rule({
     opacity       = 1.0, -- override 0.85 override 1.0 override"
     no_blur       = true,
 
-    -- BORDER COLOR
     -- border_color = "rgb(ffffff) rgb(000000) 45deg",
-
-    -- ANIMATION
-    -- animation     = "popin 80%",
-    -- no_anim       = false,
-
-    -- DIMMING
-    dim_around    = false, -- Dims everything around maximized windows
-
-    -- TEARING
+    -- animation = "popin 80%",
     -- immediate = false,
 })
 
@@ -314,6 +301,3 @@ hl.window_rule({
 
 -- Sourcing active animations
 require("source.animations.active.active")
-
-
-
