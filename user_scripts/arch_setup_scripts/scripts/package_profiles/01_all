@@ -203,6 +203,7 @@ wget
 curl
 openssh
 ufw
+wayvnc
 vsftpd
 reflector
 bmon

@@ -5,50 +5,41 @@ Run ``orientation portrait`` or ``orientation landscape`` to switch its shape.
 """
 
 import argparse
-import ipaddress
 import json
-import os
 from pathlib import Path
-import shutil
-import socket
-import stat
 import subprocess
 import sys
-import tempfile
 import time
 
 
-HOME = Path.home()
-RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
-CONFIG_DIR = HOME / ".config" / "wayvnc"
+from vnc_common import (
+    CONFIG_HOME, RUNTIME, MASTER, PHONE, PHONE_PORT, atomic_write,
+    control_data, exec_wayvnc, install_unit, message, prepare, run, session,
+    script_command, show_status, wait_ready, wait_session, write_config as configure,
+    rfb_ready as probe_rfb,
+)
+
+CONFIG_DIR = CONFIG_HOME / "wayvnc"
 CONFIG = CONFIG_DIR / "phone-display.conf"
 KEY = CONFIG_DIR / "phone-display-key.pem"
 CERT = CONFIG_DIR / "phone-display-cert.pem"
-UNIT_NAME = "dusky_phone_display.service"
-UNIT = HOME / ".config" / "systemd" / "user" / UNIT_NAME
+UNIT_NAME = PHONE
+UNIT = CONFIG_HOME / "systemd/user" / UNIT_NAME
 STATE = RUNTIME / "dusky-phone-display.json"
 CONTROL = RUNTIME / "dusky-phone-wayvnc.sock"
 OUTPUT = "DUSKY-PHONE"
-PORT = 5901
+PORT = PHONE_PORT
 LANDSCAPE_SIZE = (1280, 720)
-PREFERENCES = HOME / ".config/dusky/settings/remote/vnc_display.json"
-
-
-def run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, text=True, capture_output=True, check=check)
+PREFERENCES = CONFIG_HOME / "dusky/settings/remote/vnc_display.json"
 
 
 def save_preferences(values: dict) -> None:
-    PREFERENCES.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=PREFERENCES.parent) as directory:
-        replacement = Path(directory) / PREFERENCES.name
-        replacement.write_text(json.dumps(values, indent=2) + "\n")
-        replacement.replace(PREFERENCES)
+    atomic_write(PREFERENCES, json.dumps(values, indent=2) + "\n")
 
 
 def preferences() -> dict:
     if not PREFERENCES.exists():
-        save_preferences({"orientation": "landscape"})
+        return {"orientation": "landscape"}
     try:
         values = json.loads(PREFERENCES.read_text())
     except ValueError as error:
@@ -72,99 +63,31 @@ def monitors(instance: str) -> list[dict]:
     return json.loads(result.stdout)
 
 
-def session() -> dict | None:
-    result = run("hyprctl", "instances", "-j", check=False)
-    if result.returncode:
-        return None
-    candidates = sorted(json.loads(result.stdout), key=lambda item: item.get("time", 0), reverse=True)
-    for item in candidates:
-        name = item.get("wl_socket", "")
-        path = RUNTIME / name
-        if name and path.exists() and stat.S_ISSOCK(path.stat().st_mode) and path.stat().st_uid == os.getuid():
-            return item
-    return None
-
-
-def certificate_valid() -> bool:
-    if not KEY.is_file() or not CERT.is_file():
-        return False
-    if run("openssl", "x509", "-checkend", "2592000", "-noout", "-in", str(CERT), check=False).returncode:
-        return False
-    key = run("openssl", "pkey", "-in", str(KEY), "-pubout", check=False)
-    cert = run("openssl", "x509", "-in", str(CERT), "-pubkey", "-noout", check=False)
-    return key.returncode == cert.returncode == 0 and key.stdout == cert.stdout
-
-
-def write_config() -> bool:
-    CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    CONFIG_DIR.chmod(0o700)
-    changed = False
-    if not certificate_valid():
-        with tempfile.TemporaryDirectory(dir=CONFIG_DIR) as directory:
-            key = Path(directory) / "key.pem"
-            cert = Path(directory) / "cert.pem"
-            run("openssl", "genrsa", "-traditional", "-out", str(key), "3072")
-            run("openssl", "req", "-new", "-x509", "-key", str(key), "-out", str(cert),
-                "-days", "3650", "-sha256", "-subj", "/CN=Phone Display")
-            key.chmod(0o600)
-            cert.chmod(0o600)
-            key.replace(KEY)
-            cert.replace(CERT)
-        changed = True
-    KEY.chmod(0o600)
-    content = (
-        f"address=0.0.0.0\nport={PORT}\nenable_auth=true\nenable_pam=true\n"
-        f"rsa_private_key_file={KEY}\nprivate_key_file={KEY}\ncertificate_file={CERT}\n"
-    )
-    if not CONFIG.exists() or CONFIG.read_text() != content:
-        CONFIG.write_text(content)
-        changed = True
-    CONFIG.chmod(0o600)
-    return changed
-
-
 def unit_content() -> str:
-    try:
-        script = f"%h/{Path(__file__).resolve().relative_to(HOME).as_posix().replace('%', '%%')}"
-    except ValueError:
-        script = str(Path(__file__).resolve()).replace("%", "%%")
-    script = json.dumps(script, ensure_ascii=False)
-    python = json.dumps(sys.executable.replace("%", "%%"), ensure_ascii=False)
     return (
         "[Unit]\nDescription=Phone secondary display over WayVNC\n"
-        "After=graphical-session.target\nPartOf=graphical-session.target\n"
+        f"After=graphical-session.target {MASTER}\n"
+        f"BindsTo={MASTER}\nPartOf=graphical-session.target {MASTER}\n"
         "StartLimitIntervalSec=0\n\n"
         "[Service]\nType=exec\n"
-        f"ExecStart={python} {script} serve\n"
-        f"ExecStopPost={python} {script} cleanup\n"
-        "Restart=always\nRestartSec=2\n\n"
-        "[Install]\nWantedBy=default.target graphical-session.target\n"
+        f"ExecStart={script_command(Path(__file__), 'serve')}\n"
+        f"ExecStopPost={script_command(Path(__file__), 'cleanup')}\n"
+        "Restart=always\nRestartSec=5\nRestartSteps=5\nRestartMaxDelaySec=30\n\n"
+        f"[Install]\nWantedBy={MASTER}\n"
     )
 
 
 def rfb_ready() -> bool:
-    try:
-        with socket.create_connection(("127.0.0.1", PORT), timeout=2) as connection:
-            connection.settimeout(2)
-            greeting = bytearray()
-            while len(greeting) < 12:
-                chunk = connection.recv(12 - len(greeting))
-                if not chunk:
-                    break
-                greeting.extend(chunk)
-        return greeting == b"RFB 003.008\n"
-    except OSError:
-        return False
+    return probe_rfb(PORT)
 
 
 def output_ready() -> bool:
-    result = run("wayvncctl", "-S", str(CONTROL), "--json", "output-list", check=False)
-    if result.returncode:
-        return False
-    try:
-        return any(item.get("name") == OUTPUT and item.get("captured") for item in json.loads(result.stdout))
-    except (TypeError, ValueError):
-        return False
+    outputs = control_data(CONTROL, "output-list")
+    return outputs is not None and any(item.get("name") == OUTPUT and item.get("captured") for item in outputs)
+
+
+def ready() -> bool:
+    return output_ready() and rfb_ready() and display_ready()
 
 
 def display_ready() -> bool:
@@ -177,40 +100,19 @@ def display_ready() -> bool:
 
 
 def install() -> None:
-    if os.geteuid() == 0:
-        raise RuntimeError("Run setup as the desktop user, without sudo")
+    prepare()
     preferences()
-    if not Path("/usr/bin/wayvnc").exists():
-        print("Installing WayVNC from the distribution repository...")
-        subprocess.run(["sudo", "pacman", "-S", "--needed", "--noconfirm", "wayvnc"], check=True)
-    if not Path("/etc/pam.d/wayvnc").is_file():
-        raise RuntimeError("WayVNC PAM profile is missing; reinstall the wayvnc package")
-    if not session():
-        raise RuntimeError("Start a Hyprland desktop session before setup")
-    if shutil.which("ufw"):
-        subprocess.run(["sudo", "ufw", "allow", f"{PORT}/tcp", "comment", "Dusky phone display"], check=True)
-    config_changed = write_config()
-    UNIT.parent.mkdir(parents=True, exist_ok=True)
-    content = unit_content()
-    unit_changed = not UNIT.exists() or UNIT.read_text() != content
-    if unit_changed:
-        UNIT.write_text(content)
-        run("systemctl", "--user", "daemon-reload")
-    enabled = run("systemctl", "--user", "is-enabled", UNIT_NAME, check=False).stdout.strip() == "enabled"
-    if unit_changed and enabled:
-        run("systemctl", "--user", "reenable", UNIT_NAME)
-    elif not enabled:
-        run("systemctl", "--user", "enable", UNIT_NAME)
+    # Desktop service is the master switch, even for a phone-only setup.
+    import vnc_setup
+    vnc_setup.install(show=False)
+    config_changed = configure(CONFIG, KEY, CERT, PORT)
+    unit_changed = install_unit(UNIT, unit_content())
     active = run("systemctl", "--user", "is-active", UNIT_NAME, check=False).stdout.strip() == "active"
     if not active:
         run("systemctl", "--user", "start", UNIT_NAME)
-    elif config_changed or unit_changed or not (rfb_ready() and output_ready() and display_ready()):
+    elif config_changed or unit_changed or not ready():
         run("systemctl", "--user", "restart", UNIT_NAME)
-    deadline = time.monotonic() + 12
-    while time.monotonic() < deadline:
-        if rfb_ready() and output_ready() and display_ready():
-            break
-        time.sleep(0.2)
+    wait_ready(ready, UNIT_NAME)
     status()
 
 
@@ -218,8 +120,7 @@ def serve() -> None:
     if not CONFIG.is_file():
         raise RuntimeError("Run setup first")
     width, height = display_size()
-    while not (current := session()):
-        time.sleep(2)
+    current = wait_session()
     instance = current["instance"]
     existing = next((item for item in monitors(instance) if item["name"] == OUTPUT), None)
     if existing:
@@ -227,7 +128,7 @@ def serve() -> None:
         if previous.get("instance") != instance:
             raise RuntimeError(f"Output {OUTPUT} already exists and is not owned by this service")
         hypr(instance, "output", "remove", OUTPUT)
-    STATE.write_text(json.dumps({"instance": instance}))
+    atomic_write(STATE, json.dumps({"instance": instance}))
     try:
         hypr(instance, "output", "create", "headless", OUTPUT)
         rule = (f'hl.monitor({{ output = "{OUTPUT}", mode = "{width}x{height}@60", '
@@ -241,12 +142,8 @@ def serve() -> None:
             time.sleep(0.1)
         else:
             raise RuntimeError(f"Hyprland did not configure the {width}x{height} phone output")
-        env = os.environ.copy()
-        env["XDG_RUNTIME_DIR"] = str(RUNTIME)
-        env["WAYLAND_DISPLAY"] = current["wl_socket"]
-        env["HYPRLAND_INSTANCE_SIGNATURE"] = instance
-        os.execve("/usr/bin/wayvnc", ["wayvnc", "-C", str(CONFIG), "-o", OUTPUT,
-                                         "-S", str(CONTROL)], env)
+        # Keep the saved dimensions when clients request desktop resizing.
+        exec_wayvnc(current, CONFIG, CONTROL, "-o", OUTPUT, "-R")
     except Exception:
         cleanup()
         raise
@@ -255,54 +152,36 @@ def serve() -> None:
 def cleanup() -> None:
     if not STATE.exists():
         return
-    try:
-        instance = json.loads(STATE.read_text())["instance"]
-        result = hypr(instance, "-j", "monitors", check=False)
-        if result.returncode == 0 and any(item["name"] == OUTPUT for item in json.loads(result.stdout)):
-            hypr(instance, "output", "remove", OUTPUT)
-    finally:
-        STATE.unlink(missing_ok=True)
-
-
-def addresses() -> list[str]:
-    result = run("ip", "-j", "-4", "addr", "show", "scope", "global")
-    found = []
-    for link in json.loads(result.stdout):
-        if "UP" not in link.get("flags", []) or link.get("ifname") == "CloudflareWARP":
-            continue
-        for address in link.get("addr_info", []):
-            ip = ipaddress.ip_address(address["local"])
-            if not (ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified):
-                label = "Tailscale remote" if link["ifname"] == "tailscale0" else link["ifname"]
-                found.append(f"{label}: {ip}:{PORT}")
-    return found
+    instance = json.loads(STATE.read_text())["instance"]
+    result = hypr(instance, "-j", "monitors", check=False)
+    if result.returncode:
+        # An exited compositor no longer owns any virtual monitor.
+        instances = json.loads(run("hyprctl", "instances", "-j").stdout)
+        if any(item["instance"] == instance for item in instances):
+            raise RuntimeError("Cannot inspect phone output; ownership record retained for recovery")
+    elif any(item["name"] == OUTPUT for item in json.loads(result.stdout)):
+        hypr(instance, "output", "remove", OUTPUT)
+        if any(item["name"] == OUTPUT for item in monitors(instance)):
+            raise RuntimeError("Phone output removal failed; ownership record retained for recovery")
+    STATE.unlink(missing_ok=True)
 
 
 def status() -> None:
-    active = run("systemctl", "--user", "is-active", UNIT_NAME, check=False).stdout.strip() == "active"
-    ready = rfb_ready() and output_ready() and display_ready()
     value = preferences()["orientation"]
     width, height = display_size(value)
-    print(f"Phone display: {'ready' if active and ready else 'off or starting'}")
-    print(f"Orientation: {value} ({width}x{height})")
-    for address in addresses():
-        print(address)
-    if active and ready:
-        print(f"Open a VNC viewer at an address above. Sign in with your Linux account; {OUTPUT} is to the right of your main screen.")
-    else:
-        print(f"Check: journalctl --user -u {UNIT_NAME} -n 30 --no-pager")
-        raise RuntimeError("Phone display is not ready")
+    show_status(UNIT_NAME, PORT, CONTROL, ready(), "Separate phone display")
+    message(f"Orientation: {value} ({width}x{height}); the phone monitor is to the right of your desktop.")
 
 
 def stop() -> None:
     run("systemctl", "--user", "disable", "--now", UNIT_NAME)
-    print("Phone display stopped; the virtual monitor was removed")
+    message("Phone display stopped; the virtual monitor was removed")
 
 
 def orientation(value: str | None) -> None:
     current = preferences()
     if value is None:
-        print(f"VNC display orientation: {current['orientation']} ({PREFERENCES})")
+        message(f"VNC display orientation: {current['orientation']} ({PREFERENCES})")
         return
     changed = value != current["orientation"]
     if changed:
@@ -312,15 +191,9 @@ def orientation(value: str | None) -> None:
     applied = display_ready() if active else False
     if active and (changed or not applied):
         run("systemctl", "--user", "restart", UNIT_NAME)
-        deadline = time.monotonic() + 12
-        while time.monotonic() < deadline:
-            if rfb_ready() and output_ready() and display_ready():
-                break
-            time.sleep(0.2)
-        else:
-            raise RuntimeError(f"Phone display did not start in {value}; check journalctl --user -u {UNIT_NAME}")
-    print(f"VNC display orientation: {value} ({width}x{height})")
-    print(f"Saved in {PREFERENCES}" + ("" if active else "; takes effect when the service starts"))
+        wait_ready(ready, UNIT_NAME)
+    message(f"VNC display orientation: {value} ({width}x{height})")
+    message(f"Saved in {PREFERENCES}" + ("" if active else "; takes effect when the service starts"))
 
 
 def main() -> None:
@@ -341,8 +214,8 @@ if __name__ == "__main__":
     try:
         main()
     except subprocess.CalledProcessError as error:
-        print(f"Error: {error.stderr.strip() or error.stdout.strip() or error}", file=sys.stderr)
+        message(f"Error: {(error.stderr or '').strip() or (error.stdout or '').strip() or error}", error=True)
         sys.exit(1)
-    except (OSError, RuntimeError, ValueError, KeyError) as error:
-        print(f"Error: {error}", file=sys.stderr)
+    except (OSError, RuntimeError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
+        message(f"Error: {error}", error=True)
         sys.exit(1)

@@ -1,0 +1,134 @@
+# Dusky VNC
+
+`vnc_setup.py` shares a physical Hyprland screen on TCP **5902**.
+`phone_display.py` creates a separate 1280×720 screen on TCP **5901**,
+to the right of the other displays. Portrait mode uses 720×1280.
+Port 5900 is deliberately avoided because local QEMU consoles commonly use it.
+
+Run setup as the desktop user in a running Hyprland session:
+
+```sh
+./vnc_setup.py
+./phone_display.py             # optional separate screen
+./vnc_setup.py status
+./phone_display.py status
+./phone_display.py orientation portrait
+./phone_display.py orientation landscape
+```
+
+Setup creates the configuration and user units, prioritizes a UFW allowance for
+TCP ports 5901 and 5902 when UFW is installed, and enables/starts the services. It requires
+`wayvnc` (including `wayvncctl` and PAM support), `python-rich`, `openssl`,
+`hyprland`, and `iproute2` to be installed. Include these and their dependencies
+in the offline ISO payload; setup does not download packages. WayVNC is included
+in both the ISO generator and offline installer's network package lists.
+
+The VNC allowance precedes UFW user rules, including existing VNC or broad deny
+rules. Repeating setup reuses the first-position allowance. Other ports and the
+firewall's policies are preserved; an inactive firewall stays inactive. Custom
+UFW before-rules, independent nftables/firewalld rules, and router isolation
+are outside this automatic UFW configuration. Setup does not reset firewalls.
+
+Keep the phone and computer on the same Wi-Fi. Enter the address shown by
+`status` and the appropriate port in RVNC Viewer, then sign in with the Linux
+account's username and password. No SIM, mobile data, DNS lookup, Tailscale,
+or internet connection is required for local VNC. RVNC Viewer on iOS was
+confirmed working on this machine. Other viewers must support RSA-AES or
+VeNCrypt; password-only legacy VNC authentication is not enabled.
+
+The main switch controls both Dusky VNC services:
+
+```sh
+systemctl --user enable --now dusky_vnc.service
+systemctl --user disable --now dusky_vnc.service
+```
+
+The service TUI already uses `--now`. Plain `enable`/`disable` controls automatic
+startup only; `--now` also starts/stops the running services. Disabling the main
+service stops both servers and removes the phone monitor. The phone service
+keeps its enablement preference, so it returns with the main service next time.
+The main service checks its enabled state at startup, so starting the phone
+service cannot implicitly start a disabled VNC system.
+To turn off only the separate screen, use `./phone_display.py stop`.
+
+The units own the WayVNC processes. There is no persistent Python supervisor
+after startup, no periodic CLI status polling, and no VNC process when stopped.
+Failures restart with a delay increasing from 5 to 30 seconds. Each server has
+its own control socket, and status checks both capture state and the RFB greeting.
+Saved phone dimensions are preserved when viewers request resizing.
+
+`offline` requires a disconnected, AP-capable second Wi-Fi adapter and dnsmasq.
+It refuses to replace an active Wi-Fi connection, creates a manual hotspot, and
+keeps it from becoming the IPv4 default route. Spare-adapter hotspot activation
+has not been exercised on this machine. `remote` separately enables Tailscale
+and requires internet for initial sign-in; Tailscale is shared network
+infrastructure and is not stopped by the VNC switch. Tailscale's existing
+routing/DNS preferences are preserved; the remote workflow was not activated
+during this audit.
+
+If a connection times out, inspect the relevant service journal and verify the
+phone is using the displayed address/port. An active listener and local RFB
+check do not prove that a router permits traffic between Wi-Fi clients. Guest
+networks/client isolation can still block access. IPv6-only networks and
+cross-subnet router configurations were not tested; these scripts listen on IPv4.
+
+## Verification on 2026-10-01
+
+Tested with Python 3.14.7, Rich 15.0.0, systemd 262, Hyprland 0.56.2,
+WayVNC 0.10.1, NeatVNC 1.0.1, NetworkManager 1.58.1, UFW 0.36.2,
+OpenSSL 3.6.5, and kernel 7.3.0-rc5-dusky-battery.
+The final ISO's released kernel and package versions still need validation.
+Upstream WayVNC [0.10.2](https://github.com/any1/wayvnc/releases/tag/v0.10.2)
+fixes resource cleanup/capture-switch crashes; use a consistent distribution
+package set with those fixes when finalizing the ISO. The installed repository
+metadata currently offers 0.10.1; no package upgrade was performed.
+
+- Three main-service off/on cycles: both PIDs became zero, both listeners closed,
+  and the owned phone output/state were removed; both servers returned on enable.
+- A final off/on cycle confirmed that attempting to start the phone service
+  while the master was disabled left both services inactive with zero PIDs;
+  enabling the master restored both servers.
+- Forced crash of each server: automatic recovery; a main-server crash also
+  stopped/recreated the phone display.
+- Portrait and landscape: expected monitor dimensions and capture readiness.
+- Both servers: successful TLS/PAM authentication and a complete 1280×720 raw
+  framebuffer update (3,686,400 bytes each).
+- 200 RFB/VeNCrypt negotiations with 16 parallel workers: all passed.
+- iPhone at 192.168.29.119: authenticated RVNC connection to desktop port 5902;
+  user confirmed the desktop displayed correctly. Port 5901 was also confirmed
+  to show the separate monitor with working cursor control. Android testing is
+  deferred.
+- Thirty-second sample: idle phone server used 0 measured CPU seconds and
+  22.12 MiB in its service cgroup. Desktop VNC with an iPhone connected used
+  0.468375 CPU seconds (1.56% of one core) and 28.29 MiB. These are short
+  observations on this machine, not throughput or latency benchmarks.
+- The existing Wi-Fi connection and default route remained unchanged.
+- The single-adapter `offline` refusal was exercised without network changes.
+- Repeating setup left both server PIDs unchanged and preserved the active
+  iPhone connection; existing UFW rules were reused.
+- Second pass: five isolated UFW scenarios (fresh default deny, broad source
+  deny, individual port denies, equivalent grouped deny, and an allowance
+  behind a deny) all allowed both VNC ports while port 5903 stayed blocked.
+  Each repeated configuration left the rule list unchanged. Tests used separate
+  mount/network namespaces and copied firewall files; the kernel lacks veth,
+  so isolated loopback ingress was evaluated through the UFW user chain.
+- Second pass: repeated setup through both `python` and `python3` preserved
+  server PIDs; one additional complete master off/on cycle passed, including
+  the disabled-master/phone-start check. Wi-Fi and routes remained unchanged.
+- Existing offline profiles must be inactive AP profiles before reuse;
+  connected client profiles and active hotspots are rejected before modification.
+- Removed ignored `deny`/`unlock_time` options from this machine's existing
+  WayVNC PAM profile. Both servers then passed TLS/PAM login and full framebuffer
+  transfer again without PAM warnings. Setup leaves packaged PAM profiles alone.
+
+Focused, non-mutating regressions:
+
+```sh
+python -m unittest discover -s user_scripts/networking/vnc -p 'test_*.py'
+```
+
+Nineteen tests cover fragmented/wrong/closed/timed-out RFB responses, malformed
+control replies, active/idle Wi-Fi selection, offline refusal, settings reads,
+atomic writes, cleanup ownership recovery, firewall idempotence/error reporting,
+offline profile reuse, and stable service commands across Python aliases. Unit syntax also passed
+`systemd-analyze --user verify`.

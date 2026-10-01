@@ -1,0 +1,141 @@
+"""Focused regressions; does not change services, firewall rules, or networks.
+
+Run: python -m unittest discover -s user_scripts/networking/vnc -p 'test_*.py'
+"""
+
+import json
+from pathlib import Path
+import socket
+import subprocess
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import phone_display as phone
+import vnc_common as common
+import vnc_setup as desktop
+
+
+def completed(stdout="", code=0):
+    return subprocess.CompletedProcess([], code, stdout, "")
+
+
+class ProtocolTests(unittest.TestCase):
+    def test_fragmented_greeting(self):
+        with patch.object(common.socket, "create_connection") as connect:
+            connect.return_value.__enter__.return_value.recv.side_effect = [b"RFB ", b"003.", b"008\n"]
+            self.assertTrue(common.rfb_ready(5902))
+
+    def test_wrong_greeting(self):
+        with patch.object(common.socket, "create_connection") as connect:
+            connect.return_value.__enter__.return_value.recv.return_value = b"HTTP/1.1 200"
+            self.assertFalse(common.rfb_ready(5902))
+
+    def test_early_close(self):
+        with patch.object(common.socket, "create_connection") as connect:
+            connect.return_value.__enter__.return_value.recv.side_effect = [b"RFB ", b""]
+            self.assertFalse(common.rfb_ready(5902))
+
+    def test_timeout(self):
+        with patch.object(common.socket, "create_connection", side_effect=socket.timeout):
+            self.assertFalse(common.rfb_ready(5902))
+
+    def test_control_error_is_not_ready(self):
+        with patch.object(common, "run", return_value=completed(code=1)):
+            self.assertIsNone(common.control_data(Path("/no/socket"), "output-list"))
+
+    def test_wrong_control_shape_is_not_ready(self):
+        for raw in ('{"error": "failed"}', '["invalid"]', 'broken'):
+            with self.subTest(raw=raw), patch.object(common, "run", return_value=completed(raw)):
+                self.assertIsNone(common.control_data(Path("/no/socket"), "output-list"))
+
+
+class SetupTests(unittest.TestCase):
+    def test_interpreter_alias_does_not_change_service_command(self):
+        with patch.object(common.sys, "executable", "/usr/bin/python"):
+            first = common.script_command(Path(desktop.__file__), "serve")
+        with patch.object(common.sys, "executable", "/usr/bin/python3"):
+            self.assertEqual(first, common.script_command(Path(desktop.__file__), "serve"))
+
+    def test_firewall_already_first_is_unchanged(self):
+        rules = "Added user rules:\nufw allow 5901,5902/tcp comment 'Dusky VNC'\nufw deny 22/tcp\n"
+        with patch.object(common.os, "geteuid", return_value=0), patch.object(common, "run", return_value=completed(rules)) as run:
+            common.firewall_worker()
+            self.assertEqual(run.call_args_list, [unittest.mock.call("ufw", "show", "added")])
+
+    def test_firewall_failed_precedence_is_reported(self):
+        with patch.object(common.os, "geteuid", return_value=0), patch.object(common, "run", return_value=completed("ufw deny 5901/tcp\n")):
+            with self.assertRaisesRegex(RuntimeError, "prioritize"):
+                common.firewall_worker()
+
+    def test_active_offline_profile_is_not_modified(self):
+        with patch.object(desktop, "offline_credentials", return_value=("VNC", "password")), patch.object(desktop.Path, "exists", return_value=True), patch.object(desktop, "run", side_effect=[completed("ap\n"), completed("activated\n")]) as run:
+            with self.assertRaisesRegex(RuntimeError, "inactive Wi-Fi hotspot"):
+                desktop.setup_offline_wifi("wlan1")
+            self.assertTrue(all("modify" not in call.args for call in run.call_args_list))
+
+    def test_client_profile_cannot_be_reused_as_hotspot(self):
+        with patch.object(desktop, "offline_credentials", return_value=("Near", "password")), patch.object(desktop.Path, "exists", return_value=True), patch.object(desktop, "run", side_effect=[completed("infrastructure\n"), completed("")]):
+            with self.assertRaisesRegex(RuntimeError, "inactive Wi-Fi hotspot"):
+                desktop.setup_offline_wifi("wlan1")
+
+    def test_offline_refuses_to_displace_wifi(self):
+        with patch.object(desktop, "wifi_device", return_value=None), patch.object(desktop, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "unused second"):
+                desktop.offline()
+            run.assert_not_called()
+
+    def test_active_wifi_is_not_a_hotspot_candidate(self):
+        with patch.object(desktop, "run", side_effect=[completed("wlan0:wifi\n"), completed("100 (connected)\n")]) as run:
+            self.assertIsNone(desktop.wifi_device())
+            self.assertEqual(run.call_count, 2)
+
+    def test_idle_ap_adapter_is_accepted(self):
+        with patch.object(desktop, "run", side_effect=[completed("wlan0:wifi\nwlan1:wifi\n"),
+                          completed("100 (connected)\n"), completed("30 (disconnected)\n"), completed("yes\n")]):
+            self.assertEqual(desktop.wifi_device(), "wlan1")
+
+    def test_orientation_read_does_not_write_defaults(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(phone, "PREFERENCES", Path(directory) / "absent.json"):
+            self.assertEqual(phone.display_size(), (1280, 720))
+            self.assertFalse(phone.PREFERENCES.exists())
+
+    def test_invalid_orientation_is_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            path.write_text('{"orientation": "sideways"}')
+            with patch.object(phone, "PREFERENCES", path), self.assertRaises(RuntimeError):
+                phone.preferences()
+
+    def test_failed_cleanup_keeps_ownership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            state.write_text(json.dumps({"instance": "session"}))
+            outputs = [{"name": phone.OUTPUT}]
+            with patch.object(phone, "STATE", state), patch.object(phone, "hypr", return_value=completed(json.dumps(outputs))), patch.object(phone, "monitors", return_value=outputs):
+                with self.assertRaisesRegex(RuntimeError, "removal failed"):
+                    phone.cleanup()
+                self.assertTrue(state.exists())
+
+    def test_successful_cleanup_removes_ownership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            state.write_text(json.dumps({"instance": "session"}))
+            with patch.object(phone, "STATE", state), patch.object(phone, "hypr", return_value=completed('[]')):
+                phone.cleanup()
+                self.assertFalse(state.exists())
+
+    def test_atomic_write_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config"
+            self.assertTrue(common.atomic_write(path, "one"))
+            inode = path.stat().st_ino
+            self.assertFalse(common.atomic_write(path, "one"))
+            self.assertEqual(path.stat().st_ino, inode)
+            self.assertTrue(common.atomic_write(path, "two"))
+            self.assertEqual(path.read_text(), "two")
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+
+if __name__ == "__main__":
+    unittest.main()

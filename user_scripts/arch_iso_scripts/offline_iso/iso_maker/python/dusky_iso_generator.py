@@ -238,7 +238,7 @@ ALL_GROUPS: dict[str, list[str]] = {
     ],
     "network": [
         "networkmanager", "wireless-regdb", "iwd", "nm-connection-editor", "inetutils", "wget",
-        "curl", "openssh", "ufw", "vsftpd", "reflector", "bmon", "ethtool", "httrack", "wavemon",
+        "curl", "openssh", "ufw", "wayvnc", "vsftpd", "reflector", "bmon", "ethtool", "httrack", "wavemon",
         "firefox", "nss-mdns", "dnsmasq", "modemmanager", "usb_modeswitch",
     ],
     "terminal": [
