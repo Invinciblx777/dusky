@@ -66,17 +66,17 @@ READ_ONLY_STATE_HELP = {
 
 # --- DETAILED EXTENDED HELP DICTIONARIES ---
 CORE_USER_DEFS = {
-    "dusky_vnc.service": (
-        "VNC Remote Desktop",
-        "WayVNC control of the active Hyprland desktop over local Wi-Fi or iPhone USB tethering. The switch enables and starts the server, or disables and stops it.",
+    "dusky_vnc_desktop.service": (
+        "VNC Desktop Sharing",
+        "Shares the active Hyprland desktop with a VNC viewer on another phone, tablet or PC over a local network or Tailscale. The switch enables and starts the server, or disables and stops it.",
     ),
-    "dusky_phone_display.service": (
-        "Phone Secondary Display",
-        "Creates a landscape or portrait Hyprland monitor for a phone and serves it with WayVNC on port 5901. Set orientation with phone_display.py orientation portrait|landscape. Disabling stops the server and removes the virtual monitor.",
+    "dusky_vnc_display.service": (
+        "VNC Secondary Display",
+        "Creates a landscape or portrait Hyprland monitor for another phone, tablet or PC and serves it with WayVNC on port 5901. Set orientation with second_display.py orientation portrait|landscape. Disabling stops the server and removes the virtual monitor.",
     ),
     "dusky_moonlight_display.service": (
         "Moonlight Secondary Display",
-        "Creates its own landscape or portrait Hyprland monitor and streams it through Sunshine to Moonlight. Set orientation with moonlight_setup.py orientation portrait|landscape. Disabling stops Sunshine and removes this monitor.",
+        "Creates its own landscape or portrait Hyprland monitor and streams it through Sunshine to Moonlight on another phone, tablet or PC. Set orientation with moonlight_setup.py orientation portrait|landscape. Disabling stops Sunshine and removes this monitor.",
     ),
     "app-dev.lizardbyte.app.Sunshine.service": (
         "Sunshine Default Service",
@@ -290,7 +290,7 @@ CORE_USER_SECTIONS = (
     ("Desktop & Session", (
         "hyprsunset.service", "hypridle.service", "osd_lock.service",
         "dusky_polkit.service", "dusky_clipboard.service", "dusky-oom-shield.service",
-        "dusky_vnc.service", "dusky_phone_display.service", "dusky_moonlight_display.service",
+        "dusky_vnc_desktop.service", "dusky_vnc_display.service", "dusky_moonlight_display.service",
     )),
     ("Panels & Integration", (
         "dusky.service", "dusky_quickpanal.service", "network_meter.service",

@@ -15,6 +15,11 @@ streaming stays disabled, matching the existing display-only workflow.
 ./moonlight_setup.py stop
 ```
 
+On first run, setup creates `dusky_moonlight_display.service` in
+`${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user`, reloads systemd, and enables
+and starts it. No manual unit deployment is needed. The service TUI discovers
+and toggles the installed unit after setup.
+
 Direct flags work too:
 
 ```sh
@@ -139,7 +144,8 @@ development checkout was not built or installed.
 
 ## Audit verification, 2026-10-01
 
-- Thirty focused regressions passed: GameStream responses/errors/timeouts,
+- Thirty-one focused regressions passed: first-run service deployment into an
+  empty directory, GameStream responses/errors/timeouts,
   settings reads, cleanup recovery, config preservation/idempotence, firewall
   idempotence, setup leaving USB profiles alone, and duplicate certificate
   repair preserving credentials, backups and disabled clients, and setup
@@ -153,6 +159,9 @@ development checkout was not built or installed.
 - Live portrait and landscape dimensions, complete service off/on, and forced
   SIGKILL recovery passed. Off left zero main PID, no HTTP listener, and no
   owned monitor/state file.
+- With the actual service file temporarily absent, `--setup` recreated it,
+  enabled/started Sunshine and reached Ready. Afterwards the service was
+  disabled/stopped again and its virtual monitor and ownership record were gone.
 - Four isolated UFW scenarios passed: default deny, broad deny, equivalent
   grouped denies, and allowances behind denies. All three streaming TCP and
   all three UDP ports were reachable; unrelated TCP/UDP ports stayed blocked.

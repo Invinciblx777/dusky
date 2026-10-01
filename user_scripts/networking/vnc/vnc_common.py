@@ -18,8 +18,8 @@ import time
 HOME = Path.home()
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
-MASTER = "dusky_vnc.service"
-PHONE = "dusky_phone_display.service"
+MASTER = "dusky_vnc_desktop.service"
+PHONE = "dusky_vnc_display.service"
 DESKTOP_PORT = 5902  # 5900 is commonly occupied by a local QEMU VNC console.
 PHONE_PORT = 5901
 FIREWALL_RULE = ("allow", f"{PHONE_PORT},{DESKTOP_PORT}/tcp", "comment", "Dusky VNC")

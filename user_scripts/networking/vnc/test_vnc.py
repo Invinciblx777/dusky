@@ -4,6 +4,7 @@ Run: python -m unittest discover -s user_scripts/networking/vnc -p 'test_*.py'
 """
 
 import json
+from contextlib import ExitStack
 from pathlib import Path
 import socket
 import subprocess
@@ -51,6 +52,42 @@ class ProtocolTests(unittest.TestCase):
 
 
 class SetupTests(unittest.TestCase):
+    def test_first_run_creates_desktop_unit_in_empty_directory(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            unit = Path(directory) / common.MASTER
+            stack.enter_context(patch.object(desktop, "UNIT", unit))
+            for name in ("prepare", "configure_firewall", "configure", "wait_ready"):
+                stack.enter_context(patch.object(desktop, name))
+            def command(*args, **kwargs):
+                return completed("disabled" if "is-enabled" in args else "inactive" if "is-active" in args else "")
+            deployment = stack.enter_context(patch.object(common, "run", side_effect=command))
+            start = stack.enter_context(patch.object(desktop, "run", side_effect=command))
+            self.assertFalse(unit.exists())
+            desktop.install(show=False)
+            self.assertEqual(unit.read_text(), desktop.unit_content())
+            self.assertIn(unittest.mock.call("systemctl", "--user", "daemon-reload"), deployment.call_args_list)
+            self.assertIn(unittest.mock.call("systemctl", "--user", "enable", common.MASTER), deployment.call_args_list)
+            self.assertIn(unittest.mock.call("systemctl", "--user", "start", common.MASTER), start.call_args_list)
+
+    def test_first_run_secondary_setup_deploys_both_units(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            desktop_unit = Path(directory) / common.MASTER
+            display_unit = Path(directory) / common.PHONE
+            stack.enter_context(patch.object(desktop, "UNIT", desktop_unit))
+            stack.enter_context(patch.object(phone, "UNIT", display_unit))
+            for module, names in ((desktop, ("prepare", "configure_firewall", "configure", "wait_ready")), (phone, ("prepare", "preferences", "configure", "wait_ready", "status"))):
+                for name in names:
+                    stack.enter_context(patch.object(module, name))
+            def command(*args, **kwargs):
+                return completed("disabled" if "is-enabled" in args else "inactive" if "is-active" in args else "")
+            for module in (common, desktop, phone):
+                stack.enter_context(patch.object(module, "run", side_effect=command))
+            phone.install()
+            self.assertEqual(desktop_unit.read_text(), desktop.unit_content())
+            self.assertEqual(display_unit.read_text(), phone.unit_content())
+            self.assertIn("BindsTo=dusky_vnc_desktop.service", display_unit.read_text())
+            self.assertIn("second_display.py", display_unit.read_text())
+
     def test_interpreter_alias_does_not_change_service_command(self):
         with patch.object(common.sys, "executable", "/usr/bin/python"):
             first = common.script_command(Path(desktop.__file__), "serve")

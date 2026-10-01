@@ -37,7 +37,7 @@ OFFLINE_PROFILE = "arch-ios-offline"
 
 def unit_content() -> str:
     return (
-        "[Unit]\nDescription=WayVNC for the active Hyprland session\n"
+        "[Unit]\nDescription=VNC desktop sharing over WayVNC\n"
         "After=graphical-session.target\nPartOf=graphical-session.target\n"
         "StartLimitIntervalSec=0\n\n"
         "[Service]\nType=exec\n"

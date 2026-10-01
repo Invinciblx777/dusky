@@ -1405,7 +1405,7 @@ type = "service"
 title = "WayVNC Desktop Sharing"
 description = "Mirror primary desktop screen (TCP 5902)"
 icon = "video-display-symbolic"
-service = "dusky_vnc.service"
+service = "dusky_vnc_desktop.service"
 scope = "user"
 
 [[pages.layout.items.layout.items]]
@@ -1414,7 +1414,7 @@ type = "service"
 title = "WayVNC Secondary Display"
 description = "Virtual secondary monitor (TCP 5901)"
 icon = "video-joined-displays-symbolic"
-service = "dusky_phone_display.service"
+service = "dusky_vnc_display.service"
 scope = "user"
 
 [[pages.layout.items.layout.items]]

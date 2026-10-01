@@ -6,6 +6,9 @@ to the right of the other displays. Portrait mode uses 720×1280.
 Both displays accept clients on phones, tablets and other PCs. Run these scripts
 on the Linux/Hyprland server; install a viewer on the receiving device.
 The `second_display.py` filename identifies the secondary-display script.
+If a setup script is renamed or moved, rerun its setup to regenerate the
+installed service's launch and cleanup paths. A stale cleanup path can stop
+WayVNC while leaving its virtual monitor attached to Hyprland.
 Port 5900 is deliberately avoided because local QEMU consoles commonly use it.
 
 Run setup as the desktop user in a running Hyprland session:
@@ -18,6 +21,13 @@ Run setup as the desktop user in a running Hyprland session:
 ./second_display.py orientation portrait
 ./second_display.py orientation landscape
 ```
+
+The scripts deploy their own service files on first run; no manual unit-file
+installation is required. `vnc_setup.py` writes `dusky_vnc_desktop.service`.
+`second_display.py` writes `dusky_vnc_display.service` and also deploys the
+desktop service. Units go in `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user`,
+then setup reloads systemd and enables/starts them. The service TUI discovers
+these installed units and toggles them; it is not the deployment step.
 
 Setup creates the configuration and user units, prioritizes a UFW allowance for
 TCP ports 5901 and 5902 when UFW is installed, and enables/starts the services. It requires
@@ -85,8 +95,8 @@ addresses inside the receiving device's viewer. Existing positional actions rema
 The main switch controls both Dusky VNC services:
 
 ```sh
-systemctl --user enable --now dusky_vnc.service
-systemctl --user disable --now dusky_vnc.service
+systemctl --user enable --now dusky_vnc_desktop.service
+systemctl --user disable --now dusky_vnc_desktop.service
 ```
 
 The service TUI already uses `--now`. Plain `enable`/`disable` controls automatic
@@ -120,6 +130,18 @@ networks/client isolation can still block access. IPv6-only networks and
 cross-subnet router configurations were not tested; these scripts listen on IPv4.
 
 ## Verification on 2026-10-01
+
+The renamed service files were removed temporarily and both actual `--setup`
+commands recreated them, enabled them and reached Ready. The subsequent
+disable/stop removed the secondary monitor and ownership record. Both renamed
+services were left disabled/inactive with zero main PID; routes stayed unchanged.
+
+After the secondary script was renamed, the installed unit still referenced
+the removed `phone_display.py` path. Its stop hook failed and left `DUSKY-PHONE`
+attached. The unit now uses `second_display.py` for both launch and cleanup.
+A complete three-service on/off cycle passed afterwards: only the physical
+screen remained, both virtual monitors and ownership records were removed,
+all services were inactive/disabled with zero main PID, and routes stayed unchanged.
 
 Tested with Python 3.14.7, Rich 15.0.0, systemd 262, Hyprland 0.56.2,
 WayVNC 0.10.1, NeatVNC 1.0.1, NetworkManager 1.58.1, UFW 0.36.2,
@@ -174,7 +196,8 @@ Focused, non-mutating regressions:
 python -m unittest discover -s user_scripts/networking/vnc -p 'test_*.py'
 ```
 
-Twenty-nine tests cover fragmented/wrong/closed/timed-out RFB responses, malformed
+Thirty-one tests cover first-run deployment into empty directories,
+fragmented/wrong/closed/timed-out RFB responses, malformed
 control replies, active/idle Wi-Fi selection, offline refusal, settings reads,
 atomic writes, cleanup ownership recovery, firewall idempotence/error reporting,
 offline profile reuse, stable service commands across Python aliases, batched

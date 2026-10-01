@@ -16,6 +16,23 @@ def result(stdout="", code=0):
 
 
 class MoonlightTests(unittest.TestCase):
+    def test_first_setup_writes_and_enables_unit_in_empty_directory(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            unit = Path(directory) / moon.UNIT_NAME
+            stack.enter_context(patch.object(moon, "UNIT", unit))
+            for name in ("ensure_dependencies", "sunshine_package", "configure_firewall", "status", "open_pairing_page"):
+                stack.enter_context(patch.object(moon, name))
+            for name, value in {"session": {"instance": "session"}, "preferences": {}, "write_config": False, "repair_duplicate_pairings": 0, "ready": True}.items():
+                stack.enter_context(patch.object(moon, name, return_value=value))
+            def command(*args, **kwargs):
+                return result("disabled" if "is-enabled" in args else "inactive" if "is-active" in args else "")
+            run = stack.enter_context(patch.object(moon, "run", side_effect=command))
+            self.assertFalse(unit.exists())
+            moon.setup(None)
+            self.assertEqual(unit.read_text(), moon.unit_content())
+            for command in ("daemon-reload", "enable", "start"):
+                self.assertTrue(any(command in call.args for call in run.call_args_list))
+
     def test_serverinfo_accepts_free_and_busy_servers(self):
         for state in ("SUNSHINE_SERVER_FREE", "SUNSHINE_SERVER_BUSY"):
             with self.subTest(state=state), patch.object(moon.http.client, "HTTPConnection") as connect:
