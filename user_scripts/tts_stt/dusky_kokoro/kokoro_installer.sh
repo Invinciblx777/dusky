@@ -27,7 +27,7 @@
 set -Eeuo pipefail
 shopt -s inherit_errexit
 
-INSTALLER_VERSION="5.1.0"
+INSTALLER_VERSION="5.1.1"
 PY_SERIES="3.14"
 KOKORO_ONNX_VERSION="0.6.1"     # pinned; its metadata is overridden below (see write_pyproject)
 ORT_MIN="1.27"
@@ -251,13 +251,13 @@ choose_hw() {
 
 choose_models() {
     local default
-    case "$HW" in nvidia|amd) default="fp16-gpu,int8" ;; *) default="int8" ;; esac
+    case "$HW" in intel) default="f32,int8" ;; *) default="fp16-gpu,int8" ;; esac
     if [[ -n "$MODELS" ]]; then :;
     elif (( ASSUME_YES )) || [[ ! -t 0 ]]; then MODELS="$default"
     else
         echo
         echo "Select the model precision files to download:"
-        echo "  1) fp16-gpu  177 MB  tested GPU model (model-files-v1.0)"
+        echo "  1) fp16-gpu  177 MB  tested fast CPU/CUDA export (model-files-v1.0)"
         echo "  2) int8      92 MB   quantised compact              (compact CPU model; benchmark on target hardware)"
         echo "  3) f32       326 MB  full precision float32"
         echo "  4) fp16      164 MB  newer export (validate on the target provider)"
@@ -435,37 +435,33 @@ download() {  # key
     tmp="$dest.part"
     if [[ -f "$dest" ]]; then
         actual=$(stat -c %s "$dest")
-        if [[ "$size" == 0 && "$actual" -gt 1000000 ]] || [[ "$actual" == "$size" ]]; then
+        if [[ "$actual" == "$size" ]]; then
             if verify_model "$dest" "$key"; then
                 ok "present: $name ($actual bytes)"
                 return 0
             fi
-            warn "$name failed validation - downloading again"
+            warn "$name failed validation"
+        else
+            warn "$name has $actual bytes (expected $size)"
         fi
-        warn "$name has $actual bytes (expected $size) - downloading again"
-        (( OFFLINE )) && die "offline mode requires a valid model at $dest"
-        rm -f "$dest"
     fi
-    (( OFFLINE )) && die "offline mode requires a valid model at $dest"
-    if [[ -f "$tmp" && $(stat -c %s "$tmp") -ge "$size" && "$size" != 0 ]]; then
+    if [[ -f "$tmp" && $(stat -c %s "$tmp") -ge "$size" ]]; then
         if [[ $(stat -c %s "$tmp") == "$size" ]] && verify_model "$tmp" "$key"; then
             mv -f "$tmp" "$dest"
             ok "recovered complete download: $name"
             return 0
         fi
+        (( OFFLINE )) && die "offline mode requires a valid model at $dest or $tmp"
         rm -f "$tmp"
     fi
+    (( OFFLINE )) && die "offline mode requires a valid model at $dest or $tmp"
     info "downloading $name"
     curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 --continue-at - \
          --progress-bar --output "$tmp" "$url"
     actual=$(stat -c %s "$tmp")
-    if [[ "$size" != 0 && "$actual" != "$size" ]]; then
+    if [[ "$actual" != "$size" ]]; then
         rm -f "$tmp"
         die "$name: got $actual bytes, expected $size (partial/corrupt download removed - re-run the installer)"
-    fi
-    if [[ "$size" == 0 && "$actual" -lt 1000000 ]]; then
-        rm -f "$tmp"
-        die "$name: downloaded file is too small ($actual bytes) - partial/corrupt download removed"
     fi
     magic=$(head -c 2 "$tmp" | od -An -tx1 | tr -d ' \n')
     case "$name" in

@@ -1,4 +1,112 @@
-# Dusky Kokoro audit — 2026-09-30
+# Dusky Kokoro final pass — 2026-10-01
+
+## Current result: 5.1.1
+
+The source and installed runtime are now 5.1.1. CPU and CUDA long runs, fresh
+cached CPU installation, repeated offline installation, playback failure
+recovery, socket activation and custom paths passed. Existing user configuration
+was preserved. **45 regression tests pass**, including installer and TUI fixtures.
+Python compilation, Bash syntax and ShellCheck pass. Results below supersede
+CPU model defaults and test counts in the historical September 30 report.
+
+### Changes in this pass
+
+- Automatic CPU selection now prefers the tested FP16 GPU export, which also
+  runs on CPU, followed by f32 and INT8. CPU installs cache FP16 GPU plus INT8;
+  explicit precision remains authoritative. Intel installations prefer f32.
+- Stop and newer interrupt requests invalidate older text preparation. A full
+  enqueue queue rejects before expensive preparation. Worker startup timeout
+  covers configuration transfer, and pipe/JSON/timeout failures reap the worker.
+  A replacement worker waits for interrupted workers to finish exiting.
+- Archive finalization failure no longer leaves waiting clients without a final
+  event. Invalid WAVs are removed when possible; narration continues after
+  archive failures. Worker telemetry reports the actual fallback model.
+- Offline installation recovers a valid complete `.part` even when the target
+  file is invalid, and preserves invalid files when recovery is impossible.
+- Both TUIs honor custom trigger paths; the Bash TUI also reads the saved install
+  location without requiring a trailing newline. Status uses the actual socket's
+  PID directory. GPU telemetry discovers DRM cards and filters the requested
+  provider's vendor instead of assuming card0/card1.
+
+### Measured CPU choice and P/E cores
+
+This host has six P cores and eight E cores. Isolated eight-thread short-phrase
+runs took **4.49 s with INT8 versus 0.91–0.92 s with FP16 GPU**: approximately
+4.9× faster for the same input text (audio differs slightly: 2.219 versus 2.304 s).
+This is an observed CPU inference gain on this host, not a hardware-wide promise.
+Longer FP16 CPU phrases of 211/320 characters took about 4.00/5.57 s for
+12.95/17.71 s of audio. The latest v1.1 f32 export was also tested, but took
+about 4.54/6.33 s. Sampled peak synthesis-process RSS was approximately
+710 MiB for FP16 GPU versus 882 MiB for f32; INT8 remains a smaller download.
+
+For the faster model, a separate isolated scheduling comparison gave warm
+short-phrase timings of 1.106–1.107 s at four threads, 0.913–0.920 s at eight,
+1.78–1.94 s at fourteen, and 0.913–0.921 s on the six P cores alone.
+P-core affinity provided no meaningful advantage over eight threads with normal
+OS scheduling. Disabling spinning on P cores took 0.955–1.063 s. Keep normal
+scheduling, the automatic eight-thread cap and explicit overrides. Automatic
+thread counts honor the process's available CPUs, including a single-CPU limit.
+[ONNX Runtime threading documentation](https://onnxruntime.ai/docs/performance/tune-performance/threading.html)
+
+### Stress and recovery results
+
+| Final workload | Result |
+| --- | --- |
+| CUDA: 251 segments | 1403.82 s of archived audio in 149.13 s; warm first audio 719 ms |
+| CPU: 36 segments | 196.87 s of archived audio in 73.97 s; warm first audio 2104 ms |
+| Sampled daemon RSS | 52.2 MiB CUDA; 52.0 MiB CPU; synthesis-worker memory is additional |
+| Maximum observed status latency during narration | 73.4 ms CUDA; 91.8 ms CPU |
+| Recovery | Each profile passed 30 stop/unload cycles, reload, two 4-million-character preparation races, final synthesis and shutdown; no observed orphan workers |
+| Archive integrity | WAV sample counts agree with reported durations |
+| Tight CUDA arena budgets | 256/512 MiB completed with CPU fallback; 1024 MiB stayed on CUDA |
+| Sampled process VRAM for those budgets | 388/622/790 MiB, respectively; not a total VRAM cap or a measured maximum for all documents |
+| Accelerator required at 256 MiB | Failure reported instead of silent CPU fallback |
+| Actual mpv failure | Terminal error delivered; next job completed after configuration reload |
+| Invalid archive directory | Playback completed with archive=null |
+| Temporary systemd units | Verification, cold activation, headless synthesis, idle exit and reactivation passed with paths containing spaces; units removed afterward |
+
+Headless playback used mpv's untimed null output. Throughput runs are completion
+and responsiveness checks, not matched before/after CUDA speed measurements.
+Concurrent workloads occurred during the CUDA run; no GPU speedup is claimed.
+CPU model/scheduling comparisons above were run separately without other audit
+inference workloads. First-audio measurements above followed a loaded engine.
+
+A fresh CPU-only environment with cached dependencies and models passed its
+installation self-test (RTF around 0.31 and effective speed control). Installed
+CUDA self-test also passed. A request through the installed trigger and actual
+Wayland/audio device completed 3.45 s of speech with a valid archive and final
+event, followed by automatic service idle exit. A one-CPU affinity fixture also
+completed synthesis and speed-control verification. In the CPU-only environment,
+requesting CUDA completed through CPU fallback, while requiring acceleration
+failed correctly. Physical 2 GiB/older GPUs, AMD, Intel acceleration,
+other CPU architectures, and perceptual language correctness remain unqualified.
+The historical language limitations below still apply. Final ISO package/build
+qualification is still required; no per-machine P/E affinity policy was added.
+
+### Reproduce this final pass
+
+```sh
+python3 -m unittest discover -s tests -v
+python3 -m py_compile dusky_main.py tui_kokoro.py tests/*.py
+bash -n kokoro_installer.sh trigger.sh tui/kokoro_tui.sh
+shellcheck kokoro_installer.sh trigger.sh tui/kokoro_tui.sh
+# Resolve the saved install location, or export DUSKY_HOME for another install:
+IFS= read -r install_dir < "${XDG_CONFIG_HOME:-$HOME/.config}/dusky-kokoro/install-path" || true
+install_dir=${DUSKY_HOME:-$install_dir}
+"$install_dir/.venv/bin/python" tests/stress_kokoro.py --models-dir "$install_dir/models" --provider cuda
+"$install_dir/.venv/bin/python" tests/stress_kokoro.py --models-dir "$install_dir/models" --provider cpu --paragraphs 35
+./trigger.sh --synth
+```
+
+Final-pass JSON, WAVs, benchmarks and logs: `/tmp/dusky-kokoro-final` (temporary).
+The three new regression/stress files are untracked and must be included in the
+ISO source/package. The existing `trigger.sh` is ignored by the dotfiles
+repository; its local recovery fix must also be retained. Nothing was staged
+or committed.
+
+---
+
+# Historical audit — 2026-09-30
 
 ## Result and scope
 
@@ -203,7 +311,7 @@ python3 -m unittest discover -s tests -v
 python3 -m py_compile dusky_main.py tui_kokoro.py
 bash -n kokoro_installer.sh trigger.sh tui/kokoro_tui.sh
 shellcheck kokoro_installer.sh trigger.sh tui/kokoro_tui.sh
-./trigger.sh --doctor-synth
+./trigger.sh --synth
 systemd-analyze --user verify "$HOME/.config/systemd/user/dusky-kokoro.service" "$HOME/.config/systemd/user/dusky-kokoro.socket"
 ```
 

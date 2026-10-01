@@ -14,8 +14,14 @@ shopt -s extglob
 
 declare -r CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/dusky-kokoro"
 declare -r CONFIG_FILE="${DUSKY_CONFIG:-$CONFIG_DIR/config.toml}"
-declare -r CONTAINED_DIR="${DUSKY_HOME:-$HOME/contained_apps/uv/dusky_kokoro}"
-declare -r TRIGGER_SCRIPT="${HOME}/user_scripts/tts_stt/dusky_kokoro/trigger.sh"
+CONTAINED_DIR="${DUSKY_HOME:-}"
+if [[ -z "$CONTAINED_DIR" && -r "$CONFIG_DIR/install-path" ]]; then
+    IFS= read -r CONTAINED_DIR < "$CONFIG_DIR/install-path" || true
+fi
+declare -r CONTAINED_DIR="${CONTAINED_DIR:-$HOME/contained_apps/uv/dusky_kokoro}"
+TRIGGER_SCRIPT="$(cd -- "$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")/.." && pwd)/trigger.sh"
+declare -r TRIGGER_SCRIPT
+declare DAEMON_PID_FILE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/dusky-kokoro/daemon.pid"
 
 declare -r APP_TITLE="Dusky Kokoro TTS Setup"
 declare -r APP_VERSION="v5.2.0"
@@ -167,8 +173,26 @@ clear_status() {
     declare -g STATUS_MESSAGE=""
 }
 
+resolve_daemon_pid_file() {
+    python3 - "$CONFIG_FILE" <<'PY'
+import os, sys, tomllib
+from pathlib import Path
+try:
+    with open(sys.argv[1], "rb") as stream:
+        config = tomllib.load(stream)
+except (OSError, tomllib.TOMLDecodeError):
+    config = {}  # Keep the editor usable while repairing an invalid config.
+socket = os.environ.get("DUSKY_SOCKET") or config.get("daemon", {}).get("socket_path")
+if socket:
+    directory = Path(os.path.expandvars(os.path.expanduser(socket))).parent
+else:
+    directory = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "dusky-kokoro"
+print(directory / "daemon.pid")
+PY
+}
+
 check_daemon_status() {
-    local pid_file="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/dusky-kokoro/daemon.pid"
+    local pid_file="$DAEMON_PID_FILE"
     if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
         DAEMON_STATUS_UI="${C_GREEN}● RUNNING${C_RESET}"
         DAEMON_IS_RUNNING="1"
@@ -1357,7 +1381,7 @@ main() {
     if (( BASH_VERSINFO[0] < 5 )); then log_err "Bash 5.0+ required"; exit 1; fi
     if [[ ! -t 0 ]]; then log_err "TTY required"; exit 1; fi
     local _dep
-    for _dep in awk realpath; do
+    for _dep in awk realpath python3; do
         if ! command -v "$_dep" &>/dev/null; then
             log_err "Missing dependency: ${_dep}"
             exit 1
@@ -1370,6 +1394,7 @@ main() {
 
     register_items
     populate_config_cache
+    DAEMON_PID_FILE=$(resolve_daemon_pid_file)
 
     ORIGINAL_STTY=$(stty -g 2>/dev/null) || ORIGINAL_STTY=""
     enable_raw_mode

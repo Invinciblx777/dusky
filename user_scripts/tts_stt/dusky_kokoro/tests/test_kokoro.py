@@ -10,7 +10,8 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock, Mock
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("dusky", ROOT / "dusky_main.py")
@@ -145,12 +146,36 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             for name in dusky.MODEL_FILES.values():
                 (Path(td) / name).touch()
-            self.assertEqual(dusky.choose_model("auto", "cpu", Path(td))[0], "int8")
+            self.assertEqual(dusky.choose_model("auto", "cpu", Path(td))[0], "fp16-gpu")
             self.assertEqual(dusky.choose_model("auto", "cuda", Path(td))[0], "fp16-gpu")
+            self.assertEqual(dusky.choose_model("auto", "openvino", Path(td))[0], "f32")
+            self.assertEqual(dusky.choose_model("int8", "cpu", Path(td))[0], "int8")
+            (Path(td) / dusky.MODEL_FILES["fp16-gpu"]).unlink()
+            self.assertEqual(dusky.choose_model("auto", "cpu", Path(td))[0], "f32")
+            (Path(td) / dusky.MODEL_FILES["f32"]).unlink()
+            self.assertEqual(dusky.choose_model("auto", "cpu", Path(td))[0], "int8")
 
     def test_provider_fallback(self):
         self.assertEqual(dusky.provider_chain("cuda", ["CPUExecutionProvider"]), ["cpu"])
         self.assertEqual(dusky.provider_chain("auto", ["MIGraphXExecutionProvider", "CPUExecutionProvider"]), ["migraphx", "cpu"])
+
+    def test_archive_close_failure_removes_invalid_wav(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "broken.wav"
+            path.touch()
+            writer = dusky.ArchiveWriter.__new__(dusky.ArchiveWriter)
+            writer.path = path
+            writer.frames = 1
+            writer._wf = SimpleNamespace(close=Mock(side_effect=OSError("disk failure")))
+            with self.assertRaises(OSError):
+                writer.close()
+            self.assertFalse(path.exists())
+
+    def test_diagnostic_rejects_invalid_speed(self):
+        for speed in (0, float("nan"), 3):
+            args = dusky.build_parser().parse_args(["synth", "--speed", str(speed)])
+            with self.subTest(speed=speed), self.assertRaises(dusky.ConfigError):
+                dusky.run_synth(args, cfg=dusky.Config(), config_file=Path("/none"))
 
     def test_wayland_command(self):
         player = dusky.MpvPlayer(dusky.PlaybackConfig(), {"WAYLAND_DISPLAY": "wayland-1"}, "Test")
@@ -172,6 +197,115 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.daemon, "_send", self.send):
             await self.daemon._cmd_speak({"text": "Test sentence.", "mode": "enqueue", **args}, None)
         return self.messages[-1]
+
+    async def test_stop_discards_text_still_being_prepared(self):
+        started, release = asyncio.Event(), asyncio.Event()
+        async def prepare(fn, *args):
+            started.set()
+            await release.wait()
+            return fn(*args)
+        with patch.object(self.daemon, "_send", self.send), patch.object(dusky.asyncio, "to_thread", prepare):
+            task=asyncio.create_task(self.daemon._cmd_speak({"text": "Old text.", "mode": "interrupt"}, None))
+            await started.wait()
+            self.daemon.stop_all("stop command")
+            release.set()
+            await task
+        self.assertTrue(self.daemon.jobs.empty())
+        self.assertEqual(self.messages[-1]["event"], "cancelled")
+
+    async def test_new_interrupt_supersedes_older_preparation(self):
+        started, release = asyncio.Event(), asyncio.Event()
+        async def prepare(fn, *args):
+            if args[0] == "Old text.":
+                started.set()
+                await release.wait()
+            return fn(*args)
+        with patch.object(self.daemon, "_send", self.send), patch.object(dusky.asyncio, "to_thread", prepare):
+            task=asyncio.create_task(self.daemon._cmd_speak({"text": "Old text.", "mode": "interrupt"}, None))
+            await started.wait()
+            await self.daemon._cmd_speak({"text": "New text.", "mode": "interrupt"}, None)
+            release.set()
+            await task
+        self.assertEqual(self.daemon.jobs.get_nowait().preview, "New text.")
+        self.assertEqual(self.messages[-1]["event"], "cancelled")
+
+    async def test_archive_finalize_failure_still_finishes_job(self):
+        job = dusky.Job(id="test", preview="Test", title="test", digest="test",
+                        segments=[dusky.Segment("Test.", 0)], chars=5,
+                        voice_spec="af_heart", speed=1.0, lang="en-us",
+                        mode="enqueue", env={}, client="test")
+        job.subscribers.append(asyncio.Queue())
+        player = SimpleNamespace(start=AsyncMock(), write=AsyncMock(), end_input=AsyncMock(),
+                                 wait=AsyncMock(return_value=0), stop=AsyncMock(), end_reason=None)
+        archive = SimpleNamespace(path=Path("/tmp/test.wav"), write=Mock(),
+                                  close=Mock(side_effect=OSError("disk failure")))
+        self.daemon.engine.ensure_loaded = AsyncMock()
+        self.daemon.engine.synthesize = AsyncMock(return_value=b"\0" * 96)
+        with patch.object(dusky, "MpvPlayer", return_value=player), patch.object(dusky.ArchiveWriter, "create", return_value=archive):
+            await self.daemon._run_job(job)
+        messages=[]
+        while not job.subscribers[0].empty():
+            messages.append(job.subscribers[0].get_nowait())
+        self.assertEqual(messages[-1]["event"], "finished")
+        self.assertIsNone(messages[-1]["archive"])
+
+    async def test_startup_pipe_failure_reaps_worker(self):
+        engine = self.daemon.engine
+        proc = SimpleNamespace(stdout=SimpleNamespace(readline=AsyncMock()),
+                               stdin=SimpleNamespace(write=Mock(), drain=AsyncMock(side_effect=BrokenPipeError()), close=Mock()),
+                               returncode=None, terminate=Mock(), wait=AsyncMock(), pid=123)
+        with patch.object(dusky.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)):
+            with self.assertRaises(dusky.EngineError):
+                await engine.ensure_loaded()
+        self.assertIsNone(engine._worker_proc)
+        proc.terminate.assert_called_once()
+        proc.wait.assert_awaited_once()
+
+    async def test_malformed_startup_reaps_worker(self):
+        engine = self.daemon.engine
+        proc = SimpleNamespace(stdout=SimpleNamespace(readline=AsyncMock(return_value=b"bad json\n")),
+                               stdin=SimpleNamespace(write=Mock(), drain=AsyncMock(), close=Mock()),
+                               returncode=None, terminate=Mock(), wait=AsyncMock(), pid=123)
+        with patch.object(dusky.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)):
+            with self.assertRaisesRegex(dusky.EngineError, "malformed ready"):
+                await engine.ensure_loaded()
+        self.assertFalse(engine.loaded)
+        proc.terminate.assert_called_once()
+        proc.wait.assert_awaited_once()
+
+    async def test_startup_drain_timeout_reaps_worker(self):
+        engine = self.daemon.engine
+        engine.cfg = dataclasses.replace(engine.cfg, engine=dataclasses.replace(
+            engine.cfg.engine, worker_start_timeout_s=0.01))
+        async def stalled():
+            await asyncio.Event().wait()
+        proc = SimpleNamespace(stdout=SimpleNamespace(readline=AsyncMock()),
+                               stdin=SimpleNamespace(write=Mock(), drain=stalled, close=Mock()),
+                               returncode=None, terminate=Mock(), wait=AsyncMock(), pid=123)
+        with patch.object(dusky.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)):
+            with self.assertRaisesRegex(dusky.EngineError, "TimeoutError"):
+                await engine.ensure_loaded()
+        self.assertFalse(engine.loaded)
+        proc.terminate.assert_called_once()
+        proc.wait.assert_awaited_once()
+
+    async def test_full_queue_skips_text_preparation(self):
+        await self.speak()
+        with patch.object(dusky.asyncio, "to_thread", AsyncMock(side_effect=AssertionError("unnecessary text work"))):
+            self.assertFalse((await self.speak(text="Large queued text."))["ok"])
+
+    async def test_fallback_model_path_is_reported(self):
+        engine = self.daemon.engine
+        state = json.dumps({"kind": "cpu", "providers": ["CPUExecutionProvider"],
+                            "degraded": True, "precision": "int8", "model": "/models/int8.onnx", "pcm_bytes": 4}).encode()
+        reader = asyncio.StreamReader()
+        reader.feed_data(dusky.struct.pack("<I", len(state)) + state + b"\0" * 4)
+        engine._worker_proc = SimpleNamespace(returncode=None, stdout=reader,
+                                             stdin=SimpleNamespace(write=Mock(), drain=AsyncMock()))
+        engine._loaded = True
+        engine.model_path = Path("/models/gpu.onnx")
+        await engine.synthesize("Test.", "af_heart", 1.0, "en-us", 0)
+        self.assertEqual(engine.model_path, Path("/models/int8.onnx"))
 
     async def test_queue_rejection_does_not_deduplicate_retry(self):
         self.assertEqual((await self.speak())["event"], "accepted")

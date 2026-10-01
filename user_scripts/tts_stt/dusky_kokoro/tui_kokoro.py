@@ -19,6 +19,7 @@ Features:
 import sys
 import os
 import subprocess
+import shlex
 from pathlib import Path
 
 _DUSKY_TUI_ROOT = Path.home() / "user_scripts" / "dusky_tui"
@@ -39,7 +40,7 @@ THEME_FILE = "~/.config/matugen/generated/dusky_tui.json"
 ENABLE_USER_PRESETS = True
 USER_PRESETS_TAB = "Presets"
 
-_TRIGGER_CMD = str(Path.home() / "user_scripts" / "tts_stt" / "dusky_kokoro" / "trigger.sh")
+_TRIGGER_CMD = shlex.quote(str(Path(__file__).resolve().with_name("trigger.sh")))
 
 # =============================================================================
 # 2. VOICE DEFINITIONS & HINTS CATALOG (54 VOICES FROM VOICES.MD)
@@ -423,7 +424,7 @@ SCHEMA = {
             default="auto",
             options=["fp16-gpu", "int8", "f32", "fp16", "auto"],
             group="Hardware Backend",
-            extended_help="**Model Weight Precision**\n\n- `fp16-gpu` (Recommended for GPU): 177 MB; benchmark speed on the target GPU.\n- `int8` (Recommended for CPU): 92 MB, compact quantized CPU model.\n- `auto`: Selects the tested fp16-gpu export on GPU providers and int8 on CPU.",
+            extended_help="**Model Weight Precision**\n\n- `fp16-gpu`: 177 MB; tested fast default on CPU and CUDA.\n- `int8`: 92 MB, compact export; not necessarily faster on CPU.\n- `auto`: Prefers the tested fp16-gpu export on CPU/CUDA and f32 on OpenVINO.",
         ),
         ConfigItem(
             label="GPU VRAM Limit (MB)",

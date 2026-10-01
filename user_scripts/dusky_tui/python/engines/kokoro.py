@@ -19,6 +19,7 @@ import math
 import os
 import re
 import socket
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -267,11 +268,17 @@ class KokoroEngine(TomlEngine):
             "weight_3": 0.00,
         }
 
+    def _socket_path(self) -> Path:
+        configured = self.cache.get("daemon.socket_path") or self.cache.get("daemon/socket_path")
+        value = os.environ.get("DUSKY_SOCKET") or configured
+        if value:
+            return Path(os.path.expandvars(str(value))).expanduser()
+        runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+        return Path(runtime) / "dusky-kokoro/control.sock"
+
     def _trigger_reload(self) -> None:
         """Attempts live socket IPC reload, then falls back to trigger.sh --reload."""
-        runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
-        configured = self.cache.get("daemon.socket_path") or self.cache.get("daemon/socket_path") or ""
-        sock_path = Path(os.path.expandvars(os.environ.get("DUSKY_SOCKET") or str(configured))).expanduser() if (os.environ.get("DUSKY_SOCKET") or configured) else Path(runtime_dir) / "dusky-kokoro" / "control.sock"
+        sock_path = self._socket_path()
         if sock_path.exists():
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
@@ -283,7 +290,8 @@ class KokoroEngine(TomlEngine):
             except Exception:
                 pass
 
-        trigger_sh = Path.home() / "user_scripts" / "tts_stt" / "dusky_kokoro" / "trigger.sh"
+        trigger_sh = Path(shutil.which("dusky-kokoro") or
+                          Path.home() / "user_scripts" / "tts_stt" / "dusky_kokoro" / "trigger.sh")
         if trigger_sh.exists() and os.access(trigger_sh, os.X_OK):
             try:
                 subprocess.Popen(
@@ -314,7 +322,7 @@ class KokoroEngine(TomlEngine):
                     self.cache[k] = val
 
         # Status telemetry injection
-        pid_file = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "dusky-kokoro/daemon.pid"
+        pid_file = self._socket_path().with_name("daemon.pid")
         is_running = False
         status_str = "STOPPED"
         if pid_file.exists():
@@ -349,14 +357,21 @@ class KokoroEngine(TomlEngine):
             except Exception:
                 pass
 
-        gpu_state = "Unknown"
-        for card_path in [Path("/sys/class/drm/card0/device/power_state"), Path("/sys/class/drm/card1/device/power_state")]:
-            if card_path.exists():
+        provider = str(self.cache.get("engine.provider", "auto"))
+        vendor = {"cuda": "0x10de", "tensorrt": "0x10de", "migraphx": "0x1002", "openvino": "0x8086"}.get(provider)
+        states = []
+        if provider != "cpu":
+            for device in sorted(Path("/sys/class/drm").glob("card[0-9]*/device")):
+                if not re.fullmatch(r"card\d+", device.parent.name):
+                    continue
                 try:
-                    gpu_state = card_path.read_text().strip()
-                    break
+                    if vendor and (device / "vendor").read_text().strip() != vendor:
+                        continue
+                    state = (device / "power_state").read_text().strip()
+                    states.append(f"{device.parent.name}: {state}")
                 except OSError:
                     pass
+        gpu_state = "; ".join(states) or ("Not used (CPU)" if provider == "cpu" else "Unknown")
 
         self.cache["daemon.status"] = status_str
         self.cache["daemon/status"] = status_str

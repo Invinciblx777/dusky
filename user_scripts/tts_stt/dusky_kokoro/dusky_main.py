@@ -71,7 +71,7 @@ from pathlib import Path
 from typing import Any, Final, Literal, NoReturn, get_type_hints, get_origin, get_args
 from urllib.parse import urlsplit
 
-VERSION: Final = "5.1.0"
+VERSION: Final = "5.1.1"
 PROTOCOL: Final = 1
 APP_NAME: Final = "dusky-kokoro"
 APP_DIR: Final = Path(__file__).resolve().parent
@@ -340,7 +340,7 @@ DEFAULT_CONFIG_TOML: Final = """# Dusky Kokoro TTS - configuration (TOML)
 
 [engine]
 provider = "auto"          # auto | cuda | tensorrt | migraphx | openvino | cpu
-precision = "auto"         # auto | f32 | fp16 | fp16-gpu | int8  (auto: fp16-gpu on GPU providers, int8 on CPU)
+precision = "auto"         # auto | f32 | fp16 | fp16-gpu | int8  (auto: tested fp16-gpu on CPU/CUDA; f32 on OpenVINO)
 models_dir = ""            # "" = <install dir>/models
 voices_file = ""           # "" = <models_dir>/voices-v1.0.bin
 device_id = 0
@@ -1283,7 +1283,7 @@ def choose_model(precision: str, kind: str, models_dir: Path) -> tuple[str, Path
             present = [k for k, f in MODEL_FILES.items() if (models_dir / f).is_file()]
             raise EngineError(f"model for precision '{precision}' missing at {path}; present: {present or 'none'}")
         return precision, path
-    order = ("fp16-gpu", "f32", "fp16", "int8") if kind in GPU_KINDS else ("int8", "f32", "fp16", "fp16-gpu")
+    order = ("fp16-gpu", "f32", "int8", "fp16") if kind in GPU_KINDS or kind == "cpu" else ("f32", "fp16-gpu", "int8", "fp16")
     for candidate in order:
         path = models_dir / MODEL_FILES[candidate]
         if path.is_file():
@@ -1348,36 +1348,38 @@ class Engine:
                 if not self.loaded:
                     await self._unload_worker("restart failed worker")
                     script_path = str(Path(__file__).resolve())
-                    self._worker_proc = await asyncio.create_subprocess_exec(
+                    await asyncio.gather(*self._reaping, return_exceptions=True)
+                    proc = await asyncio.create_subprocess_exec(
                         sys.executable, "-u", script_path, "synth-worker",
                         "--config", str(self.paths.config_file),
                         stdin=asyncio.subprocess.PIPE,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=None,
                     )
-                    assert self._worker_proc.stdout is not None
-                    assert self._worker_proc.stdin is not None
-                    self._worker_proc.stdin.write(json.dumps({
-                        "config": dataclasses.asdict(self.cfg),
-                        "models_dir": str(self.paths.models_dir), "voices_file": str(self.paths.voices_file),
-                    }).encode() + b"\n")
-                    await self._worker_proc.stdin.drain()
+                    self._worker_proc = proc
                     try:
                         async with asyncio.timeout(self.cfg.engine.worker_start_timeout_s):
-                            line = await self._worker_proc.stdout.readline()
-                    except BaseException:
-                        await self._unload_worker("worker startup interrupted")
-                        raise
-                    if not line:
+                            assert proc.stdin is not None and proc.stdout is not None
+                            proc.stdin.write(json.dumps({
+                                "config": dataclasses.asdict(self.cfg),
+                                "models_dir": str(self.paths.models_dir), "voices_file": str(self.paths.voices_file),
+                            }).encode() + b"\n")
+                            await proc.stdin.drain()
+                            line = await proc.stdout.readline()
+                            if not line:
+                                raise EngineError("synthesis worker failed to start (see daemon logs)")
+                            try:
+                                ready = json.loads(line)
+                            except (ValueError, UnicodeError) as exc:
+                                raise EngineError(f"malformed ready signal from synthesis worker: {exc}") from exc
+                            if not isinstance(ready, dict) or not ready.get("ok"):
+                                error = ready.get("error") if isinstance(ready, dict) else "invalid ready object"
+                                raise EngineError(f"synthesis worker error: {error}")
+                    except BaseException as exc:
                         await self._unload_worker("worker startup failed")
-                        raise EngineError("synthesis worker failed to start (see daemon logs)")
-                    try:
-                        ready = json.loads(line.decode("utf-8"))
-                    except Exception as exc:
-                        raise EngineError(f"malformed ready signal from synthesis worker: {exc}") from exc
-                    if not ready.get("ok"):
-                        await self._unload_worker("worker load failed")
-                        raise EngineError(f"synthesis worker error: {ready.get('error')}")
+                        if isinstance(exc, (ConnectionError, TimeoutError)):
+                            raise EngineError(f"synthesis worker startup failed: {type(exc).__name__}") from exc
+                        raise
                     self.active_providers = ready.get("providers", [])
                     self.active_kind = ready.get("kind", "none")
                     self.model_precision = ready.get("precision", "none")
@@ -1388,7 +1390,7 @@ class Engine:
                     self.stats.last_load_s = ready.get("load_s", 0.0)
                     self._loaded = True
                     log.info("Synthesis worker ready (pid %d); engine=%s; providers=%s",
-                             self._worker_proc.pid, self.active_kind, self.active_providers)
+                             proc.pid, self.active_kind, self.active_providers)
         self.touch()
 
     async def _unload_worker(self, reason: str) -> None:
@@ -1443,6 +1445,7 @@ class Engine:
                 self.active_providers = state["providers"]
                 self.degraded = state["degraded"]
                 self.model_precision = state["precision"]
+                self.model_path = Path(state["model"])
                 if state.get("error"):
                     raise EngineError(state["error"])
                 pcm = await proc.stdout.readexactly(state["pcm_bytes"])
@@ -1572,9 +1575,9 @@ class Engine:
             "disabled": ort.GraphOptimizationLevel.ORT_DISABLE_ALL,
         }[e.graph_optimization]
         so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        so.enable_mem_pattern = False   # sequence lengths never repeat: patterns cost memory, save nothing
+        so.enable_mem_pattern = False   # avoid retaining allocation patterns for many dynamic token lengths
         so.enable_cpu_mem_arena = True
-        so.intra_op_num_threads = 2 if kind in GPU_KINDS else self._cpu_threads()
+        so.intra_op_num_threads = min(2, os.process_cpu_count() or 1) if kind in GPU_KINDS else self._cpu_threads()
         so.inter_op_num_threads = 1
         so.log_severity_level = 0 if self.cfg.logging.ort_verbose else 3
         so.add_session_config_entry("session.intra_op.allow_spinning", "1" if e.allow_spinning else "0")
@@ -1765,8 +1768,12 @@ class ArchiveWriter:
         self.frames += len(samples)
 
     def close(self, discard: bool = False, max_files: int = 0) -> None:
-        with contextlib.suppress(Exception):
+        try:
             self._wf.close()
+        except (OSError, wave.Error, struct.error):
+            with contextlib.suppress(OSError):
+                self.path.unlink(missing_ok=True)
+            raise
         if discard or self.frames == 0:
             self.path.unlink(missing_ok=True)
             return
@@ -2101,6 +2108,7 @@ class Daemon:
         self._last_digest_at = 0.0
         self._notified_degraded = False
         self._job_counter = 0
+        self._prepare_generation = 0
         self.is_synthesizing = False
 
     # ---- lifecycle ------------------------------------------------------------
@@ -2319,6 +2327,9 @@ class Daemon:
         if mode not in ("interrupt", "enqueue"):
             await self._send(writer, {"ok": False, "error": f"invalid mode {mode!r}"})
             return
+        if mode == "enqueue" and self.jobs.qsize() >= cfg.daemon.max_queue:
+            await self._send(writer, {"ok": False, "error": f"queue full ({cfg.daemon.max_queue})"})
+            return
         voice_spec = str(req.get("voice") or cfg.voice.spec)
         try:
             VoiceBank.parse_spec(voice_spec)
@@ -2336,7 +2347,11 @@ class Daemon:
         wait = str(req.get("wait") or "accepted")
         raw_env = req.get("env") if isinstance(req.get("env"), dict) else {}
 
+        generation = self._prepare_generation
         paragraphs, segments = await asyncio.to_thread(prepare_text, text, cfg.text, lang)
+        if generation != self._prepare_generation:
+            await self._send(writer, {"ok": True, "event": "cancelled", "reason": "superseded during text preparation"})
+            return
         if not segments:
             await self._send(writer, {"ok": False, "error": "nothing readable after normalisation"})
             return
@@ -2446,6 +2461,7 @@ class Daemon:
 
     # ---- job control ------------------------------------------------------------
     def stop_all(self, reason: str) -> int:
+        self._prepare_generation += 1
         flushed = self._clear_queue(reason)
         job = self.current
         if job is not None and self._job_task is not None and not self._job_task.done() and not job.cancelling:
@@ -2566,7 +2582,8 @@ class Daemon:
                             await asyncio.to_thread(archive.write, pcm)
                         except (OSError, wave.Error, struct.error) as exc:
                             log.warning("archive failed; continuing playback: %s", exc)
-                            await asyncio.to_thread(archive.close, True)
+                            with contextlib.suppress(OSError, wave.Error, struct.error):
+                                await asyncio.to_thread(archive.close, True)
                             archive = None
                 await producer
             finally:
@@ -2611,7 +2628,11 @@ class Daemon:
             if player is not None:
                 await player.stop()
             if archive is not None:
-                await asyncio.to_thread(archive.close, outcome == "error", cfg.archive.max_files)
+                try:
+                    await asyncio.to_thread(archive.close, outcome == "error", cfg.archive.max_files)
+                except (OSError, wave.Error, struct.error) as exc:
+                    log.warning("archive finalization failed: %s", exc)
+                    archive = None
             job.finished_at = time.monotonic()
             job.state = outcome
             job.player = None
@@ -2882,7 +2903,9 @@ def run_synth(args: argparse.Namespace, cfg: Config | None = None, config_file: 
                          "and this sentence exists to measure the real-time factor of the engine.")
     voice_spec = args.voice or cfg.voice.spec
     lang = args.lang or VoiceBank.lang_for(voice_spec, cfg.voice.lang)
-    speed = args.speed or cfg.voice.speed
+    speed = cfg.voice.speed if args.speed is None else args.speed
+    if not 0.5 <= speed <= 2.0:
+        raise ConfigError("speed must be within 0.5 .. 2.0")
     engine = Engine(cfg, paths, VoiceBank(paths.voices_file), is_worker=True)
     report: dict[str, Any] = {"provider_requested": cfg.engine.provider, "voice": voice_spec, "lang": lang, "speed": speed}
     try:
@@ -2927,7 +2950,8 @@ def run_synth(args: argparse.Namespace, cfg: Config | None = None, config_file: 
         with contextlib.suppress(Exception):
             engine._unload_sync("synth done")
         if "writer" in locals():
-            writer.close(discard="error" in report)
+            with contextlib.suppress(OSError, wave.Error, struct.error):
+                writer.close(discard="error" in report)
         if engine._executor is not None:
             engine._executor.shutdown(wait=False, cancel_futures=True)
     print(json.dumps(report, indent=2))
@@ -3115,7 +3139,8 @@ def run_synth_worker(args: argparse.Namespace) -> int:
                 error = f"{type(exc).__name__}: {exc}"
             state = json.dumps({"pcm_bytes": len(pcm), "error": error,
                                 "kind": engine.active_kind, "providers": engine.active_providers,
-                                "degraded": engine.degraded, "precision": engine.model_precision}).encode()
+                                "degraded": engine.degraded, "precision": engine.model_precision,
+                                "model": str(engine.model_path)}).encode()
             sys.stdout.buffer.write(struct.pack("<I", len(state)))
             sys.stdout.buffer.write(state)
             sys.stdout.buffer.write(pcm)
