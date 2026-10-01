@@ -14,6 +14,7 @@ import re
 import sys
 import json
 import shutil
+import shlex
 import fnmatch
 import subprocess
 import tempfile
@@ -367,21 +368,176 @@ def sync_all(local_only: bool = False) -> None:
     stage_entries(scoped_entries(tracked_only=not DOTFILES_LIST.is_file()), local_only=local_only)
 
 
+DIR_PALETTE: list[str] = [
+    "\033[38;5;75m",   # Light Blue (.config)
+    "\033[38;5;141m",  # Purple (user_scripts)
+    "\033[38;5;79m",   # Aqua Green (.local)
+    "\033[38;5;214m",  # Orange (.zshrc / .bashrc)
+    "\033[38;5;213m",  # Pink (.themes / .icons)
+    "\033[38;5;178m",  # Gold
+    "\033[38;5;110m",  # Steel Blue
+    "\033[38;5;174m",  # Rose
+]
+
+KNOWN_DIR_COLORS: dict[str, str] = {
+    ".config": "\033[38;5;75m",
+    "user_scripts": "\033[38;5;141m",
+    ".local": "\033[38;5;79m",
+    ".zshrc": "\033[38;5;214m",
+    ".bashrc": "\033[38;5;214m",
+    ".themes": "\033[38;5;213m",
+    ".icons": "\033[38;5;213m",
+}
+
+
+def format_path_colored(path: str, dir_color_cache: dict[str, str]) -> str:
+    """Formats file path with directory hierarchy color coordination."""
+    parts = path.split("/")
+    if len(parts) == 1:
+        top = parts[0]
+        color = KNOWN_DIR_COLORS.get(top, "")
+        return f"{color}{top}\033[0m" if color else top
+
+    if len(parts) <= 2:
+        base_dir = parts[0] + "/"
+        sub_dir = ""
+        file_name = parts[1]
+    else:
+        base_dir = f"{parts[0]}/{parts[1]}/"
+        sub_dir = "/".join(parts[2:-1]) + "/" if len(parts) > 3 else ""
+        file_name = parts[-1]
+
+    if base_dir not in dir_color_cache:
+        matched_color = None
+        for prefix, col in KNOWN_DIR_COLORS.items():
+            if parts[0] == prefix or parts[0].startswith(prefix):
+                matched_color = col
+                break
+        if not matched_color:
+            idx = len(dir_color_cache) % len(DIR_PALETTE)
+            matched_color = DIR_PALETTE[idx]
+        dir_color_cache[base_dir] = matched_color
+
+    c_base = dir_color_cache[base_dir]
+    if sub_dir:
+        return f"{c_base}{base_dir}\033[0m\033[2m{sub_dir}\033[0m{file_name}"
+    return f"{c_base}{base_dir}\033[0m{file_name}"
+
+
+def get_commit_preview_cmd() -> str:
+    """Constructs preview command for commit hashes, using delta if available."""
+    delta_bin = shutil.which("delta")
+    if delta_bin:
+        return f"git --no-advice show --color=always {{1}} | {shlex.quote(delta_bin)} --paging=never ${{FZF_PREVIEW_COLUMNS:+--width=$FZF_PREVIEW_COLUMNS}}"
+    return "git --no-advice show --color=always {1}"
+
+
+def get_stash_preview_cmd() -> str:
+    """Constructs preview command for git stash entries, using delta if available."""
+    delta_bin = shutil.which("delta")
+    if delta_bin:
+        return f"git --no-advice stash show -p $(printf %s {{1}} | cut -d: -f1) | {shlex.quote(delta_bin)} --paging=never ${{FZF_PREVIEW_COLUMNS:+--width=$FZF_PREVIEW_COLUMNS}}"
+    return "git --no-advice stash show -p $(printf %s {1} | cut -d: -f1)"
+
+
+def get_numstat_map() -> dict[str, str]:
+    """Returns a mapping of relative file paths to colorized (+a, -d) diff badges."""
+    _, numstat_out, _ = run_git("diff", "--numstat", "HEAD")
+    res: dict[str, str] = {}
+    for line in numstat_out.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) == 3:
+            add, delete, path = parts
+            if add == "-" and delete == "-":
+                res[path] = "\033[90m(binary)\033[0m"
+            else:
+                try:
+                    a_int = int(add)
+                    d_int = int(delete)
+                    parts_fmt: list[str] = []
+                    if a_int > 0:
+                        parts_fmt.append(f"\033[32m+{a_int}\033[0m")
+                    if d_int > 0:
+                        parts_fmt.append(f"\033[31m-{d_int}\033[0m")
+                    if parts_fmt:
+                        res[path] = " ".join(parts_fmt)
+                except ValueError:
+                    continue
+    return res
+
+
 def sync_single() -> None:
-    """Select literal filenames, with escaped control characters for display."""
+    """Select literal filenames with live Delta preview and colorized hierarchy."""
     entries = scoped_entries()
-    choices = {}
-    displays = []
+    if not entries:
+        console.print("[green]No matching changes to commit.[/green]")
+        return
+
+    numstat_map = get_numstat_map()
+    dir_colors: dict[str, str] = {}
+    choices: dict[str, tuple[str, str | None, str]] = {}
+    displays: list[str] = []
+
     for number, entry in enumerate(entries, 1):
         path, old, status = entry
-        display = f"{number}: {format_status_badge(status)} {repr(path)[1:-1]}"
-        if old:
-            display += f" (from {repr(old)[1:-1]})"
-        choices[strip_ansi(display)] = entry
-        displays.append(display)
-    selected = fzf_select(displays, prompt="Stage Files", multi=True)
+        badge = format_status_badge(status)
+        colored_path = format_path_colored(path, dir_colors)
+        stat = numstat_map.get(path, "")
+        stat_suffix = f"  {stat}" if stat else ""
+        old_suffix = f" (from {repr(old)[1:-1]})" if old else ""
+        display = f"{number:2d}: {badge} {colored_path}{old_suffix}{stat_suffix}"
+        choices[path] = entry
+        displays.append(f"{path}\t{display}")
+
+    delta_bin = shutil.which("delta")
+    delta_filter = (
+        f" | {shlex.quote(delta_bin)} --paging=never ${{FZF_PREVIEW_COLUMNS:+--width=$FZF_PREVIEW_COLUMNS}}"
+        if delta_bin else ""
+    )
+
+    preview_cmd = (
+        'sh -c \''
+        'for f in "$@"; do '
+        '  if git rev-parse --verify HEAD >/dev/null 2>&1; then '
+        '    if git cat-file -e "HEAD:$f" 2>/dev/null; then '
+        '      git diff HEAD -- "$f"; '
+        '    else '
+        '      git diff --no-index /dev/null "$f" 2>/dev/null || true; '
+        '    fi; '
+        '  else '
+        '    git diff --cached -- "$f" 2>/dev/null || true; '
+        '  fi; '
+        'done\''
+        f' _ {{+1}}{delta_filter}'
+    )
+
+    header = (
+        " \033[90m[TAB]\033[0m Mark  \033[90m[Ctrl-A]\033[0m All  \033[90m[Ctrl-D]\033[0m Clear  "
+        "\033[90m[ENTER]\033[0m Confirm  \033[90m[Alt-P]\033[0m Layout  \033[90m[Ctrl-/]\033[0m Preview  "
+        "\033[90m[Ctrl-U]\033[0m Scroll │  "
+        "\033[33m[ M]\033[0m Mod  \033[32m[M ]\033[0m Staged  \033[35m[MM]\033[0m Both  "
+        "\033[31m[ D]\033[0m Del  \033[36m[A ]\033[0m Add  \033[90m[??]\033[0m New"
+    )
+
+    selected = fzf_select(
+        displays,
+        prompt="Stage Files",
+        multi=True,
+        preview=preview_cmd,
+        delimiter="\t",
+        with_nth="2..",
+        header=header,
+        preview_label=" file diff ",
+    )
+
     if selected:
-        stage_entries([choices[strip_ansi(line)] for line in selected])
+        selected_entries = []
+        for line in selected:
+            raw_path = line.split("\t", 1)[0]
+            if raw_path in choices:
+                selected_entries.append(choices[raw_path])
+        if selected_entries:
+            stage_entries(selected_entries)
 
 
 def format_status_badge(code: str) -> str:
@@ -408,7 +564,11 @@ def fzf_select(
     prompt: str = "Select",
     multi: bool = False,
     preview: str | None = None,
-    header: str | None = None
+    header: str | None = None,
+    delimiter: str | None = None,
+    with_nth: str | None = None,
+    preview_window: str | None = None,
+    preview_label: str | None = None,
 ) -> list[str]:
     """Feeds NUL-terminated strings to FZF safely via synchronous PIPEs."""
     if not choices:
@@ -436,7 +596,16 @@ def fzf_select(
         "--no-height",
         "--layout=reverse",
         "--border=rounded",
+        "--ellipsis=",
+        "--highlight-line",
+        "--scrollbar=│",
+        "--separator=─",
     ]
+    if delimiter:
+        fzf_cmd.append(f"--delimiter={delimiter}")
+    if with_nth:
+        fzf_cmd.append(f"--with-nth={with_nth}")
+
     if header:
         fzf_cmd.append(f"--header={header}")
     elif multi:
@@ -446,11 +615,29 @@ def fzf_select(
         )
         fzf_cmd.append(f"--header={default_header}")
 
+    bind_actions: list[str] = []
     if multi:
         fzf_cmd.append("--multi")
-        fzf_cmd.append("--bind=ctrl-a:select-all,ctrl-d:deselect-all")
+        bind_actions.extend(["ctrl-a:select-all", "ctrl-d:deselect-all"])
+
     if preview:
         fzf_cmd.extend(["--preview", preview])
+        win = preview_window or "right:65%:border-left:wrap"
+        fzf_cmd.append(f"--preview-window={win}")
+        if preview_label:
+            fzf_cmd.extend([f"--preview-label={preview_label}", "--preview-label-pos=center"])
+        bind_actions.extend([
+            "ctrl-/:toggle-preview",
+            "ctrl-u:preview-page-up",
+            "shift-down:preview-down",
+            "shift-up:preview-up",
+            "alt-p:change-preview-window(down,50%,border-top|right,65%,border-left)",
+        ])
+        if not multi:
+            bind_actions.append("ctrl-d:preview-page-down")
+
+    if bind_actions:
+        fzf_cmd.append(f"--bind={','.join(bind_actions)}")
 
     payload = "\0".join(choices) + "\0"
 
@@ -777,7 +964,7 @@ def undo_local_commits_to_commit() -> None:
         return
 
     commits = log_out.splitlines()
-    preview_cmd = "git --no-advice show --color=always {1}"
+    preview_cmd = get_commit_preview_cmd()
 
     target = fzf_select(commits, prompt="Select Target Commit", preview=preview_cmd)
     if not target:
@@ -809,7 +996,7 @@ def delete_local_commits_to_commit() -> None:
         return
 
     commits = log_out.splitlines()
-    preview_cmd = "git --no-advice show --color=always {1}"
+    preview_cmd = get_commit_preview_cmd()
 
     target = fzf_select(commits, prompt="Select Target Commit", preview=preview_cmd)
     if not target:
@@ -873,7 +1060,7 @@ def nuclear_revert() -> None:
         return
 
     commits = log_out.splitlines()
-    preview_cmd = "git --no-advice show --color=always {1}"
+    preview_cmd = get_commit_preview_cmd()
 
     target = fzf_select(commits, prompt="Select Target Commit", preview=preview_cmd)
     if not target:
@@ -1232,7 +1419,7 @@ def pop_or_apply_stash(action: str = "pop") -> None:
         console.print("[bold yellow]⚠ No stashes found in repository.[/bold yellow]")
         return
 
-    preview_cmd = "git --no-advice stash show -p $(printf %s {1} | cut -d: -f1)"
+    preview_cmd = get_stash_preview_cmd()
     prompt_text = f"Select Stash to {action.upper()}"
 
     selected = fzf_select(stashes, prompt=prompt_text, preview=preview_cmd)
@@ -1260,7 +1447,7 @@ def drop_stash() -> None:
         console.print("[bold yellow]⚠ No stashes found in repository.[/bold yellow]")
         return
 
-    preview_cmd = "git --no-advice stash show -p $(printf %s {1} | cut -d: -f1)"
+    preview_cmd = get_stash_preview_cmd()
     selected = fzf_select(stashes, prompt="Select Stash to DROP/DELETE", preview=preview_cmd)
     if not selected:
         return
