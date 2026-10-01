@@ -1,6 +1,38 @@
 # Dusky Kokoro final pass — 2026-10-01
 
-## Current result: 5.1.1
+## Installer correction — 5.1.2
+
+A fresh user checkout failed because `.gitignore` excluded the required
+`trigger.sh`. The installer copies this generic script unchanged; it does not
+create a personalized version. User paths come from environment variables and
+`install-path` at runtime. Removed the Kokoro ignore entry so the source hook
+ships with the installer. The installer still requires the complete source
+bundle, including `dusky_main.py` and `trigger.sh`.
+
+Setup now has one short backend menu with a numeric recommended default.
+Tested models are selected automatically; `--models` remains the explicit
+override. Installer and trigger help are grouped, 29 and 33 lines respectively.
+Normal installation prints progress steps and a short completion message;
+full diagnostics are retained in `<install dir>/install.log`. `--verbose`
+shows them live. Failed steps stop immediately and display the cause and log
+location. The runtime and inference settings were not changed in this update.
+
+Verification: reproduced the original missing-hook failure; fresh isolated CPU
+and NVIDIA installations passed using cached dependencies and validated models,
+including synthesis/speed-control checks. Paths containing spaces passed.
+The matched lean CPU bundle printed 85 lines before versus 16 after (about 81%
+less terminal output). All menu selections, Enter and invalid input were
+exercised in a pseudo-terminal. Forced failures in quiet and verbose modes
+stopped before subsequent commands. **50 regression tests**, Bash syntax and
+ShellCheck passed. Fixtures/logs: `/tmp/kokoro-installer-fix` (temporary).
+
+Publish `trigger.sh` together with the installer; users missing it must update
+the complete directory before retrying. No network bootstrap downloads or
+machine-specific trigger generation were introduced.
+
+---
+
+## Runtime result: 5.1.1
 
 The source and installed runtime are now 5.1.1. CPU and CUDA long runs, fresh
 cached CPU installation, repeated offline installation, playback failure
@@ -99,10 +131,8 @@ install_dir=${DUSKY_HOME:-$install_dir}
 ```
 
 Final-pass JSON, WAVs, benchmarks and logs: `/tmp/dusky-kokoro-final` (temporary).
-The three new regression/stress files are untracked and must be included in the
-ISO source/package. The existing `trigger.sh` is ignored by the dotfiles
-repository; its local recovery fix must also be retained. Nothing was staged
-or committed.
+The regression/stress files must be included in the ISO source/package.
+The installer correction above resolves the previously ignored `trigger.sh`.
 
 ---
 

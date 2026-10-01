@@ -27,7 +27,7 @@
 set -Eeuo pipefail
 shopt -s inherit_errexit
 
-INSTALLER_VERSION="5.1.1"
+INSTALLER_VERSION="5.1.2"
 PY_SERIES="3.14"
 KOKORO_ONNX_VERSION="0.6.1"     # pinned; its metadata is overridden below (see write_pyproject)
 ORT_MIN="1.27"
@@ -48,6 +48,9 @@ ROCM_SOURCE="amd"     # amd = isolated --ort-wheel installation
                       # arch = inherit a system MIGraphX build
 HSA_OVERRIDE=""       # explicit hardware override, only when supplied by the user
 ASSUME_YES=0
+VERBOSE=0
+INSTALL_LOG=""
+CURRENT_STEP="startup"
 NO_SYSTEMD=0
 SKIP_MODELS=0
 SKIP_SELFTEST=0
@@ -72,10 +75,62 @@ ok()   { printf '%s [ok]%s %s\n' "$C_OK" "$C_END" "$*"; }
 warn() { printf '%s [!!]%s %s\n' "$C_WARN" "$C_END" "$*" >&2; }
 die()  { printf '%s [xx]%s %s\n' "$C_ERR" "$C_END" "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
-trap 'die "installer aborted (line $LINENO)"' ERR
+installer_error() {
+    local status="$1" line="$2"
+    if [[ -n "$INSTALL_LOG" && -f "$INSTALL_LOG" ]]; then
+        (( VERBOSE )) || tail -n 20 "$INSTALL_LOG" >&2
+        printf '\n' >&2
+        die "$CURRENT_STEP failed (exit $status). Log: $INSTALL_LOG"
+    fi
+    die "installer failed at line $line (exit $status)"
+}
+trap 'installer_error "$?" "$LINENO"' ERR
+
+run_step() {
+    CURRENT_STEP="$1"
+    shift
+    info "$CURRENT_STEP"
+    # Keep errexit active inside each step. Testing a shell function with `if`
+    # would disable it throughout the function and could hide installation errors.
+    if (( VERBOSE )); then
+        (trap - ERR; "$@") 2>&1 | tee -a "$INSTALL_LOG"
+    else
+        (trap - ERR; "$@") >>"$INSTALL_LOG" 2>&1
+    fi
+}
 
 show_help() {
-    sed -n '2,27p' "$0" | sed 's/^#  \{0,1\}//'
+    cat <<'HELP'
+Dusky Kokoro · speech setup
+
+  Usage  kokoro_installer.sh [OPTIONS]
+  Quick  kokoro_installer.sh --yes
+
+Setup
+  --hw BACKEND          nvidia | cpu | amd | intel (default: detect)
+  -y, --yes             Use recommended defaults without prompts
+  --offline             Use cached packages and models
+  --upgrade             Refresh dependencies (online)
+  --install-system-deps Install missing Arch packages with sudo
+
+Locations & runtimes
+  --home DIR            Python environment and models
+  --trigger-dir DIR     Desktop scripts
+  --ort-wheel PATH      Custom ONNX Runtime wheel (AMD/Intel)
+  --rocm-source SOURCE  amd (custom wheel) | arch (system runtime)
+  --hsa-override VALUE  Explicit AMD architecture override
+  --models LIST         fp16-gpu,int8,f32,fp16 | all
+
+Other
+  --no-systemd          Skip the on-demand service
+  --skip-models         Keep existing models
+  --skip-selftest       Skip synthesis verification
+  --verbose             Show detailed installation output
+  --uninstall           Remove installation; keep config and archives
+  -h, --help            Show this help
+
+AMD/Intel acceleration requires a matching runtime. CPU works without one.
+HELP
 }
 
 # --- argument parsing -------------------------------------------------------------
@@ -89,6 +144,7 @@ while (( $# > 0 )); do
         --home)                (( $# >= 2 )) || die "--home needs an argument"; DUSKY_HOME="$2"; shift ;;
         --trigger-dir)         (( $# >= 2 )) || die "--trigger-dir needs an argument"; TRIGGER_DIR="$2"; shift ;;
         -y|--yes)              ASSUME_YES=1 ;;
+        --verbose)            VERBOSE=1 ;;
         --no-systemd)          NO_SYSTEMD=1 ;;
         --skip-models)         SKIP_MODELS=1 ;;
         --skip-selftest)       SKIP_SELFTEST=1 ;;
@@ -162,7 +218,7 @@ preflight() {
     [[ "$(printf '%s\n' 5.3.20 "$BASH_VERSION" | sort -V | head -n 1)" == 5.3.20 ]] || die "Bash >= 5.3.20 is required"
     [[ -f /etc/arch-release ]] || warn "not an Arch Linux system - continuing, package hints will not apply"
     [[ -f "$SCRIPT_DIR/dusky_main.py" ]] || die "dusky_main.py must sit next to this installer ($SCRIPT_DIR)"
-    [[ -f "$SCRIPT_DIR/trigger.sh" ]] || die "trigger.sh must sit next to this installer ($SCRIPT_DIR)"
+    [[ -f "$SCRIPT_DIR/trigger.sh" ]] || die "missing $SCRIPT_DIR/trigger.sh; update the complete dusky_kokoro directory"
 
     local missing=""
     have curl || missing="$missing curl"
@@ -189,7 +245,6 @@ preflight() {
     fi
     command -v python3 >/dev/null || die "Python $PY_SERIES is required"
     python3 -c 'import sys; assert sys.version_info >= (3, 14, 7)' || die "Python >= 3.14.7 is required"
-    ok "uv $(uv --version | awk '{print $2}')"
 }
 
 # --- hardware scan ----------------------------------------------------------------------
@@ -206,16 +261,11 @@ scan_gpus() {
             0x8086) GPU_INTEL=1 ;;
         esac
     done
-    echo "--------------------------------------------------------------"
-    info "GPU scan (sysfs class 0300/0302/0380):"
-    if have lspci; then
-        { lspci -d ::0300; lspci -d ::0302; lspci -d ::0380; } 2>/dev/null | sed 's/^/     /' || true
-    fi
-    (( GPU_NVIDIA )) && echo "     NVIDIA : yes  ($(head -n 1 /proc/driver/nvidia/version 2>/dev/null || echo 'kernel driver NOT loaded'))"
-    (( GPU_AMD ))    && echo "     AMD    : yes  (ROCm: $(cat /opt/rocm/.info/version 2>/dev/null || echo 'not installed'))"
-    (( GPU_INTEL ))  && echo "     Intel  : yes  ($(pacman -Q intel-compute-runtime 2>/dev/null || echo 'intel-compute-runtime not installed'))"
-    if (( GPU_NVIDIA + GPU_AMD + GPU_INTEL == 0 )); then echo "     no discrete/integrated GPU with a display class found"; fi
-    echo "--------------------------------------------------------------"
+    local -a detected=()
+    (( GPU_NVIDIA )) && detected+=(NVIDIA)
+    (( GPU_AMD )) && detected+=(AMD)
+    (( GPU_INTEL )) && detected+=(Intel)
+    info "Detected: ${detected[*]:-CPU only}"
 }
 
 choose_hw() {
@@ -232,48 +282,32 @@ choose_hw() {
     # AMD/Intel acceleration needs a matching Python 3.14 runtime build.
     # CPU remains the portable automatic choice until that build is supplied.
 
-    if [[ -n "$HW" ]]; then info "hardware mode: $HW (from --hw)"; return 0; fi
-    if (( ASSUME_YES )) || [[ ! -t 0 ]]; then HW="$default"; info "hardware mode: $HW (auto-detected)"; return 0; fi
+    if [[ -n "$HW" ]]; then return 0; fi
+    if (( ASSUME_YES )) || [[ ! -t 0 ]]; then HW="$default"; return 0; fi
     echo
-    echo "Select the inference backend:"
-    echo "  1) NVIDIA  CUDA      onnxruntime-gpu + NVIDIA runtime wheels (no system CUDA toolkit needed)"
-    echo "  2) AMD     ROCm      MIGraphX runtime (matching --ort-wheel or --rocm-source arch)"
-    echo "  3) Intel   OpenVINO  onnxruntime-openvino: Intel GPU / NPU / CPU"
-    echo "  4) CPU     only"
+    local number=4
+    [[ "$default" == nvidia ]] && number=1
+    printf '  Backend\n'
+    printf '  1  NVIDIA CUDA%s\n' "$([[ "$number" == 1 ]] && printf '  · recommended')"
+    printf '  2  AMD MIGraphX    · custom runtime\n'
+    printf '  3  Intel OpenVINO  · custom runtime\n'
+    printf '  4  CPU%s\n\n' "$([[ "$number" == 4 ]] && printf '  · recommended')"
     local answer
-    read -r -e -p "Choice [1-4] (detected default: $default): " answer || answer=""
+    read -r -e -p "  Choose [$number]: " answer || answer=""
     case "$answer" in
         1) HW=nvidia ;; 2) HW=amd ;; 3) HW=intel ;; 4) HW=cpu ;; "") HW="$default" ;;
         *) die "invalid choice" ;;
     esac
-    info "hardware mode: $HW"
 }
 
 choose_models() {
     local default
     case "$HW" in intel) default="f32,int8" ;; *) default="fp16-gpu,int8" ;; esac
-    if [[ -n "$MODELS" ]]; then :;
-    elif (( ASSUME_YES )) || [[ ! -t 0 ]]; then MODELS="$default"
-    else
-        echo
-        echo "Select the model precision files to download:"
-        echo "  1) fp16-gpu  177 MB  tested fast CPU/CUDA export (model-files-v1.0)"
-        echo "  2) int8      92 MB   quantised compact              (compact CPU model; benchmark on target hardware)"
-        echo "  3) f32       326 MB  full precision float32"
-        echo "  4) fp16      164 MB  newer export (validate on the target provider)"
-        echo "  5) all"
-        local answer
-        read -r -e -p "Choice [1-5] (default: $default): " answer || answer=""
-        case "$answer" in
-            1) MODELS=fp16-gpu,int8 ;; 2) MODELS=int8 ;; 3) MODELS=f32 ;; 4) MODELS=fp16 ;; 5) MODELS=all ;;
-            "") MODELS="$default" ;; *) die "invalid choice" ;;
-        esac
-    fi
+    [[ -n "$MODELS" ]] || MODELS="$default"
     [[ "$MODELS" == all ]] && MODELS="fp16-gpu,f32,int8,fp16"
     [[ -n "$MODELS" && "$MODELS" != ,* && "$MODELS" != *, && "$MODELS" != *,,* ]] || die "--models must be a nonempty comma-separated list"
     local m
     for m in $(tr ',' ' ' <<<"$MODELS"); do model_file "$m" >/dev/null || die "unknown model precision '$m'"; done
-    info "models: $MODELS (+ voices)"
 }
 
 # --- per-hardware prerequisites ---------------------------------------------------------------
@@ -281,9 +315,6 @@ check_hw_prereqs() {
     case "$HW" in
         nvidia)
             [[ -r /proc/driver/nvidia/version ]] || die "NVIDIA kernel driver not loaded (sudo pacman -S nvidia-open nvidia-utils; reboot)"
-            if have nvidia-smi; then
-                info "nvidia-smi: $(nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>/dev/null | head -n 1)"
-            fi
             ;;
         amd)
             if [[ "$ROCM_SOURCE" == arch ]]; then
@@ -663,20 +694,17 @@ self_test() {
 }
 
 summary() {
-    echo
-    echo "=============================================================================="
-    echo " Dusky Kokoro TTS $INSTALLER_VERSION installed  (mode: $HW)"
-    echo "=============================================================================="
-    echo "  install dir : $DUSKY_HOME"
-    echo "  config      : $CONFIG_FILE"
-    echo "  trigger     : $TRIGGER_DIR/trigger.sh"
-    echo "  socket      : \$XDG_RUNTIME_DIR/dusky-kokoro/control.sock"
-    echo
-    echo "  try it      : $TRIGGER_DIR/trigger.sh --text 'Dusky Kokoro is installed.'"
-    echo "  hotkey      : bind '$TRIGGER_DIR/trigger.sh' (clipboard) and '... --pause'"
-    echo "  status/logs : trigger.sh --status | trigger.sh --logs | trigger.sh --doctor"
-    echo "  voices      : trigger.sh --voices     (edit [voice] spec in config.toml, then trigger.sh --reload)"
-    echo "=============================================================================="
+    printf '\n%sReady%s · %s\n\n' "$C_OK" "$C_END" "$(backend_name)"
+    printf '  Read     %q --text "Hello."\n' "$HOME/.local/bin/dusky-kokoro"
+    [[ ! -e "$HOME/.local/bin/dusky-kokoro-tui" ]] || printf '  Settings %q\n' "$HOME/.local/bin/dusky-kokoro-tui"
+    printf '  Config   %s\n  Log      %s\n' "$CONFIG_FILE" "$INSTALL_LOG"
+}
+
+backend_name() {
+    case "$HW" in
+        nvidia) printf 'NVIDIA CUDA' ;; amd) printf 'AMD MIGraphX' ;;
+        intel) printf 'Intel OpenVINO' ;; cpu) printf 'CPU' ;;
+    esac
 }
 
 # --- main ----------------------------------------------------------------------------------------
@@ -686,11 +714,16 @@ scan_gpus
 choose_hw
 choose_models
 check_hw_prereqs
-setup_env
-verify_runtime
-fetch_models
-write_config
-write_units
-install_trigger
-self_test
+mkdir -p "$DUSKY_HOME"
+INSTALL_LOG="$DUSKY_HOME/install.log"
+: > "$INSTALL_LOG"
+printf '\n'
+info "Backend: $(backend_name)"
+run_step "Preparing Python environment" setup_env
+run_step "Checking runtime" verify_runtime
+run_step "Preparing models" fetch_models
+run_step "Writing configuration" write_config
+(( NO_SYSTEMD )) || run_step "Enabling on-demand service" write_units
+run_step "Installing commands" install_trigger
+run_step "Testing installation" self_test
 summary
