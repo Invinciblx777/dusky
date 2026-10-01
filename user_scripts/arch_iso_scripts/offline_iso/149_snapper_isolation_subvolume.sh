@@ -129,6 +129,7 @@ load_mount_info() {
 
     read -r source uuid opts <<< "$findmnt_out"
     source="${source%%\[*}"
+    printf -v source '%b' "$source"
 
     if [[ -z "$uuid" || "$uuid" == "-" ]]; then
         uuid="$(blkid -s UUID -o value "$source" 2>/dev/null || true)"
@@ -140,9 +141,17 @@ load_mount_info() {
     CACHE_MNT_OPTS["$target"]="$opts"
 }
 
+get_mount_path() {
+    local field="$1" value
+    shift
+    value="$(findmnt -rn -o "$field" "$@")" || return 1
+    # --raw hex-escapes unsafe bytes, including spaces and literal backslashes.
+    printf '%b\n' "$value"
+}
+
 get_mount_subvolume_path() {
     local target="$1" path
-    path="$(findmnt -n -e -o FSROOT -M "$target")" || fatal "Could not identify mounted Btrfs root for $target"
+    path="$(get_mount_path FSROOT -M "$target")" || fatal "Could not identify mounted Btrfs root for $target"
     path="${path#/}"
     printf '%s\n' "$path"
 }
@@ -235,15 +244,15 @@ release_temp_mount() {
 
 current_snapshots_mount_matches_expected() {
     local mount_target="$1" expected_subvol="$2" base_target="$3" target_uuid
-    local snap_info snap_uuid mounted_root
+    local snap_uuid mounted_root
 
     load_mount_info "$base_target"
     target_uuid="${CACHE_MNT_UUID["$base_target"]}"
 
     findmnt -M "$mount_target" >/dev/null 2>&1 || return 1
 
-    snap_info="$(findmnt -n -e -o UUID,FSROOT -M "$mount_target" 2>/dev/null || true)"
-    read -r snap_uuid mounted_root <<< "$snap_info"
+    snap_uuid="$(findmnt -n -e -o UUID -M "$mount_target")" || return 1
+    mounted_root="$(get_mount_path FSROOT -M "$mount_target")" || return 1
 
     [[ "$snap_uuid" == "$target_uuid" ]] || return 1
     [[ "$mounted_root" == "/${expected_subvol#/}" ]]
@@ -251,14 +260,14 @@ current_snapshots_mount_matches_expected() {
 
 verify_snapshots_mount() {
     local mount_target="$1" expected_subvol="$2" base_target="$3" target_uuid
-    local snap_info snap_uuid mounted_root
+    local snap_uuid mounted_root
     load_mount_info "$base_target"
     target_uuid="${CACHE_MNT_UUID["$base_target"]}"
 
     findmnt -M "$mount_target" >/dev/null 2>&1 || fatal "${mount_target} is not mounted."
 
-    snap_info="$(findmnt -n -e -o UUID,FSROOT -M "$mount_target" 2>/dev/null || true)"
-    read -r snap_uuid mounted_root <<< "$snap_info"
+    snap_uuid="$(findmnt -n -e -o UUID -M "$mount_target")" || return 1
+    mounted_root="$(get_mount_path FSROOT -M "$mount_target")" || return 1
 
     [[ "$snap_uuid" == "$target_uuid" ]] || fatal "${mount_target} filesystem UUID mismatch."
     [[ "$mounted_root" == "/${expected_subvol#/}" ]] || fatal "${mount_target} subvol mismatch."
@@ -550,6 +559,11 @@ ensure_fstab_entry_for_snapshots() {
             curr_mp = $2
             if (curr_mp != "/") sub(/\/+$/, "", curr_mp)
 
+            # libmount/systemd require a parent before its child mounts.
+            if (!done && index(curr_mp, mp "/") == 1) {
+                print newline
+                done = 1
+            }
             if (curr_mp == mp) {
                 if (!done) { print newline; done = 1 }
                 next
@@ -617,8 +631,29 @@ drain_browser_original() {
     find "$hidden" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} +
 }
 
+process_in_target_is_running() {
+    local uid="$1" names="$2" pids pid target_root process_root
+    pids="$(pgrep -u "$uid" -x "$names")" || return 1
+    target_root="$(stat -Lc '%d:%i' /)" || fatal "Cannot identify target root."
+    while IFS= read -r pid; do
+        process_root="$(stat -Lc '%d:%i' "/proc/$pid/root" 2>/dev/null || true)"
+        [[ "$process_root" != "$target_root" ]] || return 0
+    done <<< "$pids"
+    return 1
+}
+
+browser_is_running() {
+    # Linux comm is limited to 15 characters (chromium-browser is truncated).
+    process_in_target_is_running "$1" 'firefox|firefox-bin|chrome|chromium|chromium-browse|chromium-browser|google-chrome|chrome-headless'
+}
+
 isolate_browser_directory() {
     local base="$1" top="$2" uid="$3" gid="$4" path="$5" role="$6"
+    # Check before inspecting paths or changing even an existing mount.
+    if browser_is_running "$uid"; then
+        warn "Browser isolation deferred for $path: close Firefox, Chromium and Chrome, then rerun this script. Existing browser data and mounts are unchanged."
+        return 0
+    fi
     local parent subvol destination pending hidden fsroot relative
     parent="$(dirname "$path")"
     if ! test -d "$parent"; then
@@ -628,7 +663,7 @@ isolate_browser_directory() {
     parent="$(dirname "$path")"
     # A symlinked profile may resolve outside the account's home mount.
     local actual_base
-    actual_base="$(findmnt -n -o TARGET -T "$parent")"
+    actual_base="$(get_mount_path TARGET -T "$parent")"
     load_mount_info "$actual_base"
     [[ "${CACHE_MNT_UUID["$actual_base"]}" == "${CACHE_MNT_UUID["$base"]}" ]] ||
         fatal "Browser directory $path is on a different filesystem from $base."
@@ -641,15 +676,37 @@ isolate_browser_directory() {
     relative="${path#"${base%/}"/}"
     hidden="$top/${fsroot:+$fsroot/}$relative"
     if mountpoint -q "$path"; then
-        current_snapshots_mount_matches_expected "$path" "$subvol" "$base" ||
-            fatal "Browser directory $path is mounted from an unexpected subvolume."
-        ensure_fstab_entry_for_snapshots "$base" "$path" "$subvol"
-        drain_browser_original "$hidden"
+        if current_snapshots_mount_matches_expected "$path" "$subvol" "$base"; then
+            ensure_fstab_entry_for_snapshots "$base" "$path" "$subvol"
+            drain_browser_original "$hidden"
+        else
+            # Keep an existing top-level browser subvolume and its mount policy.
+            # Require a matching fstab entry so isolation survives reboot/rollback.
+            local mounted_root mounted_source entries
+            mounted_root="$(get_mount_path FSROOT -M "$path")"
+            mounted_source="$(findmnt -n -e -o SOURCE -M "$path")"
+            mounted_source="${mounted_source%%\[*}"
+            [[ "$mounted_root" == /* && "$mounted_root" != / && "${mounted_root#/}" != */* ]] ||
+                fatal "Browser directory $path is not mounted from a top-level subvolume."
+            [[ "$(findmnt -n -e -o UUID -M "$path")" == "${CACHE_MNT_UUID["$base"]}" ]] ||
+                fatal "Browser directory $path is mounted from a different filesystem."
+            path_is_btrfs_subvolume "$path" || fatal "Browser mount $path is not a Btrfs subvolume."
+            entries="$(findmnt --fstab --evaluate --json --list -M "$path" -o SOURCE,FSTYPE,OPTIONS)" ||
+                fatal "Existing browser mount $path needs a persistent fstab entry."
+            python3 -c 'import json, sys
+source, root = sys.argv[1:]
+rows = json.load(sys.stdin)["filesystems"]
+assert len(rows) == 1
+row = rows[0]
+options = dict(item.split("=", 1) if "=" in item else (item, "")
+               for item in row["options"].split(","))
+assert row["source"] == source and row["fstype"] == "btrfs"
+assert options.get("subvol", "").lstrip("/") == root.lstrip("/")
+assert "noauto" not in options' "$mounted_source" "$mounted_root" <<< "$entries" ||
+                fatal "Existing browser mount $path does not match its persistent fstab entry."
+            info "Keeping existing isolated browser mount: $path ($mounted_root)."
+        fi
         return 0
-    fi
-    # Copying a live profile can lose writes that arrive during migration.
-    if pgrep -u "$uid" -x 'firefox|firefox-bin|chrome|chromium|chromium-browser' >/dev/null; then
-        fatal "Close Firefox, Chromium and Chrome for user ID $uid before isolating browser data."
     fi
     test ! -e "$path" || test -d "$path" || fatal "Browser path is not a directory: $path"
     [[ "$(findmnt -n -e -o UUID -T "$parent")" == "${CACHE_MNT_UUID["$base"]}" ]] ||
@@ -706,10 +763,15 @@ isolate_browser_profiles() {
     [[ "$uid_min" =~ ^[0-9]+$ && "$uid_max" =~ ^[0-9]+$ ]] || fatal "Cannot determine desktop UID range."
     while IFS=: read -r _name _password uid gid _gecos account_home _shell; do
         (( uid >= uid_min && uid <= uid_max )) || continue
+        # One warning per account; skip before home/filesystem validation too.
+        if browser_is_running "$uid"; then
+            warn "Browser isolation deferred for $_name: close Firefox, Chromium and Chrome, then rerun this script. Existing browser data and mounts are unchanged."
+            continue
+        fi
         test -d "$account_home" || continue
         account_home="$(realpath -e "$account_home")"
         [[ "$(stat -f -c %T "$account_home")" == btrfs ]] || fatal "Home directory $account_home is not Btrfs."
-        base="$(findmnt -n -o TARGET -T "$account_home")"
+        base="$(get_mount_path TARGET -T "$account_home")"
         top=""
         mount_top_level_for_base "$base" top
         isolated_paths=()
@@ -725,11 +787,78 @@ chromium .config/chromium
 chrome .config/google-chrome
 firefox .config/mozilla
 firefox_legacy .mozilla
-chromium_cache .cache/chromium
-chrome_cache .cache/google-chrome
-firefox_cache .cache/mozilla
 BROWSER_PATHS
         release_temp_mount "$top"
+    done < /etc/passwd
+}
+
+# Fresh-install stores: create empty top-level subvolumes, then mount them.
+# Existing data is not migrated by this installation script.
+isolate_empty_store() {
+    local path="$1" uid="$2" gid="$3" role="$4" base top="" destination
+    local subvol="@store_${uid}_${role}" mode=0700
+    # Match the storage mounts prepared by 040_disk_mount.py.
+    case "$uid:$role" in
+        0:machines|0:portables|0:libvirt) subvol="@var_lib_${role}" ;;
+    esac
+    [[ "$uid:$role" != 0:libvirt ]] || mode=0755
+    mkdir -p -- "$(dirname "$path")"
+    path="$(realpath -m "$path")"
+    base="$(get_mount_path TARGET -T "$(dirname "$path")")"
+    if findmnt -M "$path" >/dev/null; then
+        current_snapshots_mount_matches_expected "$path" "$subvol" "$base" ||
+            fatal "Unexpected mount at fresh-install store $path."
+        return 0
+    fi
+    dir_is_empty "$path" || fatal "Fresh-install store $path contains data; this script does not migrate existing stores."
+    # tmpfiles can create empty nested machine/portable subvolumes at install.
+    # Remove those before mounting so root/home remain flat for rollback.
+    if path_is_btrfs_subvolume "$path"; then
+        delete_unmounted_subvolume "$path"
+    fi
+    install -d -m "$mode" -o "$uid" -g "$gid" -- "$path"
+    mount_top_level_for_base "$base" top
+    destination="$top/$subvol"
+    if ! test -e "$destination"; then
+        btrfs subvolume create "$destination" >/dev/null
+        chmod "$mode" "$destination"
+        chown "$uid:$gid" "$destination"
+    fi
+    ensure_fstab_entry_for_snapshots "$base" "$path" "$subvol"
+    mount "$path"
+    current_snapshots_mount_matches_expected "$path" "$subvol" "$base" ||
+        fatal "Fresh-install store mount verification failed: $path"
+    release_temp_mount "$top"
+    info "Fresh-install store isolated: $path"
+}
+
+isolate_additional_stores() {
+    local path role _name _password uid gid _gecos account_home _shell uid_min uid_max
+    # Standard daemon paths on the fresh ISO. No running-daemon/config discovery.
+    while read -r path role; do
+        isolate_empty_store "$path" 0 0 "$role"
+    done <<'SYSTEM_STORES'
+/var/lib/machines machines
+/var/lib/portables portables
+/var/lib/docker docker
+/var/lib/containerd containerd
+/var/lib/containers/storage podman
+/var/lib/libvirt libvirt
+SYSTEM_STORES
+    uid_min="$(awk '$1 == "UID_MIN" {print $2; exit}' /etc/login.defs)"
+    uid_max="$(awk '$1 == "UID_MAX" {print $2; exit}' /etc/login.defs)"
+    [[ "$uid_min" =~ ^[0-9]+$ && "$uid_max" =~ ^[0-9]+$ ]] || fatal "Cannot determine desktop UID range."
+    while IFS=: read -r _name _password uid gid _gecos account_home _shell; do
+        (( uid >= uid_min && uid <= uid_max )) || continue
+        test -d "$account_home" || continue
+        for path in .local .local/share .local/share/containers .local/share/libvirt; do
+            test -d "$account_home/$path" ||
+                install -d -m 0700 -o "$uid" -g "$gid" -- "$account_home/$path"
+        done
+        isolate_empty_store "$account_home/.cache" "$uid" "$gid" cache
+        isolate_empty_store "$account_home/.local/share/docker" "$uid" "$gid" docker
+        isolate_empty_store "$account_home/.local/share/containers/storage" "$uid" "$gid" podman
+        isolate_empty_store "$account_home/.local/share/libvirt/images" "$uid" "$gid" libvirt_images
     done < /etc/passwd
 }
 
@@ -1028,8 +1157,9 @@ execute "Mount /home/.snapshots" mount_snapshots "/home/.snapshots" "@home_snaps
 execute "Verify Snapper home" verify_snapper_works "home"
 execute "Tune Snapper home" tune_snapper "home"
 
-# --- BROWSER PROFILE AND CACHE ISOLATION ---
-execute "Isolate browser profiles and caches" isolate_browser_profiles
+# --- CACHE, CONTAINER, VM AND BROWSER ISOLATION ---
+execute "Prepare fresh-install cache, container and VM stores" isolate_additional_stores
+execute "Isolate browser profiles" isolate_browser_profiles
 
 # --- SYSTEM WIDE OPTIMIZATIONS ---
 execute "Apply Global Btrfs Settings" apply_global_btrfs_tuning
