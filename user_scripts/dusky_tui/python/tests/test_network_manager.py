@@ -2,6 +2,7 @@
 
 from contextlib import nullcontext
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -12,6 +13,11 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from python.engines import network_manager as nm, rich_speedtest
+
+
+def nmcli_arguments(command):
+    """Remove global execution options when matching an operation fixture."""
+    return [command[0], *command[5:]] if command[1:3] == ["--colors", "no"] else command
 
 
 class NetworkManagerTests(unittest.TestCase):
@@ -292,8 +298,193 @@ class NetworkManagerTests(unittest.TestCase):
     def test_qr_credentials_preserve_significant_spaces(self):
         engine = self.engine()
         uuid = "00000000-0000-0000-0000-000000000001"
-        engine._run_cmd = lambda *args, **kwargs: " Office Wi-Fi \nwpa-psk\n password \n\nno\nFriendly name\n"
+        engine._run_cmd = lambda *args, **kwargs: " Office Wi-Fi \nwpa-psk\n password \n\n0\n0\nno\nFriendly name\n"
         self.assertEqual(engine._get_wifi_credentials(uuid)[:2], (" Office Wi-Fi ", " password "))
+
+    def test_control_commands_toggle_both_values_and_target_profile_uuid(self):
+        engine = self.engine()
+        uuid = "00000000-0000-0000-0000-000000000001"
+        engine._get_saved_wifi = lambda: [{"uuid": uuid, "name": "Example"}]
+        engine._get_active_wifi_connections = lambda: [{"uuid": uuid, "device": "wlan1"}]
+        engine.shutdown_event.set()  # Skip the reconnect delay in this fixture.
+        cases = [
+            ("wifi_radio", "status", "true", ["radio", "wifi", "on"]),
+            ("wifi_radio", "status", "false", ["radio", "wifi", "off"]),
+            (uuid, "saved", "true", ["connection", "modify", "uuid", uuid, "connection.autoconnect", "yes"]),
+            (uuid, "saved", "false", ["connection", "modify", "uuid", uuid, "connection.autoconnect", "no"]),
+            ("cn__" + uuid, "saved_action", "true", ["connection", "up", "uuid", uuid]),
+            ("dc__" + uuid, "saved_action", "true", ["connection", "down", "uuid", uuid]),
+            ("fg__" + uuid, "saved_action", "true", ["connection", "delete", "uuid", uuid]),
+            ("rc__" + uuid, "saved_action", "true", ["connection", "up", "uuid", uuid, "ifname", "wlan1"]),
+            ("pw__Example", "network", "password", ["device", "wifi", "connect", "Example", "password", "password"]),
+            ("cn__Example", "network", "true", ["device", "wifi", "connect", "Example"]),
+        ]
+        for key, scope, value, expected in cases:
+            with self.subTest(key=key, value=value), patch.object(nm.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")) as run:
+                self.assertTrue(engine.write_value(key, scope, value)[0])
+                self.assertEqual(nmcli_arguments(run.call_args.args[0]), ["nmcli", *expected])
+                for call in run.call_args_list:
+                    command = call.args[0]
+                    wait = int(command[command.index("--wait") + 1])
+                    self.assertGreater(wait, 0)
+                    self.assertLess(wait, call.kwargs["timeout"])
+                    self.assertEqual(call.kwargs["env"]["LC_ALL"], "C")
+
+    def test_autoconnect_rejects_invalid_values_without_writing(self):
+        engine = self.engine()
+        with patch.object(nm.subprocess, "run") as run:
+            self.assertFalse(engine.write_value("00000000-0000-0000-0000-000000000001", "saved", "nil")[0])
+        run.assert_not_called()
+
+    def test_restart_reports_auth_required_without_retrying(self):
+        engine = self.engine()
+        with patch.object(nm.subprocess, "run", return_value=SimpleNamespace(returncode=1, stderr="sudo: a password is required")) as run:
+            self.assertEqual(engine.write_value("restart_nm", "status_action", "true")[:2], (False, "AUTH_REQUIRED"))
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], ["sudo", "-n", "systemctl", "restart", "NetworkManager"])
+
+    def test_failed_network_batch_returns_each_outcome_once(self):
+        engine = self.engine()
+        changes = [("pw__Example", "network", "password", "string"), ("band__uuid", "saved_action", "5 GHz", "cycle")]
+        with patch.object(engine, "write_value", return_value=(False, "Failed", "")) as write:
+            results = engine.write_batch_results(changes)
+        self.assertEqual(write.call_count, 2)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(not result.ok and result.actual is None for result in results.values()))
+
+    def test_clipboard_copy_does_not_wait_for_the_background_owner(self):
+        # Reproduce wl-copy's fork: stdin/stdout close, but stderr stays open.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command = root / "wl-copy"
+            release = root / "release"
+            command.write_text(
+                f"#!{sys.executable}\nimport os, sys, time\nsys.stdin.read()\n"
+                "child = os.fork()\nif child:\n    os._exit(0)\n"
+                "os.close(0)\nos.close(1)\ndeadline = time.monotonic() + 5\n"
+                f"while not os.path.exists({str(release)!r}) and time.monotonic() < deadline:\n    time.sleep(0.01)\n"
+                "os._exit(0)\n"
+            )
+            command.chmod(0o700)
+            try:
+                with patch.dict(os.environ, {"PATH": directory + os.pathsep + os.environ["PATH"]}):
+                    self.assertTrue(nm.copy_to_clipboard("Fixture text"))
+            finally:
+                release.touch()
+
+    def test_wep_qr_rejects_modes_it_cannot_represent(self):
+        engine = self.engine()
+        for key_index, key_type, reason in (("1", "1", "nonzero"), ("0", "2 (passphrase)", "passphrases")):
+            with self.subTest(key_index=key_index, key_type=key_type):
+                engine._run_cmd = lambda *args, **kwargs: f"Example\nnone\n\nabcde\n{key_index}\n{key_type}\nno\nExample\n"
+                ok, message, _ = engine._share_profile_qr("uuid")
+                self.assertFalse(ok)
+                self.assertIn(reason, message)
+        engine._run_cmd = lambda *args, **kwargs: "Example\nnone\n\nabcde\n0\n1 (key)\nyes\nExample\n"
+        self.assertEqual(engine._get_wifi_credentials("uuid"), ("Example", "abcde", "WEP", True))
+
+    def test_owe_network_offers_connect_without_an_unusable_qr_button(self):
+        engine = nm.NetworkManagerEngine()
+        engine._radio_on = True
+        engine._cached_scans = [{"ssid": "Enhanced", "security": "OWE", "signal": 80}]
+        app = SimpleNamespace(schema={i: [] for i in range(6)}, tabs={3: "Devices"})
+        app._replace_dynamic_tabs = lambda tabs: app.schema.update(tabs) or True
+        engine.app = app
+        engine._rebuild_schema()
+        keys = {item.key for item in app.schema[0]}
+        self.assertIn("cn__Enhanced", keys)
+        self.assertNotIn("pw__Enhanced", keys)
+        self.assertNotIn("qr_net__Enhanced", keys)
+        engine._get_wifi_credentials = lambda uuid: ("Enhanced", "", "OWE", False)
+        self.assertIn("OWE", engine._share_profile_qr("uuid")[1])
+
+    def test_hotspot_drafts_accept_bounds_and_reject_unrepresentable_values(self):
+        engine = nm.NetworkManagerEngine()
+        for value in ("", "12345678", "x" * 63):
+            self.assertTrue(engine.write_value("hotspot_password", "hotspot", value)[0])
+        for value in ("short", "x" * 64, "1234567\0", "1234567\n", "1234567é"):
+            self.assertFalse(engine.write_value("hotspot_password", "hotspot", value)[0])
+        for value in ("x" * 32, "é" * 16):
+            self.assertTrue(engine.write_value("hotspot_ssid", "hotspot", value)[0])
+        for value in ("", "x" * 33, "é" * 17, "name\0"):
+            self.assertFalse(engine.write_value("hotspot_ssid", "hotspot", value)[0])
+
+    def test_hotspot_stop_record_error_still_reports_successful_stop(self):
+        engine = self.engine()
+        engine._hotspot_profile = lambda **kwargs: {"uuid": "ap-id", "device": "wlan0"}
+        engine._hotspot_previous = lambda: {}
+        engine._remember_hotspot_previous = lambda *args: (_ for _ in ()).throw(OSError("read-only filesystem"))
+        with patch.object(nm.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")):
+            ok, message, _ = engine.write_value("stop_hotspot", "hotspot", "true")
+        self.assertTrue(ok)
+        self.assertIn("could not clear", message)
+
+    def test_both_hotspot_bands_prefer_an_idle_capable_adapter(self):
+        for key, band in (("start_hotspot_24", "bg"), ("start_hotspot_5", "a")):
+            with self.subTest(band=band):
+                engine = nm.NetworkManagerEngine()
+                engine._hotspot_ssid, engine._hotspot_password = "Lab", "password"
+                engine._hotspot_devices = lambda: [
+                    {"device": "busy0", "state": "connected", "2.4": "yes", "5": "yes"},
+                    {"device": "idle0", "state": "disconnected", "2.4": "yes", "5": "yes"},
+                ]
+                engine._run_cmd = lambda args, **kwargs: "enabled\n" if "radio" in args else ""
+                engine._prepare_hotspot_firewall = lambda device: ""
+                engine._remember_hotspot_previous = lambda *args: None
+                saved = {}
+                engine._hotspot_profile = lambda active_only=False, uuid_filter="": saved or None
+                def run(command, **kwargs):
+                    args = nmcli_arguments(command)
+                    if args[1:3] == ["connection", "add"]:
+                        saved.update(uuid=args[args.index("connection.uuid") + 1], ssid="Lab", password="password")
+                        self.assertEqual(args[args.index("802-11-wireless.band") + 1], band)
+                        self.assertEqual(args[args.index("ipv4.method") + 1], "shared")
+                    elif args[1:3] == ["connection", "up"]:
+                        self.assertEqual(args[-2:], ["ifname", "idle0"])
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                with patch.object(nm.shutil, "which", return_value="/usr/bin/dnsmasq"), patch.object(nm.subprocess, "run", side_effect=run) as execute:
+                    self.assertTrue(engine.write_value(key, "hotspot", "true")[0])
+                self.assertEqual(execute.call_count, 2)
+
+    def test_wifi_status_keeps_the_exact_networkmanager_ssid(self):
+        engine = nm.NetworkManagerEngine()
+        engine._run_cmd = lambda args, **kwargs: (
+            '[{"dev":"test0","gateway":"192.0.2.1"}]' if args[0] == "ip" and "route" in args else
+            "\tSSID: shortened\n\tfreq: 5180\n\ttx bitrate: 100 MBit/s\n" if args[0] == "iw" else ""
+        )
+        with patch.object(nm.Path, "exists", return_value=True):
+            status = engine._enrich_network_status(
+                {"router_ping_ms": "1", "internet_ping_ms": "1"}, {"device": "test0", "ssid": " Name: \\ "},
+            )
+        self.assertEqual(status["ssid"], " Name: \\ ")
+        self.assertEqual(status["freq"], "5180")
+
+    def test_ethernet_status_reads_speed_without_another_process(self):
+        engine = nm.NetworkManagerEngine()
+        engine._run_cmd = lambda args, **kwargs: '[{"dev":"test0","gateway":"192.0.2.1"}]' if "route" in args else ""
+        with patch.object(nm.Path, "exists", return_value=False), patch.object(nm.Path, "read_text", return_value="2500\n"):
+            status = engine._enrich_network_status(
+                {"router_ping_ms": "1", "internet_ping_ms": "1"}, None,
+                devices=[{"device": "test0", "type": "ethernet"}],
+            )
+        self.assertEqual(status["speed"], "2500")
+
+    def test_band_cycle_retains_saved_pin_when_scan_does_not_see_that_band(self):
+        engine = nm.NetworkManagerEngine()
+        engine._radio_on = True
+        connection = {"uuid": "uuid", "name": "Example", "ssid": "Example", "device": "wlan0", "autoconnect": True}
+        engine._active_wifi_connections = [connection]
+        engine._saved_wifi = [connection]
+        engine._cached_scans = [{"ssid": "Example", "security": "WPA2", "signal": 80}]
+        engine._pinned_bands_by_uuid = {"uuid": "5 GHz"}
+        app = SimpleNamespace(schema={i: [] for i in range(6)}, tabs={3: "Devices"})
+        app._replace_dynamic_tabs = lambda tabs: app.schema.update(tabs) or True
+        engine.app = app
+        engine._rebuild_schema()
+        for tab in (0, 1):
+            item = next(item for item in app.schema[tab] if item.key == "band__uuid")
+            self.assertEqual(item.value, "5 GHz")
+            self.assertIn(item.value, item.options)
 
     def test_profile_qr_rejects_unavailable_password(self):
         engine = self.engine()
@@ -747,7 +938,7 @@ class NetworkManagerTests(unittest.TestCase):
         engine._hotspot_device = "Auto"
         engine._hotspot_devices = lambda: [{"device": "wlan0", "state": "connected", "connection": "Home", "2.4": "yes", "5": "yes"}]
         engine._prepare_hotspot_firewall = lambda device: ""
-        engine._run_cmd = lambda args, timeout=5: (
+        engine._run_cmd = lambda args, timeout=5, **kwargs: (
             "enabled\n" if args[-2:] == ["radio", "wifi"] else
             "home-id:wlan0\n" if "--active" in args else "10.42.0.1/24\n"
         )
@@ -762,6 +953,7 @@ class NetworkManagerTests(unittest.TestCase):
         commands = []
 
         def run(args, **kwargs):
+            args = nmcli_arguments(args)
             commands.append(args)
             if args[1:3] == ["connection", "add"]:
                 profile["saved"] = True
@@ -812,6 +1004,7 @@ class NetworkManagerTests(unittest.TestCase):
         engine._remember_hotspot_previous = lambda device, uuid: events.append(("remember", uuid))
 
         def run(args, **kwargs):
+            args = nmcli_arguments(args)
             events.append(("command", args))
             if args[1:3] == ["connection", "add"]:
                 profile["saved"] = True
@@ -855,6 +1048,7 @@ class NetworkManagerTests(unittest.TestCase):
             f"-A ufw-user-input -i wlan0 -p {protocol} --dport {port} -j ACCEPT"
             for port, protocol in ((67, "udp"), (53, "udp"), (53, "tcp"))
         )
+        rules += "\n-A ufw-user-forward -i wlan0 -j ACCEPT"
         with patch.object(nm.shutil, "which", return_value="/usr/bin/ufw"), \
              patch.object(Path, "read_text", return_value=rules), \
              patch.object(nm.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
@@ -872,6 +1066,15 @@ class NetworkManagerTests(unittest.TestCase):
             self.assertEqual(nm.NetworkManagerEngine._prepare_hotspot_firewall("wlan0"), "")
             self.assertEqual(run.call_count, 2)
             self.assertEqual(run.call_args.args[0][:2], ["/usr/bin/pkexec", "/usr/bin/python3"])
+            program = run.call_args.args[0][3]
+        with patch.object(nm.sys, "argv", ["-c", "wlan0", "/usr/bin/ufw"]), \
+             patch.object(nm.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
+            exec(compile(program, "<hotspot firewall>", "exec"), {})
+            self.assertEqual(run.call_count, 4)
+            self.assertEqual(run.call_args.args[0], [
+                "/usr/bin/ufw", "route", "allow", "in", "on", "wlan0",
+                "comment", "Dusky hotspot forwarding",
+            ])
 
 
 if __name__ == "__main__":

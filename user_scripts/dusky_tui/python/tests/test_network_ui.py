@@ -1,15 +1,21 @@
 """Exercise list refreshes with Textual's real event and scrolling behavior."""
 
 import asyncio
+import importlib.util
+import io
 from pathlib import Path
 import sys
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from python.frontend.core_types import ConfigItem
+from python.engines.network_manager import NetworkManagerEngine
 from python.frontend.ui import ConfigOptionList, ConfirmDialog, CustomRichTabWidget, DuskyTUI
 from rich.console import Group
+from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from textual.containers import VerticalScroll
@@ -25,6 +31,60 @@ class FakeEngine:
 
 
 class NetworkUiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_network_batch_never_repeats_password_or_band_actions(self):
+        engine = NetworkManagerEngine()
+        key = ("network", "")
+        items = [
+            ConfigItem(label="Password", key="pw__Example", scope="network", type_="string", default=""),
+            ConfigItem(label="Band", key="band__uuid", scope="saved_action", type_="cycle", default="Auto", options=["Auto", "5 GHz"]),
+        ]
+        app = DuskyTUI(engine_pool={key: engine}, default_engine_key=key,
+                       schema={0: items}, tabs=["Network"], default_mode="batch", enable_user_presets=False)
+        with patch.object(engine, "load_state", return_value={}), patch.object(engine, "write_value", return_value=(False, "Fixture failure", "")) as write:
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                items[0].value, items[1].value = "password", "5 GHz"
+                app.pending_commits.update({(0, 0), (0, 1)})
+                await app._save_batch_async()
+                self.assertEqual(write.call_count, 2)
+                self.assertEqual(app.pending_commits, {(0, 0), (0, 1)})
+
+    async def test_duplicate_network_action_views_execute_once_and_reset_together(self):
+        engine = NetworkManagerEngine()
+        key = ("network", "")
+        rows = [ConfigItem(label="Disconnect", key="dc__uuid", scope="saved_action",
+                           type_="bool", default=False, options=["trigger"]) for _ in range(2)]
+        app = DuskyTUI(engine_pool={key: engine}, default_engine_key=key,
+                       schema={0: [rows[0]], 1: [rows[1]]}, tabs=["Networks", "Saved"],
+                       default_mode="batch", enable_user_presets=False)
+        with patch.object(engine, "load_state", return_value={}), patch.object(engine, "_write_value", return_value=(True, "Fixture success", "")) as write, patch.object(app, "play_reset_sound"):
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                for row in rows:
+                    row.value = True
+                app.pending_commits.update({(0, 0), (1, 0)})
+                await app._save_batch_async()
+                write.assert_called_once()
+                self.assertTrue(all(row.value is False for row in rows))
+                self.assertFalse(app.pending_commits)
+
+    async def test_dashboard_uses_its_app_engine_and_renders_ethernet_speed(self):
+        schema_path = Path(__file__).resolve().parents[3] / "network_manager" / "tui_dusky_network.py"
+        spec = importlib.util.spec_from_file_location("network_dashboard_fixture", schema_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        engine = NetworkManagerEngine()
+        engine._verbose_info = {"type": "ethernet", "ssid": "Displayed source", "iface": "test0", "speed": "2500"}
+        unrelated = NetworkManagerEngine()
+        unrelated._verbose_info = {"type": "wifi", "ssid": "Wrong source"}
+        app = SimpleNamespace(engine_pool={("network", ""): engine})
+        output = io.StringIO()
+        Console(file=output, width=120).print(module.render_network_dashboard_view(app))
+        rendered = output.getvalue()
+        self.assertIn("Displayed source", rendered)
+        self.assertIn("2.5gbit", rendered)
+        self.assertNotIn("Wrong source", rendered)
+
     async def test_dashboard_overflow_scrolls_without_moving_actions(self):
         def dashboard():
             grid = Table.grid(expand=True)

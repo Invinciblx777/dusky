@@ -224,7 +224,8 @@ def render_network_dashboard_view(app):
         format_rate,
         format_bytes,
         format_ping_latency,
-        format_packet_loss
+        format_packet_loss,
+        format_header_speed,
     )
 
     verb = {}
@@ -232,13 +233,15 @@ def render_network_dashboard_view(app):
     ping = {}
     dns_provider = "DHCP"
 
-    eng = getattr(NetworkManagerEngine, "_instance", None)
+    eng = None
 
-    if not eng and app and hasattr(app, "engine_pool"):
+    if app and hasattr(app, "engine_pool"):
         for e in list(app.engine_pool.values()):
             if isinstance(e, NetworkManagerEngine):
                 eng = e
                 break
+    if eng is None:
+        eng = getattr(NetworkManagerEngine, "_instance", None)
 
     if eng:
         verb = dict(getattr(eng, "_verbose_info", {}))
@@ -262,7 +265,10 @@ def render_network_dashboard_view(app):
 
     freq = verb.get("freq", "")
     bitrate = verb.get("bitrate", "")
-    link_detail = (f"{freq} MHz" if freq else "N/A") + (f" ({bitrate})" if bitrate else "")
+    if conn_type == "ETHERNET":
+        link_detail = format_header_speed(verb.get("speed", "")) or "N/A"
+    else:
+        link_detail = (f"{freq} MHz" if freq else "N/A") + (f" ({bitrate})" if bitrate else "")
 
     is_wifi = conn_type == "WIFI"
     conn_icon = "󰤨" if is_wifi else "󰈀"
@@ -362,7 +368,7 @@ SCHEMA[3].extend([
 ])
 
 # ============================================================================
-#  Tab 4: Speed Test — Fast.com speed test integration
+#  Tab 4: Speed Test — installed helper or native Cloudflare measurements
 # ============================================================================
 SCHEMA[4].extend([
     ConfigItem(
@@ -451,7 +457,7 @@ SCHEMA[5].extend([
         type_="string",
         default="",
         group="Config",
-        extended_help="Password draft: 8–63 ASCII characters. Start saves and applies it; blank generates a password. QR sharing uses the active saved profile."
+        extended_help="Password draft: 8–63 printable ASCII characters. Start saves and applies it; blank generates a password. QR sharing uses the active saved profile."
     ),
     ConfigItem(
         label="Start 2.4 GHz",

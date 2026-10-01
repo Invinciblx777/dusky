@@ -17,6 +17,7 @@ import tty
 import urllib.parse
 import concurrent.futures
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,13 @@ HOTSPOT_PROFILE = "Dusky Hotspot"
 ROUTE_CHOICE_FILE = Path.home() / ".config/dusky/settings/network/internet_source.json"
 HOTSPOT_PREVIOUS_FILE = Path.home() / ".config/dusky/settings/network/hotspot_previous.json"
 PREFERRED_ROUTE_METRIC = 1
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkWriteResult:
+    ok: bool
+    message: str
+    actual: str | None = None
 
 
 def escape_markdown(value: str) -> str:
@@ -488,7 +496,12 @@ def copy_to_clipboard(text: str) -> bool:
     if not text:
         return False
     try:
-        result = subprocess.run(["wl-copy"], input=text, text=True, capture_output=True, timeout=3)
+        # Its background clipboard owner keeps stderr open after the parent exits.
+        # Capturing that pipe would wait for clipboard ownership to end.
+        result = subprocess.run(
+            ["wl-copy", "--type", "text/plain;charset=utf-8"], input=text, text=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3,
+        )
         return result.returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -941,10 +954,7 @@ class NetworkManagerEngine(BaseEngine):
         # ---- Radio toggle ----
         if target_key == "wifi_radio":
             action = "on" if new_value == "true" else "off"
-            res = subprocess.run(
-                ["nmcli", "radio", "wifi", action],
-                capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10
-            )
+            res = self._run_nmcli(["nmcli", "radio", "wifi", action], timeout=10)
             if res.returncode == 0:
                 self.rescan_event.set()
                 return True, f"WiFi radio turned {action}.", ""
@@ -952,10 +962,12 @@ class NetworkManagerEngine(BaseEngine):
 
         # ---- Autoconnect toggle ----
         if target_scope == "saved" and self._is_uuid(target_key):
+            if new_value not in {"true", "false"}:
+                return False, "Autoconnect requires true or false.", ""
             yn = "yes" if new_value == "true" else "no"
-            res = subprocess.run(
+            res = self._run_nmcli(
                 ["nmcli", "connection", "modify", "uuid", target_key, "connection.autoconnect", yn],
-                capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10
+                timeout=10,
             )
             if res.returncode == 0:
                 return True, f"Autoconnect set to {yn}.", ""
@@ -989,6 +1001,16 @@ class NetworkManagerEngine(BaseEngine):
             return self._handle_clipboard(target_key)
 
         return False, f"Unsupported network setting: {target_scope}/{target_key}", ""
+
+    def write_batch_results(self, changes: list[tuple[str, str, str, str]]) -> dict[tuple[str, str], NetworkWriteResult]:
+        """Report each outcome so the UI never retries a failed connect or band change."""
+        results = {}
+        for key, scope, value, kind in changes:
+            ok, message, _ = self.write_value(key, scope, value, item_type=kind)
+            results[(key, scope)] = NetworkWriteResult(ok, message)
+            if message == "AUTH_REQUIRED":
+                break
+        return results
 
     # =========================================================================
     #  ACTION HANDLERS
@@ -1072,11 +1094,10 @@ class NetworkManagerEngine(BaseEngine):
     @staticmethod
     def _profile_route_settings(uuid: str) -> tuple[str, str, str, str] | None:
         try:
-            result = subprocess.run(
+            result = NetworkManagerEngine._run_nmcli(
                 ["nmcli", "-g", "ipv4.route-metric,ipv6.route-metric,ipv4.never-default,ipv6.never-default",
                 "connection", "show", "uuid", uuid],
-                capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10,
-                env=NetworkManagerEngine._get_exec_env(),
+                timeout=10,
             )
         except (OSError, subprocess.TimeoutExpired):
             return None
@@ -1085,11 +1106,11 @@ class NetworkManagerEngine(BaseEngine):
 
     @staticmethod
     def _set_profile_route_settings(uuid: str, settings: tuple[str, str, str, str]) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+        return NetworkManagerEngine._run_nmcli(
             ["nmcli", "connection", "modify", "uuid", uuid,
              "ipv4.route-metric", settings[0], "ipv6.route-metric", settings[1],
              "ipv4.never-default", settings[2], "ipv6.never-default", settings[3]],
-            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10,
+            timeout=10,
         )
 
     def _active_device_for_uuid(self, uuid: str) -> str:
@@ -1104,9 +1125,9 @@ class NetworkManagerEngine(BaseEngine):
     def _reapply_device(device: str) -> subprocess.CompletedProcess[str] | None:
         if not device or device == "--":
             return None
-        return subprocess.run(
+        return NetworkManagerEngine._run_nmcli(
             ["nmcli", "device", "reapply", device],
-            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=15,
+            timeout=15,
         )
 
     def _change_route_settings(self, uuid: str, settings: tuple[str, str, str, str]) -> str:
@@ -1309,7 +1330,7 @@ class NetworkManagerEngine(BaseEngine):
 
     @staticmethod
     def _prepare_hotspot_firewall(device: str) -> str:
-        """Allow NetworkManager's hotspot DHCP/DNS when UFW is active."""
+        """Allow hotspot DHCP/DNS and routed client traffic when UFW is active."""
         ufw = shutil.which("ufw")
         if not ufw or subprocess.run(
             ["systemctl", "is-active", "--quiet", "ufw"],
@@ -1319,19 +1340,22 @@ class NetworkManagerEngine(BaseEngine):
         try:
             rules = Path("/etc/ufw/user.rules").read_text()
             if all(f"-A ufw-user-input -i {device} -p {proto} --dport {port} -j ACCEPT" in rules
-                   for port, proto in ((67, "udp"), (53, "udp"), (53, "tcp"))):
+                   for port, proto in ((67, "udp"), (53, "udp"), (53, "tcp"))) and (
+                       f"-A ufw-user-forward -i {device} -j ACCEPT" in rules):
                 return ""
         except OSError:
             pass
         pkexec = shutil.which("pkexec")
         if not pkexec:
-            return "UFW is active; install polkit or allow hotspot DHCP/DNS on this Wi-Fi adapter."
+            return "UFW is active; install polkit or allow hotspot DHCP/DNS and forwarding on this Wi-Fi adapter."
         program = (
             "import subprocess, sys\n"
             "device, ufw = sys.argv[1:3]\n"
-            "for port, protocol, purpose in ((67, 'udp', 'DHCP'), (53, 'udp', 'DNS'), (53, 'tcp', 'DNS')):\n"
-            "    command = [ufw, 'allow', 'in', 'on', device, 'to', 'any', 'port', str(port), "
-            "'proto', protocol, 'comment', 'Dusky hotspot ' + purpose]\n"
+            "commands = [[ufw, 'allow', 'in', 'on', device, 'to', 'any', 'port', str(port), "
+            "'proto', protocol, 'comment', 'Dusky hotspot ' + purpose] "
+            "for port, protocol, purpose in ((67, 'udp', 'DHCP'), (53, 'udp', 'DNS'), (53, 'tcp', 'DNS'))]\n"
+            "commands.append([ufw, 'route', 'allow', 'in', 'on', device, 'comment', 'Dusky hotspot forwarding'])\n"
+            "for command in commands:\n"
             "    result = subprocess.run(command, capture_output=True, text=True)\n"
             "    if result.returncode:\n"
             "        sys.stderr.write(result.stderr or result.stdout)\n"
@@ -1348,14 +1372,14 @@ class NetworkManagerEngine(BaseEngine):
 
     def _handle_hotspot(self, key: str, value: str) -> tuple[bool, str, str]:
         if key == "hotspot_ssid":
-            if not value or len(value.encode("utf-8")) > 32:
+            if not value or "\0" in value or len(value.encode("utf-8")) > 32:
                 return False, "SSID must be 1–32 bytes.", ""
             self._hotspot_ssid = value
             return True, "Hotspot SSID draft updated; Start applies it.", ""
 
         if key == "hotspot_password":
-            if value and (len(value) < 8 or len(value) > 63 or not value.isascii()):
-                return False, "Password must be 8–63 ASCII characters; blank generates one.", ""
+            if value and (len(value) < 8 or len(value) > 63 or any(not 32 <= ord(char) <= 126 for char in value)):
+                return False, "Password must be 8–63 printable ASCII characters; blank generates one.", ""
             self._hotspot_password = value
             return True, "Hotspot password draft updated; Start applies it.", ""
 
@@ -1369,9 +1393,8 @@ class NetworkManagerEngine(BaseEngine):
             band = "bg" if key == "start_hotspot_24" else "a"
             if not shutil.which("dnsmasq"):
                 return False, "Install dnsmasq; NetworkManager needs it for hotspot DHCP.", ""
-            if self._run_cmd(["nmcli", "radio", "wifi"]).strip() != "enabled":
-                enabled = subprocess.run(["nmcli", "radio", "wifi", "on"], capture_output=True, text=True,
-                                         stdin=subprocess.DEVNULL, timeout=10)
+            if self._run_cmd(["nmcli", "radio", "wifi"], required=True).strip() != "enabled":
+                enabled = self._run_nmcli(["nmcli", "radio", "wifi", "on"], timeout=10)
                 if enabled.returncode:
                     return False, f"Could not enable Wi-Fi: {enabled.stderr.strip()}", enabled.stderr
             active = self._hotspot_profile(active_only=True)
@@ -1392,7 +1415,7 @@ class NetworkManagerEngine(BaseEngine):
                 return False, firewall_issue, ""
             previous_uuid = ""
             if not active:
-                rows = self._run_cmd(["nmcli", "-t", "-f", "UUID,DEVICE", "connection", "show", "--active"])
+                rows = self._run_cmd(["nmcli", "-t", "-f", "UUID,DEVICE", "connection", "show", "--active"], required=True)
                 for line in rows.splitlines():
                     fields = _split_nmcli_line(line)
                     if len(fields) > 1 and fields[1] == device:
@@ -1436,15 +1459,14 @@ class NetworkManagerEngine(BaseEngine):
                     self._remember_hotspot_previous(device, previous_uuid)
                     recovery_recorded = True
                 attempted_write = True
-                changed = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=15)
+                changed = self._run_nmcli(cmd, timeout=15)
                 if changed.returncode:
                     raise RuntimeError(f"Could not save hotspot: {changed.stderr.strip()}")
                 if not profile:
                     profile = self._hotspot_profile(uuid_filter=new_uuid)
                 if not profile:
                     raise RuntimeError("Hotspot profile was saved but cannot be found.")
-                activated = subprocess.run(["nmcli", "connection", "up", "uuid", profile["uuid"], "ifname", device],
-                                           capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30)
+                activated = self._run_nmcli(["nmcli", "connection", "up", "uuid", profile["uuid"], "ifname", device], timeout=30)
                 if activated.returncode:
                     raise RuntimeError(f"Could not start hotspot: {activated.stderr.strip()}")
             except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
@@ -1453,7 +1475,7 @@ class NetworkManagerEngine(BaseEngine):
                     restore_cmd = ["nmcli", "connection", "modify", "uuid", existing["uuid"]]
                     restore_cmd += [argument for pair in zip(settings_fields, original_settings) for argument in pair]
                     try:
-                        restored = subprocess.run(restore_cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=15)
+                        restored = self._run_nmcli(restore_cmd, timeout=15)
                         readback = self._run_cmd([
                             "nmcli", "-s", "-e", "no", "-g", ",".join(settings_fields),
                             "connection", "show", "uuid", existing["uuid"],
@@ -1465,8 +1487,7 @@ class NetworkManagerEngine(BaseEngine):
                 restore_uuid = previous_uuid or (active["uuid"] if active else "")
                 if attempted_write and restore_uuid:
                     try:
-                        restored = subprocess.run(["nmcli", "connection", "up", "uuid", restore_uuid, "ifname", device],
-                                                  capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30)
+                        restored = self._run_nmcli(["nmcli", "connection", "up", "uuid", restore_uuid, "ifname", device], timeout=30)
                         if restored.returncode:
                             recovery_errors.append(f"previous connection did not reconnect: {restored.stderr.strip()}")
                     except (OSError, subprocess.TimeoutExpired) as recovery_exc:
@@ -1495,23 +1516,26 @@ class NetworkManagerEngine(BaseEngine):
             profile = self._hotspot_profile(active_only=True)
             if not profile:
                 return True, "Hotspot is already stopped.", ""
-            res = subprocess.run(
+            res = self._run_nmcli(
                 ["nmcli", "connection", "down", "uuid", profile["uuid"]],
-                capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10
+                timeout=10,
             )
             if res.returncode == 0:
                 self.rescan_event.set()
                 previous = self._hotspot_previous()
                 if previous.get("device") == profile["device"] and previous.get("uuid"):
                     try:
-                        restored = subprocess.run(
+                        restored = self._run_nmcli(
                             ["nmcli", "connection", "up", "uuid", previous["uuid"], "ifname", profile["device"]],
-                            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30)
+                            timeout=30)
                     except (OSError, subprocess.TimeoutExpired) as exc:
                         return True, f"Hotspot stopped; previous Wi-Fi could not be restored: {exc}. Recovery record retained.", ""
                     if restored.returncode:
                         return True, f"Hotspot stopped; previous Wi-Fi did not reconnect: {restored.stderr.strip()}", ""
-                self._remember_hotspot_previous("", "")
+                try:
+                    self._remember_hotspot_previous("", "")
+                except OSError as exc:
+                    return True, f"Hotspot stopped; could not clear its recovery record: {exc}", ""
                 return True, "Hotspot stopped; previous Wi-Fi restored if available.", ""
             return False, f"Failed: {res.stderr.strip()}", res.stderr
 
@@ -1564,9 +1588,9 @@ class NetworkManagerEngine(BaseEngine):
 
         if key.startswith("fg__"):
             uuid = key[4:]
-            res = subprocess.run(
+            res = self._run_nmcli(
                 ["nmcli", "connection", "delete", "uuid", uuid],
-                capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10
+                timeout=10,
             )
             if res.returncode == 0:
                 self.rescan_event.set()
@@ -1803,7 +1827,7 @@ class NetworkManagerEngine(BaseEngine):
         active_wifi = next((connection for connection in active_connections or [] if connection.get("device") == iface), active_wifi)
         if iface:
             if enriched.get("iface") != iface:
-                for field in ("ip", "prefix", "freq", "bitrate", "rx_bytes", "tx_bytes"):
+                for field in ("ip", "prefix", "freq", "bitrate", "speed", "band", "rx_bytes", "tx_bytes"):
                     enriched.pop(field, None)
             enriched["iface"] = iface
             enriched["phy_iface"] = iface
@@ -1855,8 +1879,8 @@ class NetworkManagerEngine(BaseEngine):
                     if iw_out:
                         for line in iw_out.splitlines():
                             line_str = line.strip()
-                            if line_str.startswith("SSID:"):
-                                enriched["ssid"] = decode_iw_ssid(line_str.split("SSID:", 1)[1].strip())
+                            if line_str.startswith("SSID:") and not enriched.get("ssid"):
+                                enriched["ssid"] = decode_iw_ssid(line.lstrip().removeprefix("SSID:").removeprefix(" "))
                             elif line_str.startswith("freq:"):
                                 freq_val = line_str.split("freq:", 1)[1].strip()
                                 enriched["freq"] = freq_val
@@ -1869,6 +1893,14 @@ class NetworkManagerEngine(BaseEngine):
                                     enriched["bitrate"] = f"{parts[0]} {parts[1]}"
                 except Exception:
                     pass
+
+        if enriched.get("type") == "ethernet" and iface:
+            try:
+                speed = int(Path(f"/sys/class/net/{iface}/speed").read_text())
+                if speed > 0:
+                    enriched["speed"] = str(speed)
+            except (OSError, ValueError):
+                pass
 
         # ICMP samples describe this interface and address family, not a
         # generic claim that the internet is reachable through another link.
@@ -2010,6 +2042,8 @@ class NetworkManagerEngine(BaseEngine):
             "802-11-wireless-security.key-mgmt",
             "802-11-wireless-security.psk",
             "802-11-wireless-security.wep-key0",
+            "802-11-wireless-security.wep-tx-keyidx",
+            "802-11-wireless-security.wep-key-type",
             "802-11-wireless.hidden",
             "connection.id"
         ]
@@ -2023,7 +2057,11 @@ class NetworkManagerEngine(BaseEngine):
         key_mgmt = lines[1].strip() if len(lines) > 1 else ""
         psk = lines[2] if len(lines) > 2 else ""
         wep_key = lines[3] if len(lines) > 3 else ""
-        hidden_str = lines[4].strip() if len(lines) > 4 else "no"
+        hidden_str = lines[6].strip()
+        if key_mgmt.lower() == "none" and lines[4].strip() not in {"", "0"}:
+            raise RuntimeError("Standard Wi-Fi QR codes cannot represent a nonzero WEP key index.")
+        if key_mgmt.lower() == "none" and wep_key and lines[5].strip().startswith("2"):
+            raise RuntimeError("WEP passphrases require a profile editor; this QR format expects the actual WEP key.")
         password = psk or wep_key
 
         if not key_mgmt or key_mgmt.lower() == "none":
@@ -2050,6 +2088,8 @@ class NetworkManagerEngine(BaseEngine):
             return False, f"Could not read Wi-Fi credentials: {exc}", ""
         if not ssid:
             return False, "The saved Wi-Fi profile has no SSID.", ""
+        if security == "OWE":
+            return False, "OWE cannot be represented by this Wi-Fi QR format.", ""
         if "802-1X" in security:
             return False, "Enterprise Wi-Fi credentials cannot be shared with this QR format.", ""
         if security != "Open" and not password:
@@ -2093,7 +2133,7 @@ class NetworkManagerEngine(BaseEngine):
         if password:
             cmd.extend(["password", password])
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30)
+            res = self._run_nmcli(cmd, timeout=30)
             if res.returncode:
                 return False, f"Could not connect to {ssid}: {res.stderr.strip() or f'exit {res.returncode}'}", res.stderr
             return True, f"Connected to {ssid}.", ""
@@ -2104,9 +2144,9 @@ class NetworkManagerEngine(BaseEngine):
 
     def _async_connect_saved(self, label: str, uuid: str) -> tuple[bool, str, str]:
         try:
-            res = subprocess.run(
+            res = self._run_nmcli(
                 ["nmcli", "connection", "up", "uuid", uuid],
-                capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30,
+                timeout=30,
             )
             if res.returncode:
                 return False, f"Could not connect to {label}: {res.stderr.strip() or f'exit {res.returncode}'}", res.stderr
@@ -2118,9 +2158,9 @@ class NetworkManagerEngine(BaseEngine):
 
     def _async_disconnect(self, label: str, uuid: str) -> tuple[bool, str, str]:
         try:
-            res = subprocess.run(
+            res = self._run_nmcli(
                 ["nmcli", "connection", "down", "uuid", uuid],
-                capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=15,
+                timeout=15,
             )
             if res.returncode:
                 return False, f"Could not disconnect {label}: {res.stderr.strip() or f'exit {res.returncode}'}", res.stderr
@@ -2136,17 +2176,14 @@ class NetworkManagerEngine(BaseEngine):
             if connection is None:
                 return False, "The selected connection is no longer active.", ""
             up_cmd = ["nmcli", "connection", "up", "uuid", uuid, "ifname", connection["device"]]
-            down = subprocess.run(
+            down = self._run_nmcli(
                 ["nmcli", "connection", "down", "uuid", uuid],
-                capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=15,
+                timeout=15,
             )
             if down.returncode:
                 return False, f"Could not disconnect {label}: {down.stderr.strip() or f'exit {down.returncode}'}", down.stderr
             self.shutdown_event.wait(0.8)
-            up = subprocess.run(
-                up_cmd,
-                capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30,
-            )
+            up = self._run_nmcli(up_cmd, timeout=30)
             if up.returncode:
                 return False, f"Could not reconnect {label}: {up.stderr.strip() or f'exit {up.returncode}'}", up.stderr
             return True, f"Reconnected to {label}.", ""
@@ -2223,7 +2260,7 @@ class NetworkManagerEngine(BaseEngine):
             up_cmd.extend(["ifname", iface])
 
         def run(command: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
-            return subprocess.run(command, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=timeout)
+            return self._run_nmcli(command, timeout=timeout)
 
         previous: str | None = None
         try:
@@ -2392,9 +2429,12 @@ class NetworkManagerEngine(BaseEngine):
                             ))
                         pinned_band = self._pinned_bands_by_uuid.get(uuid, "Auto")
                         available = self._bands_by_uuid.get(uuid, [])
+                        band_options = ["Auto"] + [f"{band} GHz" for band in available]
+                        if pinned_band not in band_options:
+                            band_options.append(pinned_band)
                         t0.append(self._make_item(
                             label=f"Band{suffix}: {pinned_band}", key=f"band__{uuid}", scope="saved_action",
-                            type_="cycle", default=pinned_band, options=["Auto"] + [f"{band} GHz" for band in available],
+                            type_="cycle", default=pinned_band, options=band_options,
                             parent_ref=parent_uid, extended_help=f"Pin the band for this profile on {connection['device']}."
                         ))
                 elif is_saved:
@@ -2437,11 +2477,12 @@ class NetworkManagerEngine(BaseEngine):
                             label="Connect", key=f"cn__{ssid}", scope="network",
                             type_="bool", default=False, parent_ref=parent_uid, options=["trigger"]
                         ))
-                        t0.append(self._make_item(
-                            label="Share QR", key=f"qr_net__{ssid}", scope="network",
-                            type_="bool", default=False, parent_ref=parent_uid, options=["trigger"],
-                            extended_help=f"Show QR for {escape_markdown(ssid)}."
-                        ))
+                        if security == "Open":
+                            t0.append(self._make_item(
+                                label="Share QR", key=f"qr_net__{ssid}", scope="network",
+                                type_="bool", default=False, parent_ref=parent_uid, options=["trigger"],
+                                extended_help=f"Show QR for {escape_markdown(ssid)}."
+                            ))
 
 
         # ----- Tab 1: Saved Profiles -----
@@ -2490,6 +2531,8 @@ class NetworkManagerEngine(BaseEngine):
                 avail_b = self._bands_by_uuid.get(uuid, [])
                 band_opts = ["Auto"] + [f"{b} GHz" for b in avail_b]
                 pinned_band = self._pinned_bands_by_uuid.get(uuid, "Auto")
+                if pinned_band not in band_opts:
+                    band_opts.append(pinned_band)
                 t1.append(self._make_item(
                     label=f"Band: {pinned_band}", key=f"band__{uuid}", scope="saved_action",
                     type_="cycle", default=pinned_band, options=band_opts,
@@ -2788,12 +2831,20 @@ class NetworkManagerEngine(BaseEngine):
             env["PATH"] = f"{user_bin}:{current_path}"
         return env
 
+    @staticmethod
+    def _run_nmcli(args: list[str], timeout: int = 10) -> subprocess.CompletedProcess[str]:
+        """Let nmcli report its own timeout before the process deadline expires."""
+        return subprocess.run(
+            [args[0], "--colors", "no", "--wait", str(max(1, timeout - 2)), *args[1:]],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL,
+            env=NetworkManagerEngine._get_exec_env(), timeout=timeout,
+        )
+
     def _run_cmd(self, args: list[str], timeout: int = 5, required: bool = False) -> str:
         try:
-            command = [args[0], "--colors", "no", *args[1:]] if args[0] == "nmcli" else args
-            res = subprocess.run(
-                command, capture_output=True, text=True, stdin=subprocess.DEVNULL,
-                env=self._get_exec_env(), timeout=timeout
+            res = self._run_nmcli(args, timeout) if args[0] == "nmcli" else subprocess.run(
+                args, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                env=self._get_exec_env(), timeout=timeout,
             )
             if res.returncode:
                 if required:
