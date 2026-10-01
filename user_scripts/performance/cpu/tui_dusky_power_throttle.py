@@ -110,7 +110,7 @@ if not power_items:
             label="RAPL Unavailable",
             key="unsupported",
             type_="action",
-            default="N/A",
+            default=":",
             read_only=True,
             extended_help="No supported RAPL / Powercap energy domains were discovered in /sys/class/powercap. Check whether the platform exposes writable package power constraints through powercap."
         )
