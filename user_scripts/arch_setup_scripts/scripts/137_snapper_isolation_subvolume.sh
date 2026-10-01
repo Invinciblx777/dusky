@@ -730,8 +730,18 @@ drain_browser_original() {
     sudo find "$hidden" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} +
 }
 
+browser_is_running() {
+    # Linux comm is limited to 15 characters (chromium-browser is truncated).
+    pgrep -u "$1" -x 'firefox|firefox-bin|chrome|chromium|chromium-browse|chromium-browser|google-chrome|chrome-headless' >/dev/null
+}
+
 isolate_browser_directory() {
     local base="$1" top="$2" uid="$3" gid="$4" path="$5" role="$6"
+    # Check before inspecting paths or changing even an existing mount.
+    if browser_is_running "$uid"; then
+        warn "Browser isolation deferred for $path: close Firefox, Chromium and Chrome, then rerun this script. Existing browser data and mounts are unchanged."
+        return 0
+    fi
     local parent subvol destination pending hidden fsroot relative
     parent="$(dirname "$path")"
     if ! sudo test -d "$parent"; then
@@ -754,15 +764,37 @@ isolate_browser_directory() {
     relative="${path#"${base%/}"/}"
     hidden="$top/${fsroot:+$fsroot/}$relative"
     if sudo mountpoint -q "$path"; then
-        current_snapshots_mount_matches_expected "$path" "$subvol" "$base" ||
-            fatal "Browser directory $path is mounted from an unexpected subvolume."
-        ensure_fstab_entry_for_snapshots "$base" "$path" "$subvol"
-        drain_browser_original "$hidden"
+        if current_snapshots_mount_matches_expected "$path" "$subvol" "$base"; then
+            ensure_fstab_entry_for_snapshots "$base" "$path" "$subvol"
+            drain_browser_original "$hidden"
+        else
+            # Keep an existing top-level browser subvolume and its mount policy.
+            # Require a matching fstab entry so isolation survives reboot/rollback.
+            local mounted_root mounted_source entries
+            mounted_root="$(sudo findmnt -n -o FSROOT -M "$path")"
+            mounted_source="$(sudo findmnt -n -e -o SOURCE -M "$path")"
+            mounted_source="${mounted_source%%\[*}"
+            [[ "$mounted_root" == /* && "$mounted_root" != / && "${mounted_root#/}" != */* ]] ||
+                fatal "Browser directory $path is not mounted from a top-level subvolume."
+            [[ "$(sudo findmnt -n -e -o UUID -M "$path")" == "${CACHE_MNT_UUID["$base"]}" ]] ||
+                fatal "Browser directory $path is mounted from a different filesystem."
+            path_is_btrfs_subvolume "$path" || fatal "Browser mount $path is not a Btrfs subvolume."
+            entries="$(sudo findmnt --fstab --evaluate --json --list -M "$path" -o SOURCE,FSTYPE,OPTIONS)" ||
+                fatal "Existing browser mount $path needs a persistent fstab entry."
+            python3 -c 'import json, sys
+source, root = sys.argv[1:]
+rows = json.load(sys.stdin)["filesystems"]
+assert len(rows) == 1
+row = rows[0]
+options = dict(item.split("=", 1) if "=" in item else (item, "")
+               for item in row["options"].split(","))
+assert row["source"] == source and row["fstype"] == "btrfs"
+assert options.get("subvol", "").lstrip("/") == root.lstrip("/")
+assert "noauto" not in options' "$mounted_source" "$mounted_root" <<< "$entries" ||
+                fatal "Existing browser mount $path does not match its persistent fstab entry."
+            info "Keeping existing isolated browser mount: $path ($mounted_root)."
+        fi
         return 0
-    fi
-    # Copying a live profile can lose writes that arrive during migration.
-    if pgrep -u "$uid" -x 'firefox|firefox-bin|chrome|chromium|chromium-browser' >/dev/null; then
-        fatal "Close Firefox, Chromium and Chrome for user ID $uid before isolating browser data."
     fi
     sudo test ! -e "$path" || sudo test -d "$path" || fatal "Browser path is not a directory: $path"
     [[ "$(sudo findmnt -n -e -o UUID -T "$parent")" == "${CACHE_MNT_UUID["$base"]}" ]] ||
@@ -819,6 +851,11 @@ isolate_browser_profiles() {
     [[ "$uid_min" =~ ^[0-9]+$ && "$uid_max" =~ ^[0-9]+$ ]] || fatal "Cannot determine desktop UID range."
     while IFS=: read -r _name _password uid gid _gecos account_home _shell; do
         (( uid >= uid_min && uid <= uid_max )) || continue
+        # One warning per account; skip before home/filesystem validation too.
+        if browser_is_running "$uid"; then
+            warn "Browser isolation deferred for $_name: close Firefox, Chromium and Chrome, then rerun this script. Existing browser data and mounts are unchanged."
+            continue
+        fi
         sudo test -d "$account_home" || continue
         account_home="$(sudo realpath -e "$account_home")"
         [[ "$(sudo stat -f -c %T "$account_home")" == btrfs ]] || fatal "Home directory $account_home is not Btrfs."
