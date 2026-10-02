@@ -211,7 +211,7 @@ ALL_GROUPS: dict[str, list[str]] = {
         "qt6-multimedia-ffmpeg", "adw-gtk-theme", "upower", "plocate", "matugen",
         "otf-font-awesome", "ttf-jetbrains-mono-nerd", "otf-atkinsonhyperlegiblemono-nerd",
         "ttf-atkinson-hyperlegible", "otf-atkinson-hyperlegible",
-        "noto-fonts-emoji", "sassc", "python-packaging", "python", "python-gobject",
+        "noto-fonts-emoji", "ttf-liberation", "sassc", "python-packaging", "python", "python-gobject",
         "python-cairo", "python-opengl", "gtk-layer-shell", "python-evdev", "python-pyudev",
         "fontconfig", "python-pyquery", "python-textual", "python-rich", "python-pillow", "papirus-icon-theme",
     ],
