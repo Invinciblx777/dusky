@@ -738,6 +738,17 @@ write_value_to_file() {
         if ! populate_config_cache; then release_lock_fd "$lock_fd"; return 1; fi
         before=$CONFIG_SIGNATURE
     fi
+    # Optional compare-and-swap protects relative edits, including stale no-ops.
+    # Arguments 5/6 are the expected presence (0/1) and raw cached value.
+    if (( $# >= 5 )); then
+        local actual_present=0
+        [[ ${CONFIG_CACHE[$cache_key]+present} ]] && actual_present=1
+        if [[ $actual_present != "$5" || ${CONFIG_CACHE[$cache_key]-} != "${6-}" ]]; then
+            release_lock_fd "$lock_fd"
+            set_status "Setting changed externally; refreshed. Retry the adjustment."
+            return 1
+        fi
+    fi
     if { [[ $operation == delete && ! ${CONFIG_CACHE[$cache_key]+present} ]]; } ||
        { [[ $operation == set && ${CONFIG_CACHE[$cache_key]+present} &&
             ${CONFIG_CACHE[$cache_key]} == "$new_val" ]]; }; then
@@ -951,6 +962,10 @@ modify_value() {
     get_active_context
     local -n _items_ref="$REPLY_REF"
     IFS='|' read -r key type block min max step <<< "${ITEM_MAP["${REPLY_CTX}::${label}"]}"
+    local cache_key="${key}|${block}" expected_present=0 expected_value
+    [[ ${CONFIG_CACHE[$cache_key]+present} ]] && expected_present=1
+    expected_value=${CONFIG_CACHE[$cache_key]-}
+    load_active_values
     current=${VALUE_CACHE["${REPLY_CTX}::${label}"]:-}
 
     if [[ ! ${VALUE_CACHE["${REPLY_CTX}::${label}"]+present} || -z $current ]]; then
@@ -1052,10 +1067,12 @@ modify_value() {
         *) return 0 ;;
     esac
 
-    if write_value_to_file "$key" "$new_val" "$block"; then
+    if write_value_to_file "$key" "$new_val" "$block" set "$expected_present" "$expected_value"; then
         load_active_values
         clear_status
         if (( LAST_WRITE_CHANGED )); then post_write_action; fi
+    else
+        load_active_values
     fi
     return 0
 }
@@ -1072,6 +1089,10 @@ toggle_never() {
     # Only applies to 'int' types.
     if [[ $type != int ]]; then return 0; fi
 
+    local cache_key="${key}|${block}" expected_present=0 expected_value
+    [[ ${CONFIG_CACHE[$cache_key]+present} ]] && expected_present=1
+    expected_value=${CONFIG_CACHE[$cache_key]-}
+    load_active_values
     current=${VALUE_CACHE["${REPLY_CTX}::${label}"]:-}
     if [[ ! ${VALUE_CACHE["${REPLY_CTX}::${label}"]+present} || -z $current ]]; then
         current=${DEFAULTS["${REPLY_CTX}::${label}"]:-}
@@ -1086,10 +1107,12 @@ toggle_never() {
         new_val=$NEVER_VAL
     fi
 
-    if write_value_to_file "$key" "$new_val" "$block"; then
+    if write_value_to_file "$key" "$new_val" "$block" set "$expected_present" "$expected_value"; then
         load_active_values
         clear_status
         if (( LAST_WRITE_CHANGED )); then post_write_action; fi
+    else
+        load_active_values
     fi
     return 0
 }
@@ -1175,6 +1198,10 @@ reset_defaults() {
 # =============================================================================
 
 acquire_sudo() {
+    if ! command -v sudo >/dev/null 2>&1; then
+        set_status "This action requires sudo, which is not installed."
+        return 1
+    fi
     if sudo -n true 2>/dev/null; then
         return 0
     fi
