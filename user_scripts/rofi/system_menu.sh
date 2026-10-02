@@ -691,7 +691,7 @@ show_power_menu() {
                 run_term_hold "bat_notify_config" "$SCRIPTS_DIR/arch_setup_scripts/scripts/440_config_bat_notify.sh"
                 ;;
             '  Idle Settings')
-                run_term_hold "dusky_hypridle" "$SCRIPTS_DIR/hypridle/dusky_hypridle.sh"
+                run_term_hold "dusky_tui" python3 "$SCRIPTS_DIR/hypridle/tui_dusky_hypridle.py"
                 ;;
             '  Lock Screen Select')
                 run_term_hold "dusky_tui" python3 "$SCRIPTS_DIR/hyprlock/tui_hyprlock.py"

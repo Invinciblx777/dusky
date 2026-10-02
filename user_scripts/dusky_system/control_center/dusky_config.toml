@@ -3077,7 +3077,7 @@ icon = "preferences-system-time-symbolic"
 style = "suggested"
 [pages.layout.items.items.on_press]
 type = "exec"
-command = "kitty --class dusky_hypridle.sh --hold sh -c \"$HOME/user_scripts/hypridle/dusky_hypridle.sh\""
+command = "foot --app-id=dusky_tui --hold python3 $HOME/user_scripts/hypridle/tui_dusky_hypridle.py"
 
 [[pages.layout.items.items]]
 type = "button"
