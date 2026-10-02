@@ -440,7 +440,7 @@ show_display_menu() {
                 run_term "waybar_tui" python3 "$SCRIPTS_DIR/waybar/tui_waybars.py"
                 ;;
             '  Monitor Wizard')
-                run_term_hold "dusky_tui" python3 "$SCRIPTS_DIR/hypr/monitor/monitor_wizard.py"
+                run_term_hold "dusky_tui" python3 "$SCRIPTS_DIR/hypr/monitor/tui_monitor_wizard.py"
                 ;;
             '  Scale Up')
                 run_app python3 "$SCRIPTS_DIR/hypr/monitor/adjust_scale.py" +
