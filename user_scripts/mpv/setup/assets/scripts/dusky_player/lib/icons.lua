@@ -53,6 +53,28 @@ icons.hdr_auto = icons.high_quality
 icons.repeat_one = icons['repeat']
 icons.autorenew = icons.refresh
 
+local arc = {}
+for i = 0, 64 do
+    local angle = i / 64 * math.pi * 1.5
+    arc[#arc + 1] = 12 + 10 * math.cos(angle)
+    arc[#arc + 1] = 12 + 10 * math.sin(angle)
+end
+for i = 64, 0, -1 do
+    local angle = i / 64 * math.pi * 1.5
+    arc[#arc + 1] = 12 + 8 * math.cos(angle)
+    arc[#arc + 1] = 12 + 8 * math.sin(angle)
+end
+icons.spinner = {polygon(arc)}
+for _, center in ipairs({{21, 12}, {12, 3}}) do
+    local cap = {}
+    for i = 0, 23 do
+        local angle = i / 24 * math.pi * 2
+        cap[#cap + 1] = center[1] + math.cos(angle)
+        cap[#cap + 1] = center[2] + math.sin(angle)
+    end
+    icons.spinner[#icons.spinner + 1] = polygon(cap)
+end
+
 local cache = {}
 local function path_for(name)
     if cache[name] then return cache[name] end

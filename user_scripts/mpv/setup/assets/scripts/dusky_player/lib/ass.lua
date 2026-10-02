@@ -246,9 +246,14 @@ end
 ---@param opts? {color?: string; opacity?: number; clip?: string; border?: number; border_color?: string;}
 function ass_mt:spinner(x, y, size, opts)
 	opts = opts or {}
-	opts.rotate = (state.render_last_time * 1.75 % 1) * -360
-	opts.color = opts.color or fg
-	self:icon(x, y, size, 'autorenew', opts)
+	local angle = (state.render_last_time * 1.75 % 1) * -360
+	local scale = size / 24 * 100
+	local tags = string.format('\\pos(%f,%f)\\rDefault\\an7\\org(%f,%f)\\frz%f\\blur0\\p1\\fscx%f\\fscy%f\\bord%f\\shad0\\1c&H%s\\3c&H%s',
+		x - size / 2, y - size / 2, x, y, angle, scale, scale, opts.border or 0, opts.color or fg, opts.border_color or bg)
+	if opts.opacity then tags = tags .. self.opacity(nil, opts.opacity) end
+	if opts.clip then tags = tags .. opts.clip end
+	self:new_event()
+	self:append('{' .. tags .. '}' .. icon_path('spinner') .. '{\\p0}')
 	request_render()
 end
 
