@@ -4,7 +4,8 @@
 Auto mode plays regular videos directly and active broadcasts with live travel
 keys and a tmpfs archive when a single muxed stream is selected. mpv cannot
 archive separate video/audio streams together; live mode disables that archive,
-while file mode requires a single stream. Live rewind depends on the server.
+while file mode requires a single stream. Live rewind uses retained data;
+older positions require server support.
 
 Examples:
   %(prog)s URL                             # choose format; auto video/live mode
@@ -22,8 +23,9 @@ Examples:
 
 Preferences: CLI > replay entry > env > config.toml > builtin.
 Settings/history use XDG_CONFIG_HOME/dusky/settings/ytdlp_stream (0600).
+History keeps the last 10 distinct URLs, newest first; use list to replay.
 Each playback has its own temporary session, removed even on failure. --keep
-moves archives into the recording pool; live jumps create separate segments.
+moves archives into the recording pool; reopened live jumps create separate segments.
 Tmpfs prevents direct video writes to persistent filesystems; it may be swapped.
 
 Env overrides: MPV_DVR_FORMAT, MPV_DVR_SPEED, MPV_DVR_TMPDIR, MPV_DVR_BUFFER,
@@ -89,7 +91,7 @@ def _cfg_dir() -> str:
 
 CONFIG_FILE = os.path.join(_cfg_dir(), "config.toml")
 HISTORY_FILE = os.path.join(_cfg_dir(), "history.toml")
-MAX_HISTORY = 100
+MAX_HISTORY = 10
 
 # key: (type, builtin default)
 GLOBAL_SPEC: dict[str, tuple[str, object]] = {
@@ -807,7 +809,7 @@ def resolve_buffer(want: str | None, need_player: bool) -> str:
 
     Never forced: ask prompts on a tty, defaults to near when piped or when
     there is no player (--record-only / -F). Direct-live note: full widens
-    the local rewind window; reopening still depends on the server timeline.
+    the local rewind window; cached seeks keep the player open.
     Global/env/CLI merging happens before this call, so want is already final.
     """
     w = (want or "ask").strip().lower()
@@ -817,9 +819,13 @@ def resolve_buffer(want: str | None, need_player: bool) -> str:
         return w if w in ("full", "near") else "near"
     if not sys.stdin.isatty():
         return "near"
-    print("Buffer: [full] allows up to 2 GiB of demuxer cache for easy back/forth scrubbing "
-          "(more RAM); [near] keeps mpv defaults (file stays fully seekable either way).",
-          file=sys.stderr)
+    message = "Rewind buffer\nnear: less memory. full: keep more of what you've watched in memory."
+    if _RICH and sys.stderr.isatty():
+        text = Text(message)
+        text.stylize("bold cyan", 0, len("Rewind buffer"))
+        Console(stderr=True).print(text)
+    else:
+        print(message, file=sys.stderr)
     try:
         ans = input("Buffer full or near? [near/full, default=near]: ").strip().lower() or "near"
     except (EOFError, KeyboardInterrupt):
@@ -862,8 +868,7 @@ def join_threshold(fmts: list[dict], choice: str) -> int:
     return max(START_BYTES, min(int(tbr * 125 * 1.5), 2 * 1024 * 1024))
 
 
-# Lua snapshots position at the key press, avoiding stale polling and preserving
-# the user's input.conf. Reopening is useful on HLS sources that clamp seeks.
+# Seek inside the RAM cache first; reopening discards it and requires server DVR.
 TRAVEL_DELTAS = {91: -60, 92: 60, 93: -600, 94: 600}
 TRAVEL_LUA = r"""
 local utils = require 'mp.utils'
@@ -884,6 +889,16 @@ mp.register_event('shutdown', snapshot)
 for key, code in pairs({['Ctrl+Left']=91, ['Ctrl+Right']=92,
                         ['Shift+Left']=93, ['Shift+Right']=94}) do
     mp.add_forced_key_binding(key, 'travel-' .. code, function()
+        local position = mp.get_property_number('time-pos')
+        local delta = ({[91]=-60, [92]=60, [93]=-600, [94]=600})[code]
+        local cache = mp.get_property_native('demuxer-cache-state') or {}
+        local target = position and math.max(0, position + delta)
+        for _, range in ipairs(cache['seekable-ranges'] or {}) do
+            if target and target >= range.start and target <= range['end'] then
+                mp.commandv('seek', tostring(target), 'absolute+exact')
+                return
+            end
+        end
         snapshot()
         mp.commandv('quit', code)
     end)
@@ -1092,6 +1107,7 @@ def build_parser() -> argparse.ArgumentParser:
                f"  {PROG} URL -F              List formats with a quick codec check\n"
                f"  {PROG} URL -F --probe      List formats with a longer codec check\n"
                f"  {PROG} URL -f '#2'         Play row 2 from the format list\n"
+               f"  {PROG} list                Choose from your last 10 videos\n"
                f"  {PROG} URL --mode live     Enable live travel and an optional archive\n\n"
                "Settings: CLI > replay entry > environment > config.toml > defaults.\n"
                "Player keys: } = 2x, ]/[ = adjust speed, Backspace = reset, Left/Right = seek.\n"
@@ -1099,7 +1115,7 @@ def build_parser() -> argparse.ArgumentParser:
                "Codec budgets apply after yt-dlp metadata extraction; unresolved codecs show ?.",
     )
     ap.add_argument("url", nargs="?",
-                    metavar="URL", help="video or live-stream URL supported by yt-dlp")
+                    metavar="URL", help="video/live-stream URL, or 'list' to choose from recent history")
     formats = ap.add_argument_group("Formats and codec detection")
     playback = ap.add_argument_group("Playback")
     recording = ap.add_argument_group("Recording and DVR")
@@ -1164,7 +1180,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help=f"persist global defaults, e.g. --set-global buffer=near speed=2 "
                          f"({', '.join(sorted(GLOBAL_SPEC))})")
     mg.add_argument("--show-config", action="store_true", help="show global defaults and exit")
-    mg.add_argument("--history", action="store_true", help="list previously played streams and exit")
+    mg.add_argument("--history", action="store_true", help="show saved history and exit (use list to choose and play)")
     mg.add_argument("--replay", default=None, metavar="N|URL",
                     help="replay a history entry with its stored settings (index, URL, or title match)")
     mg.add_argument("--forget", default=None, metavar="N|URL", help="drop a history entry and exit")
@@ -1224,26 +1240,47 @@ def _eff_float(cli: object | None, entry: dict, key: str, cfg: dict, builtin: fl
     return builtin
 
 
-def show_history() -> None:
-    entries = load_history()
+def show_history(entries: list[dict] | None = None) -> None:
+    entries = load_history() if entries is None else entries
     if not entries:
-        print("History is empty.")
+        print("No videos in history yet.")
         return
     if _RICH and sys.stdout.isatty():
-        t = Table(show_header=True, header_style="bold")
-        for col in ("#", "LAST PLAYED", "TITLE", "FORMAT", "BUF", "SPEED", "PLAYS"):
-            t.add_column(col, justify="right" if col in ("#", "SPEED", "PLAYS") else "left")
-        for i, e in enumerate(entries):
-            ts = time.strftime("%m-%d %H:%M", time.localtime(int(e.get("last_played", 0) or 0)))
-            t.add_row(str(i), ts, str(e.get("title") or "?")[:40], str(e.get("format") or "?"),
-                      str(e.get("buffer") or "?"), str(e.get("speed") or "?"), str(e.get("plays", 1)))
-            t.add_row("", "", f"[dim]{str(e.get('url') or '')[:80]}[/dim]", "", "", "", "")
-        Console().print(t)
+        table = Table(title="Recently played", header_style="bold cyan", expand=True)
+        table.add_column("#", justify="right", style="cyan", no_wrap=True)
+        table.add_column("Video")
+        table.add_column("Last played", no_wrap=True)
+        for i, entry in enumerate(entries):
+            stamp = time.strftime("%m-%d %H:%M", time.localtime(int(entry.get("last_played", 0) or 0)))
+            video = Text(str(entry.get("title") or "Untitled"))
+            video.append("\n" + str(entry["url"]), style="dim")
+            table.add_row(str(i), video, stamp)
+        Console().print(table)
         return
-    for i, e in enumerate(entries):
-        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(e.get("last_played", 0) or 0)))
-        print(f"{i}: [{ts}] {e.get('title')} | f={e.get('format')} buf={e.get('buffer')} "
-              f"spd={e.get('speed')} x{e.get('plays', 1)}\n    {e.get('url')}")
+    for i, entry in enumerate(entries):
+        stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(entry.get("last_played", 0) or 0)))
+        print(f"{i}: {entry.get('title') or 'Untitled'} [{stamp}]\n   {entry['url']}")
+
+
+def pick_history() -> dict | None:
+    entries = load_history()[:MAX_HISTORY]
+    show_history(entries)
+    if not entries or not sys.stdin.isatty():
+        return None
+    while True:
+        try:
+            if _RICH and sys.stdout.isatty():
+                Console().print(Text("Play which number? Enter=0, q=close", style="bold cyan"))
+                choice = input("> ").strip() or "0"
+            else:
+                choice = input("Play which number? [Enter=0, q=close]: ").strip() or "0"
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if choice.lower() in ("q", "quit", "exit"):
+            return None
+        if choice.isdecimal() and int(choice) < len(entries):
+            return entries[int(choice)]
+        print(f"Choose a number from 0 to {len(entries) - 1}, or q to close.", file=sys.stderr)
 
 
 def _eff_int(cli: object | None, entry: dict, key: str, cfg: dict, builtin: int) -> int:
@@ -1294,6 +1331,13 @@ def main() -> int:
         print("History cleared.")
         return 0
 
+    picked_entry = None
+    if args.url == "list":
+        picked_entry = pick_history()
+        if picked_entry is None:
+            return 0
+        args.url = None
+
     mpv_bin = shutil.which("mpv")
     if mpv_bin is None:
         raise SystemExit("ERROR: mpv not found in PATH")
@@ -1302,11 +1346,11 @@ def main() -> int:
         return doctor(mpv_bin, ytdlp)
 
     # Replay supplies URL + per-stream prefs; explicit CLI still wins.
-    entry: dict = find_entry(args.replay) if args.replay is not None else {}
+    entry: dict = picked_entry or (find_entry(args.replay) if args.replay is not None else {})
     if args.url and entry and args.url != entry.get("url"):
         entry = {}
     if entry:
-        print(f"Replaying #{load_history().index(entry)}: {entry.get('title')} "
+        print(f"Replaying: {entry.get('title')} "
               f"(stored f={entry.get('format')} buf={entry.get('buffer')} spd={entry.get('speed')})",
               file=sys.stderr)
     url = args.url or entry.get("url")
@@ -1433,6 +1477,8 @@ def main() -> int:
                           "--script-opts-append=ytdl_hook-use_manifests=no"]
         common = ["--no-save-position-on-quit", "--no-resume-playback", "--cache-on-disk=no"]
         player = [mpv_bin] + common + BUFFER_PRESETS[bufmode] + [f"--speed={args.speed}"]
+        if info.get("is_live") and mode in ("live", "plain"):
+            player += ["--cache=yes", "--force-seekable=yes"]
         # Explicit negative CLI booleans must also override mpv.conf.
         for key in ("fullscreen", "mute"):
             player.append(f"--{key}={'yes' if getattr(args, key) else 'no'}")
@@ -1490,7 +1536,7 @@ def main() -> int:
             open_start = start_opt
             state_path = os.path.join(session, "position.json")
             print("Travel: Ctrl+Left/Right = ±60s; Shift+Left/Right = ±10min. "
-                  "Reopens at the current position; available timeline depends on the server.", file=sys.stderr)
+                  "Uses your buffer first; older positions require rewind support from the stream.", file=sys.stderr)
             segment = 0
             while True:
                 segment_path = os.path.join(session, f"recording-{segment}.mkv")

@@ -403,5 +403,113 @@ class FormatSelection(unittest.TestCase):
             self.assertEqual([track['format_id'] for track in tracks], ['232', '234'])
 
 
+class HistoryAndLive(unittest.TestCase):
+    def setUp(self):
+        self.output = self.enterContext(contextlib.redirect_stdout(io.StringIO()))
+        self.enterContext(contextlib.redirect_stderr(io.StringIO()))
+
+    def entries(self):
+        return [{'url': f'https://example.com/{i}', 'title': f'Video {i}',
+                 'mode': 'plain', 'format': 'best', 'buffer': 'near'} for i in range(3)]
+
+    def test_history_selection_quit_empty_and_noninteractive(self):
+        for replies, expected in [(['1'], 1), ([''], 0), (['99', '2'], 2), (['q'], None)]:
+            with self.subTest(replies=replies), patch.object(player, 'load_history', return_value=self.entries()), \
+                    patch.object(player.sys.stdin, 'isatty', return_value=True), \
+                    patch('builtins.input', side_effect=replies):
+                result = player.pick_history()
+                self.assertEqual(result['title'] if result else None,
+                                 f'Video {expected}' if expected is not None else None)
+        for entries, tty in [([], True), (self.entries(), False)]:
+            with patch.object(player, 'load_history', return_value=entries), \
+                    patch.object(player.sys.stdin, 'isatty', return_value=tty), patch('builtins.input') as ask:
+                self.assertIsNone(player.pick_history())
+                ask.assert_not_called()
+
+    def test_history_persists_ten_unique_urls_and_moves_replays_to_front(self):
+        with tempfile.TemporaryDirectory(dir='/dev/shm') as directory, \
+                patch.object(player, '_cfg_dir', return_value=directory), \
+                patch.object(player, 'HISTORY_FILE', str(Path(directory) / 'history.toml')):
+            for i in range(12):
+                player.remember({'url': f'https://example.com/{i}', 'title': f'Video {i}'})
+            history = player.load_history()
+            self.assertEqual(len(history), 10)
+            self.assertEqual(history[0]['url'], 'https://example.com/11')
+            self.assertEqual(history[-1]['url'], 'https://example.com/2')
+            player.remember({'url': 'https://example.com/5', 'title': 'Played again'})
+            history = player.load_history()
+            self.assertEqual(len(history), 10)
+            self.assertEqual(history[0]['url'], 'https://example.com/5')
+            self.assertEqual(history[0]['plays'], 2)
+            self.assertEqual(len({entry['url'] for entry in history}), 10)
+
+    def test_list_replays_selected_url_and_enables_seeking_only_for_live(self):
+        for live in (False, True):
+            with self.subTest(live=live), \
+                    patch.object(player.sys, 'argv', ['vid', 'list', '--print-cmds']), \
+                    patch.object(player.sys.stdin, 'isatty', return_value=True), \
+                    patch('builtins.input', return_value='1'), \
+                    patch.object(player, 'load_history', return_value=self.entries()), \
+                    patch.object(player, 'load_config', return_value={}), \
+                    patch.object(player, 'pick_tmpfs', return_value='/dev/shm'), \
+                    patch.object(player, 'run_yt_dlp_json', return_value={'formats': [], 'is_live': live}) as extract, \
+                    patch.dict(os.environ, {}, clear=True), \
+                    contextlib.redirect_stderr(io.StringIO()) as diagnostics:
+                self.assertEqual(player.main(), 0)
+                self.assertEqual(extract.call_args.args[0], 'https://example.com/1')
+                self.assertEqual('--force-seekable=yes' in diagnostics.getvalue(), live)
+                self.assertEqual('--cache=yes' in diagnostics.getvalue(), live)
+
+    def test_real_mpv_travel_rewinds_cached_data_without_reopening(self):
+        with tempfile.TemporaryDirectory(dir='/dev/shm') as directory:
+            root = Path(directory)
+            media = root / 'test.mp4'
+            subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=64x48:rate=5',
+                            '-t', '120', '-c:v', 'libx264', '-preset', 'ultrafast', '-g', '5',
+                            '-movflags', '+faststart', str(media)], check=True, timeout=15)
+            travel = root / 'travel'
+            travel.mkdir()
+            (travel / 'main.lua').write_text(player.TRAVEL_LUA)
+            harness = root / 'verify.lua'
+            harness.write_text("""
+mp.register_event('file-loaded', function()
+    mp.commandv('seek', '70', 'absolute+exact')
+    mp.add_timeout(0.5, function()
+        print('BEFORE_REWIND ' .. tostring(mp.get_property_number('time-pos')))
+        mp.commandv('script-binding', 'travel/travel-91')
+        mp.add_timeout(0.5, function()
+            print('AFTER_REWIND ' .. tostring(mp.get_property_number('time-pos')))
+            mp.commandv('quit')
+        end)
+    end)
+end)
+""")
+            result = subprocess.run(['mpv', '--no-config', '--vo=null', '--ao=null', '--pause',
+                                     '--cache=yes', '--force-seekable=yes', '--demuxer-max-bytes=32M',
+                                     '--demuxer-max-back-bytes=32M', '--input-terminal=no',
+                                     f'--scripts-append={travel}', f'--scripts-append={harness}', str(media)],
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            output = result.stdout + result.stderr
+            self.assertIn('BEFORE_REWIND 70', output)
+            self.assertIn('AFTER_REWIND 10', output)
+            # A jump beyond the cache still requests the existing server-reopen path.
+            harness.write_text("""
+mp.register_event('file-loaded', function()
+    mp.commandv('seek', '70', 'absolute+exact')
+    mp.add_timeout(0.5, function()
+        mp.commandv('script-binding', 'travel/travel-94')
+    end)
+end)
+""")
+            outside = subprocess.run(['mpv', '--no-config', '--vo=null', '--ao=null', '--pause',
+                                      '--cache=yes', '--input-terminal=no',
+                                      f'--scripts-append={travel}', f'--scripts-append={harness}', str(media)],
+                                     capture_output=True, text=True, timeout=10)
+            self.assertEqual(outside.returncode, 94, outside.stdout + outside.stderr)
+            state = json.loads((root / 'position.json').read_text())
+            self.assertEqual(state['time-pos'], 70)
+
+
 if __name__ == '__main__':
     unittest.main()
