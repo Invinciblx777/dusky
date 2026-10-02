@@ -1,4 +1,4 @@
-# ~/.config/systemd/user/dusky-kokoro.socket
+# ~/.config/systemd/user/dusky_kokoro.socket
 #
 # The control socket is owned by systemd, not by the daemon. Consequences:
 #   * trigger.sh connects successfully even when no daemon process exists; the

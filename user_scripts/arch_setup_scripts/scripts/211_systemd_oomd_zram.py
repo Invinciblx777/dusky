@@ -1527,8 +1527,8 @@ Action=kill-by-pgscan
                  mode=0o755, desc="dusky-run transient-scope launcher"),
         FileSpec(dest=Path("/usr/local/src/dusky-oom-shield.c"), content=DUSKY_OOM_SHIELD_C,
                  desc="dusky-oom-shield C source"),
-        FileSpec(dest=Path("/etc/systemd/user/dusky-oom-shield.service"),
-                 content=DUSKY_OOM_SHIELD_SERVICE, desc="dusky-oom-shield user service"),
+        FileSpec(dest=Path("/etc/systemd/user/dusky_oom_shield.service"),
+                 content=DUSKY_OOM_SHIELD_SERVICE, desc="dusky_oom_shield user service"),
     ]
     for svc in CRITICAL_USER:
         out.append(FileSpec(dest=Path(f"/etc/systemd/user/{svc}.d/90-desktop-oom.conf"),
@@ -1683,9 +1683,9 @@ def active_sessions() -> list[tuple[int, str]]:
 
 def reload_user_managers() -> None:
     # --global is the authoritative, user-agnostic enablement: it creates
-    # /etc/systemd/user/graphical-session.target.wants/dusky-oom-shield.service
+    # /etc/systemd/user/graphical-session.target.wants/dusky_oom_shield.service
     # for every present and future user, and is idempotent.
-    run_sysctl(["systemctl", "--global", "enable", "dusky-oom-shield.service"], quiet_ok=False)
+    run_sysctl(["systemctl", "--global", "enable", "dusky_oom_shield.service"], quiet_ok=False)
 
     sessions = active_sessions()
     if not sessions:
@@ -1713,16 +1713,16 @@ def reload_user_managers() -> None:
 
         graphical = user_ctl("is-active", "--quiet", "graphical-session.target").returncode == 0
         if graphical:
-            r = user_ctl("restart", "dusky-oom-shield.service")
+            r = user_ctl("restart", "dusky_oom_shield.service")
             verb = "restarted"
         else:
-            r = user_ctl("start", "dusky-oom-shield.service")
+            r = user_ctl("start", "dusky_oom_shield.service")
             verb = "started"
         if r.returncode == 0:
             say(f"[green]{'SHIELD':11}[/] {verb} for {name} (uid {uid})",
                 plain=f"{'SHIELD':11} {verb} for {name} (uid {uid})")
         else:
-            warn(f"{name}: shield {verb[:-1]} failed: {r.stderr.strip() or 'see journalctl --user -u dusky-oom-shield'}")
+            warn(f"{name}: shield {verb[:-1]} failed: {r.stderr.strip() or 'see journalctl --user -u dusky_oom_shield'}")
 
 
 # --------------------------------------------------------------------------- #
@@ -1860,10 +1860,10 @@ def verify() -> int:
             r = subprocess.run(["runuser", "-u", name, "-w",
                                 "XDG_RUNTIME_DIR,DBUS_SESSION_BUS_ADDRESS", "--",
                                 "systemctl", "--user", "is-active", "--quiet",
-                                "dusky-oom-shield.service"],
+                                "dusky_oom_shield.service"],
                                env=env, capture_output=True, text=True, check=False)
         else:
-            r = subprocess.run(["systemctl", "--user", "is-active", "--quiet", "dusky-oom-shield.service"],
+            r = subprocess.run(["systemctl", "--user", "is-active", "--quiet", "dusky_oom_shield.service"],
                                capture_output=True, text=True, check=False)
 
         if r.returncode == 0:

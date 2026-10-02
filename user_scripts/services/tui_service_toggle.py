@@ -163,7 +163,7 @@ CORE_USER_DEFS = {
         "Firefox RAM Cache Resync",
         "Runs the Firefox profile RAM sync every hour while the companion service is active.",
     ),
-    "dusky-oom-shield.service": (
+    "dusky_oom_shield.service": (
         "Dusky OOM Shield",
         "Protects the active Hyprland session and pinned windows from systemd-oomd pressure kills.",
     ),
@@ -194,7 +194,7 @@ CORE_SYSTEM_DEFS = {
         "CPU Power Restorer",
         "Restores your custom CPU core states and package power limit adjustments dynamically on system boot.",
     ),
-    "dusky-kbd-backlight.service": (
+    "dusky_kbd_backlight.service": (
         "Keyboard Backlight State",
         "Restores the configured keyboard backlight hardware state at boot.",
     ),
@@ -227,7 +227,7 @@ CORE_SYSTEM_DEFS = {
         "Root + Home Snapshots",
         "Creates paired root and home snapshots daily at 8 PM and keeps up to six scheduled pairs.",
     ),
-    "dusky-zram-recompress.timer": (
+    "dusky_zram_recompress.timer": (
         "ZRAM Recompression",
         "Recompresses idle ZRAM pages every hour while the timer is enabled.",
     ),
@@ -337,7 +337,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _fast_exec:
 CORE_USER_SECTIONS = (
     ("Desktop & Session", (
         "hyprsunset.service", "hypridle.service", "osd_lock.service",
-        "dusky_polkit.service", "dusky_clipboard.service", "dusky-oom-shield.service",
+        "dusky_polkit.service", "dusky_clipboard.service", "dusky_oom_shield.service",
         "wireplumber.service",
     )),
     ("Remote Displays & Streaming", (
@@ -367,9 +367,9 @@ CORE_USER_SECTIONS = (
 CORE_SYSTEM_SECTIONS = (
     ("Power & Hardware", (
         "tlp.service", "battery-charge-limit.service", "dusky_cpu.service",
-        "dusky-kbd-backlight.service", "ghelper-gpu-boot.service",
+        "dusky_kbd_backlight.service", "ghelper-gpu-boot.service",
         "glance_cpu_pkg_watt.service", "thermald.service", "acpid.service",
-        "asusd.service", "supergfxd.service", "dusky-zram-recompress.timer",
+        "asusd.service", "supergfxd.service", "dusky_zram_recompress.timer",
         "dusky_boot_zram_flush.timer", "dusky_pro_active_zram_swap.timer",
         "dusky_powertop_autotune.timer",
     )),

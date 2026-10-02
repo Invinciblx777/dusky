@@ -478,7 +478,7 @@ SCHEMA = {
             type_="bool",
             default=True,
             group="Power Management & Laptop Battery",
-            extended_help="**Socket-Activated Standby**\n\nWhen enabled, the daemon exits when idle and relies on `dusky-kokoro.socket` to relaunch on demand with 0% idle CPU and zero battery drain.",
+            extended_help="**Socket-Activated Standby**\n\nWhen enabled, the daemon exits when idle and relies on `dusky_kokoro.socket` to relaunch on demand with 0% idle CPU and zero battery drain.",
         ),
         ConfigItem(
             label="Default Queue Mode",
@@ -506,7 +506,7 @@ SCHEMA = {
             type_="action",
             default=f"{_TRIGGER_CMD} --restart",
             group="Daemon Controls",
-            extended_help="**Daemon Restart**\n\nExecutes `systemctl --user restart dusky-kokoro.service` directly.",
+            extended_help="**Daemon Restart**\n\nExecutes `systemctl --user restart dusky_kokoro.service` directly.",
         ),
         ConfigItem(
             label="Reload Daemon Config",

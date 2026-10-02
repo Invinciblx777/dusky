@@ -32,9 +32,9 @@ SOCKET_PATH=$(printenv DUSKY_SOCKET || true)
 CONFIG_FILE="${DUSKY_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/dusky-kokoro/config.toml}"
 
 STANDALONE_LOG="$RUNTIME_DIR/dusky-kokoro/daemon.log"
-SOCKET_UNIT="dusky-kokoro.socket"
-SERVICE_UNIT="dusky-kokoro.service"
-ADHOC_UNIT="dusky-kokoro-adhoc.service"
+SOCKET_UNIT="dusky_kokoro.socket"
+SERVICE_UNIT="dusky_kokoro.service"
+ADHOC_UNIT="dusky_kokoro_adhoc.service"
 START_TIMEOUT=45          # seconds to wait for a cold daemon (model download excluded)
 REQUEST_TIMEOUT=120       # seconds to wait for the daemon's acknowledgement
 

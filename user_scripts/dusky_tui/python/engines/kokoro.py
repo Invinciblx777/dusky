@@ -337,7 +337,7 @@ class KokoroEngine(TomlEngine):
         if not is_running:
             try:
                 res = subprocess.run(
-                    ["systemctl", "--user", "is-active", "dusky-kokoro.service"],
+                    ["systemctl", "--user", "is-active", "dusky_kokoro.service"],
                     capture_output=True,
                     text=True,
                     timeout=1.0,
@@ -347,7 +347,7 @@ class KokoroEngine(TomlEngine):
                     status_str = "RUNNING (systemd)"
                 else:
                     res_sock = subprocess.run(
-                        ["systemctl", "--user", "is-active", "dusky-kokoro.socket"],
+                        ["systemctl", "--user", "is-active", "dusky_kokoro.socket"],
                         capture_output=True,
                         text=True,
                         timeout=1.0,

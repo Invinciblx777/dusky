@@ -1,12 +1,12 @@
-# ~/.config/systemd/user/dusky-kokoro.service
+# ~/.config/systemd/user/dusky_kokoro.service
 #
-# Socket-activated: enable dusky-kokoro.socket, never this unit directly.
-#   systemctl --user enable --now dusky-kokoro.socket
+# Socket-activated: enable dusky_kokoro.socket, never this unit directly.
+#   systemctl --user enable --now dusky_kokoro.socket
 #
 # Notes
 #   * Type=notify: the daemon sends READY=1 / STATUS=... / STOPPING=1 itself
 #     (15-line sd_notify implementation, no python-systemd dependency), so
-#     "systemctl --user status dusky-kokoro" shows the live engine state.
+#     "systemctl --user status dusky_kokoro" shows the live engine state.
 #   * Restart=on-failure: exit-on-idle is a clean exit (0) and must NOT be
 #     restarted; crashes are.
 #   * KillMode=mixed: SIGTERM to the daemon only (it quits mpv gracefully over
@@ -19,8 +19,8 @@
 #   * Debug logging for the next start:  systemctl --user set-environment DUSKY_LOG_LEVEL=DEBUG
 [Unit]
 Description=Dusky Kokoro TTS daemon (Kokoro-ONNX, socket-activated, exits when idle)
-Requires=dusky-kokoro.socket
-After=dusky-kokoro.socket pipewire.service wireplumber.service pulseaudio.service
+Requires=dusky_kokoro.socket
+After=dusky_kokoro.socket pipewire.service wireplumber.service pulseaudio.service
 PartOf=graphical-session.target
 
 [Service]
@@ -40,4 +40,4 @@ UMask=0077
 OOMScoreAdjust=100
 
 [Install]
-# intentionally empty: activation happens through dusky-kokoro.socket
+# intentionally empty: activation happens through dusky_kokoro.socket
