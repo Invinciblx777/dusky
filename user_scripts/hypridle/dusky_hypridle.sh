@@ -1376,6 +1376,13 @@ draw_main_view() {
     if (( TAB_SCROLL_START > CURRENT_TAB )); then TAB_SCROLL_START=$CURRENT_TAB; fi
     if (( TAB_SCROLL_START < 0 )); then TAB_SCROLL_START=0; fi
     local -i max_tab_width=$(( BOX_INNER_WIDTH - 6 ))
+    local -i total_tab_width=0
+    for name in "${TABS[@]}"; do total_tab_width=$(( total_tab_width + ${#name} + 4 )); done
+    total_tab_width=$(( total_tab_width - 2 ))
+    if (( total_tab_width <= BOX_INNER_WIDTH - 2 )); then
+        TAB_SCROLL_START=0
+        max_tab_width=$BOX_INNER_WIDTH
+    fi
     LEFT_ARROW_ZONE=""; RIGHT_ARROW_ZONE=""
 
     while true; do
@@ -1459,6 +1466,19 @@ draw_main_view() {
             TAB_ZONES+=("${zone_start}:$(( zone_start + tab_name_len + 1 ))")
             used_len=$(( used_len + chunk_len )); current_col=$(( current_col + chunk_len ))
         done
+        # Center the complete tab group; overflowing groups keep arrow navigation.
+        if (( TAB_SCROLL_START == 0 )) && [[ -z $RIGHT_ARROW_ZONE ]]; then
+            local -i tab_content_width=$(( used_len - 2 )) tab_shift
+            left_pad=$(( (BOX_INNER_WIDTH - tab_content_width) / 2 ))
+            tab_shift=$(( left_pad - 3 ))
+            local tab_prefix="${C_MAGENTA}│   "
+            printf -v pad_buf '%*s' "$left_pad" ''
+            tab_line="${C_MAGENTA}│${pad_buf}${tab_line:${#tab_prefix}}"
+            for (( i=0; i<${#TAB_ZONES[@]}; i++ )); do
+                TAB_ZONES[i]="$(( ${TAB_ZONES[i]%%:*} + tab_shift )):$(( ${TAB_ZONES[i]##*:} + tab_shift ))"
+            done
+            used_len=$(( left_pad + tab_content_width - 1 ))
+        fi
         local -i pad=$(( BOX_INNER_WIDTH - used_len - 1 ))
         if (( pad > 0 )); then printf -v pad_buf '%*s' "$pad" ''; tab_line+="$pad_buf"; fi
         tab_line+="${C_MAGENTA}│${C_RESET}"
@@ -2072,6 +2092,10 @@ parse_args() {
             --config)
                 shift
                 if [[ $# -gt 0 ]]; then CONFIG_FILE=$1; else log_err "--config requires a path"; exit 2; fi
+                ;;
+            --config=*)
+                CONFIG_FILE=${1#--config=}
+                [[ -n $CONFIG_FILE ]] || { log_err "--config requires a path"; exit 2; }
                 ;;
             --help|-h)
                 printf 'Usage: %s [--config /path/to/hypridle.conf]\n' "${0##*/}"
