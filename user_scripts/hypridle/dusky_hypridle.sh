@@ -135,6 +135,8 @@ declare CURRENT_MENU_ID=""
 declare -i PARENT_ROW=0 PARENT_SCROLL=0
 declare -i PICKER_PARENT_VIEW=0 PICKER_PARENT_ROW=0 PICKER_PARENT_SCROLL=0
 declare -gi RESIZE_PENDING=0 PASTE_ACTIVE=0
+declare -gi MOUSE_CLICK_PENDING=0 MOUSE_PRESS_X=0 MOUSE_PRESS_Y=0
+declare MOUSE_PRESS_CONTEXT=""
 declare PASTE_TAIL=""
 
 declare PICKER_TITLE=""
@@ -346,6 +348,7 @@ commit_tmpfile_to_target() {
 }
 
 suspend_ui() {
+    MOUSE_CLICK_PENDING=0
     printf '%s%s%s%s' "$MOUSE_OFF" "$CURSOR_SHOW" "$C_RESET" "$ALT_SCREEN_OFF"
     stty "$ORIGINAL_STTY" < /dev/tty || exit 1
     TUI_STARTED=0
@@ -1823,6 +1826,36 @@ go_back() {
     clear_status
 }
 
+# Return a selection-only event for left press/motion, and a click only when
+# release matches a press with no intervening motion or view change. Basic
+# click-only terminals still provide press/release pairs; no mode ACK is needed.
+classify_mouse_event() {
+    local code=$1 x=$2 y=$3 terminator=$4
+    local context="${CURRENT_VIEW}:${CURRENT_TAB}:${CURRENT_MENU_ID}"
+    REPLY=$code
+    if [[ $terminator == m ]]; then
+        local pending=$MOUSE_CLICK_PENDING
+        MOUSE_CLICK_PENDING=0
+        if (( code == 0 && pending && x == MOUSE_PRESS_X && y == MOUSE_PRESS_Y )) &&
+           [[ $context == "$MOUSE_PRESS_CONTEXT" ]]; then
+            REPLY=0
+            return 0
+        fi
+        return 1
+    fi
+    case $code in
+        0)
+            MOUSE_CLICK_PENDING=1; MOUSE_PRESS_X=$x; MOUSE_PRESS_Y=$y
+            MOUSE_PRESS_CONTEXT=$context
+            REPLY=32
+            ;;
+        32) MOUSE_CLICK_PENDING=0 ;;
+        2|64|65) MOUSE_CLICK_PENDING=0 ;;
+        *) MOUSE_CLICK_PENDING=0; return 1 ;;
+    esac
+    return 0
+}
+
 handle_mouse() {
     local input="$1"
     local -i button x y i start end
@@ -1844,19 +1877,14 @@ handle_mouse() {
     if (( ${#field1} > 3 || ${#field2} > 6 || ${#field3} > 6 )); then return 0; fi
     button=$((10#$field1)); x=$((10#$field2)); y=$((10#$field3))
 
+    if (( x < 1 || x > MIN_TERM_COLS || y < 1 || y > TERM_ROWS )); then
+        MOUSE_CLICK_PENDING=0; return 0
+    fi
+    classify_mouse_event "$button" "$x" "$y" "$terminator" || return 0
+    button=$REPLY
     if (( button == 64 )); then navigate -1; return 0; fi
     if (( button == 65 )); then navigate 1; return 0; fi
-
-    # Button-drag motion (mode 1002) arrives with +32 on the button code.
-    # Dragging only moves the selection; it never adjusts or activates.
-    local -i is_drag=0
-    if (( button >= 32 && button < 64 )); then
-        is_drag=1
-        button=$(( button - 32 ))
-    fi
-
-    if [[ "$terminator" != "M" ]] || (( button != 0 && button != 2 )); then return 0; fi
-    if (( x < 1 || x > MIN_TERM_COLS )); then return 0; fi
+    if (( button != 0 && button != 2 && button != 32 )); then return 0; fi
 
     if (( y == TAB_ROW )); then
         if (( CURRENT_VIEW == 0 )); then
@@ -1889,7 +1917,7 @@ handle_mouse() {
                 fi
             done
         else
-            if (( button == 0 && ! is_drag )); then
+            if (( button == 0 )); then
                 go_back
             fi
             return 0
@@ -1912,7 +1940,9 @@ handle_mouse() {
 
         if (( clicked_idx >= 0 && clicked_idx < count )); then
             SELECTED_ROW=$clicked_idx
-            if (( ! is_drag && x > ADJUST_THRESHOLD )); then
+            # Motion shares click hit-testing, but can never reach an action.
+            if (( button == 32 )); then return 0; fi
+            if (( x > ADJUST_THRESHOLD )); then
                 if (( button == 0 )); then
                     activate_item || adjust 1
                 elif (( button == 2 )); then
@@ -1943,19 +1973,14 @@ handle_mouse_picker() {
     if (( ${#field1} > 3 || ${#field2} > 6 || ${#field3} > 6 )); then return 0; fi
     button=$((10#$field1)); x=$((10#$field2)); y=$((10#$field3))
 
+    if (( x < 1 || x > MIN_TERM_COLS || y < 1 || y > TERM_ROWS )); then
+        MOUSE_CLICK_PENDING=0; return 0
+    fi
+    classify_mouse_event "$button" "$x" "$y" "$terminator" || return 0
+    button=$REPLY
     if (( button == 64 )); then picker_navigate -1; return 0; fi
     if (( button == 65 )); then picker_navigate 1; return 0; fi
-
-    # Button-drag motion (mode 1002) arrives with +32 on the button code.
-    # Dragging only moves the selection; it never confirms.
-    local -i is_drag=0
-    if (( button >= 32 && button < 64 )); then
-        is_drag=1
-        button=$(( button - 32 ))
-    fi
-
-    if [[ "$terminator" != "M" ]] || (( button != 0 && button != 2 )); then return 0; fi
-    if (( x < 1 || x > MIN_TERM_COLS )); then return 0; fi
+    if (( button != 0 && button != 2 && button != 32 )); then return 0; fi
 
     local -i effective_start=$(( ITEM_START_ROW + 1 ))
     if (( y >= effective_start && y < effective_start + MAX_DISPLAY_ROWS )); then
@@ -1963,7 +1988,8 @@ handle_mouse_picker() {
         local -i count=${#PICKER_ITEMS[@]}
         if (( clicked_idx >= 0 && clicked_idx < count )); then
             PICKER_SELECTED=$clicked_idx
-            if (( button == 0 && ! is_drag )); then
+            if (( button == 32 )); then return 0; fi
+            if (( button == 0 )); then
                 picker_confirm
             fi
         fi
@@ -2106,6 +2132,7 @@ handle_input_router() {
     fi
     if [[ $key == '[200~' ]]; then discard_bracketed_paste; return 0; fi
     if ! terminal_size_ok; then
+        MOUSE_CLICK_PENDING=0
         case $key in q|Q|$'\x03') exit 0 ;; esac
         return 0
     fi
@@ -2196,6 +2223,7 @@ main() {
     while true; do
         if (( RESIZE_PENDING )); then
             RESIZE_PENDING=0
+            MOUSE_CLICK_PENDING=0
             update_terminal_size
             redraw=1
         fi
@@ -2203,7 +2231,7 @@ main() {
         if IFS= read -rsn1 -t "$READ_LOOP_TIMEOUT" key < /dev/tty; then
             # Refresh geometry before applying input after a resize.
             if (( RESIZE_PENDING )); then
-                RESIZE_PENDING=0; update_terminal_size
+                RESIZE_PENDING=0; MOUSE_CLICK_PENDING=0; update_terminal_size
             fi
             handle_input_router "$key"
             redraw=1
