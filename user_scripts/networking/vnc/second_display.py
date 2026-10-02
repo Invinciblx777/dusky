@@ -121,6 +121,7 @@ def serve() -> None:
         raise RuntimeError("Run setup first")
     width, height = display_size()
     current = wait_session()
+    configure(CONFIG, KEY, CERT, PORT)
     instance = current["instance"]
     existing = next((item for item in monitors(instance) if item["name"] == OUTPUT), None)
     if existing:

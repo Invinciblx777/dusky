@@ -52,6 +52,27 @@ class ProtocolTests(unittest.TestCase):
 
 
 class SetupTests(unittest.TestCase):
+    def test_tailscale_certificate_refresh_preserves_vnc_off_switch(self):
+        for active in (True, False):
+            with self.subTest(active=active), patch.object(desktop, "ensure_dependencies"), \
+                 patch.object(desktop, "CONFIG") as config, patch.object(desktop, "configure", return_value=True), \
+                 patch.object(desktop, "wait_ready"), patch.object(desktop, "message"), \
+                 patch.object(desktop, "rfb_ready", return_value=active):
+                config.is_file.return_value = True
+                def command(*args, **kwargs):
+                    if args[0] == "tailscale":
+                        return completed("100.64.0.1")
+                    if "is-enabled" in args:
+                        return completed("enabled")
+                    if "is-active" in args:
+                        return completed("active" if "--user" not in args or active else "inactive")
+                    return completed()
+                with patch.object(desktop, "run", side_effect=command) as run:
+                    desktop.remote()
+                restart = unittest.mock.call("systemctl", "--user", "restart", common.MASTER)
+                self.assertEqual(restart in run.call_args_list, active)
+                self.assertNotIn(unittest.mock.call("systemctl", "--user", "start", common.MASTER), run.call_args_list)
+
     def test_first_run_creates_desktop_unit_in_empty_directory(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
             unit = Path(directory) / common.MASTER

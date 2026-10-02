@@ -143,6 +143,7 @@ def serve() -> None:
     if not CONFIG.is_file():
         raise RuntimeError("Run setup first")
     current = wait_session()
+    configure(CONFIG, KEY, CERT, PORT)
     result = run("hyprctl", "--instance", current["instance"], "-j", "monitors")
     outputs = json.loads(result.stdout)
     # Explicitly select a physical screen; the first advertised output can be virtual.
@@ -179,6 +180,10 @@ def remote() -> None:
     if ip.returncode or not ip.stdout.strip():
         raise RuntimeError("Tailscale has no IPv4 address yet; finish sign-in and retry")
     message(f"Tailscale address: {ip.stdout.strip()}:{PORT}")
+    if CONFIG.is_file() and configure(CONFIG, KEY, CERT, PORT):
+        if run("systemctl", "--user", "is-active", UNIT_NAME, check=False).stdout.strip() == "active":
+            run("systemctl", "--user", "restart", UNIT_NAME)
+            wait_ready(ready, UNIT_NAME)
     if rfb_ready():
         message("Connect a VNC viewer on another device signed in to the same tailnet.")
     else:

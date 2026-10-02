@@ -57,19 +57,32 @@ def atomic_write(path: Path, content: str, mode: int = 0o600) -> bool:
 
 def write_config(config: Path, key: Path, cert: Path, port: int) -> bool:
     config.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    names = sorted({"localhost", socket.gethostname()})
+    ips = sorted({"127.0.0.1", *[ip for _, ip in addresses()]})
     valid = False
     if key.is_file() and cert.is_file():
         expiry = run("openssl", "x509", "-checkend", "2592000", "-noout", "-in", str(cert), check=False)
         public_key = run("openssl", "pkey", "-in", str(key), "-pubout", check=False)
         cert_key = run("openssl", "x509", "-in", str(cert), "-pubkey", "-noout", check=False)
         valid = expiry.returncode == public_key.returncode == cert_key.returncode == 0 and public_key.stdout == cert_key.stdout
+        if valid:
+            # VeNCrypt clients validate the connection address, including LAN
+            # and Tailscale IPs. Retain certificates while all names still fit.
+            valid = all(run("openssl", "x509", "-in", str(cert), "-noout", option, value,
+                            check=False).returncode == 0
+                        for option, values in (("-checkhost", names), ("-checkip", ips))
+                        for value in values)
     if not valid:
         with tempfile.TemporaryDirectory(dir=config.parent) as directory:
             new_key, new_cert = Path(directory) / "key.pem", Path(directory) / "cert.pem"
             # Traditional RSA PEM is required by NeatVNC's RSA-AES reader.
-            run("openssl", "genrsa", "-traditional", "-out", str(new_key), "3072")
+            if key.is_file() and run("openssl", "rsa", "-in", str(key), "-check", "-noout", check=False).returncode == 0:
+                shutil.copyfile(key, new_key)  # Keep the RSA identity when refreshing TLS names.
+            else:
+                run("openssl", "genrsa", "-traditional", "-out", str(new_key), "3072")
             run("openssl", "req", "-new", "-x509", "-key", str(new_key), "-out", str(new_cert),
-                "-days", "3650", "-sha256", "-subj", "/CN=WayVNC")
+                "-days", "3650", "-sha256", "-subj", "/CN=WayVNC",
+                "-addext", "subjectAltName=" + ",".join([*("DNS:" + name for name in names), *("IP:" + ip for ip in ips)]))
             new_key.chmod(0o600)
             new_cert.chmod(0o600)
             new_key.replace(key)
@@ -368,11 +381,14 @@ def show_status(unit: str, port: int, control: Path, ready: bool, description: s
     guide = (
         "1. Install a VNC viewer on the receiving phone, tablet or PC.\n"
         "   iPhone/Android: RealVNC Viewer (RVNC Viewer), from App Store/Google Play.\n"
-        "   Linux/Windows/macOS PC: TigerVNC, or another RSA-AES/VeNCrypt viewer.\n"
-        "   Downloads: https://www.realvnc.com/en/connect/download/viewer/ or https://tigervnc.org/\n"
+        "   Linux/Wayland: Remmina with the VNC protocol; run vnc_viewer.py on the receiving PC.\n"
+        "   Manual Arch install: sudo pacman -S --needed remmina libvncserver\n"
+        "   Windows/macOS: TigerVNC. Linux TigerVNC requires an X11 display/XWayland.\n"
+        "   Downloads: https://remmina.org/ | https://tigervnc.org/ | https://www.realvnc.com/en/connect/download/viewer/\n"
         "2. Use the same Wi-Fi/Ethernet network, or connect both devices to the same Tailscale tailnet.\n"
         "   On iPhone, allow Local Network access. For remote access, choose the Tailscale address.\n"
         f"3. Add the server manually in the viewer: {address}\n"
+        "   Remmina: select VNC and use IP:port. Or run: ./vnc_viewer.py IP:port\n"
         f"   TigerVNC uses {tiger_address}; a separate Port field should contain {port}.\n"
         f"4. Sign in as {username} with this Linux server's account password.\n"
         "   Confirm the server identity if asked. No browser/PIN setup is needed.\n"

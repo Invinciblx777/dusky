@@ -48,8 +48,19 @@ are outside this automatic UFW configuration. Setup does not reset firewalls.
 
 Keep the server and receiving device on the same Wi-Fi or Ethernet network.
 Install [RealVNC/RVNC Viewer](https://www.realvnc.com/en/connect/download/viewer/)
-on iPhone/Android, or [TigerVNC](https://tigervnc.org/) on a Linux, Windows or
-macOS PC. Other viewers must support RSA-AES or VeNCrypt.
+on iPhone/Android. On Linux/Wayland, use [Remmina](https://remmina.org/) with
+its **VNC** protocol (libvncserver plugin). Install it on an Arch receiving PC with
+`sudo pacman -S --needed remmina libvncserver`. Prefer the receiving-PC helper
+below: it sets up certificate trust before opening a saved VNC connection.
+Remmina runs natively on Wayland; `GDK_BACKEND=wayland remmina` explicitly
+selects that backend if needed. The standalone `gvncviewer` shipped with
+gtk-vnc 1.5.0 failed this server's authentication request in testing; Remmina's
+GVNC plugin also interrupted its connection attempt and left a black window.
+Use Remmina's standard **VNC** plugin (libvncserver), which remains native Wayland.
+[TigerVNC](https://tigervnc.org/) is an alternative on Windows/macOS or Linux
+with an X11 display. Linux TigerVNC 1.16.2 requires X11/XWayland and fails with
+`Can't open display` in a Wayland-only session. Other viewers must support
+RSA-AES or VeNCrypt.
 Enter the address shown by `status` and sign in with the **server's** Linux
 username and password. RVNC uses `SERVER_IP:5902` for desktop sharing or
 `SERVER_IP:5901` for the secondary display. TigerVNC uses an explicit port after
@@ -58,8 +69,53 @@ two colons: `SERVER_IP::5902` or `SERVER_IP::5901`, as documented in its
 address/port fields takes the IP and port separately.
 No SIM, mobile data, DNS lookup, Tailscale,
 or internet connection is required for local VNC. RVNC Viewer on iOS was
-confirmed working on this machine; desktop viewers have not been exercised.
+confirmed working on this machine. Remmina 1.4.43 with libvncserver 0.9.15 was
+launched natively on Wayland. The old server certificate (only `CN=WayVNC`)
+failed its verification over Tailscale. Setup now issues certificates with
+the server hostname, localhost, LAN addresses and Tailscale address in their
+subject alternative names, retaining the RSA key when possible. Setup, service
+startup and `--reconnect` refresh missing names; `--remote` also refreshes the
+desktop certificate after Tailscale joins. If addresses change while a server
+is running, rerun setup or reconnect before connecting to its new address.
+Desktop login/video confirmation is
+still pending on the other PC, which needs this certificate update.
 Password-only legacy VNC authentication is not enabled.
+
+### Receiving Arch PC setup
+
+Run `vnc_viewer.py` on the PC you will control the server **from**:
+
+```sh
+./vnc_viewer.py                              # install missing packages, ask for the server address
+./vnc_viewer.py SERVER_IP:5902 --username SERVER_USER
+./vnc_viewer.py TAILSCALE_IP:5902 --username SERVER_USER
+./vnc_viewer.py SERVER_IP:5901                # separate monitor
+./vnc_viewer.py --install-only               # install without opening a window
+./vnc_viewer.py SERVER_IP:5902 --reset-trust   # intentional server identity replacement
+```
+
+The receiving-PC helper installs missing `remmina`, `openssl`, `libvncserver` and
+`python-rich` using sudo pacman; the viewer runs as your desktop user with the
+Wayland backend. It saves connections under `${XDG_DATA_HOME:-$HOME/.local/share}/remmina`
+and disables the applet in Remmina's preferences before launching with
+`--no-tray-icon`: Remmina otherwise creates its login-autostart file before
+processing that flag. Existing generated applet entries are removed, and the
+viewer runs on demand. This app-generated autostart path is ignored
+by the dotfiles repository and is not shipped by this setup.
+It preserves existing connection preferences and retrieves the server's TLS
+certificate without sending credentials, saves it on first use, and checks
+the certificate and connection address before opening Remmina. Future runs use
+that saved trust. Renewed certificates are accepted automatically only when the
+public key is unchanged and the new certificate passes name/time verification;
+`--reset-trust` explicitly replaces identity trust. This is trust on first
+use, so the first connection must reach the intended server. Certificates are
+saved beside profiles as `.crt` files and configured as Remmina's CA certificate.
+You should see a Linux username/password prompt, without a certificate-files
+form. Enter passwords in Remmina. If verification reports an IP/name mismatch,
+rerun the updated server setup; leaving certificate fields empty cannot fix it.
+The helper configures no server services, firewall rules or network profiles. Remmina handles reopening
+connections and removing saved entries. Downloads require internet or cached packages;
+viewing over an existing LAN does not.
 
 Setup and status show a numbered Rich "Connect another device" guide with
 mobile/desktop viewer download links, exact address/port, server Linux username, iPhone local-network
@@ -196,7 +252,7 @@ Focused, non-mutating regressions:
 python -m unittest discover -s user_scripts/networking/vnc -p 'test_*.py'
 ```
 
-Thirty-one tests cover first-run deployment into empty directories,
+Thirty-two server tests cover first-run deployment into empty directories,
 fragmented/wrong/closed/timed-out RFB responses, malformed
 control replies, active/idle Wi-Fi selection, offline refusal, settings reads,
 atomic writes, cleanup ownership recovery, firewall idempotence/error reporting,
@@ -206,5 +262,26 @@ reconnect service preferences, recovering a disabled master without reconfigurin
 a healthy one, and flag dispatch. Diagnostics, master and secondary reconnect
 and empty-session disconnect were exercised live; individual viewer disconnect
 was checked with fixtures rather than disconnecting an authenticated phone.
-Unit syntax also passed
+Tailscale certificate refresh also preserves the VNC off switch. Unit syntax passed
 `systemd-analyze --user verify`.
+
+## Native receiving-PC verification on 2026-10-02
+
+- All 40 VNC tests passed, including eight receiving-PC tests covering package
+  installation failure, address syntax, saved preferences, native Wayland
+  launch, TLS bootstrap, certificate renewal with the same key, rejection of a
+  replacement key, clear certificate mismatch errors and applet suppression
+  with existing preferences preserved.
+- A temporary real WayVNC server passed first-use certificate setup and repeated
+  verified TLS handshakes. Both installed VNC services then refreshed their
+  certificates at startup and passed the receiving helper's TLS check.
+- The actual receiving helper opened Remmina's Linux username/password form
+  directly, without a certificate-files form; Hyprland reported `xwayland: false`.
+- A fresh-preferences launch confirmed that pre-disabling the applet prevented
+  creation of `remmina-applet.desktop`; the generated file is absent from the
+  Git index and ignored, so it will not be deployed with the dotfiles.
+- Both services were disabled/stopped after testing, the temporary viewer/server
+  exited, the secondary monitor was removed, and Wi-Fi routes were unchanged.
+- The other PC's old certificate was confirmed to fail with an IP address
+  mismatch for its Tailscale address. That PC needs the updated server scripts
+  and another setup run before remote login/video can be verified.
