@@ -212,15 +212,9 @@ def generate_schema() -> tuple[list[str], dict[int, list[ConfigItem]]]:
             ),
             ConfigItem(
                 label="Visual Layout Designer", key="action_visual_layout", scope=scope_str, type_="action",
-                default=f"{sys.executable} {Path(__file__).parent / 'monitor_layout.py'}",
-                force_interactive=True, group="Layout & Transforms",
-                extended_help="Opens a full-screen interactive 2D spatial canvas to move, snap, and align displays with magnetic snapping and live compositor preview."
-            ),
-            ConfigItem(
-                label="Floating Layout Window", key="action_floating_layout", scope=scope_str, type_="action",
                 default=f"{sys.executable} {Path(__file__).parent / 'monitor_layout.py'} --floating",
                 force_interactive=False, group="Layout & Transforms",
-                extended_help="Spawns the interactive 2D layout canvas in a dedicated floating terminal window."
+                extended_help="Spawns an interactive 2D spatial canvas in a centered floating window to position, snap, and scale displays with live compositor preview."
             ),
             ConfigItem(
                 label="Position on Canvas", key="position", scope=scope_str, type_="picker", default="auto",
@@ -503,15 +497,9 @@ def generate_schema() -> tuple[list[str], dict[int, list[ConfigItem]]]:
     preset_items.extend([
         ConfigItem(
             label="Visual Layout Designer", key="action_visual_layout_preset", scope="DEFAULT", type_="action",
-            default=f"{sys.executable} {Path(__file__).parent / 'monitor_layout.py'}",
-            force_interactive=True, group="Visual Placement",
-            extended_help="Opens a full-screen interactive 2D spatial canvas to move, snap, and align displays with magnetic snapping and live compositor preview."
-        ),
-        ConfigItem(
-            label="Floating Layout Window", key="action_floating_layout_preset", scope="DEFAULT", type_="action",
             default=f"{sys.executable} {Path(__file__).parent / 'monitor_layout.py'} --floating",
             force_interactive=False, group="Visual Placement",
-            extended_help="Spawns the interactive 2D layout canvas in a dedicated floating terminal window."
+            extended_help="Spawns an interactive 2D spatial canvas in a centered floating window to position, snap, and scale displays with live compositor preview."
         ),
     ])
 

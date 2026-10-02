@@ -408,6 +408,7 @@ class MonitorLayoutCanvas:
 
     def run(self, stdscr: curses.window) -> int:
         curses.curs_set(0)
+        curses.raw()  # Disables flow control (IXON / Ctrl+S / Ctrl+Q) so terminal I/O never blocks
         curses.start_color()
         curses.use_default_colors()
 
