@@ -170,6 +170,12 @@ alias darkmode="$HOME/user_scripts/theme_matugen/theme_ctl.sh set --mode dark"
 alias lightmode="$HOME/user_scripts/theme_matugen/theme_ctl.sh set --mode light"
 alias run_sysbench="$HOME/user_scripts/performance/sysbench_benchmark.py"
 
+# mpv + yt-dlp livestream playback (vid URL, vid --help, etc.)
+_vid() {
+    python3 "$HOME/user_scripts/tools/yt_dlp_downloader/live_stream_mpv/mpv_yt_dlp_playback_livestream.py" "$@"
+}
+alias vid='noglob _vid'
+
 # Local AI Web Bridge Shortcut
 _ask_func() {
     local prompt=""
