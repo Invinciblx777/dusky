@@ -285,6 +285,7 @@ mpv_speed = 1.0
 volume = 100
 window = true
 window_geometry = "420x96"
+use_user_mpv_config = true
 prefetch_segments = 4
 
 [archive]
@@ -519,7 +520,7 @@ write_value_to_file() {
     local section
     case "$key" in
         blend|voice_*|weight_*|lang|spec|speed) section=voice ;;
-        mpv_speed|volume|window|window_geometry|prefetch_segments) section=playback ;;
+        mpv_speed|volume|window|window_geometry|use_user_mpv_config|prefetch_segments) section=playback ;;
         enabled|bit_depth) section=archive ;;
         process_idle_timeout_s) section=daemon ;;
         sentence_pause_ms|paragraph_pause_ms|trim_silence) section=text ;;

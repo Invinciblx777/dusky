@@ -269,7 +269,7 @@ class PlaybackConfig:
     audio_device: str = ""
     volume: int = 100
     cache_max_mb: int = 512
-    use_user_mpv_config: bool = False
+    use_user_mpv_config: bool = True
     extra_args: tuple[str, ...] = ()
     prefetch_segments: int = 4
     write_stall_timeout_s: float = 0.0
@@ -406,7 +406,7 @@ window_title = "Kokoro TTS"
 audio_device = ""          # mpv --audio-device (list with: mpv --audio-device=help)
 volume = 100
 cache_max_mb = 512         # mpv demuxer cache: generation may run this far ahead of playback
-use_user_mpv_config = false
+use_user_mpv_config = true
 extra_args = []
 prefetch_segments = 4      # synthesized segments buffered ahead of the player
 write_stall_timeout_s = 0.0   # abort if mpv stops consuming audio for this long (0 = never)

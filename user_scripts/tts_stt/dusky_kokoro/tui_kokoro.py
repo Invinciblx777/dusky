@@ -348,6 +348,15 @@ SCHEMA = {
             extended_help="**Mini Player Window**\n\nShows a compact floating mpv window with playback controls. Allows `[Space]` pause and `[q]` stop hotkeys.",
         ),
         ConfigItem(
+            label="User MPV Config",
+            key="use_user_mpv_config",
+            scope="playback",
+            type_="bool",
+            default=True,
+            group="Playback Controls",
+            extended_help="**Load MPV User Configuration**\n\nLoads `~/.config/mpv/` (user scripts, shaders, themes, and Dusky Player UI). When disabled, runs with bare `--no-config`.",
+        ),
+        ConfigItem(
             label="Window Geometry",
             key="window_geometry",
             scope="playback",
