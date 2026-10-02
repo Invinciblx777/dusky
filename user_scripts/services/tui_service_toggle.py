@@ -167,6 +167,14 @@ CORE_USER_DEFS = {
         "Dusky OOM Shield",
         "Protects the active Hyprland session and pinned windows from systemd-oomd pressure kills.",
     ),
+    "wireplumber.service": (
+        "WirePlumber Audio Session",
+        "Session and policy manager for PipeWire. Handles audio streams, hardware device switching, Bluetooth audio endpoints, and volume persistence.",
+    ),
+    "gamemoded.service": (
+        "GameMode Optimizer",
+        "Feral Interactive GameMode daemon. Temporarily prioritizes CPU frequency governors, I/O scheduling, and GPU performance while gaming.",
+    ),
 }
 
 CORE_SYSTEM_DEFS = {
@@ -202,10 +210,6 @@ CORE_SYSTEM_DEFS = {
         "NumLock on TTY Boot",
         "Disables NumLock on virtual consoles (TTYs 1 to 6) during boot. Useful for keyboards that default to NumLock ON, preventing lock-out at the login screen.",
     ),
-    "swayosd-libinput-backend.service": (
-        "SwayOSD Input Backend",
-        "Backend service for SwayOSD. Handles raw libinput events to render volume/brightness overlays without relying on the window manager.",
-    ),
     "sshd.service": (
         "SSH Server (OpenSSH)",
         "OpenSSH server daemon. Allows remote access to this machine via SSH. Ensure your firewall is configured if exposing this to the internet.",
@@ -216,7 +220,7 @@ CORE_SYSTEM_DEFS = {
     ),
     "firewalld.service": (
         "Firewall (firewalld)",
-        "Dynamic firewall manager. Provides a D-Bus interface to manage firewall rules and network zones.",
+        "Dynamic firewall manager. Provides a D-Bus interface to manage network zones and packet filtering rules.",
     ),
     "tailscaled.service": ("Tailscaled", "Allows remote access"),
     "dusky_snapshot.timer": (
@@ -259,6 +263,50 @@ CORE_SYSTEM_DEFS = {
         "Powertop Auto-Tune",
         "One-shot boot timer that runs `powertop --auto-tune` 2 minutes after boot to flip all power tunables to their Good setting. Enable this timer to auto-tune on every boot; the companion dusky_powertop_autotune.service runs only when triggered. Disabled by default because it can conflict with TLP.",
     ),
+    "NetworkManager.service": (
+        "NetworkManager",
+        "Primary network management daemon. Detects, configures, and maintains Wi-Fi, Ethernet, and mobile broadband connections.",
+    ),
+    "bluetooth.service": (
+        "Bluetooth Daemon (BlueZ)",
+        "Linux Bluetooth protocol stack daemon. Manages Bluetooth adapters, pairing, audio streaming, and peripheral connections.",
+    ),
+    "systemd-timesyncd.service": (
+        "Network Time Synchronization",
+        "Systemd network time synchronization daemon using SNTP. Synchronizes the local system clock across the network.",
+    ),
+    "systemd-resolved.service": (
+        "Systemd DNS Resolver",
+        "Network name resolution service providing local DNS caching, DNSSEC validation, and LLMNR/mDNS hostname resolution.",
+    ),
+    "udisks2.service": (
+        "Storage Daemon (udisks2)",
+        "Disk management and storage service. Handles automatic mounting and unmounting of flash drives, external SSDs, and storage partitions.",
+    ),
+    "thermald.service": (
+        "Thermal Daemon (thermald)",
+        "Monitors CPU temperature sensors and dynamically applies cooling controls (P-states, T-states, cooling fans) to prevent thermal throttling.",
+    ),
+    "acpid.service": (
+        "ACPI Event Daemon",
+        "Dispatches Advanced Configuration and Power Interface hardware events, such as laptop lid close/open, power button presses, and AC adapter plug/unplug.",
+    ),
+    "snapper-timeline.timer": (
+        "Snapper Hourly Timeline",
+        "Creates automated hourly Btrfs snapshots of the root and home subvolumes for granular point-in-time rollbacks.",
+    ),
+    "reflector.timer": (
+        "Pacman Mirrorlist Reflector",
+        "Weekly system timer that benchmarks available Arch Linux mirrors by download speed and updates /etc/pacman.d/mirrorlist.",
+    ),
+    "asusd.service": (
+        "ASUS ROG/TUF Daemon (asusd)",
+        "Hardware control daemon for ASUS laptops. Manages battery charge limits, fan profiles, keyboard RGB lighting, and anime matrix displays.",
+    ),
+    "supergfxd.service": (
+        "SuperGFX dGPU Switcher",
+        "Dedicated GPU switching daemon for ASUS and hybrid laptops. Allows switching between Integrated, Hybrid, and Dedicated GPU graphics modes.",
+    ),
 }
 
 import concurrent.futures
@@ -290,6 +338,7 @@ CORE_USER_SECTIONS = (
     ("Desktop & Session", (
         "hyprsunset.service", "hypridle.service", "osd_lock.service",
         "dusky_polkit.service", "dusky_clipboard.service", "dusky-oom-shield.service",
+        "wireplumber.service",
     )),
     ("Remote Displays & Streaming", (
         "dusky_vnc_desktop.service", "dusky_vnc_display.service",
@@ -298,6 +347,7 @@ CORE_USER_SECTIONS = (
     ("Panels & Integration", (
         "dusky.service", "dusky_quickpanal.service", "network_meter.service",
         "dusky_notif_time.service", "dusky_visualizer.service", "dusky_screentime.service",
+        "gamemoded.service",
     )),
     ("Media & AI", (
         "dusky_llm.service", "dusky_stt.service",
@@ -318,21 +368,23 @@ CORE_SYSTEM_SECTIONS = (
     ("Power & Hardware", (
         "tlp.service", "battery-charge-limit.service", "dusky_cpu.service",
         "dusky-kbd-backlight.service", "ghelper-gpu-boot.service",
-        "glance_cpu_pkg_watt.service", "dusky-zram-recompress.timer",
+        "glance_cpu_pkg_watt.service", "thermald.service", "acpid.service",
+        "asusd.service", "supergfxd.service", "dusky-zram-recompress.timer",
         "dusky_boot_zram_flush.timer", "dusky_pro_active_zram_swap.timer",
         "dusky_powertop_autotune.timer",
     )),
     ("Input & Session", (
-        "numlock_disable.service", "swayosd-libinput-backend.service",
-        "dusky_keylogger.service",
+        "numlock_disable.service", "dusky_keylogger.service",
     )),
     ("Network & Security", (
-        "vsftpd.service", "sshd.service", "warp-svc.service",
-        "firewalld.service", "tailscaled.service", "ufw.service",
+        "NetworkManager.service", "bluetooth.service", "systemd-timesyncd.service",
+        "systemd-resolved.service", "ufw.service", "firewalld.service",
+        "tailscaled.service", "sshd.service", "warp-svc.service", "vsftpd.service",
     )),
     ("Storage & Maintenance", (
-        "dusky_snapshot.timer", "linux-modules-cleanup.service",
-        "snapper-cleanup.timer", "fstrim.timer",
+        "udisks2.service", "dusky_snapshot.timer", "snapper-timeline.timer",
+        "snapper-cleanup.timer", "fstrim.timer", "reflector.timer",
+        "linux-modules-cleanup.service",
     )),
 )
 
