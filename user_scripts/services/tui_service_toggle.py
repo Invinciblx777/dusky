@@ -396,8 +396,7 @@ def _append_core_sections(tab_idx, definitions, installed, scope, sections, rows
     for section_idx, (title, units) in enumerate((*sections, ("Other", tuple(definitions)))):
         members = [
             unit for unit in units
-            if unit in definitions and unit in installed
-            and installed[unit] in MANAGEABLE_STATES and unit not in assigned
+            if unit in definitions and unit in installed and unit not in assigned
         ]
         if not members:
             continue
