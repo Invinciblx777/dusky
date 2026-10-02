@@ -1,33 +1,43 @@
 #!/usr/bin/env python3
+"""
+===============================================================================
+DUSKY MONITOR WIZARD: HIGH-PRECISION HYPRLAND DISPLAY & WORKSPACE MANAGER
+===============================================================================
+Dynamic TUI router schema for multi-monitor arrangements, 1/120 fractional scaling,
+spatial placement geometry, workspace-to-output distribution, and HDR/SDR pipeline.
+Native Wayland/Hyprland fractional scaling, spatial placement geometry, and workspace management.
+"""
+
 import json
 import subprocess
 import sys
 from pathlib import Path
 
-_dusky_root = Path.home() / "user_scripts" / "dusky_tui"
-if str(_dusky_root) not in sys.path:
-    sys.path.insert(0, str(_dusky_root))
-
-import sys
-from pathlib import Path
-
-_DUSKY_TUI_ROOT = Path.home() / "user_scripts" / "dusky_tui"
-if str(_DUSKY_TUI_ROOT) not in sys.path:
-    sys.path.insert(0, str(_DUSKY_TUI_ROOT))
+_DUSKY_ROOT = Path.home() / "user_scripts" / "dusky_tui"
+if str(_DUSKY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_DUSKY_ROOT))
 
 from python.frontend.core_types import ConfigItem
+from python.engines.monitor_engine import (
+    preset_choices,
+    grid_scales,
+    format_scale,
+    calculate_relative_positions,
+    calculate_ppi,
+    detect_bitdepth,
+    is_internal_connector
+)
 
 # --- TUI ROUTER CONFIGURATION ---
 ENGINE_TYPE = "monitor"
-APP_TITLE = "Dusky Monitor Wizard"
-DEFAULT_MODE = "batch"  # Monitors should default to batch to prevent Wayland configuration tearing
+APP_TITLE = "Dusky Monitor & Workspace Wizard"
+DEFAULT_MODE = "batch"  # Batch mode prevents Wayland configuration tearing during live updates
 TARGET_FILE = "~/.config/hypr/edit_here/source/monitors.lua"
-THEME_FILE = "~/.config/matugen/generated/dusky_tui.json" # <-- This is the surgical fix!
+THEME_FILE = "~/.config/matugen/generated/dusky_tui.json"
 ENABLE_USER_PRESETS = True
 USER_PRESETS_TAB = "Presets"
 
-# --- MATHEMATICAL CONSTANTS ---
-# Extensively expanded to support 16:10, 21:9, 32:9, and higher resolutions natively
+# --- STANDARD FALLBACK RESOLUTIONS ---
 STANDARD_RES = [
     (5120, 2880), (5120, 1440), (3840, 2400), (3840, 2160), (3840, 1600),
     (3440, 1440), (2880, 1800), (2560, 1600), (2560, 1440), (2560, 1080),
@@ -35,14 +45,8 @@ STANDARD_RES = [
     (1366, 768), (1280, 1024), (1280, 800), (1280, 720), (1024, 768)
 ]
 
-SCALE_STEPS = [
-    0.5, 0.6, 0.75, 0.8, 0.9, 1.0, 1.0625, 1.1, 1.125, 1.15, 1.2, 1.25,
-    1.33, 1.4, 1.5, 1.6, 1.67, 1.75, 1.8, 1.88, 2.0, 2.25, 2.4, 2.5,
-    2.67, 2.8, 3.0
-]
-
-POS_VARIANTS = [
-    "auto", "auto-right", "auto-left", "auto-up", "auto-down", 
+POS_COMPOSITOR_VARIANTS = [
+    "auto", "auto-right", "auto-left", "auto-up", "auto-down",
     "auto-center-right", "auto-center-left", "auto-center-up", "auto-center-down"
 ]
 
@@ -50,19 +54,35 @@ CM_PROFILES = ["auto", "srgb", "dcip3", "dp3", "adobe", "wide", "edid", "hdr", "
 SDR_EOTFS = ["default", "srgb", "gamma22"]
 
 
-def _calculate_valid_scales(native_w: int, native_h: int) -> list[str]:
-    valid_scales = []
-    for s in SCALE_STEPS:
-        lw, lh = native_w / s, native_h / s
-        if lw < 640 or lh < 360: continue
-        valid_scales.append(s)
-            
-    valid = valid_scales if valid_scales else [1.0]
-    return ["auto"] + [f"{v:g}" for v in valid]
+def _calculate_valid_scales(native_w: int, native_h: int) -> tuple[list[str], list[str]]:
+    """
+    Generates scale choices strictly adhering to Hyprland's 1/120 quantum grid.
+    Returns (options, hints) with standard preset pills highlighted as recommended.
+    """
+    presets = preset_choices(native_w, native_h)
+    all_sharp = grid_scales(native_w, native_h, min_scale=0.5, max_scale=3.0)
+
+    combined = sorted(list(set(presets + all_sharp)))
+    if not combined:
+        combined = [1.0]
+
+    options = ["auto"]
+    hints = ["Automatic (PPI heuristic)"]
+
+    for s in combined:
+        fmt = format_scale(s)
+        options.append(fmt)
+        if s in presets:
+            hints.append("Recommended Preset (Sharp)")
+        else:
+            hints.append("Sharp Divisor")
+
+    return options, hints
+
 
 def generate_schema() -> tuple[list[str], dict[int, list[ConfigItem]]]:
     try:
-        proc = subprocess.run(["hyprctl", "-j", "monitors", "all"], capture_output=True, text=True, timeout=5)
+        proc = subprocess.run(["hyprctl", "-j", "monitors", "all"], capture_output=True, text=True, timeout=3)
         raw = proc.stdout.strip()
         if raw and not raw[0] in ("[", "{"):
             for i, line in enumerate(raw.splitlines()):
@@ -75,193 +95,395 @@ def generate_schema() -> tuple[list[str], dict[int, list[ConfigItem]]]:
 
     tabs = []
     schema = {}
-    
-    available_outputs = [m.get("name", "") for m in monitors]
-    
-    # ---------------------------------------------------------
-    # 1. HARDWARE MONITORS
-    # ---------------------------------------------------------
+
+    available_outputs = [m.get("name", "") for m in monitors if m.get("name")]
+    primary_output = available_outputs[0] if available_outputs else "eDP-1"
+    secondary_output = available_outputs[1] if len(available_outputs) > 1 else primary_output
+
+    internal_outputs = [name for name in available_outputs if is_internal_connector(name)]
+    external_outputs = [name for name in available_outputs if not is_internal_connector(name)]
+
+    # Calculate spatial geometry options (relative positions)
+    relative_positions = calculate_relative_positions(monitors)
+
+    # -------------------------------------------------------------------------
+    # 1. HARDWARE MONITORS TABS (One per physical output)
+    # -------------------------------------------------------------------------
     for i, m in enumerate(monitors):
         name = m.get("name", f"Unknown-{i}")
         desc = m.get("description", "")
+        make = m.get("make", "")
+        model = m.get("model", "")
+        serial = m.get("serial", "")
         tabs.append(name)
         schema[i] = []
-        
+
         native_w = int(m.get("width", 1920))
         native_h = int(m.get("height", 1080))
+        pw_mm = int(m.get("physicalWidth", 0))
+        ph_mm = int(m.get("physicalHeight", 0))
+        ppi, diag_in = calculate_ppi(native_w, native_h, pw_mm, ph_mm)
+        detected_bpc = detect_bitdepth(m.get("currentFormat", ""))
         scope_str = f"monitor/{name}"
-        
+
+        # Modes & refresh rate
         avail_modes_raw = m.get("availableModes", [])
         clean_modes = [mode.replace("Hz", "").replace("hz", "").strip() for mode in avail_modes_raw]
-        
+
         base_refresh_float = float(m.get("refreshRate", 60.0))
         base_refresh = f"{base_refresh_float:.2f}"
-        
+
         fallback_modes = []
         for w, h in STANDARD_RES:
             if w <= native_w and h <= native_h:
                 fallback_modes.append(f"{w}x{h}@{base_refresh}")
                 if base_refresh != "60.00":
                     fallback_modes.append(f"{w}x{h}@60.00")
-                    
+
         all_modes = ["preferred", "highres", "highrr", "maxwidth"] + clean_modes
         for f_mode in fallback_modes:
             if f_mode not in all_modes:
                 all_modes.append(f_mode)
 
+        # Identifiers
         ident_options = [name]
         ident_hints = ["Raw Port ID"]
         if desc:
             ident_options.append(f"desc:{desc}")
-            ident_hints.append("Hardware Safe ID")
+            ident_hints.append("Hardware Safe ID (EDID Description)")
+
+        # Scales (1/120 fractional grid)
+        scale_options, scale_hints = _calculate_valid_scales(native_w, native_h)
+
+        # Positions (Dynamic relative placement + standard auto)
+        rel_opts = relative_positions.get(name, [])
+        pos_options = []
+        pos_hints = []
+        for val, lbl, hint in rel_opts:
+            if val not in pos_options:
+                pos_options.append(val)
+                pos_hints.append(f"{lbl} — {hint}")
+
+        for auto_var in POS_COMPOSITOR_VARIANTS:
+            if auto_var not in pos_options:
+                pos_options.append(auto_var)
+                pos_hints.append("Compositor Keyword")
+
+        # Hardware facts header for extended help
+        hw_info = (
+            f"**Hardware Identity**:\n"
+            f"- Device: {make} {model} ({name})\n"
+            f"- Serial: {serial if serial else 'N/A'}\n"
+            f"- Description: {desc}\n"
+            f"- Dimensions: {pw_mm}mm × {ph_mm}mm (~{diag_in}\" diag, {ppi} PPI)\n"
+            f"- Buffer Format: {m.get('currentFormat', 'Unknown')} ({detected_bpc}-bit)\n"
+            f"- Active Mode: {native_w}x{native_h} @ {base_refresh}Hz\n"
+        )
 
         schema[i].extend([
             ConfigItem(
-                label="Enable Monitor", key="disabled", scope=scope_str, type_="bool", default=False,
-                group="Core Setup", extended_help="Toggles the monitor state. Disabling a monitor literally removes it from the layout, moving all windows and workspaces to remaining ones."
+                label="Enable Monitor", key="enabled", scope=scope_str, type_="bool", default=True,
+                group="Core Setup",
+                extended_help=f"{hw_info}\n**Enable Monitor**:\nToggles the monitor state. Disabling removes it from the canvas and relocates windows to remaining displays."
             ),
             ConfigItem(
                 label="Target Identifier", key="output", scope=scope_str, type_="picker", default=name,
                 options=ident_options, hints=ident_hints, group="Core Setup",
-                extended_help="Output name or 'desc:' description prefix. Leaving this empty defines a fallback rule for when no other rules match."
+                extended_help=f"{hw_info}\n**Target Identifier**:\nOutput name ('{name}') or 'desc:' description. Description matching prevents port-swapping issues."
             ),
             ConfigItem(
                 label="Resolution & Rate", key="mode", scope=scope_str, type_="string", default="preferred",
                 options=all_modes, group="Core Setup",
-                extended_help="Select a preset, or manually type a resolution/refresh rate (e.g. '1920x1080@144'). Special values: preferred, highres, highrr, maxwidth. You can also pass a custom 'modeline' string here."
+                extended_help=f"{hw_info}\n**Resolution & Refresh Rate**:\nSelect an advertised hardware mode or a virtual alias ('preferred', 'highres', 'highrr', 'maxwidth')."
             ),
             ConfigItem(
-                label="Display Scale", key="scale", scope=scope_str, type_="picker", default="auto",
-                options=_calculate_valid_scales(native_w, native_h), group="Core Setup",
-                extended_help="Scale factor. 'auto' lets Hyprland decide based on PPI. Warning: A valid scale must divide your resolution cleanly without decimals to avoid invalid logical pixel errors."
+                label="Display Scale", key="scale", scope=scope_str, type_="picker", default="1",
+                options=scale_options, hints=scale_hints, group="Core Setup",
+                extended_help=f"{hw_info}\n**Display Scale Factor**:\nFractional scaling on Hyprland's 1/120 grid. Presets prevent compositor yellow warning banners."
             ),
             ConfigItem(
                 label="Position on Canvas", key="position", scope=scope_str, type_="picker", default="auto",
-                options=POS_VARIANTS + [f"{m.get('x', 0)}x{m.get('y', 0)}"], group="Layout & Transforms",
-                extended_help="Position in pixels (e.g. 1920x0). Hyprland uses an inverse Y cartesian system (negative y is higher). 'auto' auto-places based on the top-left corner. 'auto-center' places based on the monitor center."
+                options=pos_options, hints=pos_hints, group="Layout & Transforms",
+                extended_help=f"{hw_info}\n**Position on Canvas**:\nSelect auto-placement or an exact relative coordinate calculated against peer displays."
             ),
             ConfigItem(
                 label="Rotation Transform", key="transform", scope=scope_str, type_="picker", default="0",
                 options=["0", "1", "2", "3", "4", "5", "6", "7"],
-                hints=["Normal", "90°", "180°", "270°", "Flipped", "Flipped+90°", "Flipped+180°", "Flipped+270°"],
-                group="Layout & Transforms", extended_help="Rotates or flips the monitor output."
+                hints=["Normal", "90° (Portrait)", "180°", "270° (Portrait Inv)", "Flipped", "Flipped + 90°", "Flipped + 180°", "Flipped + 270°"],
+                group="Layout & Transforms",
+                extended_help="Rotates or flips the monitor output. Logical width and height are automatically swapped on 90°/270°."
             ),
             ConfigItem(
-                label="Reserved Area", key="reserved_area", scope=scope_str, type_="int", default=0,
-                group="Layout & Transforms", extended_help="A custom reserved area (in pixels) unoccupied by tiled windows on all sides. Note: TUI supports integer (all sides) only. To define individual sides (top/bottom/left/right), use the manual 'Edit File' option."
+                label="Reserved Padding", key="reserved_area", scope=scope_str, type_="int", default=0,
+                group="Layout & Transforms",
+                extended_help="Custom reserved margin (in pixels) unoccupied by tiled windows on all edges."
             ),
             ConfigItem(
                 label="Mirror Output", key="mirror", scope=scope_str, type_="picker", default="",
                 options=[""] + [out for out in available_outputs if out != name],
-                hints=["None"] + ["Clone this display"] * (len(available_outputs)-1),
+                hints=["None (Independent Screen)"] + [f"Clone {out}" for out in available_outputs if out != name],
                 group="Layout & Transforms",
-                extended_help="Mirrors another display. Mirroring will not re-render elements for the second monitor (e.g., 1080p mirrored to 4K is still 1080p). Squishing/stretching will occur on differing aspect ratios (like 16:9 vs 16:10)."
+                extended_help="Mirrors another display pixel-for-pixel."
             ),
             ConfigItem(
-                label="Variable Refresh Rate", key="vrr", scope=scope_str, type_="cycle", default="0",
-                options=["0", "1", "2"], hints=["Off", "On", "Fullscreen Only"], group="Advanced Display",
-                extended_help="Configures per-display Variable Refresh Rate (VRR / FreeSync)."
+                label="VRR", key="vrr", scope=scope_str, type_="cycle", default="0",
+                options=["0", "1", "2"], hints=["Off", "Always On", "Fullscreen Only"], group="Advanced Display",
+                extended_help="Configures per-display Variable Refresh Rate (VRR / FreeSync / G-Sync)."
             ),
             ConfigItem(
-                label="Bitdepth", key="bitdepth", scope=scope_str, type_="cycle", default="8",
-                options=["8", "10"], group="Advanced Display",
-                extended_help="Enable 10-bit support. Note: Colors registered in Hyprland (e.g., border color) do not support 10-bit, and some apps do not support 10-bit screen capture."
+                label="Bitdepth", key="bitdepth", scope=scope_str, type_="cycle", default=str(detected_bpc),
+                options=["8", "10", "16"], hints=["8-bit (Standard SDR)", "10-bit (Deep Color)", "16-bit (HDR Float)"],
+                group="Advanced Display",
+                extended_help="Enables 10-bit or 16-bit color output for supported HDR and wide-gamut monitors."
             ),
             ConfigItem(
                 label="Force Wide Color", key="supports_wide_color", scope=scope_str, type_="cycle", default="0",
-                options=["-1", "0", "1"], hints=["Off", "Auto", "On"], group="Advanced Display",
-                extended_help="Force wide color gamut support. (-1 = off, 0 = auto, 1 = on)"
+                options=["-1", "0", "1"], hints=["Force Off", "Auto Detect", "Force On"], group="Advanced Display",
+                extended_help="Controls wide color gamut support (-1 = off, 0 = auto, 1 = on)."
             ),
             ConfigItem(
                 label="Force HDR", key="supports_hdr", scope=scope_str, type_="cycle", default="0",
-                options=["-1", "0", "1"], hints=["Off", "Auto", "On"], group="Advanced Display",
-                extended_help="Force HDR support. (-1 = off, 0 = auto, 1 = on)"
+                options=["-1", "0", "1"], hints=["Force Off", "Auto Detect", "Force On"], group="Advanced Display",
+                extended_help="Forces HDR capability on the display pipeline (-1 = off, 0 = auto, 1 = on)."
             ),
             ConfigItem(
-                label="ICC Profile Path", key="icc", scope=scope_str, type_="string", default="",
-                group="Color Pipeline", extended_help="Absolute path to an ICC profile. Applying an ICC overrides the CM preset, forces sdr_eotf to sRGB, and is fundamentally incompatible with HDR gaming."
+                label="ICC Profile", key="icc", scope=scope_str, type_="string", default="",
+                group="Color Pipeline",
+                extended_help="Absolute filesystem path to an ICC color profile (.icc or .icm)."
             ),
             ConfigItem(
                 label="Color Management", key="cm", scope=scope_str, type_="picker", default="auto",
                 options=CM_PROFILES, group="Color Pipeline",
-                extended_help="'auto' uses sRGB for 8bpc and wide for 10bpc. 'hdr' enables experimental wide color gamut and HDR PQ transfer function."
+                extended_help="Selects color management preset. 'hdr' activates wide color gamut and PQ transfer."
             ),
             ConfigItem(
-                label="SDR Transfer Curve", key="sdr_eotf", scope=scope_str, type_="picker", default="default",
+                label="SDR Curve (EOTF)", key="sdr_eotf", scope=scope_str, type_="picker", default="default",
                 options=SDR_EOTFS, group="Color Pipeline",
-                extended_help="The transfer function assumed to be in use on an SDR display for sRGB content. 'default' follows the global render:cm_sdr_eotf setting."
+                extended_help="Assumed electro-optical transfer function for SDR content."
             ),
             ConfigItem(
-                label="HDR: SDR Brightness", key="sdrbrightness", scope=scope_str, type_="float", default=1.0,
+                label="HDR SDR Brightness", key="sdrbrightness", scope=scope_str, type_="float", default=1.0,
                 min_val=0.1, max_val=3.0, step=0.1, group="HDR / SDR Mapping",
-                extended_help="Controls SDR brightness in HDR mode. Typical brightness values should be in the 1.0 to 2.0 range."
+                extended_help="Controls white-point brightness of SDR content in HDR mode. Typically 1.0 to 1.8."
             ),
             ConfigItem(
-                label="HDR: SDR Saturation", key="sdrsaturation", scope=scope_str, type_="float", default=1.0,
+                label="HDR SDR Saturation", key="sdrsaturation", scope=scope_str, type_="float", default=1.0,
                 min_val=0.1, max_val=2.0, step=0.1, group="HDR / SDR Mapping",
-                extended_help="Controls SDR saturation in HDR mode. Default is 1.0."
+                extended_help="Controls SDR color saturation in HDR mode. Default is 1.0."
             ),
             ConfigItem(
                 label="SDR Min Luminance", key="sdr_min_luminance", scope=scope_str, type_="float", default=0.2,
-                group="Luminance Tuning", extended_help="SDR minimum luminance for SDR to HDR mapping."
+                group="Luminance Tuning", extended_help="Minimum luminance (nits) for SDR-to-HDR tone mapping."
             ),
             ConfigItem(
                 label="SDR Max Luminance", key="sdr_max_luminance", scope=scope_str, type_="int", default=80,
-                group="Luminance Tuning", extended_help="SDR maximum luminance."
+                group="Luminance Tuning", extended_help="Maximum luminance (nits) for SDR content."
             ),
             ConfigItem(
-                label="Monitor Min Luminance", key="min_luminance", scope=scope_str, type_="float", default=-1.0,
-                group="Luminance Tuning", extended_help="Monitor minimum possible luminance. Default is -1."
+                label="Min Luminance", key="min_luminance", scope=scope_str, type_="float", default=-1.0,
+                group="Luminance Tuning", extended_help="Monitor minimum measurable luminance (-1 = EDID default)."
             ),
             ConfigItem(
-                label="Monitor Max Luminance", key="max_luminance", scope=scope_str, type_="int", default=-1,
-                group="Luminance Tuning", extended_help="Monitor maximum possible luminance. Default is -1."
+                label="Max Luminance", key="max_luminance", scope=scope_str, type_="int", default=-1,
+                group="Luminance Tuning", extended_help="Monitor maximum peak luminance (-1 = EDID default)."
             ),
             ConfigItem(
                 label="Max Avg Luminance", key="max_avg_luminance", scope=scope_str, type_="int", default=-1,
-                group="Luminance Tuning", extended_help="Monitor maximum average luminance. Default is -1."
+                group="Luminance Tuning", extended_help="Monitor maximum full-field average luminance (-1 = EDID default)."
             )
         ])
 
-    # ---------------------------------------------------------
-    # 2. GLOBAL SYSTEM SETTINGS
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # 2. WORKSPACE PLANNING TAB (SECTION 6: hl.workspace_rule)
+    # -------------------------------------------------------------------------
+    tabs.append("Workspaces")
+    ws_idx = len(tabs) - 1
+    schema[ws_idx] = []
+
+    # Quick workspace distribution strategy presets
+    seq_payload = {}
+    for w_i in range(1, 11):
+        target_m = primary_output if w_i <= 5 else secondary_output
+        seq_payload[f"workspace_rule/{w_i}.monitor"] = target_m
+        seq_payload[f"workspace_rule/{w_i}.default"] = (w_i in (1, 6))
+
+    all_primary_payload = {}
+    for w_i in range(1, 11):
+        all_primary_payload[f"workspace_rule/{w_i}.monitor"] = primary_output
+        all_primary_payload[f"workspace_rule/{w_i}.default"] = (w_i == 1)
+
+    interleave_payload = {}
+    for w_i in range(1, 11):
+        target_m = primary_output if (w_i % 2 == 1) else secondary_output
+        interleave_payload[f"workspace_rule/{w_i}.monitor"] = target_m
+        interleave_payload[f"workspace_rule/{w_i}.default"] = (w_i in (1, 2))
+
+    strategy_items = []
+    if len(available_outputs) > 1:
+        strategy_items.append(
+            ConfigItem(
+                label="Sequential (1-5 / 6-10)", key="plan_seq", scope="DEFAULT",
+                type_="preset", default=None, group="Quick Strategies",
+                preset_payload=seq_payload,
+                extended_help="Distributes workspaces 1-5 on primary, and 6-10 on secondary."
+            )
+        )
+    strategy_items.append(
+        ConfigItem(
+            label="All on Primary", key="plan_all_pri", scope="DEFAULT",
+            type_="preset", default=None, group="Quick Strategies",
+            preset_payload=all_primary_payload,
+            extended_help="Pins all workspaces (1-10) to the primary display."
+        )
+    )
+    if len(available_outputs) > 1:
+        strategy_items.append(
+            ConfigItem(
+                label="Interleaved (Odd / Even)", key="plan_inter", scope="DEFAULT",
+                type_="preset", default=None, group="Quick Strategies",
+                preset_payload=interleave_payload,
+                extended_help="Alternates workspaces: Odd on primary, Even on secondary."
+            )
+        )
+
+    schema[ws_idx].extend(strategy_items)
+
+    # Workspaces 1..10 Individual Bindings (clean, concise labels)
+    for w_num in range(1, 11):
+        ws_str = str(w_num)
+        ws_scope = f"workspace_rule/{ws_str}"
+        grp = f"Workspaces {1 if w_num <= 5 else 6}–{5 if w_num <= 5 else 10}"
+
+        schema[ws_idx].extend([
+            ConfigItem(
+                label=f"WS {ws_str} Monitor", key="monitor", scope=ws_scope, type_="picker",
+                default=primary_output, options=available_outputs, group=grp,
+                extended_help=f"Selects the display to which Workspace {ws_str} is pinned."
+            ),
+            ConfigItem(
+                label=f"WS {ws_str} Default Focus", key="default", scope=ws_scope, type_="bool",
+                default=(w_num == 1), group=grp,
+                extended_help=f"When true, Workspace {ws_str} focuses automatically when this monitor connects."
+            ),
+            ConfigItem(
+                label=f"WS {ws_str} Persistent", key="persistent", scope=ws_scope, type_="bool",
+                default=False, group=grp,
+                extended_help=f"When true, Workspace {ws_str} stays visible in the bar even when empty."
+            )
+        ])
+
+    # -------------------------------------------------------------------------
+    # 3. GLOBAL SYSTEM SETTINGS (SECTION 7: hl.config)
+    # -------------------------------------------------------------------------
     tabs.append("Globals")
     g_idx = len(tabs) - 1
     schema[g_idx] = [
         ConfigItem(
             label="Variable Frame Rate (VFR)", key="vfr", scope="debug", type_="bool", default=True,
-            group="Power & Performance", extended_help="When true, Hyprland stops sending frames to the GPU while nothing is changing on screen. Saves ~1 W on laptops."
+            group="Power & Performance",
+            extended_help="When true, stops sending redundant frames when screen is static. Saves ~1 W on laptops."
         ),
         ConfigItem(
             label="Debug Overlay (FPS)", key="overlay", scope="debug", type_="bool", default=False,
-            group="Power & Performance", extended_help="When true, Hyprland draws a debug overlay showing FPS, frame timings, and damage regions in the top-left corner of the screen."
+            group="Power & Performance",
+            extended_help="Draws a real-time overlay showing FPS, timings, and GPU damage regions."
         ),
         ConfigItem(
-            label="Global VRR Override", key="vrr", scope="misc", type_="cycle", default="0",
+            label="Global VRR", key="vrr", scope="misc", type_="cycle", default="0",
             options=["0", "1", "2"], hints=["Off", "Always On", "Fullscreen Only"], group="Power & Performance",
-            extended_help="Globally sets the Variable Refresh Rate behavior across all monitors."
+            extended_help="Globally configures Variable Refresh Rate behavior across all outputs."
         ),
         ConfigItem(
             label="Global SDR EOTF", key="cm_sdr_eotf", scope="render", type_="picker", default="auto",
             options=["auto", "srgb", "gamma22"], group="Color Pipeline",
-            extended_help="Sets the default transfer function assumed for SDR displays. Monitors set to 'default' will inherit this value."
+            extended_help="Default transfer function assumed for SDR displays."
+        ),
+        ConfigItem(
+            label="Fullscreen HDR Passthrough", key="cm_fs_passthrough", scope="render", type_="bool", default=False,
+            group="Color Pipeline",
+            extended_help="Fullscreen HDR apps bypass Hyprland color pipeline for raw, zero-overhead gaming."
         ),
         ConfigItem(
             label="Auto HDR Promotion", key="cm_auto_hdr", scope="render", type_="bool", default=False,
-            group="Color Pipeline", extended_help="If enabled, fullscreen HDR is possible without explicitly setting the monitor 'cm' property to 'hdr'."
+            group="Color Pipeline",
+            extended_help="Automatically promotes SDR content to HDR in supported media players."
         )
     ]
-        
+
+    # -------------------------------------------------------------------------
+    # 4. PRESETS TAB (Concise, punchy labels without redundant prefixes)
+    # -------------------------------------------------------------------------
     tabs.append(USER_PRESETS_TAB)
-    
-    if len(tabs) == 2: # Only Globals and Presets exist
+    p_idx = len(tabs) - 1
+    preset_items = [
+        ConfigItem(
+            label="Gaming", key="preset_gaming", scope="DEFAULT", type_="preset",
+            default=None, group="Display Profiles",
+            preset_payload={
+                "misc.vrr": 2,
+                "debug.vfr": True,
+                "render.cm_fs_passthrough": True,
+                "render.cm_auto_hdr": False
+            },
+            extended_help="High-refresh gaming: Fullscreen VRR, VFR enabled, Fullscreen HDR passthrough active."
+        ),
+        ConfigItem(
+            label="Color Accurate SDR", key="preset_color_sdr", scope="DEFAULT", type_="preset",
+            default=None, group="Display Profiles",
+            preset_payload={
+                "misc.vrr": 0,
+                "render.cm_sdr_eotf": "srgb",
+                "render.cm_fs_passthrough": False,
+                "render.cm_auto_hdr": False
+            },
+            extended_help="Calibrated sRGB pipeline: Piecewise sRGB curve, VRR disabled to prevent panel flicker."
+        ),
+        ConfigItem(
+            label="Battery Saver", key="preset_battery", scope="DEFAULT", type_="preset",
+            default=None, group="Display Profiles",
+            preset_payload={
+                "misc.vrr": 0,
+                "debug.vfr": True,
+                "render.cm_fs_passthrough": False,
+                "render.cm_auto_hdr": False
+            },
+            extended_help="Maximum power efficiency: VFR active, VRR disabled, standard color management."
+        )
+    ]
+
+    if internal_outputs and external_outputs:
+        clamshell_payload = {}
+        for im in internal_outputs:
+            clamshell_payload[f"monitor/{im}.enabled"] = False
+        for em in external_outputs:
+            clamshell_payload[f"monitor/{em}.enabled"] = True
+        for w_i in range(1, 11):
+            clamshell_payload[f"workspace_rule/{w_i}.monitor"] = external_outputs[0]
+            clamshell_payload[f"workspace_rule/{w_i}.default"] = (w_i == 1)
+
+        preset_items.append(
+            ConfigItem(
+                label="Clamshell (External Only)", key="preset_clamshell", scope="DEFAULT", type_="preset",
+                default=None, group="Display Profiles",
+                preset_payload=clamshell_payload,
+                extended_help="Clamshell mode: disables internal laptop screen and routes all workspaces to external monitor."
+            )
+        )
+
+    schema[p_idx] = preset_items
+
+    if len(tabs) == 3:  # Only Workspaces, Globals, Presets (no physical monitors found)
         tabs.insert(0, "Fallback")
-        schema[0] = [ConfigItem(label="No Monitors Detected", key="none", type_="string", default="", group="Error", extended_help="Hyprland IPC returned no monitors. Verify your socket is accessible.")]
-        # Shift indices
-        schema = {k+1 if k >= 0 else k: v for k, v in schema.items()}
+        schema[0] = [
+            ConfigItem(
+                label="No Monitors Detected", key="none", type_="string", default="", group="Error",
+                extended_help="Hyprland IPC returned zero active displays. Verify your socket is accessible."
+            )
+        ]
+        schema = {k + 1 if k >= 0 else k: v for k, v in schema.items()}
 
     return tabs, schema
+
 
 TABS, SCHEMA = generate_schema()
 
@@ -269,9 +491,6 @@ TABS, SCHEMA = generate_schema()
 # DIRECT EXECUTION HANDLER
 # =============================================================================
 if __name__ == "__main__":
-    import sys, subprocess
-    from pathlib import Path
-
     script_path = Path(__file__).resolve()
     main_router = Path.home() / "user_scripts" / "dusky_tui" / "python" / "main" / "main.py"
 

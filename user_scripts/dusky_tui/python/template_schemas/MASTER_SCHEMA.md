@@ -195,7 +195,7 @@ network engine's status/speed-test/hotspot tabs).
 | `lua` | [engines/lua.md](./engines/lua.md) | `HyprlandLuaEngine` | `~/Documents/hyprland.lua` | `hl.config` table path (`a/b`); `hl.method` → `method/<id>` |
 | `autostart` | [engines/autostart.md](./engines/autostart.md) | `AutostartLuaEngine` | hyprland Lua | scope `autostart`, fixed key catalog |
 | `trackpad` | [engines/trackpad.md](./engines/trackpad.md) | `TrackpadLuaEngine` | hyprland Lua | scope `gestures`; gestures via `gesture/<f>/<dir>` |
-| `monitor` | [engines/monitor.md](./engines/monitor.md) | `MonitorLuaEngine` | `~/Documents/monitors.lua` | scope `monitor/<name>`; globals `misc`/`debug`/`render` |
+| `monitor` | [engines/monitor.md](./engines/monitor.md) | `MonitorLuaEngine` | `~/Documents/monitors.lua` | scope `monitor/<name>`; `workspace_rule/<1-10>`; globals `misc`/`debug`/`render` |
 | `systemd` | [engines/systemd.md](./engines/systemd.md) | `SystemdEngine` | (none) | scope `user`/`system`; key = unit name |
 | `hyprlang` | [engines/hyprlang.md](./engines/hyprlang.md) | `HyprlangEngine` | hypr*.conf | block name → scope; `cat:key` inline; `$var` → `DEFAULT` |
 | `cmdline` | [engines/cmdline.md](./engines/cmdline.md) | `CmdlineEngine` | `/etc/kernel/cmdline` | scope `DEFAULT`; kernel params, `:N` dupes |
