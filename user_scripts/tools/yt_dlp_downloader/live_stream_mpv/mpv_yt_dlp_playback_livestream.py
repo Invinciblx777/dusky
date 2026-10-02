@@ -752,7 +752,7 @@ def _pick_codec_best(fmts: list[dict], fam: str) -> str | None:
 
 def resolve_format(fmts: list[dict], want: str | None, prefer_codec: str | None = None,
                    fallback_best: bool = False) -> str:
-    """IDs take precedence; #N explicitly selects a row. Attach audio to video-only IDs."""
+    """IDs take precedence; the prompt also accepts row numbers. #N forces a row."""
     if not fmts:
         return want or DEFAULT_FORMAT
     if prefer_codec and not want:
@@ -760,10 +760,11 @@ def resolve_format(fmts: list[dict], want: str | None, prefer_codec: str | None 
         if preferred not in CODEC_ALIASES:
             raise SystemExit(f"ERROR: unknown codec {prefer_codec!r}; use av1/vp9/hevc/avc")
         want = CODEC_ALIASES[preferred]
-    if want is None and sys.stdin.isatty():
+    prompted = want is None and sys.stdin.isatty()
+    if prompted:
         print_formats(fmts)
         try:
-            want = input("Pick [#row / ID / codec / selector; default=best, q=quit]: ").strip()
+            want = input("Pick [row / ID / codec / selector; #N forces row N; Enter=best, q=quit]: ").strip()
         except (EOFError, KeyboardInterrupt):
             raise SystemExit(130)
         if want.lower() in ("q", "quit", "exit"):
@@ -776,7 +777,7 @@ def resolve_format(fmts: list[dict], want: str | None, prefer_codec: str | None 
     match = next((f for f in fmts if f["id"] == w), None)
     if match:
         return _format_with_audio(match)
-    if w.startswith("#"):
+    if w.startswith("#") or (prompted and w.isdecimal()):
         row = w.removeprefix("#")
         if row.isdigit() and int(row) < len(fmts):
             return _format_with_audio(fmts[int(row)])
@@ -1094,6 +1095,7 @@ def build_parser() -> argparse.ArgumentParser:
                f"  {PROG} URL --mode live     Enable live travel and an optional archive\n\n"
                "Settings: CLI > replay entry > environment > config.toml > defaults.\n"
                "Player keys: } = 2x, ]/[ = adjust speed, Backspace = reset, Left/Right = seek.\n"
+               "Format prompt: enter a row number or ID; IDs win ties, #N forces row N.\n"
                "Codec budgets apply after yt-dlp metadata extraction; unresolved codecs show ?.",
     )
     ap.add_argument("url", nargs="?",

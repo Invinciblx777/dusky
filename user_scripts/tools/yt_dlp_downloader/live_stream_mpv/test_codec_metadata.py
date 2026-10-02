@@ -347,5 +347,61 @@ class CodecMetadata(unittest.TestCase):
                     player.mp4_codec_header('https://example.com/v.mp4', {}, time.monotonic() + 5)
 
 
+class FormatSelection(unittest.TestCase):
+    def youtube_info(self):
+        # Match the eight rows in the reported live-stream table.
+        formats = []
+        for fid, height in [('233', None), ('234', None), ('269', 144), ('229', 240),
+                            ('230', 360), ('231', 480), ('232', 720), ('270', 1080)]:
+            formats.append({'format_id': fid, 'url': f'https://example.com/{fid}.m3u8',
+                            'protocol': 'm3u8_native', 'ext': 'mp4', 'height': height,
+                            'vcodec': 'avc1.4D401F' if height else 'none',
+                            'acodec': 'none' if height else 'aac',
+                            'abr': None if height else (64 if fid == '233' else 128)})
+        return {'id': 'test', 'title': 'test live stream', 'extractor': 'youtube',
+                'extractor_key': 'Youtube', 'webpage_url': 'https://www.youtube.com/watch?v=test',
+                'is_live': True, 'live_status': 'is_live', 'formats': formats}
+
+    def test_prompt_accepts_row_numbers_and_attaches_audio(self):
+        formats = player.fmt_list(self.youtube_info())
+        for answer in ('6', '#6', '232'):
+            with self.subTest(answer=answer), patch.object(player.sys.stdin, 'isatty', return_value=True), \
+                    patch('builtins.input', return_value=answer), patch.object(player, 'print_formats'):
+                self.assertEqual(player.resolve_format(formats, None), '232+bestaudio/232')
+
+    def test_numeric_ids_win_ties_and_hash_forces_row(self):
+        formats = [{'id': '1', 'acodec': 'aac'}, {'id': 'other', 'acodec': 'aac'}]
+        for answer, expected in [('1', '1'), ('#1', 'other')]:
+            with self.subTest(answer=answer), patch.object(player.sys.stdin, 'isatty', return_value=True), \
+                    patch('builtins.input', return_value=answer), patch.object(player, 'print_formats'):
+                self.assertEqual(player.resolve_format(formats, None), expected)
+        # Explicit CLI/raw selectors retain yt-dlp's format-ID semantics.
+        self.assertEqual(player.resolve_format(formats, '0'), '0')
+
+    def test_invalid_prompt_row_reports_local_error(self):
+        with patch.object(player.sys.stdin, 'isatty', return_value=True), \
+                patch('builtins.input', return_value='99'), patch.object(player, 'print_formats'):
+            with self.assertRaisesRegex(SystemExit, 'format row.*out of range'):
+                player.resolve_format(player.fmt_list(self.youtube_info()), None)
+
+    def test_real_ytdlp_selects_row_video_and_separate_audio(self):
+        with tempfile.TemporaryDirectory(dir='/dev/shm') as directory:
+            metadata = Path(directory) / 'metadata.json'
+            info = self.youtube_info()
+            metadata.write_text(json.dumps(info))
+            cmd = ['yt-dlp', '--ignore-config', '--no-cache-dir', '--skip-download', '-J',
+                   '--load-info-json', str(metadata), '--format']
+            original = subprocess.run(cmd + ['6'], capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(original.returncode, 0)
+            self.assertIn('Requested format is not available', original.stderr)
+            with patch.object(player.sys.stdin, 'isatty', return_value=True), \
+                    patch('builtins.input', return_value='6'), patch.object(player, 'print_formats'):
+                choice = player.resolve_format(player.fmt_list(info), None)
+            selected = subprocess.run(cmd + [choice], capture_output=True, text=True, timeout=10)
+            self.assertEqual(selected.returncode, 0, selected.stderr)
+            tracks = json.loads(selected.stdout)['requested_formats']
+            self.assertEqual([track['format_id'] for track in tracks], ['232', '234'])
+
+
 if __name__ == '__main__':
     unittest.main()
