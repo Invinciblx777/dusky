@@ -9,6 +9,7 @@ while file mode requires a single stream. Live rewind depends on the server.
 Examples:
   %(prog)s URL                             # choose format; auto video/live mode
   %(prog)s URL -F                          # list format IDs and row numbers
+  %(prog)s URL --probe                     # allow up to 20 seconds for missing codecs
   %(prog)s URL -f '#1' --speed 2            # second row, including separate audio
   %(prog)s URL --mode file --buffer full   # growing-file DVR on tmpfs
   %(prog)s URL --mode plain                # direct URL playback
@@ -70,6 +71,7 @@ BUFFER_PRESETS = {
 try:
     from rich.console import Console
     from rich.table import Table
+    from rich.text import Text
 
     _RICH = True
 except ImportError:
@@ -605,12 +607,14 @@ def mp4_codec_header(url: str, headers: dict, deadline: float) -> bytes:
     raise ValueError("MP4 codec header not found")
 
 
-def probe_missing_codecs(info: dict, *, env: dict | None = None) -> None:
+def probe_missing_codecs(info: dict, *, env: dict | None = None, fast: bool = True) -> None:
     """Fill missing extractor metadata from stream headers; never guess from the container.
 
     Known codecs and explicit 'none' values remain authoritative. Only format
     listing/interactive selection/codec preferences need this extra network work.
-    At most four probes run together, with a shared 20-second probe budget.
+    At most four probes run together, sharing 3 seconds (20 with --probe).
+    Fast mode uses only interruptible subprocess probes, so Python network
+    reads cannot delay the format prompt beyond the short probe budget.
     """
     formats = info.get("formats") or ([info] if info.get("url") else [])
     unknown = [f for f in formats if f.get("url") and
@@ -621,8 +625,10 @@ def probe_missing_codecs(info: dict, *, env: dict | None = None) -> None:
     if not ffprobe:
         print("NOTE: codec metadata is missing; install ffprobe to detect it.", file=sys.stderr)
         return
-    print(f"Detecting missing codecs for {len(unknown)} formats...", file=sys.stderr)
-    deadline = time.monotonic() + 20
+    budget = 3 if fast else 20
+    print(f"Detecting missing codecs for {len(unknown)} formats "
+          f"(up to {budget}s)...", file=sys.stderr)
+    deadline = time.monotonic() + budget
 
     def probe(fmt: dict) -> dict:
         remaining = deadline - time.monotonic()
@@ -631,6 +637,10 @@ def probe_missing_codecs(info: dict, *, env: dict | None = None) -> None:
         cmd = [ffprobe, "-v", "error", "-probesize", "262144",
                "-analyzeduration", "1000000",
                "-show_entries", "stream=codec_type,codec_name", "-of", "json"]
+        if fmt.get("protocol") in ("m3u8", "m3u8_native"):
+            # HLS segment URLs need not have a media suffix (Rumble uses .tar
+            # with ?r_file=media-N.ts). Probe their contents rather than suffixes.
+            cmd += ["-extension_picky", "0"]
         header = None
         if fmt["url"].startswith(("http://", "https://")):
             cmd += ["-rw_timeout", "5000000"]
@@ -641,7 +651,8 @@ def probe_missing_codecs(info: dict, *, env: dict | None = None) -> None:
             cookies = fmt.get("cookies") or info.get("cookies")
             if cookies:
                 cmd += ["-cookies", cookies]
-            elif fmt.get("ext") == "mp4" and fmt.get("protocol") in (None, "http", "https"):
+            elif (not fast and fmt.get("ext") == "mp4"
+                  and fmt.get("protocol") in (None, "http", "https")):
                 try:
                     header = mp4_codec_header(fmt["url"], headers, deadline)
                 except (OSError, ValueError, http.client.HTTPException):
@@ -1054,65 +1065,98 @@ class SpaceGuard(threading.Thread):
 
 # ---------- CLI ----------
 
+class PlaybackArgumentParser(argparse.ArgumentParser):
+    """Use argparse's help layout, with optional terminal-only Rich styling."""
+
+    def print_help(self, file=None) -> None:
+        stream = file if file is not None else sys.stdout
+        if not _RICH or not stream.isatty():
+            super().print_help(file=stream)
+            return
+        help_text = Text(self.format_help())
+        help_text.highlight_regex(r"(?m)^[A-Z][^\n]*:$", "bold magenta")
+        help_text.highlight_regex(r"(?<!\w)--?[a-zA-Z][a-zA-Z-]*", "bold cyan")
+        help_text.highlight_regex(r"\b(?:3|20)[ -]seconds?\b", "bold green")
+        Console(file=stream, force_terminal=True).print(help_text, soft_wrap=True, end="")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(
-        allow_abbrev=False, prog=PROG, description="Watch YouTube/X live in mpv with tmpfs DVR (rewind + 2x).",
-        epilog="Precedence: CLI > --replay entry > env > config.toml > builtin. "
-               "Player keys: } = 2x, ]/[ = speed, Backspace = reset, Left/Right = seek.",
+    ap = PlaybackArgumentParser(
+        allow_abbrev=False, add_help=False, color=False,
+        prog=PROG, usage="%(prog)s [OPTIONS] [URL]",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Watch videos and live streams in mpv, with optional DVR on tmpfs.\n"
+                    "Missing codecs: quick 3-second check by default; --probe allows 20 seconds.",
+        epilog=f"Examples:\n  {PROG} URL                 Choose a format, then play\n"
+               f"  {PROG} URL -F              List formats with a quick codec check\n"
+               f"  {PROG} URL -F --probe      List formats with a longer codec check\n"
+               f"  {PROG} URL -f '#2'         Play row 2 from the format list\n"
+               f"  {PROG} URL --mode live     Enable live travel and an optional archive\n\n"
+               "Settings: CLI > replay entry > environment > config.toml > defaults.\n"
+               "Player keys: } = 2x, ]/[ = adjust speed, Backspace = reset, Left/Right = seek.\n"
+               "Codec budgets apply after yt-dlp metadata extraction; unresolved codecs show ?.",
     )
     ap.add_argument("url", nargs="?",
-                    help="youtube.com/watch, youtu.be, x.com/i/broadcasts/..., x.com/.../status/... works for VOD too")
-    ap.add_argument("-F", "--list-formats", action="store_true", help="list available resolutions and exit")
-    ap.add_argument("-f", "--format", default=None,
+                    metavar="URL", help="video or live-stream URL supported by yt-dlp")
+    formats = ap.add_argument_group("Formats and codec detection")
+    playback = ap.add_argument_group("Playback")
+    recording = ap.add_argument_group("Recording and DVR")
+    extraction = ap.add_argument_group("Authentication and extraction")
+    diagnostics = ap.add_argument_group("Help and diagnostics")
+    diagnostics.add_argument("-h", "--help", action="help", help="show this help and exit")
+    formats.add_argument("-F", "--list-formats", action="store_true", help="list available resolutions and exit")
+    formats.add_argument("-p", "--probe", action="store_true",
+                         help="allow up to 20 seconds to detect missing codecs (default: 3 seconds)")
+    formats.add_argument("-f", "--format", default=None,
                     help="format ID, #row from -F, codec (av1/vp9/hevc/avc), best/worst, "
                          "or raw yt-dlp selector (default: prompt, best if piped)")
-    ap.add_argument("--prefer-codec", default=None,
+    formats.add_argument("--prefer-codec", default=None,
                     help="auto-pick best format with this codec: av1/vp9/hevc/avc (ignored if -f given)")
-    ap.add_argument("--buffer", default=None,
+    playback.add_argument("--buffer", default=None,
                     help="player RAM window: ask/full/near (default: ask on tty, near if piped). "
                          "full = up to 2 GiB back/forth cache; file stays seekable either way")
-    ap.add_argument("--speed", type=float, default=None, help="initial player speed, 2 = 2x (default: 1.0)")
-    ap.add_argument("--tmpdir", default=None, help="tmpfs dir for recording (default: largest writable tmpfs)")
-    ap.add_argument("--cookies", default=None,
+    playback.add_argument("--speed", type=float, default=None, help="initial player speed, 2 = 2x (default: 1.0)")
+    recording.add_argument("--tmpdir", default=None, help="tmpfs dir for recording (default: largest writable tmpfs)")
+    extraction.add_argument("--cookies", default=None,
                     help="Netscape cookie file for login-walled broadcasts (copied to tmpfs, original untouched)")
-    ap.add_argument("--cookies-from-browser", default=None, metavar="BROWSER",
+    extraction.add_argument("--cookies-from-browser", default=None, metavar="BROWSER",
                     help="e.g. chromium, firefox (passed to yt-dlp and mpv)")
-    ap.add_argument("--allow-disk", dest="allow_disk", default=None,
+    recording.add_argument("--allow-disk", dest="allow_disk", default=None,
                     action=argparse.BooleanOptionalAction, help="allow non-tmpfs --tmpdir (SSD wear)")
-    ap.add_argument("--min-free", type=int, default=None, metavar="MB", help="required free tmpfs MB (default: 500)")
-    ap.add_argument("--keep", dest="keep", default=None,
+    recording.add_argument("--min-free", type=int, default=None, metavar="MB", help="required free tmpfs MB (default: 500)")
+    recording.add_argument("--keep", dest="keep", default=None,
                     action=argparse.BooleanOptionalAction, help="keep tmpfs recording on exit")
-    ap.add_argument("--show-recorder", dest="show_recorder", default=None,
+    recording.add_argument("--show-recorder", dest="show_recorder", default=None,
                     action=argparse.BooleanOptionalAction,
                     help="also show the live recorder window (default: headless)")
-    ap.add_argument("--record-only", action="store_true", help="record to tmpfs without launching the player")
-    ap.add_argument("--mode", default=None,
+    recording.add_argument("--record-only", action="store_true", help="record to tmpfs without launching the player")
+    playback.add_argument("--mode", default=None,
                     help="auto = live for current broadcasts, plain for regular videos (default); "
                          "live = play URL with a tmpfs archive; "
                          "file = two-process growing-file DVR (no server window needed); "
                          "plain = play URL, no recording")
-    ap.add_argument("--fullscreen", dest="fullscreen", default=None,
+    playback.add_argument("--fullscreen", dest="fullscreen", default=None,
                     action=argparse.BooleanOptionalAction, help="start player fullscreen")
-    ap.add_argument("--mute", dest="mute", default=None,
+    playback.add_argument("--mute", dest="mute", default=None,
                     action=argparse.BooleanOptionalAction, help="start player muted")
-    ap.add_argument("--low-latency", dest="low_latency", default=None,
+    playback.add_argument("--low-latency", dest="low_latency", default=None,
                     action=argparse.BooleanOptionalAction, help="URL playback uses mpv --profile=low-latency")
-    ap.add_argument("--timeout", type=float, default=None, help="seconds to wait for recording to start (default: 30)")
-    ap.add_argument("--start", default=None,
+    recording.add_argument("--timeout", type=float, default=None, help="seconds to wait for recording to start (default: 30)")
+    playback.add_argument("--start", default=None,
                     help="open at position: seconds (3600), MM:SS, HH:MM:SS, percent (50%%), #chapter, none, "
                          "or negative seconds from the end (-1800). Live seek availability depends on the server.")
-    ap.add_argument("--player-args", default="", help='extra player args, e.g. --player-args="--volume=80"')
-    ap.add_argument("--recorder-args", default="", help="extra recorder args (file mode only)")
-    ap.add_argument("--ytdlp-option", action="append", default=[], metavar="KEY[=VALUE]",
+    playback.add_argument("--player-args", default="", help='extra player args, e.g. --player-args="--volume=80"')
+    recording.add_argument("--recorder-args", default="", help="extra recorder args (file mode only)")
+    extraction.add_argument("--ytdlp-option", action="append", default=[], metavar="KEY[=VALUE]",
                     help="pass a yt-dlp option to probe + mpv hook, e.g. --ytdlp-option=socket-timeout=15")
-    ap.add_argument("--ignore-ytdlp-config", dest="ignore_ytdlp_config",
+    extraction.add_argument("--ignore-ytdlp-config", dest="ignore_ytdlp_config",
                     default=None, action=argparse.BooleanOptionalAction,
                     help="ignore external yt-dlp config files for determinism (default: on)")
-    ap.add_argument("--floor-mb", type=int, default=None, metavar="MB",
+    recording.add_argument("--floor-mb", type=int, default=None, metavar="MB",
                     help="stop recording if tmpfs free space falls below this (default: 256)")
-    ap.add_argument("--doctor", action="store_true", help="check executables and required mpv options, then exit")
-    ap.add_argument("--print-cmds", action="store_true", help="print mpv commands without running them")
-    mg = ap.add_argument_group("config + history",
+    diagnostics.add_argument("--doctor", action="store_true", help="check executables and required mpv options, then exit")
+    diagnostics.add_argument("--print-cmds", action="store_true", help="print mpv commands without running them")
+    mg = ap.add_argument_group("Settings and history",
                                f"stored in {os.path.join(_cfg_dir())} (0600, video stays in tmpfs)")
     mg.add_argument("--set-global", action="append", nargs="+", default=[], metavar="KEY=VALUE",
                     help=f"persist global defaults, e.g. --set-global buffer=near speed=2 "
@@ -1333,9 +1377,9 @@ def main() -> int:
         info = run_yt_dlp_json(url, yt_extra + yt_cookie_flags + ["--format", DEFAULT_FORMAT],
                               executable=ytdlp, env=env)
         codec_choice = str(args.format or "").strip().lower() in CODEC_ALIASES
-        if (args.list_formats or codec_choice or (args.prefer_codec and not args.format)
+        if (args.probe or args.list_formats or codec_choice or (args.prefer_codec and not args.format)
                 or (args.format is None and sys.stdin.isatty())):
-            probe_missing_codecs(info, env=env)
+            probe_missing_codecs(info, env=env, fast=not args.probe)
         fmts = fmt_list(info)
         print(f"Title: {info.get('title') or '?'} | uploader: {info.get('uploader') or '?'} | "
               f"live: {info.get('live_status') or info.get('is_live') or '?'}", file=sys.stderr)
