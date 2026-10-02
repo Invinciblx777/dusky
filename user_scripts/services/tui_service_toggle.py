@@ -255,6 +255,10 @@ CORE_SYSTEM_DEFS = {
         "Weekly SSD Trim",
         "Discards unused filesystem blocks once a week on supported storage.",
     ),
+    "systemd-tmpfiles-clean.timer": (
+        "Temporary Directory Cleanup",
+        "Daily cleanup of stale files in /tmp and /var/tmp via systemd-tmpfiles --clean. Vendor-enabled through timers.target; static unit, use start/stop.",
+    ),
     "dusky_keylogger.service": (
         "Dusky Keystroke Stats",
         "Always-on keystroke statistics daemon. Captures raw key presses via evdev (no Wayland/X11), classifies them (Shift/Caps/NumLock, shortcut chords), and stores them with kernel timestamps in SQLite at ~/.local/share/dusky-keylogger/keys.db (mode 0600). Powers the `dusky stats` / `dusky dashboard` analytics. Stop/disable it here to pause logging.",
@@ -383,8 +387,8 @@ CORE_SYSTEM_SECTIONS = (
     )),
     ("Storage & Maintenance", (
         "udisks2.service", "dusky_snapshot.timer", "snapper-timeline.timer",
-        "snapper-cleanup.timer", "fstrim.timer", "reflector.timer",
-        "linux-modules-cleanup.service",
+        "snapper-cleanup.timer", "fstrim.timer", "systemd-tmpfiles-clean.timer",
+        "reflector.timer", "linux-modules-cleanup.service",
     )),
 )
 

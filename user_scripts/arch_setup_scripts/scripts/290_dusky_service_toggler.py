@@ -64,6 +64,7 @@ SYSTEM_SERVICES: Final[list[ServiceConfig]] = [
     ServiceConfig("bluetooth.service", True, "Bluetooth protocol stack daemon"),
     ServiceConfig("ufw.service", True, "Uncomplicated Firewall daemon"),
     ServiceConfig("fstrim.timer", True, "Weekly SSD TRIM maintenance timer"),
+    ServiceConfig("systemd-tmpfiles-clean.timer", True, "Daily cleanup of temporary directories (/tmp, /var/tmp) timer"),
     ServiceConfig("systemd-timesyncd.service", True, "Network time synchronization daemon"),
     ServiceConfig("acpid.service", True, "Advanced Configuration and Power Interface daemon"),
     ServiceConfig("systemd-resolved.service", True, "Network Name Resolution manager"),
