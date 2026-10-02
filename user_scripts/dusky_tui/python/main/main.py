@@ -626,7 +626,15 @@ EXAMPLES:
 
         elif e_type == "fontconfig":
             from python.engines.fontconfig import FontconfigEngine
-            return FontconfigEngine(config_path=config_path)
+            defaults = {
+                item.key: item.default
+                for items in SCHEMA.values() for item in items
+                if item.type_ not in ("action", "preset", "menu")
+                and (item.engine_type_override or ENGINE_TYPE).lower() == e_type
+                and (resolve_target(item.target_file_override) if item.target_file_override
+                     else str(TARGET_FILE)) == config_path
+            }
+            return FontconfigEngine(config_path=config_path, defaults=defaults)
 
         elif e_type in ("toml", "toml_engine"):
             from python.engines.toml import TomlEngine
