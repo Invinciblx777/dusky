@@ -106,7 +106,7 @@ declare -r CURSOR_HIDE=$'\033[?25l'
 declare -r CURSOR_SHOW=$'\033[?25h'
 declare -r ALT_SCREEN_ON=$'\033[?1049h'
 declare -r ALT_SCREEN_OFF=$'\033[?1049l'
-declare -r MOUSE_ON=$'\033[?1000h\033[?1006h\033[?2004h'
+declare -r MOUSE_ON=$'\033[?1000h\033[?1002h\033[?1006h\033[?2004h'
 declare -r MOUSE_OFF=$'\033[?1000l\033[?1002l\033[?1006l\033[?2004l'
 
 declare -r ESC_READ_TIMEOUT=0.08
@@ -1847,6 +1847,14 @@ handle_mouse() {
     if (( button == 64 )); then navigate -1; return 0; fi
     if (( button == 65 )); then navigate 1; return 0; fi
 
+    # Button-drag motion (mode 1002) arrives with +32 on the button code.
+    # Dragging only moves the selection; it never adjusts or activates.
+    local -i is_drag=0
+    if (( button >= 32 && button < 64 )); then
+        is_drag=1
+        button=$(( button - 32 ))
+    fi
+
     if [[ "$terminator" != "M" ]] || (( button != 0 && button != 2 )); then return 0; fi
     if (( x < 1 || x > MIN_TERM_COLS )); then return 0; fi
 
@@ -1881,7 +1889,7 @@ handle_mouse() {
                 fi
             done
         else
-            if (( button == 0 )); then
+            if (( button == 0 && ! is_drag )); then
                 go_back
             fi
             return 0
@@ -1904,7 +1912,7 @@ handle_mouse() {
 
         if (( clicked_idx >= 0 && clicked_idx < count )); then
             SELECTED_ROW=$clicked_idx
-            if (( x > ADJUST_THRESHOLD )); then
+            if (( ! is_drag && x > ADJUST_THRESHOLD )); then
                 if (( button == 0 )); then
                     activate_item || adjust 1
                 elif (( button == 2 )); then
@@ -1938,6 +1946,14 @@ handle_mouse_picker() {
     if (( button == 64 )); then picker_navigate -1; return 0; fi
     if (( button == 65 )); then picker_navigate 1; return 0; fi
 
+    # Button-drag motion (mode 1002) arrives with +32 on the button code.
+    # Dragging only moves the selection; it never confirms.
+    local -i is_drag=0
+    if (( button >= 32 && button < 64 )); then
+        is_drag=1
+        button=$(( button - 32 ))
+    fi
+
     if [[ "$terminator" != "M" ]] || (( button != 0 && button != 2 )); then return 0; fi
     if (( x < 1 || x > MIN_TERM_COLS )); then return 0; fi
 
@@ -1947,7 +1963,7 @@ handle_mouse_picker() {
         local -i count=${#PICKER_ITEMS[@]}
         if (( clicked_idx >= 0 && clicked_idx < count )); then
             PICKER_SELECTED=$clicked_idx
-            if (( button == 0 )); then
+            if (( button == 0 && ! is_drag )); then
                 picker_confirm
             fi
         fi
