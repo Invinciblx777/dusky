@@ -76,6 +76,7 @@ SYSTEM_SERVICES: Final[list[ServiceConfig]] = [
     ServiceConfig("tlp.service", False, "Power management daemon (disabled by default)"),
     ServiceConfig("dusky_powertop_autotune.timer", False, "Powertop auto-tune 2min after boot (disabled by default, conflicts with TLP)"),
     ServiceConfig("vsftpd.service", False, "FTP server daemon (disabled by default)"),
+    ServiceConfig("sshd.service", False, "OpenSSH server daemon (disabled by default)"),
     ServiceConfig("reflector.timer", False, "Pacman mirrorlist reflector timer (disabled by default)"),
 ]
 
