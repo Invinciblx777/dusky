@@ -108,9 +108,7 @@ picker_cb_demo_theme() {
 }
 
 action_demo_sudo() {
-    if ! sudo -n true 2>/dev/null; then
-        acquire_sudo || return 0
-    fi
+    acquire_sudo || return 0
     set_status "Sudo acquired. Service restart simulated."
 }
 
@@ -711,6 +709,17 @@ write_value_to_file() {
         if ! populate_config_cache; then release_lock_fd "$lock_fd"; return 1; fi
         before=$CONFIG_SIGNATURE
     fi
+    # Optional compare-and-swap protects relative edits, including stale no-ops.
+    # Arguments 5/6 are the expected presence (0/1) and raw cached value.
+    if (( $# >= 5 )); then
+        local actual_present=0
+        [[ ${CONFIG_CACHE[$cache_key]+present} ]] && actual_present=1
+        if [[ $actual_present != "$5" || ${CONFIG_CACHE[$cache_key]-} != "${6-}" ]]; then
+            release_lock_fd "$lock_fd"
+            set_status "Setting changed externally; refreshed. Retry the adjustment."
+            return 1
+        fi
+    fi
     if { [[ $operation == delete && ! ${CONFIG_CACHE[$cache_key]+present} ]]; } ||
        { [[ $operation == set && ${CONFIG_CACHE[$cache_key]+present} &&
             ${CONFIG_CACHE[$cache_key]} == "$new_val" ]]; }; then
@@ -873,6 +882,10 @@ modify_value() {
     get_active_context
     local -n _items_ref="$REPLY_REF"
     IFS='|' read -r key type block min max step <<< "${ITEM_MAP["${REPLY_CTX}::${label}"]}"
+    local cache_key="${key}|${block}" expected_present=0 expected_value
+    [[ ${CONFIG_CACHE[$cache_key]+present} ]] && expected_present=1
+    expected_value=${CONFIG_CACHE[$cache_key]-}
+    load_active_values
     current=${VALUE_CACHE["${REPLY_CTX}::${label}"]:-}
 
     if [[ ! ${VALUE_CACHE["${REPLY_CTX}::${label}"]+present} || -z $current ]]; then
@@ -946,10 +959,12 @@ modify_value() {
         *) return 0 ;;
     esac
 
-    if write_value_to_file "$key" "$new_val" "$block"; then
+    if write_value_to_file "$key" "$new_val" "$block" set "$expected_present" "$expected_value"; then
         load_active_values
         clear_status
         if (( LAST_WRITE_CHANGED )); then post_write_action; fi
+    else
+        load_active_values
     fi
     return 0
 }
@@ -1035,6 +1050,10 @@ reset_defaults() {
 # =============================================================================
 
 acquire_sudo() {
+    if ! command -v sudo >/dev/null 2>&1; then
+        set_status "This action requires sudo, which is not installed."
+        return 1
+    fi
     if sudo -n true 2>/dev/null; then
         return 0
     fi
@@ -1233,6 +1252,13 @@ draw_main_view() {
     if (( TAB_SCROLL_START > CURRENT_TAB )); then TAB_SCROLL_START=$CURRENT_TAB; fi
     if (( TAB_SCROLL_START < 0 )); then TAB_SCROLL_START=0; fi
     local -i max_tab_width=$(( BOX_INNER_WIDTH - 6 ))
+    local -i total_tab_width=0
+    for name in "${TABS[@]}"; do total_tab_width=$(( total_tab_width + ${#name} + 4 )); done
+    total_tab_width=$(( total_tab_width - 2 ))
+    if (( total_tab_width <= BOX_INNER_WIDTH - 2 )); then
+        TAB_SCROLL_START=0
+        max_tab_width=$BOX_INNER_WIDTH
+    fi
     LEFT_ARROW_ZONE=""; RIGHT_ARROW_ZONE=""
 
     while true; do
@@ -1316,6 +1342,19 @@ draw_main_view() {
             TAB_ZONES+=("${zone_start}:$(( zone_start + tab_name_len + 1 ))")
             used_len=$(( used_len + chunk_len )); current_col=$(( current_col + chunk_len ))
         done
+        # Center the complete tab group; overflowing groups keep arrow navigation.
+        if (( TAB_SCROLL_START == 0 )) && [[ -z $RIGHT_ARROW_ZONE ]]; then
+            local -i tab_content_width=$(( used_len - 2 )) tab_shift
+            left_pad=$(( (BOX_INNER_WIDTH - tab_content_width) / 2 ))
+            tab_shift=$(( left_pad - 3 ))
+            local tab_prefix="${C_MAGENTA}│   "
+            printf -v pad_buf '%*s' "$left_pad" ''
+            tab_line="${C_MAGENTA}│${pad_buf}${tab_line:${#tab_prefix}}"
+            for (( i=0; i<${#TAB_ZONES[@]}; i++ )); do
+                TAB_ZONES[i]="$(( ${TAB_ZONES[i]%%:*} + tab_shift )):$(( ${TAB_ZONES[i]##*:} + tab_shift ))"
+            done
+            used_len=$(( left_pad + tab_content_width - 1 ))
+        fi
         local -i pad=$(( BOX_INNER_WIDTH - used_len - 1 ))
         if (( pad > 0 )); then printf -v pad_buf '%*s' "$pad" ''; tab_line+="$pad_buf"; fi
         tab_line+="${C_MAGENTA}│${C_RESET}"
@@ -1924,6 +1963,10 @@ parse_args() {
                 shift
                 if [[ $# -gt 0 ]]; then CONFIG_FILE=$1; else log_err "--config requires a path"; exit 2; fi
                 ;;
+            --config=*)
+                CONFIG_FILE=${1#--config=}
+                [[ -n $CONFIG_FILE ]] || { log_err "--config requires a path"; exit 2; }
+                ;;
             --help|-h)
                 printf 'Usage: %s [--config /path/to/settings.conf]\n' "${0##*/}"
                 exit 0
@@ -1947,7 +1990,7 @@ main() {
     if [[ ! -t 0 || ! -t 1 ]]; then log_err "Interactive TTY stdin/stdout required"; exit 1; fi
 
     local dep
-    for dep in realpath mktemp flock stat chmod chown mv rm stty sudo awk mkdir sha256sum; do
+    for dep in realpath mktemp flock stat chmod chown mv rm stty awk mkdir sha256sum; do
         if ! command -v "$dep" >/dev/null 2>&1; then log_err "Missing dependency: $dep"; exit 1; fi
     done
 
