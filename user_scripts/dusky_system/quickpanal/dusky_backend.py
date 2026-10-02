@@ -1093,20 +1093,33 @@ def apply_local_brightness(value: float) -> None:
         return
     run_command([*base_cmd, "--quiet", "set", f"{brightness}%"], timeout=CONTROL_TIMEOUT)
 
-_SERVICE_ENABLED_CACHE: dict[str, tuple[float, bool]] = {}
+_SERVICE_ENABLED_CACHE: dict[str, bool] = {}
+_SERVICE_ENABLED_LOCK = threading.Lock()
+_SERVICE_ENABLED_REVISION = 0
+
+def invalidate_service_enabled_cache() -> None:
+    """UnitFilesChanged invalidates cached enablement without hidden polling."""
+    global _SERVICE_ENABLED_REVISION
+    with _SERVICE_ENABLED_LOCK:
+        _SERVICE_ENABLED_CACHE.clear()
+        _SERVICE_ENABLED_REVISION += 1
 
 def _is_service_enabled(service: str, force_check: bool = False) -> bool:
-    cached = _SERVICE_ENABLED_CACHE.get(service)
-    now = time.monotonic()
-    if cached is not None and not force_check and now - cached[0] < 30.0:
-        return cached[1]
+    with _SERVICE_ENABLED_LOCK:
+        cached = _SERVICE_ENABLED_CACHE.get(service)
+        revision = _SERVICE_ENABLED_REVISION
+    if cached is not None and not force_check:
+        return cached
     if SYSTEMCTL is None:
         return False
     result = run_command([SYSTEMCTL, "--user", "is-enabled", service], timeout=0.5, capture_stdout=True)
-    if result is None:
-        return cached[1] if cached else False
+    if result is None or not result.stdout.strip():
+        return cached if cached is not None else False
     enabled = result.returncode == 0
-    _SERVICE_ENABLED_CACHE[service] = (now, enabled)
+    with _SERVICE_ENABLED_LOCK:
+        # A query that overlapped an enable/disable must not refill a stale cache.
+        if revision == _SERVICE_ENABLED_REVISION:
+            _SERVICE_ENABLED_CACHE[service] = enabled
     return enabled
 
 def is_dusky_notif_time_service_enabled(force_check: bool = False) -> bool:

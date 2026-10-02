@@ -223,14 +223,10 @@ class CompactSliderRow(Gtk.Box):
         if self._suspended or token != self._refresh_token or user_revision != self._user_revision:
             return GLib.SOURCE_REMOVE
         if value is None:
-            self.set_no_show_all(True)
-            self.set_visible(False)
-            self.hide()
+            self._set_available(False)
             self._pending_local_value = None
             return GLib.SOURCE_REMOVE
-        self.set_no_show_all(False)
-        self.set_visible(True)
-        self.show_all()
+        self._set_available(True)
         clamped = snap_to_step(value, self.adjustment.get_lower(), self.adjustment.get_upper(), self.adjustment.get_step_increment())
         if self._pending_local_value is not None:
             if math.isclose(clamped, self._pending_local_value, rel_tol=0.0, abs_tol=max(self.adjustment.get_step_increment() * 0.5, 1e-09)):
@@ -248,6 +244,18 @@ class CompactSliderRow(Gtk.Box):
         finally:
             self._suppress_apply = False
         return GLib.SOURCE_REMOVE
+
+    def _set_available(self, available: bool) -> None:
+        self.set_no_show_all(not available)
+        if self.get_visible() == available:
+            return
+        if available:
+            self.show_all()
+        else:
+            self.hide()
+        win = self.get_toplevel()
+        if hasattr(win, '_update_content_height'):
+            win._update_content_height()
 
     def suspend(self) -> None:
         self._suspended = True

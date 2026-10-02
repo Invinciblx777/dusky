@@ -32,7 +32,8 @@ from dusky_backend import (
     LatestValueWorker, RefreshPool, HyprsunsetController, LOG, start_thread, gi_object_c_pointer,
     HAS_VOLUME, HAS_BRIGHTNESS, HAS_LOCAL_BRIGHTNESS, HAS_SUNSET, DDC_MANAGER,
     get_volume, apply_volume, get_brightness, apply_local_brightness, 
-    get_hyprsunset_state, _RE_MAKO_BADGE, _RE_UPDATES_TOTAL,
+    get_hyprsunset_state, is_hyprsunset_service_enabled, _RE_MAKO_BADGE, _RE_UPDATES_TOTAL,
+    invalidate_service_enabled_cache,
     BRIGHTNESS_POST_SUBMIT_REFRESH_GRACE_SECONDS
 )
 WINDOW_CLASS: str = 'dusky_quickpanal.py'
@@ -120,6 +121,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         self._cpu_last: tuple[int, int] | None = None
         self._updating_power = False
         self._slider_rows: list[CompactSliderRow] = []
+        self._sunset_row: CompactSliderRow | None = None
         self.dynamic_toggles: dict[str, QuickIconToggle] = {}
         self._grab_active = False
         self._wifi_pending = False
@@ -319,6 +321,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
                 self.sliders_box.pack_start(row, False, False, 0)
             if HAS_SUNSET:
                 row = CompactSliderRow("󰡬", "sunset", 1000.0, 6000.0, 50.0, lambda: get_hyprsunset_state(getattr(self.app, "_sunset_controller", None)), sunset_submit, self.pool, post_submit_refresh_grace_seconds=BRIGHTNESS_POST_SUBMIT_REFRESH_GRACE_SECONDS)
+                self._sunset_row = row
                 self._slider_rows.append(row)
                 self.sliders_box.pack_start(row, False, False, 0)
             if self._slider_rows:
@@ -924,6 +927,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         snapshot = None
         dnd = None
         height = None
+        sunset_available = False
         try:
             result = run_command(['hyprctl', '-j', 'monitors'], timeout=0.8, capture_stdout=True)
             if result is not None and result.returncode == 0:
@@ -939,9 +943,14 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
                     dnd = 'do-not-disturb' in result.stdout.splitlines()
         except Exception as exc:
             LOG.warning('Could not prepare panel layout: %s', exc)
-        GLib.idle_add(self._finish_open, snapshot, dnd, height)
+        if self._sunset_row is not None:
+            try:
+                sunset_available = is_hyprsunset_service_enabled()
+            except Exception as exc:
+                LOG.warning('Could not prepare night light slider: %s', exc)
+        GLib.idle_add(self._finish_open, snapshot, dnd, height, sunset_available)
 
-    def _finish_open(self, snapshot: Any, dnd: bool | None, height: int | None) -> bool:
+    def _finish_open(self, snapshot: Any, dnd: bool | None, height: int | None, sunset_available: bool) -> bool:
         self._opening = False
         if height is not None:
             if self.scrolled_main.get_min_content_height() > height:
@@ -954,6 +963,8 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
                 panel._apply_dnd_state(dnd)
             if snapshot is not None:
                 panel._apply_notifs(*snapshot, panel._refresh_token)
+        if self._sunset_row is not None:
+            self._sunset_row._set_available(sunset_available)
         self.overlay.show_all()
         self._update_content_height()
         _minimum, natural = self.get_preferred_size()
@@ -1075,6 +1086,14 @@ class QuickPanalApp(Gtk.Application):
         self._volume_worker: LatestValueWorker | None = None
         self._local_brightness_worker: LatestValueWorker | None = None
         self._sunset_controller: HyprsunsetController | None = None
+        self._unit_files_signal_id = 0
+
+    def _on_unit_files_changed(self, *args: Any) -> None:
+        invalidate_service_enabled_cache()
+        if self.window and self.window._visible and self.window._sunset_row:
+            # Enablement changes must not wait for a recent drag's value grace.
+            self.window._sunset_row._pending_local_value = None
+            self.window._sunset_row.refresh_async()
 
     def submit_volume(self, value: float) -> None:
         if self._volume_worker:
@@ -1118,6 +1137,14 @@ class QuickPanalApp(Gtk.Application):
     @override
     def do_startup(self) -> None:
         Gtk.Application.do_startup(self)
+        connection = self.get_dbus_connection()
+        if connection is not None:
+            # systemd broadcasts this signal without Manager.Subscribe(). Use
+            # the application's existing connection and match only this event.
+            self._unit_files_signal_id = connection.signal_subscribe(
+                'org.freedesktop.systemd1', 'org.freedesktop.systemd1.Manager',
+                'UnitFilesChanged', '/org/freedesktop/systemd1', None,
+                Gio.DBusSignalFlags.NONE, self._on_unit_files_changed)
         GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda *_: self.quit() or GLib.SOURCE_REMOVE)
         self.hold()
         config_data = load_or_create_config()
@@ -1142,6 +1169,9 @@ class QuickPanalApp(Gtk.Application):
 
     @override
     def do_shutdown(self) -> None:
+        if self._unit_files_signal_id:
+            self.get_dbus_connection().signal_unsubscribe(self._unit_files_signal_id)
+            self._unit_files_signal_id = 0
         if self.window and self.window._timer_id is not None:
             GLib.source_remove(self.window._timer_id)
             self.window._timer_id = None
