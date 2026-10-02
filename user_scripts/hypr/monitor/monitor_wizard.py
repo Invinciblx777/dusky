@@ -202,6 +202,18 @@ def generate_schema() -> tuple[list[str], dict[int, list[ConfigItem]]]:
                 extended_help=f"{hw_info}\n**Display Scale Factor**:\nFractional scaling on Hyprland's 1/120 grid. Presets prevent compositor yellow warning banners."
             ),
             ConfigItem(
+                label="Visual Layout Designer", key="action_visual_layout", scope=scope_str, type_="action",
+                default=f"{sys.executable} {Path(__file__).parent / 'monitor_layout.py'}",
+                force_interactive=True, group="Layout & Transforms",
+                extended_help="Opens a full-screen interactive 2D spatial canvas to move, snap, and align displays with magnetic snapping and live compositor preview."
+            ),
+            ConfigItem(
+                label="Floating Layout Window", key="action_floating_layout", scope=scope_str, type_="action",
+                default=f"{sys.executable} {Path(__file__).parent / 'monitor_layout.py'} --floating",
+                force_interactive=False, group="Layout & Transforms",
+                extended_help="Spawns the interactive 2D layout canvas in a dedicated floating terminal window."
+            ),
+            ConfigItem(
                 label="Position on Canvas", key="position", scope=scope_str, type_="picker", default="auto",
                 options=pos_options, hints=pos_hints, group="Layout & Transforms",
                 extended_help=f"{hw_info}\n**Position on Canvas**:\nSelect auto-placement or an exact relative coordinate calculated against peer displays."
@@ -469,6 +481,21 @@ def generate_schema() -> tuple[list[str], dict[int, list[ConfigItem]]]:
                 extended_help="Clamshell mode: disables internal laptop screen and routes all workspaces to external monitor."
             )
         )
+
+    preset_items.extend([
+        ConfigItem(
+            label="Visual Layout Designer", key="action_visual_layout_preset", scope="DEFAULT", type_="action",
+            default=f"{sys.executable} {Path(__file__).parent / 'monitor_layout.py'}",
+            force_interactive=True, group="Visual Placement",
+            extended_help="Opens a full-screen interactive 2D spatial canvas to move, snap, and align displays with magnetic snapping and live compositor preview."
+        ),
+        ConfigItem(
+            label="Floating Layout Window", key="action_floating_layout_preset", scope="DEFAULT", type_="action",
+            default=f"{sys.executable} {Path(__file__).parent / 'monitor_layout.py'} --floating",
+            force_interactive=False, group="Visual Placement",
+            extended_help="Spawns the interactive 2D layout canvas in a dedicated floating terminal window."
+        ),
+    ])
 
     schema[p_idx] = preset_items
 
