@@ -57,12 +57,18 @@ SDR_EOTFS = ["default", "srgb", "gamma22"]
 def _calculate_valid_scales(native_w: int, native_h: int) -> tuple[list[str], list[str]]:
     """
     Generates scale choices strictly adhering to Hyprland's 1/120 quantum grid.
-    Returns (options, hints) with standard preset pills highlighted as recommended.
+    Includes exact resulting logical dimensions and enforces minimum logical bounds (640x360).
     """
+    MIN_LOGICAL_LONG = 640
+    MIN_LOGICAL_SHORT = 360
+    long_, short = max(native_w, native_h), min(native_w, native_h)
+
     presets = preset_choices(native_w, native_h)
-    all_sharp = grid_scales(native_w, native_h, min_scale=0.5, max_scale=3.0)
+    all_sharp = grid_scales(native_w, native_h, min_scale=0.5, max_scale=3.5)
 
     combined = sorted(list(set(presets + all_sharp)))
+    # Enforce ergonomic usability boundaries
+    combined = [s for s in combined if (long_ / s >= MIN_LOGICAL_LONG and short / s >= MIN_LOGICAL_SHORT)]
     if not combined:
         combined = [1.0]
 
@@ -72,10 +78,13 @@ def _calculate_valid_scales(native_w: int, native_h: int) -> tuple[list[str], li
     for s in combined:
         fmt = format_scale(s)
         options.append(fmt)
+        lw = int(round(native_w / s))
+        lh = int(round(native_h / s))
+        res_info = f"{lw}x{lh} logical"
         if s in presets:
-            hints.append("Recommended Preset (Sharp)")
+            hints.append(f"{res_info} (Recommended)")
         else:
-            hints.append("Sharp Divisor")
+            hints.append(f"{res_info} (Sharp)")
 
     return options, hints
 
@@ -221,7 +230,16 @@ def generate_schema() -> tuple[list[str], dict[int, list[ConfigItem]]]:
             ConfigItem(
                 label="Rotation Transform", key="transform", scope=scope_str, type_="picker", default="0",
                 options=["0", "1", "2", "3", "4", "5", "6", "7"],
-                hints=["Normal", "90° (Portrait)", "180°", "270° (Portrait Inv)", "Flipped", "Flipped + 90°", "Flipped + 180°", "Flipped + 270°"],
+                hints=[
+                    "0° (normal)",
+                    "90° (clockwise)",
+                    "180° (inverted)",
+                    "270° (counter-clockwise)",
+                    "0° (flipped)",
+                    "90° (flipped + clockwise)",
+                    "180° (flipped + inverted)",
+                    "270° (flipped + counter-clockwise)"
+                ],
                 group="Layout & Transforms",
                 extended_help="Rotates or flips the monitor output. Logical width and height are automatically swapped on 90°/270°."
             ),

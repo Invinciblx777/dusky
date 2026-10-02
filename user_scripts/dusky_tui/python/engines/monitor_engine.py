@@ -540,7 +540,9 @@ class MonitorLuaEngine(HyprlandLuaEngine):
                         block = m.group(1)
                         if re.search(r'\b' + re.escape(k) + r'\s*=', block):
                             return m.group(0)
-                        return block.rstrip() + ',\n    ' + k + ' = ' + v + '\n' + m.group(2)
+                        clean_block = block.rstrip()
+                        comma_prefix = "" if clean_block.endswith(",") else ","
+                        return clean_block + comma_prefix + '\n    ' + k + ' = ' + v + '\n' + m.group(2)
 
                     new_content, count = re.subn(pattern, repl, content)
                     if count > 0:

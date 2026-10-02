@@ -6,6 +6,7 @@ DUSKY DISPLAY LAYOUT DESIGNER: INTERACTIVE 2D SPATIAL CANVAS
 Interactive terminal-based 2D spatial canvas for multi-monitor placement in
 Hyprland / Wayland. Features magnetic edge-snapping, aspect-ratio corrected
 rendering, live compositor preview, and direct Lua AST persistence.
+Incorporates 1/120 quantum scale laddering and decoupled rotation transform algebra.
 """
 
 import os
@@ -31,6 +32,38 @@ except ImportError:
     MonitorLuaEngine = None
 
 
+def compute_new_transform(current: int, delta: int) -> int:
+    """Rotates within quadrant (0-3) preserving flip bit (4)."""
+    flip_bit = current & 4
+    rot_bits = current & 3
+    new_rot = (rot_bits + delta + 4) % 4
+    return flip_bit | new_rot
+
+
+def toggle_flip(current: int) -> int:
+    """Toggles flip bit (4) preserving rotation (0-3)."""
+    return current ^ 4
+
+
+def get_scale_ladder(w: int, h: int) -> list[float]:
+    """
+    Calculates sharp scale ladder for a given mode on Hyprland's 1/120 quantum grid.
+    Enforces minimum usable logical boundaries (640x360).
+    """
+    MIN_LOGICAL_LONG = 640
+    MIN_LOGICAL_SHORT = 360
+    long_, short = max(w, h), min(w, h)
+
+    g = math.gcd(120 * w, 120 * h)
+    scales: list[float] = []
+    for n in range(60, 481):  # 0.50x to 4.00x
+        if g % n == 0:
+            s = round(n / 120.0, 5)
+            if (long_ / s) >= MIN_LOGICAL_LONG and (short / s) >= MIN_LOGICAL_SHORT:
+                scales.append(s)
+    return scales if scales else [1.0]
+
+
 @dataclass
 class MonitorCanvasItem:
     output_id: int
@@ -45,6 +78,8 @@ class MonitorCanvasItem:
     y: int
     initial_x: int
     initial_y: int
+    initial_scale: float
+    initial_transform: int
     focused: bool
     disabled: bool
     current_mode: str
@@ -53,13 +88,15 @@ class MonitorCanvasItem:
     def logical_width(self) -> int:
         eff_w = self.height if (self.transform % 2 == 1) else self.width
         s = self.scale if self.scale > 0 else 1.0
-        return max(1, int(round(eff_w / s)))
+        n = max(1, round(s * 120))
+        return max(1, int(round((eff_w * 120) / n)))
 
     @property
     def logical_height(self) -> int:
         eff_h = self.width if (self.transform % 2 == 1) else self.height
         s = self.scale if self.scale > 0 else 1.0
-        return max(1, int(round(eff_h / s)))
+        n = max(1, round(s * 120))
+        return max(1, int(round((eff_h * 120) / n)))
 
 
 class MonitorLayoutCanvas:
@@ -74,7 +111,7 @@ class MonitorLayoutCanvas:
         self.live_preview = live_preview_default
         self.monitors: list[MonitorCanvasItem] = []
         self.selected_idx = 0
-        self.status_message = "Ready. Use arrows to move, [ / ] to snap, Enter to save."
+        self.status_message = "Ready. [Arrows] Move  [R] Rotate  [F] Flip  [+/-] Scale  [Enter] Save."
         self.status_is_error = False
         self.has_unsaved_changes = False
         self.saved_successfully = False
@@ -137,6 +174,8 @@ class MonitorLayoutCanvas:
                     y=y,
                     initial_x=x,
                     initial_y=y,
+                    initial_scale=s,
+                    initial_transform=t,
                     focused=foc,
                     disabled=dis,
                     current_mode=mode
@@ -150,6 +189,7 @@ class MonitorLayoutCanvas:
                     output_id=0, name="eDP-1", description="Primary Display",
                     width=1920, height=1080, refresh_rate=60.0, scale=1.0,
                     transform=0, x=0, y=0, initial_x=0, initial_y=0,
+                    initial_scale=1.0, initial_transform=0,
                     focused=True, disabled=False, current_mode="1920x1080@60.00"
                 )
             ]
@@ -170,6 +210,57 @@ class MonitorLayoutCanvas:
             self.has_unsaved_changes = True
             self.status_message = f"Normalized layout origin to (0, 0) [Shifted by {-min_x}, {-min_y}]."
 
+    def _rotate_selected(self, delta: int = 1) -> None:
+        """Rotates the selected monitor by 90-degree step preserving flips."""
+        if not self.monitors:
+            return
+        cur = self.monitors[self.selected_idx]
+        cur.transform = compute_new_transform(cur.transform, delta)
+        self.has_unsaved_changes = True
+        rot_deg = (cur.transform & 3) * 90
+        flip_str = " (flipped)" if (cur.transform & 4) else ""
+        self.status_message = f"Rotated {cur.name} to {rot_deg}°{flip_str} [Logical: {cur.logical_width}x{cur.logical_height}]."
+        if self.live_preview:
+            self._dispatch_live_preview()
+
+    def _flip_selected(self) -> None:
+        """Toggles horizontal/vertical flip on the selected monitor."""
+        if not self.monitors:
+            return
+        cur = self.monitors[self.selected_idx]
+        cur.transform = toggle_flip(cur.transform)
+        self.has_unsaved_changes = True
+        flip_state = "Flipped" if (cur.transform & 4) else "Unflipped"
+        self.status_message = f"{flip_state} {cur.name} [Transform: {cur.transform}]."
+        if self.live_preview:
+            self._dispatch_live_preview()
+
+    def _step_scale_selected(self, direction: int) -> None:
+        """Steps scale up (+1) or down (-1) along the sharp scale ladder."""
+        if not self.monitors:
+            return
+        cur = self.monitors[self.selected_idx]
+        ladder = get_scale_ladder(cur.width, cur.height)
+        if not ladder:
+            return
+
+        cur_s = round(cur.scale, 5)
+        closest_idx = min(range(len(ladder)), key=lambda i: abs(ladder[i] - cur_s))
+        new_idx = max(0, min(len(ladder) - 1, closest_idx + direction))
+
+        if new_idx == closest_idx and (
+            (direction > 0 and ladder[closest_idx] <= cur_s) or 
+            (direction < 0 and ladder[closest_idx] >= cur_s)
+        ):
+            self.status_message = f"{cur.name}: Scale limit reached at {ladder[closest_idx]:g}x."
+            return
+
+        cur.scale = ladder[new_idx]
+        self.has_unsaved_changes = True
+        self.status_message = f"Scaled {cur.name} to {cur.scale:g}x [Logical: {cur.logical_width}x{cur.logical_height}]."
+        if self.live_preview:
+            self._dispatch_live_preview()
+
     def _snap_selected(self, direction: str) -> None:
         """Magnetically snaps the selected monitor flush to its neighbor."""
         if len(self.monitors) < 2:
@@ -181,7 +272,6 @@ class MonitorLayoutCanvas:
         if not peers:
             return
 
-        # Pick nearest peer based on euclidean distance between centers
         cur_cx = cur.x + cur.logical_width / 2
         cur_cy = cur.y + cur.logical_height / 2
 
@@ -211,7 +301,6 @@ class MonitorLayoutCanvas:
             cur.x = peer.x + (peer.logical_width - cur.logical_width) // 2
             self.status_message = f"Snapped {cur.name} BELOW {peer.name} (Centered)."
         elif direction == "center":
-            # If side-by-side: vertical center. If stacked: horizontal center.
             if abs(cur_cx - (peer.x + peer.logical_width / 2)) >= abs(cur_cy - (peer.y + peer.logical_height / 2)):
                 cur.y = peer.y + (peer.logical_height - cur.logical_height) // 2
                 self.status_message = f"Aligned vertical center of {cur.name} with {peer.name}."
@@ -240,33 +329,24 @@ class MonitorLayoutCanvas:
 
         peers = [m for idx, m in enumerate(self.monitors) if idx != self.selected_idx and not m.disabled]
 
-        # Magnetic snap checks against all peers
         for p in peers:
-            # Snap flush right: cur.x close to p.x + p.logical_width
             if abs(new_x - (p.x + p.logical_width)) < self.SNAP_THRESHOLD:
                 new_x = p.x + p.logical_width
-            # Snap flush left: cur.x + cur.logical_width close to p.x
             elif abs((new_x + cur.logical_width) - p.x) < self.SNAP_THRESHOLD:
                 new_x = p.x - cur.logical_width
 
-            # Snap flush bottom: cur.y close to p.y + p.logical_height
             if abs(new_y - (p.y + p.logical_height)) < self.SNAP_THRESHOLD:
                 new_y = p.y + p.logical_height
-            # Snap flush top: cur.y + cur.logical_height close to p.y
             elif abs((new_y + cur.logical_height) - p.y) < self.SNAP_THRESHOLD:
                 new_y = p.y - cur.logical_height
 
-            # Align top edges
             if abs(new_y - p.y) < self.SNAP_THRESHOLD:
                 new_y = p.y
-            # Align bottom edges
             elif abs((new_y + cur.logical_height) - (p.y + p.logical_height)) < self.SNAP_THRESHOLD:
                 new_y = p.y + p.logical_height - cur.logical_height
 
-            # Align left edges
             if abs(new_x - p.x) < self.SNAP_THRESHOLD:
                 new_x = p.x
-            # Align right edges
             elif abs((new_x + cur.logical_width) - (p.x + p.logical_width)) < self.SNAP_THRESHOLD:
                 new_x = p.x + p.logical_width - cur.logical_width
 
@@ -288,16 +368,17 @@ class MonitorLayoutCanvas:
             subprocess.run(["hyprctl", "keyword", "monitor", arg], capture_output=True, timeout=1)
 
     def _revert_live(self) -> None:
-        """Restores monitors to their initial positions upon cancel."""
+        """Restores monitors to their initial positions, scales, and transforms upon cancel."""
         for m in self.monitors:
             m.x = m.initial_x
             m.y = m.initial_y
+            m.scale = m.initial_scale
+            m.transform = m.initial_transform
         self._dispatch_live_preview()
 
     def save_and_apply(self) -> bool:
-        """Writes coordinates permanently to monitors.lua and dispatches compositor reload."""
+        """Writes coordinates, scales, and transforms to monitors.lua and dispatches reload."""
         self._normalize_origin()
-        success = True
 
         if MonitorLuaEngine:
             try:
@@ -306,8 +387,10 @@ class MonitorLayoutCanvas:
                 changes = []
                 for m in self.monitors:
                     scope = f"monitor/{m.name}"
-                    pos_str = f"{m.x}x{m.y}"
-                    changes.append(("position", scope, pos_str, "string"))
+                    scale_str = f"{m.scale:.5f}".rstrip("0").rstrip(".") if m.scale % 1 != 0 else str(int(m.scale))
+                    changes.append(("position", scope, f"{m.x}x{m.y}", "string"))
+                    changes.append(("scale", scope, scale_str, "string"))
+                    changes.append(("transform", scope, str(m.transform), "string"))
                 engine.write_batch(changes)
             except Exception as e:
                 self.status_message = f"Failed to write Lua AST: {e}"
@@ -403,6 +486,18 @@ class MonitorLayoutCanvas:
             elif key in (curses.KEY_SF, ord('J')):
                 self._move_selected(0, self.LARGE_STEP)
 
+            # Rotation (90-deg clockwise) & Flip
+            elif key in (ord('r'), ord('R')):
+                self._rotate_selected(1)
+            elif key in (ord('f'), ord('F')):
+                self._flip_selected()
+
+            # Scaling (+ / - along sharp quantum ladder)
+            elif key in (ord('+'), ord('=')):
+                self._step_scale_selected(1)
+            elif key in (ord('-'), ord('_')):
+                self._step_scale_selected(-1)
+
             # Magnetic Snap Hotkeys
             elif key == ord('['):
                 self._snap_selected("left")
@@ -432,15 +527,17 @@ class MonitorLayoutCanvas:
                 else:
                     self.status_message = "Live preview DISABLED."
 
-            # Reset
-            elif key in (ord('r'), ord('R')):
+            # Reset layout (Backspace or X)
+            elif key in (curses.KEY_BACKSPACE, 127, ord('x'), ord('X')):
                 for m in self.monitors:
                     m.x = m.initial_x
                     m.y = m.initial_y
+                    m.scale = m.initial_scale
+                    m.transform = m.initial_transform
                 if self.live_preview:
                     self._dispatch_live_preview()
                 self.has_unsaved_changes = False
-                self.status_message = "Reset layout to current live coordinates."
+                self.status_message = "Reset layout to current live coordinates, scale, and transform."
 
             # Mouse click selection
             elif key == curses.KEY_MOUSE:
@@ -477,7 +574,6 @@ class MonitorLayoutCanvas:
         Renders an aspect-ratio-corrected 2D viewport representing the desktop canvas.
         Returns a mapping of monitor index to screen bounding box (col, row, width, height) for mouse picking.
         """
-        # Canvas frame
         for y in range(top, top + height):
             win.addch(y, left, "│", curses.color_pair(2) | curses.A_DIM)
             win.addch(y, left + width - 1, "│", curses.color_pair(2) | curses.A_DIM)
@@ -492,7 +588,6 @@ class MonitorLayoutCanvas:
             win.addstr(top + height // 2, left + max(2, (width - 22) // 2), "No active monitors.", curses.color_pair(4))
             return {}
 
-        # 1. Virtual coordinate bounding box
         min_vx = min(m.x for m in active)
         max_vx = max(m.x + m.logical_width for m in active)
         min_vy = min(m.y for m in active)
@@ -501,17 +596,13 @@ class MonitorLayoutCanvas:
         span_vx = max(1, max_vx - min_vx)
         span_vy = max(1, max_vy - min_vy)
 
-        # Available drawing cells inside frame
         draw_w = width - 4
         draw_h = height - 2
-
-        # Aspect correction: terminal cells are ~2x taller than they are wide.
-        # So 1 visual unit = 1 row = 2 columns.
         char_aspect = 2.0
 
         scale_x = draw_w / span_vx
         scale_y = (draw_h * char_aspect) / span_vy
-        uniform_scale = min(scale_x, scale_y) * 0.82  # 18% margin for movement headroom
+        uniform_scale = min(scale_x, scale_y) * 0.82
 
         center_col = left + width // 2
         center_row = top + height // 2
@@ -525,18 +616,15 @@ class MonitorLayoutCanvas:
             if m.disabled:
                 continue
 
-            # Compute terminal box coordinates
             box_w = max(16, int(round(m.logical_width * uniform_scale)))
             box_h = max(5, int(round((m.logical_height * uniform_scale) / char_aspect)))
 
-            # Relative offset from virtual center
             offset_vx = m.x - center_vx
             offset_vy = m.y - center_vy
 
             box_x = int(round(center_col + (offset_vx * uniform_scale)))
             box_y = int(round(center_row + ((offset_vy * uniform_scale) / char_aspect)))
 
-            # Clamp within canvas window bounds
             box_x = max(left + 1, min(left + width - box_w - 1, box_x))
             box_y = max(top, min(top + height - box_h, box_y))
 
@@ -560,42 +648,36 @@ class MonitorLayoutCanvas:
         color = curses.color_pair(1 if is_selected else 2)
         style = curses.A_BOLD if is_selected else curses.A_NORMAL
 
-        # Box characters (Double line for selected, single line for inactive)
         tl, tr, bl, br, hl, vl = ("╔", "╗", "╚", "╝", "═", "║") if is_selected else ("┌", "┐", "└", "┘", "─", "│")
 
-        # Top border
         try:
             win.addstr(y, x, tl + hl * (w - 2) + tr, color | style)
-            # Side borders & interior
             for r in range(y + 1, y + h - 1):
                 win.addstr(r, x, vl, color | style)
                 win.addstr(r, x + 1, " " * (w - 2), curses.color_pair(2))
                 win.addstr(r, x + w - 1, vl, color | style)
-            # Bottom border
             win.addstr(y + h - 1, x, bl + hl * (w - 2) + br, color | style)
         except curses.error:
             pass
 
-        # Text labels inside box
         try:
-            # Header: Name
             name_str = f" {m.name} "
+            rot_tag = f"({(m.transform & 3)*90}°)" if m.transform != 0 else ""
+            if rot_tag:
+                name_str += rot_tag
             if is_selected:
                 win.addstr(y, x + max(1, (w - len(name_str)) // 2), name_str, curses.color_pair(6) | curses.A_BOLD)
             else:
                 win.addstr(y, x + max(1, (w - len(name_str)) // 2), name_str, curses.color_pair(2) | curses.A_BOLD)
 
-            # Line 1: Mode & scale
             line1 = f"{m.width}x{m.height} @{m.scale:g}x"
             if h >= 4 and len(line1) <= w - 2:
                 win.addstr(y + 1, x + max(1, (w - len(line1)) // 2), line1, curses.color_pair(7 if is_selected else 2))
 
-            # Line 2: Coordinates
             line2 = f"Pos: {m.x}, {m.y}"
             if h >= 5 and len(line2) <= w - 2:
                 win.addstr(y + 2, x + max(1, (w - len(line2)) // 2), line2, curses.color_pair(1 if is_selected else 2) | curses.A_BOLD)
 
-            # Line 3: Logical size
             if h >= 6:
                 line3 = f"({m.logical_width}x{m.logical_height}L)"
                 if len(line3) <= w - 2:
@@ -613,7 +695,8 @@ class MonitorLayoutCanvas:
             win.addstr(top, 1, msg[:width - 2], color | curses.A_BOLD)
             cur = self.monitors[self.selected_idx] if self.monitors else None
             if cur:
-                sub = f" Active: {cur.name} ({cur.width}x{cur.height}, {cur.refresh_rate:.1f}Hz) | Logical: {cur.logical_width}x{cur.logical_height} | Pos: {cur.x}x{cur.y} | Live Preview: {'[ON]' if self.live_preview else '[OFF]'} "
+                rot_lbl = f"{(cur.transform & 3)*90}°" + (" (flipped)" if (cur.transform & 4) else "")
+                sub = f" Active: {cur.name} ({cur.width}x{cur.height}) | Rot: {rot_lbl} | Scale: {cur.scale:g}x | Logical: {cur.logical_width}x{cur.logical_height} | Pos: {cur.x}x{cur.y} | Live: {'[ON]' if self.live_preview else '[OFF]'} "
                 win.addstr(top + 1, 1, sub[:width - 2], curses.color_pair(2) | curses.A_DIM)
         except curses.error:
             pass
@@ -623,8 +706,8 @@ class MonitorLayoutCanvas:
         sep = "─" * (width - 2)
         try:
             win.addstr(top, 1, sep, curses.color_pair(2) | curses.A_DIM)
-            shortcuts_1 = " [Tab] Cycle  [Arrows/hjkl] Move  [Shift+Arrows] Quantum 120px  [0] Normalize Origin "
-            shortcuts_2 = " [[] Snap Left  []] Snap Right  [{] Snap Above  [}] Snap Below  [C] Center  [Enter/S] Save & Apply  [Q] Exit "
+            shortcuts_1 = " [Tab] Cycle  [Arrows/hjkl] Move  [Shift+Arrows] 120px  [R] Rotate 90°  [F] Flip  [+/-] Scale "
+            shortcuts_2 = " [[] Snap Left  []] Snap Right  [{] Snap Above  [}] Snap Below  [C] Center  [0] Origin  [Enter/S] Save  [Q] Exit "
             win.addstr(top + 1, 1, shortcuts_1[:width - 2], curses.color_pair(1))
             win.addstr(top + 2, 1, shortcuts_2[:width - 2], curses.color_pair(2))
         except curses.error:
@@ -640,7 +723,6 @@ def launch_in_floating_terminal(script_path: Path) -> int:
             break
 
     if not term:
-        # Fallback to direct curses in current terminal
         return curses.wrapper(lambda scr: MonitorLayoutCanvas().run(scr))
 
     cmd = []
