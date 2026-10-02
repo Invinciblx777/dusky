@@ -206,7 +206,7 @@ def generate_schema() -> tuple[list[str], dict[int, list[ConfigItem]]]:
                 extended_help=f"{hw_info}\n**Resolution & Refresh Rate**:\nSelect an advertised hardware mode or a virtual alias ('preferred', 'highres', 'highrr', 'maxwidth')."
             ),
             ConfigItem(
-                label="Display Scale", key="scale", scope=scope_str, type_="picker", default="1",
+                label="Display Scale", key="scale", scope=scope_str, type_="picker", default="auto",
                 options=scale_options, hints=scale_hints, group="Core Setup",
                 extended_help=f"{hw_info}\n**Display Scale Factor**:\nFractional scaling on Hyprland's 1/120 grid. Presets prevent compositor yellow warning banners."
             ),
