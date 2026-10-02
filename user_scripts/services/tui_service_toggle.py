@@ -95,12 +95,12 @@ CORE_USER_DEFS = {
         "Service to track network traffic. Often used in conjunction with Waybar to display real-time upload and download speeds.",
     ),
     "dusky.service": (
-        "Dusky Background Service",
-        "The primary Dusky ecosystem background service. Handles core daemon tasks required for the environment.",
+        "Control Center Preload",
+        "Autostarts Control center to open it faster on the first invocation, second invocation is always the same",
     ),
     "dusky_quickpanal.service": (
-        "Dusky quickpanal Service",
-        "Manages the Dusky quick access panel (Quickpanal) overlay.",
+        "Dusky QuickPanal Preload",
+        "Autostarts Quick panel service to open it faster on the first Invocation, second invoke is the same regardless.",
     ),
     "update_checker.timer": (
         "Automatic Update Checker",
