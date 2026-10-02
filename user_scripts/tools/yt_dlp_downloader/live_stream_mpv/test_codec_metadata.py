@@ -426,22 +426,22 @@ class HistoryAndLive(unittest.TestCase):
                 self.assertIsNone(player.pick_history())
                 ask.assert_not_called()
 
-    def test_history_persists_ten_unique_urls_and_moves_replays_to_front(self):
+    def test_history_persists_thirty_unique_urls_and_moves_replays_to_front(self):
         with tempfile.TemporaryDirectory(dir='/dev/shm') as directory, \
                 patch.object(player, '_cfg_dir', return_value=directory), \
                 patch.object(player, 'HISTORY_FILE', str(Path(directory) / 'history.toml')):
-            for i in range(12):
+            for i in range(32):
                 player.remember({'url': f'https://example.com/{i}', 'title': f'Video {i}'})
             history = player.load_history()
-            self.assertEqual(len(history), 10)
-            self.assertEqual(history[0]['url'], 'https://example.com/11')
+            self.assertEqual(len(history), 30)
+            self.assertEqual(history[0]['url'], 'https://example.com/31')
             self.assertEqual(history[-1]['url'], 'https://example.com/2')
             player.remember({'url': 'https://example.com/5', 'title': 'Played again'})
             history = player.load_history()
-            self.assertEqual(len(history), 10)
+            self.assertEqual(len(history), 30)
             self.assertEqual(history[0]['url'], 'https://example.com/5')
             self.assertEqual(history[0]['plays'], 2)
-            self.assertEqual(len({entry['url'] for entry in history}), 10)
+            self.assertEqual(len({entry['url'] for entry in history}), 30)
 
     def test_list_replays_selected_url_and_enables_seeking_only_for_live(self):
         for live in (False, True):
@@ -459,6 +459,39 @@ class HistoryAndLive(unittest.TestCase):
                 self.assertEqual(extract.call_args.args[0], 'https://example.com/1')
                 self.assertEqual('--force-seekable=yes' in diagnostics.getvalue(), live)
                 self.assertEqual('--cache=yes' in diagnostics.getvalue(), live)
+
+    def test_playback_promotes_old_selection_and_last_reuses_it(self):
+        with tempfile.TemporaryDirectory(dir='/dev/shm') as directory, \
+                patch.object(player, '_cfg_dir', return_value=directory), \
+                patch.object(player, 'HISTORY_FILE', str(Path(directory) / 'history.toml')), \
+                patch.object(player, 'load_config', return_value={}), \
+                patch.object(player, 'pick_tmpfs', return_value='/dev/shm'), \
+                patch.object(player.sys.stdin, 'isatty', return_value=True), \
+                patch.object(player, 'run_yt_dlp_json', return_value={'formats': [], 'title': 'Replayed'}), \
+                patch.object(player.subprocess, 'Popen') as launch, \
+                patch.dict(os.environ, {}, clear=True):
+            launch.return_value.wait.return_value = 0
+            launch.return_value.poll.return_value = 0
+            player.save_history(self.entries())
+            for command, replies in [('list', ['2']), ('last', [])]:
+                with patch.object(player.sys, 'argv', ['vid', command]), \
+                        patch('builtins.input', side_effect=replies):
+                    self.assertEqual(player.main(), 0)
+                self.assertEqual(launch.call_args.args[0][-1], 'https://example.com/2')
+                history = player.load_history()
+                self.assertEqual(history[0]['url'], 'https://example.com/2')
+                self.assertEqual(len(history), 3)
+            self.assertEqual(history[0]['plays'], 2)
+            self.assertEqual(history[0]['format'], 'best')
+            self.assertGreater(history[0]['last_played'], 0)
+
+    def test_last_with_empty_history_reports_local_error(self):
+        with patch.object(player.sys, 'argv', ['vid', 'last']), \
+                patch.object(player, 'load_history', return_value=[]), \
+                patch.object(player, 'run_yt_dlp_json') as extract:
+            with self.assertRaisesRegex(SystemExit, 'history is empty'):
+                player.main()
+            extract.assert_not_called()
 
     def test_real_mpv_travel_rewinds_cached_data_without_reopening(self):
         with tempfile.TemporaryDirectory(dir='/dev/shm') as directory:

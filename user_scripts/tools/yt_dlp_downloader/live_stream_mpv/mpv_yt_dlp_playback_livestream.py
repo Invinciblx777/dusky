@@ -23,7 +23,8 @@ Examples:
 
 Preferences: CLI > replay entry > env > config.toml > builtin.
 Settings/history use XDG_CONFIG_HOME/dusky/settings/ytdlp_stream (0600).
-History keeps the last 10 distinct URLs, newest first; use list to replay.
+History keeps the last 30 distinct URLs, newest first. Use list to choose,
+or last to replay the most recently played item.
 Each playback has its own temporary session, removed even on failure. --keep
 moves archives into the recording pool; reopened live jumps create separate segments.
 Tmpfs prevents direct video writes to persistent filesystems; it may be swapped.
@@ -91,7 +92,7 @@ def _cfg_dir() -> str:
 
 CONFIG_FILE = os.path.join(_cfg_dir(), "config.toml")
 HISTORY_FILE = os.path.join(_cfg_dir(), "history.toml")
-MAX_HISTORY = 10
+MAX_HISTORY = 30
 
 # key: (type, builtin default)
 GLOBAL_SPEC: dict[str, tuple[str, object]] = {
@@ -1107,7 +1108,8 @@ def build_parser() -> argparse.ArgumentParser:
                f"  {PROG} URL -F              List formats with a quick codec check\n"
                f"  {PROG} URL -F --probe      List formats with a longer codec check\n"
                f"  {PROG} URL -f '#2'         Play row 2 from the format list\n"
-               f"  {PROG} list                Choose from your last 10 videos\n"
+               f"  {PROG} list                Choose from your last 30 videos\n"
+               f"  {PROG} last                Replay your most recently played item\n"
                f"  {PROG} URL --mode live     Enable live travel and an optional archive\n\n"
                "Settings: CLI > replay entry > environment > config.toml > defaults.\n"
                "Player keys: } = 2x, ]/[ = adjust speed, Backspace = reset, Left/Right = seek.\n"
@@ -1115,7 +1117,7 @@ def build_parser() -> argparse.ArgumentParser:
                "Codec budgets apply after yt-dlp metadata extraction; unresolved codecs show ?.",
     )
     ap.add_argument("url", nargs="?",
-                    metavar="URL", help="video/live-stream URL, or 'list' to choose from recent history")
+                    metavar="URL", help="URL, 'list' to choose from history, or 'last' to replay the newest item")
     formats = ap.add_argument_group("Formats and codec detection")
     playback = ap.add_argument_group("Playback")
     recording = ap.add_argument_group("Recording and DVR")
@@ -1336,6 +1338,9 @@ def main() -> int:
         picked_entry = pick_history()
         if picked_entry is None:
             return 0
+        args.url = None
+    elif args.url == "last":
+        picked_entry = find_entry("0")
         args.url = None
 
     mpv_bin = shutil.which("mpv")
