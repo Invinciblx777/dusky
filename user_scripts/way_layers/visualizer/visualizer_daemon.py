@@ -554,7 +554,7 @@ def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
 def load_json_dict(path: Path) -> dict[str, Any] | None:
     try:
         if not path.exists():
-            return {}
+            return None
 
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
@@ -1591,6 +1591,10 @@ class Visualizer:
                 self.remove_tick()
             return
 
+        # If the user explicitly toggled GPU acceleration, give GL another chance.
+        if old_config.gpu_acceleration != new_config.gpu_acceleration:
+            self.gl_failed = False
+
         # Enabled state changes dominate everything else.
         if old_config.enabled != new_config.enabled:
             if new_config.enabled:
@@ -1606,10 +1610,6 @@ class Visualizer:
 
         if not new_config.enabled:
             return
-
-        # If the user explicitly toggled GPU acceleration, give GL another chance.
-        if old_config.gpu_acceleration != new_config.gpu_acceleration:
-            self.gl_failed = False
 
         # FPS affects both tick and Cava.
         if old_config.fps != new_config.fps:
@@ -1633,6 +1633,7 @@ class Visualizer:
         # Window geometry / renderer / blur-affecting settings.
         window_changed = any(
             (
+                old_config.bars != new_config.bars,
                 old_config.position != new_config.position,
                 old_config.height_pct != new_config.height_pct,
                 old_config.style != new_config.style,
@@ -2984,6 +2985,11 @@ noise_reduction = {noise}
             self.log.warning("Could not apply CSS: %s", exc)
 
     def destroy_window(self) -> None:
+        # Deferred fallback belongs to the window that failed, not its successor.
+        if self.fallback_source is not None:
+            self.remove_glib_source(self.fallback_source)
+            self.fallback_source = None
+        self.fallback_pending = False
         if self.monitor is not None and self.monitor_handler is not None:
             self.monitor.disconnect(self.monitor_handler)
         self.monitor = None
@@ -3242,9 +3248,6 @@ noise_reduction = {noise}
                 pass
             self.fifo_identity = None
 
-        if self.fallback_source is not None:
-            self.remove_glib_source(self.fallback_source)
-            self.fallback_source = None
         display = Gdk.Display.get_default()
         if display is not None:
             for handler in self.display_handlers:

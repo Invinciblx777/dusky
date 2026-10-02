@@ -35,6 +35,47 @@ class VisualizerTests(unittest.TestCase):
     def tearDown(self):
         self.app.shutdown()
 
+    def test_gpu_setting_change_clears_failure_while_disabled_or_enabling(self):
+        self.app.setup_window = lambda: None
+        self.app.start_cava = lambda: True
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                old = m.replace(self.app.config, enabled=False, gpu_acceleration=False)
+                self.app.config = m.replace(old, enabled=enabled, gpu_acceleration=True)
+                self.app.gl_failed = True
+                self.app.apply_config_changes(old)
+                self.assertFalse(self.app.gl_failed)
+
+    def test_destroy_window_cancels_its_pending_fallback(self):
+        self.app.schedule_cairo_fallback()
+        source = self.app.fallback_source
+        self.assertIsNotNone(m.GLib.MainContext.default().find_source_by_id(source))
+        self.app.destroy_window()
+        self.assertIsNone(self.app.fallback_source)
+        self.assertFalse(self.app.fallback_pending)
+        self.assertIsNone(m.GLib.MainContext.default().find_source_by_id(source))
+
+    def test_bar_count_change_recalculates_window_geometry(self):
+        old = self.app.config
+        self.app.config = m.replace(old, bars=16)
+        self.app.start_cava = lambda: True
+        with patch.object(self.app, "setup_window") as setup:
+            self.app.apply_config_changes(old)
+        setup.assert_called_once_with()
+
+    def test_missing_files_retain_current_settings_on_reload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(m, "CONFIG_FILE", Path(tmp) / "missing.json"), \
+                 patch.object(m, "COLORS_FILE", Path(tmp) / "missing-colors.json"):
+                self.app.config.enabled = False
+                self.app.config.gain = 3
+                self.app.colors.accent = "#123456"
+                self.app.apply_config_changes = lambda old: None
+                self.app.execute_reload()
+                self.assertFalse(self.app.config.enabled)
+                self.assertEqual(self.app.config.gain, 3)
+                self.assertEqual(self.app.colors.accent, "#123456")
+
     def test_config_bounds_and_round_trip(self):
         config = m.Config.from_dict({"bars": 17, "inner_glow": 9,
             "specular_shine": -1, "stardust": 5, "fps": "nan",

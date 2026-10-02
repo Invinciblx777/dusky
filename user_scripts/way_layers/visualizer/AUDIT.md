@@ -45,7 +45,7 @@ PyOpenGL 3.1.10, Cava 1.0.0, PipeWire 1.6.9, GLib 2.88.3, Mesa 26.2.3.
 The final ISO package manifest was not available; these are the tested installed
 versions, not a claim that the unpublished ISO has identical packages.
 
-- All 16 regression tests pass, including 126 Cairo style/position/bar-count
+- All 20 regression tests pass, including 126 Cairo style/position/bar-count
   combinations, fragmented IPC/audio, config failures, lock contention, idle
   decay, and active/inactive/stale-FIFO client behavior.
 - Live Wayland tests initialize OpenGL 4.6 and observe nontransparent framebuffer
@@ -84,3 +84,26 @@ accessibility bus emitted a dbind warning in this session; rendering tests passe
 - [Hyprland Lua layer rules](https://wiki.hypr.land/configuring/core/rules/layer-rules/)
 - [Cava 1.0.0 configuration](https://github.com/karlstav/cava/blob/1.0.0/example_files/config)
 - Installed Cava, hyprctl, and systemd-run help and GI method documentation.
+
+## Second pass — lifecycle review
+
+The top-level startup/control/reload/render/shutdown interactions were reviewed
+again. Four additional regression tests reproduced five failing cases before the
+fixes (GPU retry has both disabled and simultaneous-enable cases).
+
+- Clear a prior GPU failure when its setting changes, before disabled/enabled
+  early returns. Explicit renderer changes now permit a fresh GPU attempt even
+  when made while disabled or in the same edit that enables the visualizer.
+- Cancel a window's queued Cairo fallback when that window is destroyed or
+  replaced. Its successor cannot be overwritten by a stale fallback callback.
+  Shutdown uses the same cleanup path.
+- Recalculate window geometry after bar-count changes, including the margin
+  needed for wide dots on large outputs.
+- Missing config/theme files now preserve the current settings during reload,
+  matching malformed-file behavior. A temporarily missing config cannot silently
+  re-enable a disabled visualizer. Initial startup still uses defaults; use
+  `--reset` to explicitly restore them.
+
+All 20 regression tests and the live Wayland smoke test were rerun after these
+changes. No new global architectural issue was found within the reviewed paths.
+Physical hotplug and long-duration/multi-driver behavior remain unverified.
