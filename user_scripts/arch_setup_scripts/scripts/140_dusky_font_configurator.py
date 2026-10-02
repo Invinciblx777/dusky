@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#d: Deploy and verify the Dusky font configuration
+#d: Install prerequisites, deploy and verify the Dusky font configuration
 """Deploy schema defaults through the same engine used by the font TUI.
 
-Run as the desktop user; missing required packages are installed with pacman. --font-family
-(or DUSKY_DEFAULT_SANS) overrides the sans-serif default. Missing fonts,
+Run as the desktop user; missing required packages are installed with pacman.
+--font-family (or DUSKY_DEFAULT_SANS) overrides the sans-serif default. Missing fonts,
 cache errors, toolkit sync errors, and incorrect aliases exit nonzero.
 """
 from __future__ import annotations
@@ -45,7 +45,9 @@ def ensure_packages() -> None:
     print(f"[INSTALL] Required packages: {', '.join(missing)}", flush=True)
     command = ["pacman", "--sync", "--needed", "--noconfirm", "--", *missing]
     if os.geteuid() != 0:
-        command = ["sudo", "--", *command]
+        # The orchestrator supplies a PTY in a new session without a
+        # controlling terminal. Read authentication from its input stream.
+        command = ["sudo", "--stdin", "--", *command]
     # Use the installer's existing repository databases and cached packages;
     # no isolated database refresh or unrelated system upgrade here.
     subprocess.run(command, check=True)
