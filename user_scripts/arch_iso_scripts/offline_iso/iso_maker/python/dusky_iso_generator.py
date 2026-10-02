@@ -207,7 +207,7 @@ ALL_GROUPS: dict[str, list[str]] = {
         "libnotify", "mako", "file",
     ],
     "appearance": [
-        "qt5-wayland", "qt6-wayland", "gtk3", "gtk4", "glib2", "dconf", "nwg-look", "qt5ct", "qt6ct", "qt6-svg",
+        "qt5-wayland", "qt6-wayland", "gtk3", "gtk4", "glib2", "dconf", "gsettings-desktop-schemas", "nwg-look", "qt5ct", "qt6ct", "qt6-svg",
         "qt6-multimedia-ffmpeg", "adw-gtk-theme", "upower", "plocate", "matugen",
         "otf-font-awesome", "ttf-jetbrains-mono-nerd", "otf-atkinsonhyperlegiblemono-nerd",
         "ttf-atkinson-hyperlegible", "otf-atkinson-hyperlegible",

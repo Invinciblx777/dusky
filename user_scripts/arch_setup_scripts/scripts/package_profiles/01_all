@@ -37,6 +37,7 @@ gtk3
 gtk4
 glib2
 dconf
+gsettings-desktop-schemas
 nwg-look
 qt5ct
 qt6ct
