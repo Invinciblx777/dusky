@@ -41,6 +41,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 import fcntl
 import http.client
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import math
 import os
@@ -57,6 +58,7 @@ import threading
 import time
 import tomllib
 import urllib.request
+from urllib.parse import urljoin, urlsplit
 
 PROG = os.path.basename(sys.argv[0]) or "mpv_yt_dlp_playback_livestream.py"
 CANDIDATE_TMPFS = ["/dev/shm", "/tmp"]
@@ -869,12 +871,90 @@ def join_threshold(fmts: list[dict], choice: str) -> int:
     return max(START_BYTES, min(int(tbr * 125 * 1.5), 2 * 1024 * 1024))
 
 
+@contextmanager
+def rumble_dvr_playlist(url: str, headers: dict):
+    """Expose Rumble's append-only DVR as EVENT HLS; media stays on the CDN.
+
+    FFmpeg 9 rejects seeks in unfinished HLS without an EVENT declaration.
+    Only the playlist is adapted, preserving live reloads and segment timestamps.
+    Refuse a sliding window rather than presenting an incorrect timeline.
+    """
+    def fetch():
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=5) as response:
+            base = response.geturl()
+            lines = response.read().decode('utf-8-sig').splitlines()
+        if not lines or lines[0] != '#EXTM3U':
+            raise ValueError('not an active DVR playlist')
+        if any(line.startswith('#EXT-X-PLAYLIST-TYPE:') and line != '#EXT-X-PLAYLIST-TYPE:EVENT'
+               for line in lines):
+            raise ValueError('playlist is not an append-only event')
+        sequence = next((int(line.split(':', 1)[1]) for line in lines
+                         if line.startswith('#EXT-X-MEDIA-SEQUENCE:')), 0)
+        segments = tuple(urljoin(base, line) for line in lines if line and not line.startswith('#'))
+        if sequence not in (0, 1) or not segments:
+            raise ValueError('playlist does not retain the broadcast beginning')
+        output = ['#EXTM3U', '#EXT-X-PLAYLIST-TYPE:EVENT']
+        for line in lines[1:]:
+            if line == '#EXT-X-PLAYLIST-TYPE:EVENT':
+                continue
+            if line and not line.startswith('#'):
+                line = urljoin(base, line)
+            else:
+                line = re.sub(r'URI="([^"]*)"',
+                              lambda match: 'URI="' + urljoin(base, match[1]) + '"', line)
+            output.append(line)
+        return sequence, segments, ('\n'.join(output) + '\n').encode()
+
+    initial_sequence, initial_segments, initial_body = fetch()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            nonlocal initial_body, initial_segments
+            if self.path != '/dvr.m3u8':
+                self.send_error(404)
+                return
+            try:
+                if initial_body is not None:
+                    body, initial_body = initial_body, None
+                else:
+                    sequence, segments, body = fetch()
+                    if sequence != initial_sequence or segments[:len(initial_segments)] != initial_segments:
+                        raise ValueError('DVR playlist removed or replaced earlier segments')
+                    initial_segments = segments
+            except (OSError, ValueError, http.client.HTTPException) as error:
+                print(f'WARNING: DVR playlist refresh failed: {error}', file=sys.stderr)
+                self.send_error(502)
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/vnd.apple.mpegurl')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, *args):
+            pass
+
+    with HTTPServer(('127.0.0.1', 0), Handler) as server:
+        worker = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.1}, daemon=True)
+        worker.start()
+        try:
+            yield f'http://127.0.0.1:{server.server_port}/dvr.m3u8'
+        finally:
+            server.shutdown()
+            worker.join()
+
+
 # Seek inside the RAM cache first; reopening discards it and requires server DVR.
 TRAVEL_DELTAS = {91: -60, 92: 60, 93: -600, 94: 600}
 TRAVEL_LUA = r"""
 local utils = require 'mp.utils'
 local dir = utils.join_path(mp.get_script_directory(), '..')
 local state = {}
+local options = {server_seek=false}
+require('mp.options').read_options(options)
 local function snapshot()
     for _, key in ipairs({'time-pos', 'duration', 'speed', 'mute', 'fullscreen'}) do
         local value = mp.get_property_native(key)
@@ -899,6 +979,12 @@ for key, code in pairs({['Ctrl+Left']=91, ['Ctrl+Right']=92,
                 mp.commandv('seek', tostring(target), 'absolute+exact')
                 return
             end
+        end
+        local duration = mp.get_property_number('duration')
+        if options.server_seek and target and duration and duration > 0 and target < duration
+            and mp.get_property_native('seekable') then
+            mp.commandv('seek', tostring(target), 'absolute+exact')
+            return
         end
         snapshot()
         mp.commandv('quit', code)
@@ -1448,7 +1534,9 @@ def main() -> int:
         # offline so raw selectors are handled by yt-dlp itself without a second
         # website extraction, URL reimplementation, or missing separate audio.
         record = mode != "plain"
-        if record:
+        rumble_dvr = bool(info.get("is_live") and info.get("extractor_key") == "RumbleEmbed"
+                          and mode in ("live", "plain"))
+        if record or rumble_dvr:
             metadata = os.path.join(session, "metadata.json")
             with open(metadata, "w", encoding="utf-8") as f:
                 json.dump(info, f)
@@ -1459,10 +1547,9 @@ def main() -> int:
             if selected.returncode:
                 raise SystemExit("ERROR: format selection failed: " + selected.stderr[-3000:])
             selected_info = json.loads(selected.stdout)
-            tracks = (selected_info.get("requested_formats")
-                      or selected_info.get("requested_downloads") or [selected_info])
+            tracks = selected_info.get("requested_formats") or [selected_info]
             fragmented = any(t.get("fragments") for t in tracks)
-            if len(tracks) > 1 or fragmented:
+            if record and (len(tracks) > 1 or fragmented):
                 if mode == "file":
                     raise SystemExit("ERROR: file DVR requires a single muxed format "
                                      "(or audio-only stream) without EDL fragments. "
@@ -1474,12 +1561,38 @@ def main() -> int:
             if record:
                 check_free(pool, max(args.min_free, floor_mb + 1))
 
+        server_rewind = False
+        if rumble_dvr and len(tracks) == 1 and not fragmented:
+            track = tracks[0]
+            source = track.get("url", "")
+            if urlsplit(source).path.endswith("_DVR.m3u8"):
+                headers = {**(info.get("http_headers") or {}), **(track.get("http_headers") or {})}
+                try:
+                    adapted = stack.enter_context(rumble_dvr_playlist(source, headers))
+                except (OSError, ValueError, http.client.HTTPException) as error:
+                    print(f"NOTE: server rewind unavailable: {error}. Using normal playback.", file=sys.stderr)
+                else:
+                    # The hook retains titles, headers and subtitles; load the already
+                    # selected format instead of extracting the unadapted URL again.
+                    playback_info = {**selected_info, **track, "url": adapted}
+                    for key in ("manifest_url", "requested_formats", "requested_downloads", "fragments"):
+                        playback_info.pop(key, None)
+                    playback_info["manifest_url"] = adapted
+                    playback_info["formats"] = [dict(playback_info)]
+                    playback_info["formats"][0].pop("formats", None)
+                    replay_metadata = os.path.join(session, "dvr.json")
+                    with open(replay_metadata, "w", encoding="utf-8") as file:
+                        json.dump(playback_info, file)
+                    raw_opts.append(f"load-info-json={replay_metadata}")
+                    server_rewind = True
+                    print("Rewind: the stream's earlier footage is available on the seek bar.", file=sys.stderr)
+
         pin_opt = f"--script-opts-append=ytdl_hook-ytdl_path={ytdlp}"
         url_flags = [pin_opt, f"--ytdl-format={choice}", "--ytdl-raw-options-clr"]
         url_flags += [f"--ytdl-raw-options-append={o}" for o in raw_opts]
-        if record:
+        if record or server_rewind:
             url_flags += ["--script-opts-append=ytdl_hook-all_formats=no",
-                          "--script-opts-append=ytdl_hook-use_manifests=no"]
+                          f"--script-opts-append=ytdl_hook-use_manifests={'yes' if server_rewind else 'no'}"]
         common = ["--no-save-position-on-quit", "--no-resume-playback", "--cache-on-disk=no"]
         player = [mpv_bin] + common + BUFFER_PRESETS[bufmode] + [f"--speed={args.speed}"]
         if info.get("is_live") and mode in ("live", "plain"):
@@ -1537,11 +1650,14 @@ def main() -> int:
             os.mkdir(script)
             with open(os.path.join(script, "main.lua"), "w", encoding="utf-8") as f:
                 f.write(TRAVEL_LUA)
-            base_cmd = player + url_flags + [f"--scripts-append={script}"] + extra_player
+            base_cmd = player + url_flags + [f"--scripts-append={script}"]
+            if server_rewind:
+                base_cmd.append("--script-opts-append=travel-server_seek=yes")
+            base_cmd += extra_player
             open_start = start_opt
             state_path = os.path.join(session, "position.json")
             print("Travel: Ctrl+Left/Right = ±60s; Shift+Left/Right = ±10min. "
-                  "Uses your buffer first; older positions require rewind support from the stream.", file=sys.stderr)
+                  "Uses your buffer or the stream’s rewind timeline; reopens only when needed.", file=sys.stderr)
             segment = 0
             while True:
                 segment_path = os.path.join(session, f"recording-{segment}.mkv")

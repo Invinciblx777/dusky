@@ -1,6 +1,6 @@
 """Missing-codec regression tests; use isolated metadata and local media."""
 import contextlib
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, SimpleHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import io
 import json
@@ -542,6 +542,162 @@ end)
             self.assertEqual(outside.returncode, 94, outside.stdout + outside.stderr)
             state = json.loads((root / 'position.json').read_text())
             self.assertEqual(state['time-pos'], 70)
+
+
+class ServerDVR(unittest.TestCase):
+    def test_playlist_reload_growth_uris_end_and_sliding_window_rejection(self):
+        url = 'https://cdn.example.com/live/chunklist_DVR.m3u8'
+        initial = ('#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-TARGETDURATION:2\n'
+                   '#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n#EXT-X-MAP:URI="init.mp4"\n'
+                   '#EXTINF:2,\na.ts\n')
+        responses = [initial, initial + '#EXTINF:2,\nb.ts\n#EXT-X-ENDLIST\n',
+                     initial.replace('SEQUENCE:1', 'SEQUENCE:2')]
+
+        def fetch(request, timeout):
+            response = io.BytesIO(responses.pop(0).encode())
+            response.geturl = lambda: url
+            return response
+
+        # Use a captured real urlopen for the adapter's local HTTP endpoint.
+        urlopen = player.urllib.request.urlopen
+        with patch.object(player.urllib.request, 'urlopen', side_effect=fetch), \
+                contextlib.redirect_stderr(io.StringIO()), \
+                player.rumble_dvr_playlist(url, {'Referer': 'test'}) as adapted:
+            with urlopen(adapted, timeout=3) as response:
+                body = response.read().decode()
+            self.assertIn('#EXT-X-PLAYLIST-TYPE:EVENT', body)
+            self.assertIn('https://cdn.example.com/live/a.ts', body)
+            self.assertIn('URI="https://cdn.example.com/live/key.bin"', body)
+            self.assertIn('URI="https://cdn.example.com/live/init.mp4"', body)
+            with urlopen(adapted, timeout=3) as response:
+                self.assertIn('#EXT-X-ENDLIST', response.read().decode())
+            with self.assertRaises(player.urllib.request.HTTPError) as error:
+                urlopen(adapted, timeout=3)
+            self.assertEqual(error.exception.code, 502)
+            error.exception.close()
+
+    def test_main_adapts_selected_format_in_plain_and_live_modes(self):
+        source = 'https://cdn.example.com/chunklist_DVR.m3u8'
+        info = {'id': 'test', 'title': 'DVR test', 'extractor_key': 'RumbleEmbed',
+                'is_live': True, 'live_status': 'is_live', 'url': source,
+                'format_id': 'hls-2', 'http_headers': {'Referer': 'test'},
+                'formats': [{'format_id': 'hls-2', 'url': source, 'vcodec': 'h264', 'acodec': 'aac'}],
+                # Current yt-dlp's clean JSON contains filenames here, not tracks.
+                'requested_downloads': [{'filename': 'test.mp4'}]}
+        for mode in ('plain', 'live'):
+            with self.subTest(mode=mode), \
+                    patch.object(player.sys, 'argv', ['vid', 'https://rumble.com/test', '--mode', mode,
+                                                      '-f', 'best', '--buffer', 'near', '--print-cmds']), \
+                    patch.object(player, 'load_config', return_value={}), \
+                    patch.object(player, 'pick_tmpfs', return_value='/dev/shm'), \
+                    patch.object(player, 'run_yt_dlp_json', return_value=info), \
+                    patch.object(player.subprocess, 'run', return_value=Mock(returncode=0, stdout=json.dumps(info))), \
+                    patch.object(player, 'rumble_dvr_playlist',
+                                 return_value=contextlib.nullcontext('http://127.0.0.1:1234/dvr.m3u8')) as adapt, \
+                    patch.object(player.json, 'dump', wraps=json.dump) as dump, \
+                    patch.dict(os.environ, {}, clear=True), \
+                    contextlib.redirect_stderr(io.StringIO()) as diagnostics:
+                self.assertEqual(player.main(), 0)
+                adapt.assert_called_once_with(source, {'Referer': 'test'})
+                metadata = dump.call_args.args[0]
+                self.assertEqual(metadata['url'], 'http://127.0.0.1:1234/dvr.m3u8')
+                self.assertEqual(metadata['manifest_url'], metadata['url'])
+                self.assertIn('ytdl_hook-use_manifests=yes', diagnostics.getvalue())
+                self.assertNotIn('requested_downloads', metadata)
+                self.assertIn('load-info-json=', diagnostics.getvalue())
+                self.assertEqual('travel-server_seek=yes' in diagnostics.getvalue(), mode == 'live')
+
+    def test_real_mpv_server_rewind_outside_local_cache(self):
+        with tempfile.TemporaryDirectory(dir='/dev/shm') as directory:
+            root = Path(directory)
+            subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=64x48:rate=5',
+                            '-f', 'lavfi', '-i', 'sine=frequency=440',
+                            '-t', '240', '-c:v', 'libx264', '-preset', 'ultrafast', '-g', '10', '-c:a', 'aac',
+                            '-f', 'hls', '-hls_time', '2', '-hls_list_size', '0', '-start_number', '1',
+                            str(root / 'chunklist_DVR.m3u8')], check=True, timeout=15)
+            playlist = root / 'chunklist_DVR.m3u8'
+            prefix, *segments = playlist.read_text().replace('#EXT-X-ENDLIST\n', '').split('#EXTINF:')
+            visible = 60  # Start with two minutes; append a segment on each reload.
+
+            requests = []
+
+            class Handler(SimpleHTTPRequestHandler):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, directory=directory, **kwargs)
+
+                def do_GET(self):
+                    nonlocal visible
+                    if self.path != '/chunklist_DVR.m3u8':
+                        return super().do_GET()
+                    visible = min(visible + 1, len(segments))
+                    body = (prefix + ''.join('#EXTINF:' + segment for segment in segments[:visible])).encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/vnd.apple.mpegurl')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, *args):
+                    requests.append(self.path)
+
+            with ThreadingHTTPServer(('127.0.0.1', 0), Handler) as server:
+                worker = threading.Thread(target=server.serve_forever, daemon=True)
+                worker.start()
+                self.addCleanup(worker.join)
+                self.addCleanup(server.shutdown)
+                source = f'http://127.0.0.1:{server.server_port}/chunklist_DVR.m3u8'
+                harness = root / 'verify.lua'
+                harness.write_text("""
+mp.register_event('file-loaded', function()
+    mp.commandv('seek', '114', 'absolute+exact')
+    mp.add_timeout(0.5, function()
+        print('EDGE ' .. tostring(mp.get_property_number('time-pos')))
+        print('WINDOW ' .. tostring(mp.get_property_number('duration')))
+        mp.commandv('script-binding', 'travel/travel-91')
+        mp.add_timeout(0.5, function()
+            print('SERVER_KEY ' .. tostring(mp.get_property_number('time-pos')))
+            mp.commandv('seek', '10', 'absolute+exact')
+            local deadline = mp.get_time() + 5
+            local timer
+            timer = mp.add_periodic_timer(0.1, function()
+                local cache = mp.get_property_native('demuxer-cache-state') or {}
+                local reader = cache['reader-pts']
+                if (reader and reader >= 10 and reader < 20) or mp.get_time() >= deadline then
+                    print('AFTER_SEEK ' .. tostring(mp.get_property_number('time-pos')))
+                    print('SERVER_DATA ' .. tostring(reader))
+                    timer:kill()
+                    mp.commandv('quit')
+                end
+            end)
+        end)
+    end)
+end)
+""")
+                travel = root / 'travel'
+                travel.mkdir()
+                (travel / 'main.lua').write_text(player.TRAVEL_LUA)
+                command = ['mpv', '--no-config', '--vo=null', '--ao=null', '--pause', '--cache=yes',
+                           '--force-seekable=yes', '--demuxer-max-bytes=1M', '--demuxer-max-back-bytes=1M',
+                           '--input-terminal=no', f'--scripts-append={harness}']
+                original = subprocess.run(command + [source], capture_output=True, text=True, timeout=15)
+                before = original.stdout + original.stderr
+                self.assertIn('Not seekable, but enabling seeking', before)
+                self.assertNotIn('AFTER_SEEK 10', before)
+                with player.rumble_dvr_playlist(source, {}) as adapted:
+                    # Establish the synthetic MPEG-TS timestamp origin at segment 0.
+                    # The harness then jumps to 114s before rewinding outside the cache.
+                    fixed = subprocess.run(command + ['--demuxer-lavf-o=live_start_index=0',
+                                                       f'--scripts-append={travel}',
+                                                       '--script-opts-append=travel-server_seek=yes', adapted],
+                                           capture_output=True, text=True, timeout=15)
+                after = fixed.stdout + fixed.stderr
+                self.assertEqual(fixed.returncode, 0, after)
+                self.assertRegex(after, r'EDGE 11[34]')
+                window = float(player.re.search(r'WINDOW ([0-9.]+)', after)[1])
+                self.assertGreaterEqual(window, 120)
+                self.assertRegex(after, r'SERVER_KEY 5[34]')
+                self.assertIn('AFTER_SEEK 10', after)
+                self.assertRegex(after, r'SERVER_DATA 1[0-9]\.', after + str(requests))
 
 
 if __name__ == '__main__':
