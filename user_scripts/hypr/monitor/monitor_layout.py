@@ -389,8 +389,8 @@ class MonitorLayoutCanvas:
                     scope = f"monitor/{m.name}"
                     scale_str = f"{m.scale:.5f}".rstrip("0").rstrip(".") if m.scale % 1 != 0 else str(int(m.scale))
                     changes.append(("position", scope, f"{m.x}x{m.y}", "string"))
-                    changes.append(("scale", scope, scale_str, "string"))
-                    changes.append(("transform", scope, str(m.transform), "string"))
+                    changes.append(("scale", scope, scale_str, "float"))
+                    changes.append(("transform", scope, str(int(m.transform)), "int"))
                 engine.write_batch(changes)
             except Exception as e:
                 self.status_message = f"Failed to write Lua AST: {e}"
@@ -725,25 +725,41 @@ def launch_in_floating_terminal(script_path: Path) -> int:
     if not term:
         return curses.wrapper(lambda scr: MonitorLayoutCanvas().run(scr))
 
-    cmd = []
     if term == "kitty":
-        cmd = [
-            "hyprctl", "dispatch", "exec",
-            f"[float; size 1050 680; center] kitty --class dusky-monitor-layout python3 {script_path}"
-        ]
+        app_cmd = f"kitty --class dusky-monitor-layout python3 {script_path}"
     elif term == "foot":
-        cmd = [
-            "hyprctl", "dispatch", "exec",
-            f"[float; size 1050 680; center] foot -a dusky-monitor-layout python3 {script_path}"
-        ]
+        app_cmd = f"foot -a dusky-monitor-layout python3 {script_path}"
     else:
-        cmd = [
-            "hyprctl", "dispatch", "exec",
-            f"[float; size 1050 680; center] {term} -e python3 {script_path}"
-        ]
+        app_cmd = f"{term} -e python3 {script_path}"
 
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    return proc.returncode
+    rule_cmd = f"[float; size 1050 680; center] {app_cmd}"
+
+    # In Hyprland 0.56+ (Lua dispatcher CLI), call hl.dsp.exec_cmd
+    res = subprocess.run(
+        ["hyprctl", "dispatch", f"hl.dsp.exec_cmd({json.dumps(rule_cmd)})"],
+        capture_output=True, text=True
+    )
+    if res.returncode == 0:
+        print("Floating layout canvas launched.")
+        return 0
+
+    # Fallback to standard hyprctl dispatch exec
+    res = subprocess.run(
+        ["hyprctl", "dispatch", "exec", rule_cmd],
+        capture_output=True, text=True
+    )
+    if res.returncode == 0:
+        print("Floating layout canvas launched.")
+        return 0
+
+    # Direct launch fallback
+    try:
+        subprocess.Popen(app_cmd, shell=True, start_new_session=True)
+        print("Floating layout canvas launched.")
+        return 0
+    except Exception as e:
+        sys.stderr.write(f"Failed to spawn floating terminal: {e}\n")
+        return 1
 
 
 def main() -> int:

@@ -444,6 +444,14 @@ class MonitorLuaEngine(HyprlandLuaEngine):
                 val = "false" if is_on else "true"
                 itype = "bool"
 
+            # Enforce Lua integer types for compositor fields
+            if key in ("transform", "vrr", "bitdepth", "reserved_area") and ast_scope.startswith("monitor/"):
+                itype = "int"
+                try:
+                    val = str(int(val))
+                except (ValueError, TypeError):
+                    val = "0"
+
             # --- FRACTIONAL SCALING VALIDATION & HYPRLAND QUANTUM ENFORCEMENT ---
             if key == "scale" and ast_scope.startswith("monitor/"):
                 mon_name = ast_scope.split("/")[1] if len(ast_scope.split("/")) >= 2 else ""
@@ -452,8 +460,17 @@ class MonitorLuaEngine(HyprlandLuaEngine):
                         scale_val = float(val)
                         phys_w, phys_h = self._monitor_resolutions.get(mon_name, (1920, 1080))
                         val = self._get_valid_scale(scale_val, phys_w, phys_h)
+                        itype = "float"
                     except ValueError:
                         pass
+
+            # Enforce Lua float types for color/luminance fields
+            if key in ("sdrbrightness", "sdrsaturation", "sdr_min_luminance", "sdr_max_luminance", "min_luminance", "max_luminance", "max_avg_luminance") and ast_scope.startswith("monitor/"):
+                itype = "float"
+                try:
+                    val = str(float(val))
+                except (ValueError, TypeError):
+                    pass
 
             translated_changes.append((key, ast_scope, val, itype))
 
@@ -531,6 +548,12 @@ class MonitorLuaEngine(HyprlandLuaEngine):
                 if state_key not in current_ast_state:
                     if val_repr in ("true", "false") or key in ("disabled", "vrr", "bitdepth", "transform", "reserved_area"):
                         lua_val = val_repr
+                    elif key in ("scale", "sdrbrightness", "sdrsaturation", "sdr_min_luminance", "sdr_max_luminance", "min_luminance", "max_luminance", "max_avg_luminance") and val_repr not in ("auto", "preferred", "highres", "highrr"):
+                        try:
+                            float(val_repr)
+                            lua_val = val_repr
+                        except ValueError:
+                            lua_val = json.dumps(val_repr)
                     else:
                         lua_val = json.dumps(val_repr)
 
