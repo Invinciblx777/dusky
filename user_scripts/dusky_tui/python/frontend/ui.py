@@ -12,6 +12,7 @@ import sys
 import signal
 import tempfile
 import logging
+import termios
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, override
@@ -3366,15 +3367,44 @@ Tooltip {
                 else:
                     self.notify_status("No suitable external editor found (xdg-open or mousepad).", level="warning")
 
-            elif button == 3:
-                editor_env = os.environ.get("VISUAL", os.environ.get("EDITOR", "nano"))
-                editor_cmd = shlex.split(editor_env)
-
-                with self.suspend():
-                    subprocess.run([*editor_cmd, str(expanded_path)])
+                self.run_suspended_interactive([*editor_cmd, str(expanded_path)])
 
         except (FileNotFoundError, OSError):
             self.notify_status("Error resolving path or launching external editor.", level="error")
+
+    def run_suspended_interactive(self, cmd: list[str] | str, shell: bool = False) -> subprocess.CompletedProcess:
+        """
+        Runs an interactive CLI application (editor, curses tool, fzf, etc.)
+        while cleanly suspending Textual, managing termios attributes, disabling
+        software flow control (IXON/Ctrl+S) so the TTY never locks up, flushing
+        residual input escapes, and forcing a full screen redraw upon return.
+        """
+        stdin_fd: int | None = None
+        saved_termios = None
+        if sys.stdin.isatty():
+            try:
+                stdin_fd = sys.stdin.fileno()
+                saved_termios = termios.tcgetattr(stdin_fd)
+                working = termios.tcgetattr(stdin_fd)
+                working[0] &= ~termios.IXON  # Disable software flow control
+                termios.tcsetattr(stdin_fd, termios.TCSANOW, working)
+                termios.tcflow(stdin_fd, termios.TCOON)
+            except Exception:
+                pass
+
+        try:
+            with self.suspend():
+                return subprocess.run(cmd, shell=shell)
+        finally:
+            if stdin_fd is not None:
+                try:
+                    termios.tcflush(stdin_fd, termios.TCIFLUSH)
+                    termios.tcflow(stdin_fd, termios.TCOON)
+                    if saved_termios is not None:
+                        termios.tcsetattr(stdin_fd, termios.TCSANOW, saved_termios)
+                except Exception:
+                    pass
+            self.refresh(layout=True)
 
     # =========================================================================
     # MOUNT
@@ -7418,8 +7448,7 @@ Tooltip {
 
                 self._tty_action_busy = True
                 try:
-                    with self.suspend():
-                        completed = subprocess.run(command, shell=True)
+                    completed = self.run_suspended_interactive(command, shell=True)
                     rc = completed.returncode
                     if rc == 0:
                         self.notify_status(f"Action '{item.label}' completed.", level="success")
