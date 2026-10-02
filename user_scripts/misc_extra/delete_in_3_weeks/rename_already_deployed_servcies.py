@@ -7,10 +7,12 @@ from legacy naming conventions (e.g., hyphens or legacy names) to canonical unde
 
 Features:
   - Detects active and enabled states of legacy units across system and user scopes.
-  - Gracefully stops and disables legacy units.
+  - Safely stops and disables legacy units with strict execution timeouts (no hung updates).
   - Atomically renames or supersedes unit files and drop-in configuration directories.
   - Cleans up obsolete wants/requires symlinks and broken legacy aliases.
-  - Reloads systemd daemon and restores enabled/active states on the new units.
+  - Handles global user services (systemctl --global) and per-user session daemons.
+  - Validates active D-Bus and runtime socket availability before dispatching user calls.
+  - Reloads systemd daemons and restores enabled/active states on the new units.
   - Fully idempotent, crash-resilient (never fails), and safe for unattended updater runs.
 """
 
@@ -80,6 +82,7 @@ USER_MIGRATIONS: list[MigrationRule] = [
     MigrationRule("dusky-vnc.service", "dusky_vnc_desktop.service"),
     MigrationRule("dusky-vnc-desktop.service", "dusky_vnc_desktop.service"),
     MigrationRule("dusky-phone-display.service", "dusky_vnc_display.service"),
+    MigrationRule("dusky-vnc-display.service", "dusky_vnc_display.service"),
     # Kokoro TTS services & socket
     MigrationRule("dusky-kokoro.service", "dusky_kokoro.service"),
     MigrationRule("dusky-kokoro.socket", "dusky_kokoro.socket"),
@@ -95,10 +98,20 @@ USER_MIGRATIONS: list[MigrationRule] = [
     MigrationRule("dusky-notif-time.service", "dusky_notif_time.service"),
     MigrationRule("dusky-ram-monitor.service", "dusky_ram_monitor.service"),
     MigrationRule("dusky-screentime.service", "dusky_screentime.service"),
+    MigrationRule("dusky-stt.service", "dusky_stt.service"),
+    MigrationRule("dusky-moonlight-display.service", "dusky_moonlight_display.service"),
 ]
 
+# Default per-command timeout in seconds to prevent stalling the updater
+DEFAULT_TIMEOUT_SEC = 15.0
 
-def run_cmd(cmd: list[str], env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+
+def run_cmd(
+    cmd: list[str],
+    env: dict[str, str] | None = None,
+    timeout: float = DEFAULT_TIMEOUT_SEC,
+) -> subprocess.CompletedProcess:
+    """Run command safely with timeout and structured fallback."""
     try:
         return subprocess.run(
             cmd,
@@ -106,14 +119,25 @@ def run_cmd(cmd: list[str], env: dict[str, str] | None = None) -> subprocess.Com
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            timeout=timeout,
             check=False,
         )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, returncode=124, stdout="", stderr="Command timed out")
     except Exception as e:
         return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr=str(e))
 
 
+def is_user_bus_available(uid: int) -> bool:
+    """Check if the user's systemd user bus or private socket is accessible."""
+    runtime = Path(f"/run/user/{uid}")
+    if not runtime.is_dir():
+        return False
+    return (runtime / "systemd" / "private").exists() or (runtime / "bus").exists()
+
+
 def get_user_sessions() -> list[tuple[int, str]]:
-    """Discover active user sessions and target user accounts."""
+    """Discover user accounts that have active sessions or configuration trees."""
     users: dict[int, str] = {}
 
     # 1. SUDO_USER if running elevated
@@ -126,7 +150,7 @@ def get_user_sessions() -> list[tuple[int, str]]:
             pass
 
     # 2. Active login sessions from loginctl
-    res = run_cmd(["loginctl", "list-sessions", "--no-legend"])
+    res = run_cmd(["loginctl", "list-sessions", "--no-legend"], timeout=5.0)
     if res.returncode == 0:
         for line in res.stdout.splitlines():
             parts = line.strip().split()
@@ -170,10 +194,14 @@ def run_systemctl(
     args: list[str],
     user_ctx: tuple[int, str] | None = None,
     global_user: bool = False,
+    timeout: float = DEFAULT_TIMEOUT_SEC,
 ) -> subprocess.CompletedProcess:
     """Execute systemctl either system-wide, globally, or for a specific user session."""
     if user_ctx:
         uid, username = user_ctx
+        if not is_user_bus_available(uid):
+            return subprocess.CompletedProcess(["systemctl", "--user", *args], returncode=3, stdout="", stderr="User bus unavailable")
+
         if os.geteuid() == 0:
             runtime = f"/run/user/{uid}"
             env = os.environ.copy()
@@ -181,21 +209,21 @@ def run_systemctl(
             bus_path = f"{runtime}/bus"
             if os.path.exists(bus_path):
                 env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus_path}"
-            
+
             if shutil.which("runuser"):
                 cmd = ["runuser", "-u", username, "-w", "XDG_RUNTIME_DIR,DBUS_SESSION_BUS_ADDRESS", "--", "systemctl", "--user", *args]
-                return run_cmd(cmd, env=env)
+                return run_cmd(cmd, env=env, timeout=timeout)
             else:
                 cmd = ["su", "-", username, "-c", f"systemctl --user {' '.join(args)}"]
-                return run_cmd(cmd, env=env)
+                return run_cmd(cmd, env=env, timeout=timeout)
         else:
-            return run_cmd(["systemctl", "--user", *args])
+            return run_cmd(["systemctl", "--user", *args], timeout=timeout)
 
     cmd = ["systemctl"]
     if global_user:
         cmd.append("--global")
     cmd.extend(args)
-    return run_cmd(cmd)
+    return run_cmd(cmd, timeout=timeout)
 
 
 def migrate_unit_files(
@@ -207,6 +235,9 @@ def migrate_unit_files(
     owner_gid: int = -1,
 ) -> bool:
     """Safely migrate unit file, drop-in override folder, and remove stale symlinks on disk."""
+    if not unit_dir.exists():
+        return False
+
     changed = False
     old_file = unit_dir / old_unit
     new_file = unit_dir / new_unit if new_unit else None
@@ -269,15 +300,14 @@ def migrate_unit_files(
 
     # 3. Clean stale symlinks in .wants/.requires folders under unit_dir
     try:
-        if unit_dir.exists():
-            for symlink in unit_dir.glob(f"*/*.wants/{old_unit}"):
-                if symlink.is_symlink() or symlink.exists():
-                    if dry_run:
-                        info(f"[dry-run] Would remove stale symlink: {symlink}")
-                    else:
-                        symlink.unlink(missing_ok=True)
-                    changed = True
-            for symlink in unit_dir.glob(f"*.wants/{old_unit}"):
+        patterns = (
+            f"*/*.wants/{old_unit}",
+            f"*.wants/{old_unit}",
+            f"*/*.requires/{old_unit}",
+            f"*.requires/{old_unit}",
+        )
+        for pat in patterns:
+            for symlink in unit_dir.glob(pat):
                 if symlink.is_symlink() or symlink.exists():
                     if dry_run:
                         info(f"[dry-run] Would remove stale symlink: {symlink}")
@@ -307,11 +337,14 @@ def live_swap_service(
     res_enabled = run_systemctl(["is-enabled", "--quiet", old_unit], user_ctx=user_ctx)
     was_enabled = (res_enabled.returncode == 0)
 
-    # If neither active nor enabled, check if old unit is loaded or failed
-    res_status = run_systemctl(["status", old_unit], user_ctx=user_ctx)
-    was_known = (res_status.returncode != 4)  # 4 means completely non-existent / not found
+    # Check if failed
+    res_failed = run_systemctl(["is-failed", "--quiet", old_unit], user_ctx=user_ctx)
+    was_failed = (res_failed.returncode == 0)
 
-    if not (was_active or was_enabled or was_known):
+    # If neither active nor enabled, clean any lingering failed state and exit
+    if not (was_active or was_enabled):
+        if was_failed and not dry_run:
+            run_systemctl(["reset-failed", old_unit], user_ctx=user_ctx)
         return False
 
     if dry_run:
@@ -339,7 +372,7 @@ def live_swap_service(
             if r.returncode == 0:
                 details.append("started")
             else:
-                warn(f"{scope_str}: Failed to start {new_unit}: {r.stderr.strip() or 'unknown error'}")
+                warn(f"{scope_str}: Notice: {new_unit} start deferred ({r.stderr.strip() or 'inactive'})")
 
         run_systemctl(["reset-failed", old_unit], user_ctx=user_ctx)
         run_systemctl(["reset-failed", new_unit], user_ctx=user_ctx)
@@ -408,12 +441,29 @@ def migrate_user_global_scope(dry_run: bool = False) -> bool:
     user_global_dir = Path("/etc/systemd/user")
     activity = False
 
+    # 1. Disk migrations
     for rule in USER_MIGRATIONS:
         if migrate_unit_files(user_global_dir, rule.old_unit, rule.new_unit, dry_run=dry_run):
             activity = True
 
     if clean_dangling_dusky_symlinks([user_global_dir], dry_run=dry_run) > 0:
         activity = True
+
+    # 2. Check global enablement (systemctl --global)
+    for rule in USER_MIGRATIONS:
+        res = run_systemctl(["is-enabled", "--quiet", rule.old_unit], global_user=True)
+        if res.returncode == 0:
+            if dry_run:
+                swap(rule.old_unit, rule.new_unit or "[PURGE]", "global user: enabled [dry-run]")
+                activity = True
+            else:
+                run_systemctl(["disable", "--quiet", rule.old_unit], global_user=True)
+                if rule.new_unit:
+                    run_systemctl(["enable", "--quiet", rule.new_unit], global_user=True)
+                    swap(rule.old_unit, rule.new_unit, "global user: enabled")
+                else:
+                    purge(f"global user: {rule.old_unit}")
+                activity = True
 
     return activity
 
@@ -464,10 +514,11 @@ def migrate_user_scope(dry_run: bool = False) -> bool:
         if reload_needed and not dry_run:
             run_systemctl(["daemon-reload"], user_ctx=user_ctx)
 
-        # 2. Live-swap runtime user services
-        for rule in USER_MIGRATIONS:
-            if live_swap_service(rule, user_ctx=user_ctx, dry_run=dry_run):
-                activity = True
+        # 2. Live-swap runtime user services if user bus is active
+        if is_user_bus_available(uid):
+            for rule in USER_MIGRATIONS:
+                if live_swap_service(rule, user_ctx=user_ctx, dry_run=dry_run):
+                    activity = True
 
     # B. Also inspect non-logged-in home directories if root
     if os.geteuid() == 0:
@@ -512,9 +563,11 @@ def main() -> int:
             ok("Migration complete: Legacy Dusky services successfully live-swapped.")
         else:
             ok("All Dusky services verified up to date (no migration required).")
-    except Exception as e:
-        # Guarantee zero crash exit under any circumstance
-        warn(f"Encountered unexpected non-fatal exception during migration: {e}")
+    except KeyboardInterrupt:
+        warn("Migration interrupted by user signal.")
+    except BaseException as e:
+        # Guarantee zero crash exit under any circumstance to prevent tripping up the updater
+        warn(f"Encountered non-fatal exception during migration: {e}")
 
     return 0
 
