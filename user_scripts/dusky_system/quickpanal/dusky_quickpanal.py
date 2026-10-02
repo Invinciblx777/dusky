@@ -112,6 +112,11 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         self._weather_retry_after = 0.0
         self._updating_radios = False
         self._reposition_scheduled = False
+        self._allocated_size: tuple[int, int] | None = None
+        self._surface_size: tuple[int, int] | None = None
+        self._position_future = None
+        self._position_dirty = False
+        self._opening = False
         self._cpu_last: tuple[int, int] | None = None
         self._updating_power = False
         self._slider_rows: list[CompactSliderRow] = []
@@ -141,6 +146,8 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         self.connect('size-allocate', self._on_size_allocate)
         self._grab_cb = CB_TYPE(self._on_grab_cleared) if LIBGRAB else None
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        self.main_box = main_box
+        main_box.connect('size-allocate', self._update_content_height)
         main_box.set_margin_start(12)
         main_box.set_margin_end(12)
         main_box.set_margin_top(12)
@@ -803,6 +810,7 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
             tg.update_state(icon='folder-download-symbolic', css_class='normal', tooltip=final_tt, badge='')
 
     def _on_map(self, *args: Any) -> None:
+        self.request_reposition()
         if LIBGRAB and self.get_visible() and self._grab_cb and (not self._grab_active):
             pointer = gi_object_c_pointer(self)
             if pointer is not None:
@@ -857,7 +865,6 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
     def request_reposition(self) -> None:
         if not self._visible:
             return
-        self.resize(320, 1)
         if not self._reposition_scheduled:
             self._reposition_scheduled = True
             GLib.idle_add(self._do_reposition_idle)
@@ -868,17 +875,107 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _on_size_allocate(self, widget: Gtk.Widget, allocation: Gdk.Rectangle) -> None:
-        if self._visible and (not self._reposition_scheduled):
-            self._reposition_scheduled = True
-            GLib.idle_add(self._do_reposition_idle)
+        size = (allocation.width, allocation.height)
+        if size != self._allocated_size:
+            self._allocated_size = size
+            self.request_reposition()
+
+    def _update_content_height(self, *args: Any) -> None:
+        # Give Wayland the final minimum on its first configure, rather than
+        # mapping the scroller's empty minimum and growing on the next frame.
+        width = self.scrolled_main.get_allocated_width()
+        if width <= 1:
+            width = max(1, self.get_size()[0])
+        _minimum, natural = self.main_box.get_preferred_height_for_width(width)
+        height = min(natural, self.scrolled_main.get_max_content_height())
+        if height != self.scrolled_main.get_min_content_height():
+            self.scrolled_main.set_min_content_height(height)
 
     def _reposition_to_corner(self) -> None:
         if self._visible and self.pool:
-            self.pool.submit(self._fetch_position)
+            if self._position_future is not None:
+                self._position_dirty = True
+                return
+            self._position_dirty = False
+            self._position_future = self.pool.submit(self._fetch_position)
+            if self._position_future is not None:
+                self._position_future.add_done_callback(
+                    lambda future: GLib.idle_add(self._position_finished, future))
+
+    def _position_finished(self, future: Any) -> bool:
+        if self._position_future is future:
+            self._position_future = None
+            if self._position_dirty:
+                self.request_reposition()
+        return GLib.SOURCE_REMOVE
+
+    def open_panel(self) -> None:
+        if self.get_visible():
+            self.present()
+            return
+        if self._opening:
+            return
+        self._opening = True
+        # Fetch before mapping so hidden notification changes never expose an
+        # obsolete layout. This thread does not start the hardware workers.
+        start_thread('prepare-panel', self._prepare_open)
+
+    def _prepare_open(self) -> None:
+        snapshot = None
+        dnd = None
+        height = None
+        try:
+            result = run_command(['hyprctl', '-j', 'monitors'], timeout=0.8, capture_stdout=True)
+            if result is not None and result.returncode == 0:
+                monitors = json.loads(result.stdout)
+                if monitors:
+                    mon = next((m for m in monitors if m.get('focused')), monitors[0])
+                    dimension = 'width' if int(mon.get('transform', 0)) % 2 else 'height'
+                    height = max(1, int(float(mon[dimension]) / float(mon.get('scale', 1.0)) * 0.85))
+            if hasattr(self, 'notifications_module'):
+                snapshot = self.notifications_module._fetch_snapshot()
+                result = run_command(['makoctl', 'mode'], timeout=0.5, capture_stdout=True)
+                if result is not None and result.returncode == 0:
+                    dnd = 'do-not-disturb' in result.stdout.splitlines()
+        except Exception as exc:
+            LOG.warning('Could not prepare panel layout: %s', exc)
+        GLib.idle_add(self._finish_open, snapshot, dnd, height)
+
+    def _finish_open(self, snapshot: Any, dnd: bool | None, height: int | None) -> bool:
+        self._opening = False
+        if height is not None:
+            if self.scrolled_main.get_min_content_height() > height:
+                self.scrolled_main.set_min_content_height(height)
+            self.scrolled_main.set_max_content_height(height)
+        if hasattr(self, 'notifications_module'):
+            panel = self.notifications_module
+            panel.resume()
+            if dnd is not None:
+                panel._apply_dnd_state(dnd)
+            if snapshot is not None:
+                panel._apply_notifs(*snapshot, panel._refresh_token)
+        self.overlay.show_all()
+        self._update_content_height()
+        _minimum, natural = self.get_preferred_size()
+        size = (natural.width, natural.height)
+        if size != self._surface_size:
+            # GTK3's Wayland backend restores a saved pre-resize geometry on
+            # remap. Reset it while hidden only when the desired size differs
+            # from the geometry with which this GdkWindow was first created.
+            if self.get_realized():
+                self.unrealize()
+            self.set_default_size(*size)
+            self._surface_size = size
+        self.show_all()
+        self.present()
+        return GLib.SOURCE_REMOVE
 
     def _apply_monitor_height(self, height: int, revision: int) -> None:
         if self._visible and revision == self._view_revision and height != self.scrolled_main.get_max_content_height():
+            if self.scrolled_main.get_min_content_height() > height:
+                self.scrolled_main.set_min_content_height(height)
             self.scrolled_main.set_max_content_height(height)
+            self._update_content_height()
 
     def _fetch_position(self) -> None:
         """
@@ -943,7 +1040,6 @@ class QuickPanalWindow(Gtk.ApplicationWindow):
         self._update_ui_state()
         self._timer_id = GLib.timeout_add(2000, self._update_ui_state)
         self.request_reposition()
-        GLib.timeout_add(150, lambda: (self._reposition_to_corner() if self._visible else None, GLib.SOURCE_REMOVE)[1])
 
     def _on_hide(self, *args: Any) -> None:
         self._visible = False
@@ -1042,8 +1138,7 @@ class QuickPanalApp(Gtk.Application):
     @override
     def do_activate(self) -> None:
         if self.window:
-            self.window.show_all()
-            self.window.present()
+            self.window.open_panel()
 
     @override
     def do_shutdown(self) -> None:

@@ -497,17 +497,12 @@ class NotificationsPanel(Gtk.Box):
             child.destroy()
 
     def _request_layout_update(self) -> None:
-        self.listbox.invalidate_headers()
+        # GTK negotiates the natural size, including the outer scrolling cap.
+        # A content change does not necessarily change the window's size.
         self.listbox.queue_resize()
         win = self.get_toplevel()
-        if win and isinstance(win, Gtk.Window):
-            def _idle_resize_reposition() -> bool:
-                if win.get_visible():
-                    win.resize(320, 1)
-                    if hasattr(win, 'request_reposition'):
-                        win.request_reposition()
-                return GLib.SOURCE_REMOVE
-            GLib.idle_add(_idle_resize_reposition)
+        if hasattr(win, '_update_content_height'):
+            win._update_content_height()
 
     def _on_stack_toggled(self, app_name: str, expanded: bool) -> None:
         if expanded:
@@ -561,7 +556,7 @@ class NotificationsPanel(Gtk.Box):
         self._update_visibility()
 
     def _update_visibility(self) -> None:
-        visible = not self._suspended and (bool(self._last_notifs) or bool(self._dnd_state))
+        visible = bool(self._last_notifs) or bool(self._dnd_state)
         self.set_no_show_all(not visible)
         if visible:
             self.show_all()
@@ -586,6 +581,7 @@ class NotificationsPanel(Gtk.Box):
     def _apply_notifs(self, notifs: list[NotificationData], times: dict[str, str], token: int) -> bool:
         if self._suspended or self._clearing or token != self._refresh_token:
             return GLib.SOURCE_REMOVE
+        notifs = notifs[:50]
         notifs_tuple = tuple(notifs)
         if notifs_tuple == self._last_notifs and times == self.notif_times:
             return GLib.SOURCE_REMOVE
@@ -648,7 +644,6 @@ class NotificationsPanel(Gtk.Box):
     def _on_row_activated(self, listbox: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
         if isinstance(row, NotificationStackHeader):
             row.toggle()
-            self._request_layout_update()
             return
         if not isinstance(row, NotificationRow):
             return
@@ -712,10 +707,8 @@ class NotificationsPanel(Gtk.Box):
     def suspend(self) -> None:
         self._suspended = True
         self._refresh_token += 1
-        self._last_notifs = None
-        self.notif_times.clear()
-        self._clear_listbox_safely()
-        self._update_visibility()
+        # Keep the bounded widget cache and its visibility while the parent is
+        # hidden. Reopening unchanged content should not rebuild or shrink it.
 
     def resume(self) -> None:
         self._suspended = False
