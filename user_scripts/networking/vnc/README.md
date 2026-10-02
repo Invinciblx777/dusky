@@ -92,6 +92,7 @@ Run `vnc_viewer.py` on the PC you will control the server **from**:
 ./vnc_viewer.py SERVER_IP:5901                # separate monitor
 ./vnc_viewer.py --install-only               # install without opening a window
 ./vnc_viewer.py SERVER_IP:5902 --reset-trust   # intentional server identity replacement
+./vnc_viewer.py TAILSCALE_IP:5902 --quality fast
 ```
 
 The receiving-PC helper installs missing `remmina`, `openssl`, `libvncserver` and
@@ -116,6 +117,18 @@ rerun the updated server setup; leaving certificate fields empty cannot fix it.
 The helper configures no server services, firewall rules or network profiles. Remmina handles reopening
 connections and removing saved entries. Downloads require internet or cached packages;
 viewing over an existing LAN does not.
+
+Every helper launch defaults to **fast**, including existing saved connections:
+Remmina's **Medium** preset prefers Tight/JPEG compression with JPEG quality 5
+and compression level 3, prioritizing smaller updates over image quality.
+`--quality balanced` selects Good (JPEG quality 7, compression level 2);
+`--quality best` selects Best's lossless encodings. Other saved preferences
+are preserved. Change quality inside Remmina to apply it during an active session;
+the helper reapplies its requested preset on the next launch. A relayed Tailscale connection with
+high round-trip latency will still have delayed input regardless of encoding.
+Use `tailscale ping SERVER_TAILSCALE_IP` and `tailscale netcheck` to distinguish
+relay/network limitations from viewer settings. No routing changes are needed
+to check this.
 
 Setup and status show a numbered Rich "Connect another device" guide with
 mobile/desktop viewer download links, exact address/port, server Linux username, iPhone local-network

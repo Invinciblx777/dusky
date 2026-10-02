@@ -156,8 +156,10 @@ class ViewerTests(unittest.TestCase):
             settings = configparser.ConfigParser(interpolation=None)
             settings.read(profile)
             self.assertEqual(settings["remmina"]["protocol"], "VNC")
+            self.assertEqual(settings["remmina"]["quality"], "1")
             self.assertNotIn("password", settings["remmina"])
             settings["remmina"]["viewonly"] = "1"
+            settings["remmina"]["quality"] = "1"
             with profile.open("w") as output:
                 settings.write(output)
             before = profile.read_bytes()
@@ -167,6 +169,24 @@ class ViewerTests(unittest.TestCase):
             settings.read(profile)
             self.assertEqual(settings["remmina"]["viewonly"], "1")
             self.assertEqual(settings["remmina"]["username"], "bob")
+            self.assertEqual(settings["remmina"]["quality"], "1")
+            viewer.connection_profile("server:5902", "bob", "best")
+            settings.read(profile)
+            self.assertEqual(settings["remmina"]["quality"], "9")
+            viewer.connection_profile("server:5902", None)
+            settings.read(profile)
+            self.assertEqual(settings["remmina"]["quality"], "1")
+            self.assertEqual(settings["remmina"]["viewonly"], "1")
+            self.assertEqual(settings["remmina"]["username"], "bob")
+            viewer.connection_profile("server:5902", None, "balanced")
+            settings.read(profile)
+            self.assertEqual(settings["remmina"]["quality"], "2")
+            settings["remmina"].pop("quality")
+            with profile.open("w") as output:
+                settings.write(output)
+            viewer.connection_profile("server:5902", None)
+            settings.read(profile)
+            self.assertEqual(settings["remmina"]["quality"], "1")
 
     def test_missing_packages_are_batched_and_only_pacman_is_elevated(self):
         with patch.object(viewer.shutil, "which", side_effect=[None, None, "/usr/bin/remmina", "/usr/bin/openssl"]), \
@@ -197,6 +217,7 @@ class ViewerTests(unittest.TestCase):
              patch.object(viewer.os, "execvpe") as launch:
             (Path(directory) / "wayland-test").touch()
             viewer.main()
+            viewer.connection_profile.assert_called_once_with("server:5902", "alice", "fast")
             self.assertEqual(launch.call_args.args[1], ["remmina", "--no-tray-icon", "--connect", str(Path(directory) / "connection.remmina")])
             self.assertEqual(launch.call_args.args[2]["GDK_BACKEND"], "wayland")
             self.assertEqual(os.environ["GDK_BACKEND"], "x11")

@@ -52,7 +52,8 @@ def install_dependencies() -> None:
         raise RuntimeError("Viewer installation incomplete; remmina, openssl, libvncserver and python-rich are required")
 
 
-def connection_profile(server: str, username: str | None) -> Path:
+def connection_profile(server: str, username: str | None, quality: str = "fast") -> Path:
+    quality_value = {"fast": "1", "balanced": "2", "best": "9"}[quality]
     data = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
     profile = data / "remmina" / ("dusky_vnc_" + hashlib.sha256(server.encode()).hexdigest()[:16] + ".remmina")
     settings = configparser.ConfigParser(interpolation=None)
@@ -60,7 +61,9 @@ def connection_profile(server: str, username: str | None) -> Path:
         settings.read(profile)
         if "remmina" not in settings:
             raise RuntimeError(f"Invalid saved Remmina profile: {profile}")
-        if (username is None or settings["remmina"].get("username") == username) and settings["remmina"].get("cacert") == str(profile.with_suffix(".crt")):
+        if ((username is None or settings["remmina"].get("username") == username)
+                and settings["remmina"].get("cacert") == str(profile.with_suffix(".crt"))
+                and settings["remmina"].get("quality") == quality_value):
             return profile
     else:
         settings["remmina"] = {"name": f"VNC ({server})", "protocol": "VNC",
@@ -68,6 +71,8 @@ def connection_profile(server: str, username: str | None) -> Path:
                                "shared": "1", "scale": "1"}
     if username is not None:
         settings["remmina"]["username"] = username
+    # Medium prefers Tight/JPEG with lower image quality and more compression than Good.
+    settings["remmina"]["quality"] = quality_value
     settings["remmina"]["cacert"] = str(profile.with_suffix(".crt"))
     profile.parent.mkdir(parents=True, exist_ok=True)
     # Remmina manages subsequent preferences and saved credentials itself.
@@ -194,6 +199,8 @@ def main() -> None:
     parser.add_argument("--username", help="Server's Linux username; enter its password inside Remmina")
     parser.add_argument("--install-only", action="store_true", help="Install missing packages without opening the viewer")
     parser.add_argument("--reset-trust", action="store_true", help="Trust the current server certificate again after an intentional identity replacement")
+    parser.add_argument("--quality", choices=("fast", "balanced", "best"), default="fast",
+                        help="Compression preset applied on each launch (default: fast, Tight/JPEG)")
     args = parser.parse_args()
     if os.geteuid() == 0:
         parser.error("run as your desktop user, without sudo; only package installation uses sudo")
@@ -228,10 +235,11 @@ def main() -> None:
         f"2. This PC will open a saved VNC connection to {args.server}.\n"
         "3. Certificate trust is configured automatically before the viewer opens.\n"
         "4. Sign in with that server's Linux username and password.\n"
+        f"Compression preset: {args.quality}. Use --quality balanced or --quality best for higher quality.\n"
         "Use its LAN address on the same network, or its Tailscale address on the same tailnet.\n"
         "Saved connections, reconnecting and deleting entries are available inside Remmina."
     ), title="Connect from this PC", border_style="cyan"))
-    profile = connection_profile(args.server, args.username)
+    profile = connection_profile(args.server, args.username, args.quality)
     configure_certificate(args.server, profile, args.reset_trust)
     console.print("[green]Server certificate: verified (saved trust on first use)[/green]")
     disable_applet()
