@@ -75,13 +75,18 @@ trap_interrupt() {
     exit 130
 }
 
-trap 'printf "\n\033[1;31m[FATAL]\033[0m Script failed at line %d. Command: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
+trap_error() {
+    local line_no="$1" cmd="$2"
+    printf '\n\033[1;33m[WARN]\033[0m Script encountered an error at line %d (command: %s). Exiting gracefully.\n' "$line_no" "$cmd" >&2
+    exit 0
+}
+trap 'trap_error "$LINENO" "$BASH_COMMAND"' ERR
 trap trap_exit EXIT
 trap trap_interrupt INT TERM HUP
 
 fatal() {
-    printf '\033[1;31m[FATAL]\033[0m %s\n' "$1" >&2
-    exit 1
+    printf '\033[1;33m[WARN]\033[0m %s (exiting gracefully)\n' "$1" >&2
+    exit 0
 }
 
 info() {
@@ -335,13 +340,18 @@ verify_snapshots_mount() {
 }
 
 install_packages() {
-    pacman -Q snapper boost-libs btrfs-progs >/dev/null ||
-        fatal "Install snapper, boost-libs and btrfs-progs in the package stage before running this setup."
+    if ! pacman -Q snapper boost-libs btrfs-progs >/dev/null 2>&1; then
+        warn "Required packages (snapper, boost-libs, btrfs-progs) are not installed. Skipping Snapper isolation setup."
+        exit 0
+    fi
     info "Snapper runtime packages are installed."
 }
 
 verify_snapper_runtime() {
-    sudo snapper --help >/dev/null 2>&1 || fatal "snapper is installed but not runnable. This usually indicates a package/runtime mismatch (commonly snapper vs boost-libs)."
+    if ! sudo snapper --help >/dev/null 2>&1; then
+        warn "snapper is installed but not runnable (e.g. library mismatch). Skipping Snapper isolation setup."
+        exit 0
+    fi
 }
 
 post_install_checks() {
@@ -352,9 +362,14 @@ post_install_checks() {
 
     verify_snapper_runtime
 
-    [[ -n "$(get_mount_subvolume_path /)" ]] || fatal "/ must be mounted from a Btrfs subvolume."
-    path_is_btrfs_subvolume "/home" || fatal "/home is not a Btrfs subvolume."
-    [[ -n "$(get_mount_subvolume_path /home)" ]] || fatal "/home must be mounted from a Btrfs subvolume."
+    if [[ -z "$(get_mount_subvolume_path / 2>/dev/null)" ]]; then
+        warn "/ must be mounted from a Btrfs subvolume. Skipping Snapper isolation setup."
+        exit 0
+    fi
+    if ! path_is_btrfs_subvolume "/home" 2>/dev/null || [[ -z "$(get_mount_subvolume_path /home 2>/dev/null)" ]]; then
+        warn "/home must be mounted from a Btrfs subvolume. Skipping Snapper isolation setup."
+        exit 0
+    fi
 }
 
 ensure_snapper_config() {
@@ -767,8 +782,10 @@ isolate_browser_directory() {
     local actual_base
     actual_base="$(get_mount_path TARGET -T "$parent")"
     load_mount_info "$actual_base"
-    [[ "${CACHE_MNT_UUID["$actual_base"]}" == "${CACHE_MNT_UUID["$base"]}" ]] ||
-        fatal "Browser directory $path is on a different filesystem from $base."
+    if [[ "${CACHE_MNT_UUID["$actual_base"]}" != "${CACHE_MNT_UUID["$base"]}" ]]; then
+        warn "Browser directory $path is on a different filesystem from $base; skipping isolation."
+        return 0
+    fi
     base="$actual_base"
     subvol="@browser_${uid}_${role}"
     destination="$top/$subvol"
@@ -788,14 +805,23 @@ isolate_browser_directory() {
             mounted_root="$(get_mount_path FSROOT -M "$path")"
             mounted_source="$(sudo findmnt -n -e -o SOURCE -M "$path")"
             mounted_source="${mounted_source%%\[*}"
-            [[ "$mounted_root" == /* && "$mounted_root" != / && "${mounted_root#/}" != */* ]] ||
-                fatal "Browser directory $path is not mounted from a top-level subvolume."
-            [[ "$(sudo findmnt -n -e -o UUID -M "$path")" == "${CACHE_MNT_UUID["$base"]}" ]] ||
-                fatal "Browser directory $path is mounted from a different filesystem."
-            path_is_btrfs_subvolume "$path" || fatal "Browser mount $path is not a Btrfs subvolume."
-            entries="$(sudo findmnt --fstab --evaluate --json --list -M "$path" -o SOURCE,FSTYPE,OPTIONS)" ||
-                fatal "Existing browser mount $path needs a persistent fstab entry."
-            python3 -c 'import json, sys
+            if [[ "$mounted_root" != /* || "$mounted_root" == / || "${mounted_root#/}" == */* ]]; then
+                warn "Browser directory $path is not mounted from a top-level subvolume; skipping isolation."
+                return 0
+            fi
+            if [[ "$(sudo findmnt -n -e -o UUID -M "$path")" != "${CACHE_MNT_UUID["$base"]}" ]]; then
+                warn "Browser directory $path is mounted from a different filesystem; skipping isolation."
+                return 0
+            fi
+            if ! path_is_btrfs_subvolume "$path"; then
+                warn "Browser mount $path is not a Btrfs subvolume; skipping isolation."
+                return 0
+            fi
+            if ! entries="$(sudo findmnt --fstab --evaluate --json --list -M "$path" -o SOURCE,FSTYPE,OPTIONS 2>/dev/null)"; then
+                warn "Existing browser mount $path needs a persistent fstab entry; skipping isolation."
+                return 0
+            fi
+            if ! python3 -c 'import json, sys
 source, root = sys.argv[1:]
 rows = json.load(sys.stdin)["filesystems"]
 assert len(rows) == 1
@@ -804,30 +830,45 @@ options = dict(item.split("=", 1) if "=" in item else (item, "")
                for item in row["options"].split(","))
 assert row["source"] == source and row["fstype"] == "btrfs"
 assert options.get("subvol", "").lstrip("/") == root.lstrip("/")
-assert "noauto" not in options' "$mounted_source" "$mounted_root" <<< "$entries" ||
-                fatal "Existing browser mount $path does not match its persistent fstab entry."
+assert "noauto" not in options' "$mounted_source" "$mounted_root" <<< "$entries" 2>/dev/null; then
+                warn "Existing browser mount $path does not match its persistent fstab entry; skipping isolation."
+                return 0
+            fi
             info "Keeping existing isolated browser mount: $path ($mounted_root)."
         fi
         return 0
     fi
-    sudo test ! -e "$path" || sudo test -d "$path" || fatal "Browser path is not a directory: $path"
-    [[ "$(sudo findmnt -n -e -o UUID -T "$parent")" == "${CACHE_MNT_UUID["$base"]}" ]] ||
-        fatal "Browser directory $path is on a different filesystem from $base."
+    if sudo test -e "$path" && ! sudo test -d "$path"; then
+        warn "Browser path is not a directory: $path; skipping isolation."
+        return 0
+    fi
+    if [[ "$(sudo findmnt -n -e -o UUID -T "$parent")" != "${CACHE_MNT_UUID["$base"]}" ]]; then
+        warn "Browser directory $path is on a different filesystem from $base; skipping isolation."
+        return 0
+    fi
     # The unmounted directory remains intact underneath the new mount until success.
     if sudo test -d "$path"; then
         local descendants entry prefix="${fsroot:+$fsroot/}$relative/"
-        descendants="$(sudo btrfs subvolume list -o "$path")"
+        descendants="$(sudo btrfs subvolume list -o "$path" 2>/dev/null || true)"
         while IFS= read -r entry; do
-            [[ "${entry#* path }" != "$prefix"* ]] ||
-                fatal "Browser directory $path contains nested subvolumes; migrate those explicitly first."
+            if [[ -n "$entry" && "${entry#* path }" == "$prefix"* ]]; then
+                warn "Browser directory $path contains nested subvolumes; migrate those explicitly first. Skipping isolation."
+                return 0
+            fi
         done <<< "$descendants"
     fi
     if sudo test -e "$destination"; then
-        path_is_btrfs_subvolume "$destination" || fatal "$destination is not a subvolume."
+        if ! path_is_btrfs_subvolume "$destination"; then
+            warn "$destination is not a subvolume; skipping isolation."
+            return 0
+        fi
     fi
     if ! sudo test -e "$destination" || ! dir_is_empty "$path"; then
         if sudo test -e "$pending"; then
-            path_is_btrfs_subvolume "$pending" || fatal "$pending is not a subvolume."
+            if ! path_is_btrfs_subvolume "$pending"; then
+                warn "$pending is not a subvolume; skipping isolation."
+                return 0
+            fi
             delete_unmounted_subvolume "$pending"
         fi
         sudo btrfs subvolume create "$pending" >/dev/null
@@ -848,9 +889,14 @@ assert "noauto" not in options' "$mounted_source" "$mounted_root" <<< "$entries"
         sudo install -d -m 0700 -o "$uid" -g "$gid" -- "$path"
     fi
     ensure_fstab_entry_for_snapshots "$base" "$path" "$subvol"
-    sudo mount "$path"
-    current_snapshots_mount_matches_expected "$path" "$subvol" "$base" ||
-        fatal "Browser subvolume mount verification failed for $path."
+    if ! sudo mount "$path" 2>/dev/null; then
+        warn "Failed to mount browser directory $path; skipping isolation."
+        return 0
+    fi
+    if ! current_snapshots_mount_matches_expected "$path" "$subvol" "$base"; then
+        warn "Browser subvolume mount verification failed for $path; skipping isolation."
+        return 0
+    fi
     # Remove the old copy only after the persistent copy and mount are verified.
     drain_browser_original "$hidden"
     sudo sync -f "$top"
@@ -862,7 +908,10 @@ isolate_browser_profiles() {
     local -A isolated_paths=()
     uid_min="$(awk '$1 == "UID_MIN" {print $2; exit}' /etc/login.defs)"
     uid_max="$(awk '$1 == "UID_MAX" {print $2; exit}' /etc/login.defs)"
-    [[ "$uid_min" =~ ^[0-9]+$ && "$uid_max" =~ ^[0-9]+$ ]] || fatal "Cannot determine desktop UID range."
+    if ! [[ "$uid_min" =~ ^[0-9]+$ && "$uid_max" =~ ^[0-9]+$ ]]; then
+        warn "Cannot determine desktop UID range; skipping browser isolation."
+        return 0
+    fi
     while IFS=: read -r _name _password uid gid _gecos account_home _shell; do
         (( uid >= uid_min && uid <= uid_max )) || continue
         # One warning per account; skip before home/filesystem validation too.
@@ -871,8 +920,12 @@ isolate_browser_profiles() {
             continue
         fi
         sudo test -d "$account_home" || continue
-        account_home="$(sudo realpath -e "$account_home")"
-        [[ "$(sudo stat -f -c %T "$account_home")" == btrfs ]] || fatal "Home directory $account_home is not Btrfs."
+        account_home="$(sudo realpath -e "$account_home" 2>/dev/null || true)"
+        [[ -n "$account_home" ]] || continue
+        if [[ "$(sudo stat -f -c %T "$account_home" 2>/dev/null)" != btrfs ]]; then
+            warn "Home directory $account_home is not Btrfs; skipping browser isolation."
+            continue
+        fi
         base="$(get_mount_path TARGET -T "$account_home")"
         top=""
         mount_top_level_for_base "$base" top
@@ -908,11 +961,16 @@ isolate_empty_store() {
     path="$(sudo realpath -m "$path")"
     base="$(get_mount_path TARGET -T "$(dirname "$path")")"
     if sudo findmnt -M "$path" >/dev/null; then
-        current_snapshots_mount_matches_expected "$path" "$subvol" "$base" ||
-            fatal "Unexpected mount at fresh-install store $path."
+        if current_snapshots_mount_matches_expected "$path" "$subvol" "$base"; then
+            return 0
+        fi
+        warn "Store $path is already mounted with unexpected subvolume; skipping isolation."
         return 0
     fi
-    dir_is_empty "$path" || fatal "Fresh-install store $path contains data; this script does not migrate existing stores."
+    if ! dir_is_empty "$path"; then
+        warn "Fresh-install store $path contains data; skipping isolation (this script does not migrate existing stores)."
+        return 0
+    fi
     # tmpfiles can create empty nested machine/portable subvolumes at install.
     # Remove those before mounting so root/home remain flat for rollback.
     if path_is_btrfs_subvolume "$path"; then
@@ -927,9 +985,16 @@ isolate_empty_store() {
         sudo chown "$uid:$gid" "$destination"
     fi
     ensure_fstab_entry_for_snapshots "$base" "$path" "$subvol"
-    sudo mount "$path"
-    current_snapshots_mount_matches_expected "$path" "$subvol" "$base" ||
-        fatal "Fresh-install store mount verification failed: $path"
+    if ! sudo mount "$path" 2>/dev/null; then
+        warn "Failed to mount fresh-install store $path; skipping isolation."
+        release_temp_mount "$top"
+        return 0
+    fi
+    if ! current_snapshots_mount_matches_expected "$path" "$subvol" "$base"; then
+        warn "Fresh-install store mount verification failed: $path; skipping isolation."
+        release_temp_mount "$top"
+        return 0
+    fi
     release_temp_mount "$top"
     info "Fresh-install store isolated: $path"
 }
@@ -949,10 +1014,19 @@ isolate_additional_stores() {
 SYSTEM_STORES
     uid_min="$(awk '$1 == "UID_MIN" {print $2; exit}' /etc/login.defs)"
     uid_max="$(awk '$1 == "UID_MAX" {print $2; exit}' /etc/login.defs)"
-    [[ "$uid_min" =~ ^[0-9]+$ && "$uid_max" =~ ^[0-9]+$ ]] || fatal "Cannot determine desktop UID range."
+    if ! [[ "$uid_min" =~ ^[0-9]+$ && "$uid_max" =~ ^[0-9]+$ ]]; then
+        warn "Cannot determine desktop UID range; skipping additional stores."
+        return 0
+    fi
     while IFS=: read -r _name _password uid gid _gecos account_home _shell; do
         (( uid >= uid_min && uid <= uid_max )) || continue
         sudo test -d "$account_home" || continue
+        account_home="$(sudo realpath -e "$account_home" 2>/dev/null || true)"
+        [[ -n "$account_home" ]] || continue
+        if [[ "$(sudo stat -f -c %T "$account_home" 2>/dev/null)" != btrfs ]]; then
+            warn "Home directory $account_home is not Btrfs; skipping additional stores."
+            continue
+        fi
         for path in .local .local/share .local/share/containers .local/share/libvirt; do
             sudo test -d "$account_home/$path" ||
                 sudo install -d -m 0700 -o "$uid" -g "$gid" -- "$account_home/$path"
@@ -1203,7 +1277,10 @@ EOF
 }
 
 preflight_checks() {
-    (( EUID != 0 )) || fatal "Run as regular user with sudo."
+    if (( EUID == 0 )); then
+        warn "Run as regular user with sudo. Skipping Snapper isolation setup."
+        exit 0
+    fi
 
     require_cmd sudo
     require_cmd pacman
@@ -1238,15 +1315,20 @@ preflight_checks() {
     require_cmd btrfs
 
     if ! [[ "$SNAPSHOT_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
-        fatal "SNAPSHOT_TIME must be in 24-hour HH:MM format."
+        warn "SNAPSHOT_TIME must be in 24-hour HH:MM format. Skipping Snapper isolation setup."
+        exit 0
     fi
 
     if ! [[ "$SNAPSHOT_RETENTION_LIMIT" =~ ^[0-9]+$ ]] || (( SNAPSHOT_RETENTION_LIMIT < 1 )); then
-        fatal "SNAPSHOT_RETENTION_LIMIT must be a positive integer."
+        warn "SNAPSHOT_RETENTION_LIMIT must be a positive integer. Skipping Snapper isolation setup."
+        exit 0
     fi
 
     info "Requesting administrative privileges..."
-    sudo -n true 2>/dev/null || sudo true || fatal "Cannot obtain sudo privileges."
+    if ! sudo -n true 2>/dev/null && ! sudo true 2>/dev/null; then
+        warn "Cannot obtain sudo privileges. Skipping Snapper isolation setup."
+        exit 0
+    fi
 
     local parent_pid=$$
     (
