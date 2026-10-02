@@ -49,6 +49,9 @@ glibc >= 2.28 (renameat2). Nothing is hardcoded: theme, colors, sizes,
 paths and user are derived from the matugen output, gsettings, Hyprland
 IPC and the XDG base-directory spec.
 
+Run as the desktop user; missing required packages are installed with pacman
+(same pattern as '140_dusky_font_configurator.py').
+
 Exit codes: 0 ok / nothing to do, 1 failure (invalid palette, source missing,
 build failed or any apply layer failed), 2 usage, 130 SIGINT.
 
@@ -91,9 +94,11 @@ from theme_files import publication_lock, merge_groups
 try:
     from PIL import Image, ImageMath
 except ImportError:
-    print("dusky_cursor: ERROR: the 'Pillow' module is required "
-          "(Arch Linux: pacman -S python-pillow).", file=sys.stderr)
-    raise SystemExit(1)
+    # Optional at import: mutating runs install python-pillow via
+    # ensure_packages() first, then ensure_pillow() retries the import.
+    # Read-only actions (--status/--check/--dry-run) never need it.
+    Image = None  # type: ignore[no-redef]
+    ImageMath = None  # type: ignore[no-redef]
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -144,6 +149,61 @@ FALLBACK_BACKGROUND = "#18120c"
 type RGB = tuple[int, int, int]
 
 log = logging.getLogger("dusky_cursor")
+
+# ---------------------------------------------------------------------------
+# Prerequisites - official Arch packages, auto-installed like 140_dusky_font_configurator.py
+# ---------------------------------------------------------------------------
+
+
+# Official Arch packages required by the cursor build + apply layers. The
+# Bibata source theme is intentionally excluded: it ships via AUR / the
+# 375_cursor_theme_bibata_classic_modern.sh installer, not pacman.
+REQUIRED_PACKAGES = (
+    "python-pillow", "glib2", "gsettings-desktop-schemas", "dconf", "dbus",
+    "libnotify", "hyprland", "hicolor-icon-theme",
+)
+
+
+def ensure_packages() -> None:
+    query = subprocess.run(
+        ["pacman", "--query", "--quiet", "--", *REQUIRED_PACKAGES],
+        capture_output=True, text=True,
+    )
+    if query.returncode not in (0, 1):
+        raise RuntimeError(f"Cannot query installed packages: {query.stderr.strip()}")
+    installed = set(query.stdout.splitlines())
+    missing = [package for package in REQUIRED_PACKAGES if package not in installed]
+    if not missing:
+        if query.returncode:
+            raise RuntimeError(f"Cannot query installed packages: {query.stderr.strip()}")
+        return
+    log.info("Required packages: %s", ", ".join(missing))
+    command = ["pacman", "--sync", "--needed", "--noconfirm", "--", *missing]
+    if os.geteuid() != 0:
+        # The orchestrator supplies a PTY in a new session without a
+        # controlling terminal. Read authentication from its input stream.
+        command = ["sudo", "--stdin", "--", *command]
+    # Use the installer's existing repository databases and cached packages;
+    # no isolated database refresh or unrelated system upgrade here.
+    subprocess.run(command, check=True)
+    subprocess.run(["pacman", "--query", "--quiet", "--", *REQUIRED_PACKAGES],
+                   check=True, stdout=subprocess.DEVNULL)
+
+
+def ensure_pillow() -> None:
+    """Retry the optional Pillow import after ensure_packages()."""
+    global Image, ImageMath, _M
+    if Image is not None and ImageMath is not None and _M is not None:
+        return
+    try:
+        from PIL import Image as _Image, ImageMath as _ImageMath
+    except ImportError as e:
+        raise RuntimeError("the 'Pillow' module is required "
+                           "(Arch Linux: pacman -S python-pillow).") from e
+    Image = _Image  # type: ignore[no-redef]
+    ImageMath = _ImageMath  # type: ignore[no-redef]
+    _M = _ImageMath.lambda_eval
+
 
 # ---------------------------------------------------------------------------
 # XDG locations - no hardcoded $HOME / usernames anywhere
@@ -590,7 +650,7 @@ def iter_image_chunks(raw: bytearray, name: str) -> Iterator[tuple[int, int, int
         yield off, n, w, h
 
 
-_M = ImageMath.lambda_eval
+_M = ImageMath.lambda_eval if ImageMath is not None else None  # type: ignore[union-attr]
 
 
 def recolor_chunk(chunk: bytes, w: int, h: int, fill: RGB, outline: RGB) -> bytes:
@@ -687,7 +747,7 @@ def fingerprint_path(root: Path | None = None) -> Path:
 def read_fingerprint(root: Path | None = None) -> dict[str, object]:
     try:
         data = json.loads(fingerprint_path(root).read_text(encoding="utf-8"))
-    except OSError, ValueError:
+    except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -1352,6 +1412,10 @@ def main(argv: list[str] | None = None) -> int:
         log.error("Invalid source theme name %r", source_name)
         return 2
     try:
+        # Read-only actions leave no trace: no install, no Pillow, no sudo.
+        if not args.dry_run and args.action not in ("status", "check"):
+            ensure_packages()
+            ensure_pillow()
         match args.action:
             case "status":
                 return do_status(source_name)
@@ -1372,7 +1436,7 @@ def main(argv: list[str] | None = None) -> int:
     except TimeoutError as e:
         log.error("%s", e)
         return 1
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as e:
         log.error("%s", e)
         return 1
     except KeyboardInterrupt:
