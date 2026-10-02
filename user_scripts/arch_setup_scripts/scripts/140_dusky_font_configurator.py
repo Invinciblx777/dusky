@@ -2,7 +2,7 @@
 #d: Deploy and verify the Dusky font configuration
 """Deploy schema defaults through the same engine used by the font TUI.
 
-Run as the desktop user after installing the font packages. --font-family
+Run as the desktop user; missing required packages are installed with pacman. --font-family
 (or DUSKY_DEFAULT_SANS) overrides the sans-serif default. Missing fonts,
 cache errors, toolkit sync errors, and incorrect aliases exit nonzero.
 """
@@ -18,6 +18,39 @@ import sys
 USER_SCRIPTS = Path(os.environ.get("USER_SCRIPTS", str(Path(__file__).resolve().parents[2]))).expanduser().resolve()
 DUSKY_TUI_ROOT = USER_SCRIPTS / "dusky_tui"
 SCHEMA_PATH = USER_SCRIPTS / "fonts/tui_fonts.py"
+
+
+# Official Arch packages required by the default font deployment. Install before
+# schema discovery or D-Bus startup so a fresh system can bootstrap both.
+REQUIRED_PACKAGES = (
+    "fontconfig", "glib2", "dconf", "gsettings-desktop-schemas", "dbus",
+    "ttf-atkinson-hyperlegible", "ttf-jetbrains-mono-nerd",
+    "noto-fonts-emoji", "ttf-liberation",
+)
+
+
+def ensure_packages() -> None:
+    query = subprocess.run(
+        ["pacman", "--query", "--quiet", "--", *REQUIRED_PACKAGES],
+        capture_output=True, text=True,
+    )
+    if query.returncode not in (0, 1):
+        raise RuntimeError(f"Cannot query installed packages: {query.stderr.strip()}")
+    installed = set(query.stdout.splitlines())
+    missing = [package for package in REQUIRED_PACKAGES if package not in installed]
+    if not missing:
+        if query.returncode:
+            raise RuntimeError(f"Cannot query installed packages: {query.stderr.strip()}")
+        return
+    print(f"[INSTALL] Required packages: {', '.join(missing)}", flush=True)
+    command = ["pacman", "--sync", "--needed", "--noconfirm", "--", *missing]
+    if os.geteuid() != 0:
+        command = ["sudo", "--", *command]
+    # Use the installer's existing repository databases and cached packages;
+    # no isolated database refresh or unrelated system upgrade here.
+    subprocess.run(command, check=True)
+    subprocess.run(["pacman", "--query", "--quiet", "--", *REQUIRED_PACKAGES],
+                   check=True, stdout=subprocess.DEVNULL)
 
 
 def _load_schema():
@@ -46,6 +79,7 @@ def main() -> int:
                         help="Override the schema's sans-serif default")
     args = parser.parse_args()
     try:
+        ensure_packages()
         # dconf writes require a session bus, including during a TTY install.
         if (not os.environ.get("DBUS_SESSION_BUS_ADDRESS")
                 and os.environ.get("GSETTINGS_BACKEND", "dconf") == "dconf"):
