@@ -290,14 +290,17 @@ CORE_USER_SECTIONS = (
     ("Desktop & Session", (
         "hyprsunset.service", "hypridle.service", "osd_lock.service",
         "dusky_polkit.service", "dusky_clipboard.service", "dusky-oom-shield.service",
-        "dusky_vnc_desktop.service", "dusky_vnc_display.service", "dusky_moonlight_display.service",
+    )),
+    ("Remote Displays & Streaming", (
+        "dusky_vnc_desktop.service", "dusky_vnc_display.service",
+        "dusky_moonlight_display.service", "app-dev.lizardbyte.app.Sunshine.service",
     )),
     ("Panels & Integration", (
         "dusky.service", "dusky_quickpanal.service", "network_meter.service",
         "dusky_notif_time.service", "dusky_visualizer.service", "dusky_screentime.service",
     )),
     ("Media & AI", (
-        "app-dev.lizardbyte.app.Sunshine.service", "dusky_llm.service", "dusky_stt.service",
+        "dusky_llm.service", "dusky_stt.service",
     )),
     ("Power & Monitoring", (
         "dusky_battery.service", "dusky_ram_monitor.service",
