@@ -683,8 +683,8 @@ replay_menu() {
     done
 }
 
-# --- SETTINGS HUB (ROUTER) ---
-settings_hub() {
+# --- QUICK SETTINGS (ROUTER) ---
+quick_settings() {
     while true; do
         local -a opts=(
             "  Back"
@@ -694,7 +694,7 @@ settings_hub() {
             "  Replay Buffer"
         )
         local choice
-        choice=$(run_menu "  Settings Hub" "${opts[@]}") || return 0
+        choice=$(run_menu "  Quick Settings" "${opts[@]}") || return 0
         case "$choice" in
             "  Back") return 0 ;;
             "󰕧  Video"*) video_menu ;;
@@ -720,7 +720,7 @@ main() {
             if [[ "$replay_buffer" =~ ^[0-9]+$ && ! "$replay_buffer" =~ ^0+$ ]]; then
                 replay_label=" [Replay ${replay_buffer}s]"
             fi
-            main_opts+=("  Record Full Screen$replay_label" "  Record Region$replay_label" "  Record (TUI configured)$replay_label" "  Open TUI" "  Settings Hub" "  Cancel")
+            main_opts+=("  Record Full Screen$replay_label" "  Record Region$replay_label" "  Record (TUI configured)$replay_label" "  Open TUI" "  Quick Settings" "  Cancel")
         fi
         choice=$(run_menu 'Dusky Recorder' "${main_opts[@]}") || return 0
         case "$choice" in
@@ -730,7 +730,7 @@ main() {
             "  Record"*) with_lock start_recording region; return ;;
             "  Record (TUI configured)"*) with_lock start_recording; return ;;
             "  Open TUI") exec foot --app-id=dusky_tui python3 "$HOME/user_scripts/dusky_recorder/tui_dusky_recorder.py" ;;
-            "  Settings"*) settings_hub ;;
+            "  Quick Settings") quick_settings ;;
             *) return 0 ;;
         esac
     done
