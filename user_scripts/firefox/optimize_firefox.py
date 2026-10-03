@@ -6,6 +6,9 @@ Target: Arch Linux (kernel 7.3+, rolling), Python 3.14.7+, Firefox 156+ only.
 Zero backwards-compatibility shims for legacy Python (< 3.14) or legacy Firefox (< 156).
 
 Capabilities:
+    With no action argument, apply --cache-mode memory to initialized profiles.
+    Fresh installations without initialized profiles are reported as a no-op.
+
     --cache-mode memory
         Disable Firefox's HTTP disk cache and enable the memory cache.
         Firefox retains its dynamic memory-cache sizing policy by default, or accepts
@@ -1177,7 +1180,9 @@ def validate_profile(candidate: Path, table: Sequence[MountEntry], *, recover: b
     return Profile(expanded, info.st_dev, info.st_ino, fstype)
 
 
-def select_profiles(explicit: Sequence[Path], table: Sequence[MountEntry], *, recover: bool = False) -> list[Profile]:
+def select_profiles(
+    explicit: Sequence[Path], table: Sequence[MountEntry], *, recover: bool = False, allow_empty: bool = False,
+) -> list[Profile]:
     if explicit:
         profiles_found = [validate_profile(path, table, recover=recover) for path in explicit]
     else:
@@ -1196,7 +1201,7 @@ def select_profiles(explicit: Sequence[Path], table: Sequence[MountEntry], *, re
         by_path.setdefault(prof.path, prof)
 
     profiles = sorted(by_path.values(), key=lambda p: p.path)
-    if not profiles:
+    if not profiles and not allow_empty:
         fail("No usable profile selected. Run Firefox once or specify --profile PATH.")
 
     for i, p in enumerate(profiles):
@@ -2590,13 +2595,23 @@ def run_verification_suite(verbose: bool) -> int:
             vfail("Dry-run caused filesystem mutations")
 
         # 4. Apply Memory Mode Policy
-        vlog("4. Apply --cache-mode memory")
-        run_sub("--cache-mode", "memory", "--profile", str(profile_dir), "--backup-dir", str(backups_dir))
+        vlog("4. Apply Default Memory Cache Policy (No Action Argument)")
+        run_sub("--profile", str(profile_dir), "--backup-dir", str(backups_dir))
         u_content = (profile_dir / "user.js").read_text(encoding="utf-8")
         if 'user_pref("browser.cache.disk.enable", false);' in u_content and 'user_pref("browser.cache.memory.enable", true);' in u_content:
             vok("browser.cache.disk.enable=false & memory.enable=true applied")
         else:
             vfail("Preferences missing from user.js")
+
+        applied_files = {
+            name: (profile_dir / name).read_bytes() for name in (USER_JS, STATE_FILENAME, PREFS_JS)
+        }
+        archives = set(backups_dir.iterdir())
+        run_sub("--profile", str(profile_dir), "--backup-dir", str(backups_dir))
+        if applied_files == {name: (profile_dir / name).read_bytes() for name in applied_files} and archives == set(backups_dir.iterdir()):
+            vok("Repeated default invocation changed no preferences, state, or backup archives")
+        else:
+            vfail("Repeated default invocation was not idempotent")
 
         # 5. Exact Modes & Umask Independence
         vlog("5. Exact File Modes & Umask Independence")
@@ -2744,6 +2759,26 @@ def run_verification_suite(verbose: bool) -> int:
         else:
             vfail(f"Restored stress database failed verification: rows={rows}, integrity={integrity}")
 
+        vlog("15. Fresh Installation Without Firefox Profiles")
+        fresh_home = work_dir / "fresh-home"
+        fresh_home.mkdir()
+        fresh_env = os.environ.copy()
+        fresh_env.update({
+            "HOME": str(fresh_home),
+            "XDG_CONFIG_HOME": str(fresh_home / ".config"),
+            "XDG_CACHE_HOME": str(fresh_home / ".cache"),
+        })
+        fresh_env.pop("MOZ_LEGACY_HOME", None)
+        for arguments in ((), ("--sync", "--disk-fallback"), ("--resync", "--disk-fallback")):
+            result = subprocess.run(
+                [sys.executable, str(script_path), *arguments], env=fresh_env,
+                capture_output=True, text=True, timeout=25, check=False,
+            )
+            if result.returncode == 0 and "No initialized Firefox profiles" in result.stdout and not any(fresh_home.iterdir()):
+                vok(f"Fresh install {arguments or 'default'} reports no changes without creating a profile")
+            else:
+                vfail(f"Fresh install {arguments}: exit={result.returncode}, stdout={result.stdout}, stderr={result.stderr}")
+
     finally:
         # Cleanup
         try:
@@ -2778,7 +2813,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Bleeding-edge Firefox 156+ HTTP cache-policy & RAM profile manager: "
             "Native Profile-Sync-Daemon (PSD) RAM engine with fuse-overlayfs, "
             "exclusive Linux OFD locking, private zstd backups, saved-preference rollback, "
-            "umask-independent atomic writes, and seamless legacy optimizer migration."
+            "umask-independent atomic writes, and seamless legacy optimizer migration. "
+            "Without an action argument, apply the memory-only HTTP cache policy."
         ),
         epilog=(
             "Exit status: 0 success, 1 error, 2 usage error, 3 profile locked by running Firefox, "
@@ -2787,7 +2823,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"{TOOL_NAME} {TOOL_VERSION}")
 
-    action = parser.add_mutually_exclusive_group(required=True)
+    action = parser.add_mutually_exclusive_group()
     action.add_argument(
         "--cache-mode",
         choices=("memory", "default"),
@@ -2853,6 +2889,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.cache_mode is None and not any((
+        args.disable, args.status, args.sync, args.unsync, args.resync, args.daemon,
+        args.install_service, args.remove_service, args.verify,
+    )):
+        args.cache_mode = "memory"
 
     if args.disk_fallback and not (args.sync or args.resync):
         parser.error("--disk-fallback requires --sync or --resync")
@@ -2891,7 +2932,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         table = read_mount_table()
 
         explicit_profiles = [Path(p) for p in args.profile] if args.profile else []
-        profiles = select_profiles(explicit_profiles, table, recover=not (args.status or args.dry_run))
+        profiles = select_profiles(
+            explicit_profiles, table, recover=not (args.status or args.dry_run),
+            allow_empty=not explicit_profiles and (
+                args.cache_mode == "memory" or (args.sync or args.resync) and args.disk_fallback
+            ),
+        )
+        if not profiles:
+            LOGGER.info("No initialized Firefox profiles found; no profile changes made. Run Firefox once, then rerun this command.")
+            return 0
 
         if args.status:
             return report_status(profiles, args.json)
