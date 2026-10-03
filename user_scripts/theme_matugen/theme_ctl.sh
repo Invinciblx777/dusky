@@ -96,17 +96,17 @@ readonly -A DEFAULTS=(
 )
 
 readonly -A OPTION_KEYS=(
-    [--mode]=THEME_MODE
-    [--type]=MATUGEN_TYPE
-    [--contrast]=MATUGEN_CONTRAST
-    [--index]=SOURCE_COLOR_INDEX
-    [--base16]=BASE16_BACKEND
-    [--trans-type]=AWWW_TRANS_TYPE
-    [--trans-duration]=AWWW_TRANS_DURATION
-    [--trans-fps]=AWWW_TRANS_FPS
-    [--trans-bezier]=AWWW_TRANS_BEZIER
-    [--trans-angle]=AWWW_TRANS_ANGLE
-    [--trans-pos]=AWWW_TRANS_POS
+    ["--mode"]=THEME_MODE
+    ["--type"]=MATUGEN_TYPE
+    ["--contrast"]=MATUGEN_CONTRAST
+    ["--index"]=SOURCE_COLOR_INDEX
+    ["--base16"]=BASE16_BACKEND
+    ["--trans-type"]=AWWW_TRANS_TYPE
+    ["--trans-duration"]=AWWW_TRANS_DURATION
+    ["--trans-fps"]=AWWW_TRANS_FPS
+    ["--trans-bezier"]=AWWW_TRANS_BEZIER
+    ["--trans-angle"]=AWWW_TRANS_ANGLE
+    ["--trans-pos"]=AWWW_TRANS_POS
 )
 
 # --- VARIABLES ----------------------------------------------------------------
@@ -338,7 +338,10 @@ is_valid_setting() {
                 return 0
             fi
 
-            [[ "$value" =~ ^[0-9]+$ && "$value" =~ [1-9] ]]
+            [[ "$value" =~ ^[0-9]+$ ]] || return 1
+            value="${value#"${value%%[!0]*}"}"
+            [[ -n "$value" && ${#value} -le 5 ]] &&
+                (( 10#$value <= 65535 ))
             ;;
 
         AWWW_TRANS_ANGLE)
@@ -1407,7 +1410,7 @@ Commands:
 
       --trans-type <type|disable>
       --trans-duration <seconds|disable>
-      --trans-fps <positive-integer|disable>
+      --trans-fps <1..65535|disable>
       --trans-bezier <curve|disable>
       --trans-angle <degrees|disable>
       --trans-pos <position|disable>
