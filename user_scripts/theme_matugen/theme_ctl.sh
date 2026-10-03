@@ -917,7 +917,7 @@ load_wallpapers() {
     begin_temp wallpapers
 
     # A real pipeline makes find/sort failures visible through pipefail.
-    if ! find "$canonical_root" "${depth_args[@]}" -type f \
+    if ! find -L "$canonical_root" "${depth_args[@]}" -type f \
         \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \
            -o -iname '*.webp' -o -iname '*.gif' \) \
         -print0 |
@@ -950,6 +950,7 @@ load_wallpapers() {
 select_wallpaper() {
     local strategy="$1"
     local -n _selected_ref="$2"
+    local -n _selected_id_ref="$3"
 
     local tracker last_id="" index
     local -i current=-1
@@ -1032,6 +1033,7 @@ select_wallpaper() {
     esac
 
     _selected_ref="${paths[$selected]}"
+    _selected_id_ref="${identifiers[$selected]}"
 }
 
 # --- MATUGEN ------------------------------------------------------------------
@@ -1148,8 +1150,9 @@ apply_solid_color() {
 apply_wallpaper_direct() {
     local input="$1"
     local -i regenerate="${2:-1}"
+    local identifier="${3:-}"
 
-    local image identifier
+    local image
     local -a command=(awww img)
 
     check_deps awww
@@ -1161,7 +1164,11 @@ apply_wallpaper_direct() {
         check_deps matugen
     fi
 
-    identifier=$(resolve_wallpaper_id "$image")
+    # Cycling keeps the collection path even when a link targets an external
+    # image. Resolving it first would lose our position in the collection.
+    if [[ -z "$identifier" ]]; then
+        identifier=$(resolve_wallpaper_id "$image")
+    fi
 
     ensure_awww_running
 
@@ -1208,12 +1215,12 @@ apply_wallpaper_direct() {
 apply_wallpaper_selection() {
     local strategy="$1"
     local -i regenerate="${2:-1}"
-    local selected_image
+    local selected_image selected_id
 
-    select_wallpaper "$strategy" selected_image ||
+    select_wallpaper "$strategy" selected_image selected_id ||
         die "No supported wallpapers found in '$ACTIVE_THEME_DIR' or '$WALLPAPER_ROOT'"
 
-    apply_wallpaper_direct "$selected_image" "$regenerate"
+    apply_wallpaper_direct "$selected_image" "$regenerate" "$selected_id"
 }
 
 cycle_command() {
@@ -1445,6 +1452,9 @@ Notes:
   - refresh may select a random wallpaper if the current source is missing
     or awww is displaying only solid colors.
   - A multi-monitor refresh uses the first reported image.
+  - Cycling recursively follows image and directory symlinks in active_theme.
+  - The fallback searches only the top level of Pictures/wallpapers.
+  - Broken links are skipped; directory traversal errors stop selection.
   - Wallpaper filenames containing newlines are unsupported.
   - Use an absolute path or ./filename for filenames starting with "-".
 
