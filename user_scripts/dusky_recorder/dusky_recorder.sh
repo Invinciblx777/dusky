@@ -3,7 +3,7 @@
 set -euo pipefail
 
 readonly CFG="${XDG_CONFIG_HOME:-$HOME/.config}/dusky/settings/dusky_recorder/config.conf"
-readonly ROFI_THEME_STR='window { padding: 20px 12px; border: 2px; } inputbar { spacing: 1ch; padding: 12px; } element { padding: 8px 12px; children: [element-text]; } listview { lines: 8; }'
+readonly ROFI_THEME_STR='window { padding: 20px 12px; border: 2px; } mainbox { padding: 0; border: 0; } inputbar { spacing: 1ch; padding: 12px; children: [prompt, entry]; } entry { placeholder: "Search..."; } element { padding: 8px 12px; children: [element-text]; } listview { lines: 8; scrollbar: false; padding: 0; border: 0; }'
 readonly RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$UID}"
 readonly RECORDER_STATE_DIR="$RUNTIME_DIR/dusky-recorder"
 readonly RECORDER_PID_FILE="$RECORDER_STATE_DIR/recorder.pid"
@@ -387,6 +387,20 @@ webm_codec() {
     return 1
 }
 
+report_start_failure() {
+    local line reason='Recorder exited during startup'
+    while IFS= read -r line; do
+        if [[ "$line" == *llvmpipe* ]]; then
+            reason='GPU Screen Recorder requires GPU-backed OpenGL; this system uses llvmpipe software rendering, which also prevents CPU encoding'
+            break
+        fi
+        if [[ "$reason" == 'Recorder exited during startup' && "$line" == 'gsr error: '* ]]; then
+            reason=${line#gsr error: }
+        fi
+    done < "$RECORDER_LOG"
+    status critical "$reason; log: $RECORDER_LOG"
+}
+
 start_recording() {
     local target_mode="${1:-$window}" region_coords="$region"
     local capture_source mode=recording out video_codec="$codec"
@@ -451,7 +465,7 @@ start_recording() {
     sleep 0.5
     if ! same_process "$starting_pid" "$starting_start"; then
         wait "$starting_pid" 2>/dev/null || true
-        status critical "Failed to start; check $RECORDER_LOG"
+        report_start_failure
         rm -f "$RECORDER_PID_FILE"
         return 1
     fi
