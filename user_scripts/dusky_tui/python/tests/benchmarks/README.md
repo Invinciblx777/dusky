@@ -1,6 +1,6 @@
 # Dusky TUI: current benchmark handoff
 
-Start here. This folder is self-contained; no previous AI plan or RAM workspace is required. Production code is adjacent under `../../frontend`, `../../engines` and `../../main`; the UFW schema is `../../../../network_manager/tui_ufw.py`.
+Start here. This folder is self-contained; no previous AI plan or RAM workspace is required. Production code is adjacent under `../../frontend`, `../../engines` and `../../main`; the UFW schema is `../../../../network_manager/tui_firewall.py`.
 
 ## Contents
 
@@ -22,7 +22,7 @@ From an installed Dusky tree:
 ```sh
 cd "$HOME/user_scripts/dusky_tui/python/tests/benchmarks"
 python3 benchmark_startup.py fixture.py --runs 1 --tabs 1,2 --observe 0.5 --timeout 60 --output /tmp/dusky-smoke.json
-sudo python3 benchmark_startup.py "$HOME/user_scripts/network_manager/tui_ufw.py" --runs 5 --tabs 1,2,14 --observe 3.2 --timeout 180 --label '8 W configured; headless; uncontrolled caches' --output /tmp/dusky-ufw-current.json
+sudo python3 benchmark_startup.py "$HOME/user_scripts/network_manager/tui_firewall.py" --runs 5 --tabs 1,2,14 --observe 3.2 --timeout 180 --label '8 W configured; headless; uncontrolled caches' --output /tmp/dusky-ufw-current.json
 ```
 
 Set and confirm the intended power envelope yourself before collecting comparisons. The profiler records available powercap limits; it does not change them or prove that actual power consumption is 8 W. Use the same firewall state, power settings, viewport, schema, navigation, observation duration and background workload for comparisons. It performs read/inspection and tab navigation, with no simulated save/reset actions; schema startup behavior still runs normally. UFW requires root, and the benchmark deliberately rejects launcher sudo re-execution. Inspect every run's errors, stderr and external command return codes: nonzero commands may be recorded without failing the workload.

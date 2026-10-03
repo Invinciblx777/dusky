@@ -342,7 +342,7 @@ class RuleSnapshotTests(unittest.TestCase):
 class UfwViewTests(unittest.TestCase):
     def test_collectors_read_once_and_reports_render_collected_content(self):
         import importlib.util
-        schema_path = Path(__file__).resolve().parents[3] / "network_manager" / "tui_ufw.py"
+        schema_path = Path(__file__).resolve().parents[3] / "network_manager" / "tui_firewall.py"
         spec = importlib.util.spec_from_file_location("dusky_ufw_test_schema", schema_path)
         schema = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(schema)

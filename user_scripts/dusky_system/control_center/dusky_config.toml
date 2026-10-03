@@ -2073,11 +2073,11 @@ icon = "security-high-symbolic"
 style = "suggested"
 [pages.layout.items.properties.buttons.on_press]
 type = "exec"
-command = "foot --app-id=dusky_tui --hold python3 $HOME/user_scripts/network_manager/tui_ufw.py"
+command = "foot --app-id=dusky_tui --hold python3 $HOME/user_scripts/network_manager/tui_firewall.py"
 
 [pages.layout.items.on_press]
 type = "exec"
-command = "foot --app-id=dusky_tui --hold python3 $HOME/user_scripts/network_manager/tui_ufw.py"
+command = "foot --app-id=dusky_tui --hold python3 $HOME/user_scripts/network_manager/tui_firewall.py"
 terminal = false
 
 

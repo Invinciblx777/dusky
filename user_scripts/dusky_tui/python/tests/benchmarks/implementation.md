@@ -26,7 +26,7 @@ These choices remove application layout feedback and worker-side Rich rendering.
 
 `python/engines/ufw.py`: `load_state` supplies one explicit numbered-rule snapshot to all fourteen common-service checks. `is_service_allowed` and `get_banned_ips` accept optional snapshots; an empty supplied list is valid and must not trigger another read. Standalone getters retain their own-read behavior.
 
-`network_manager/tui_ufw.py`: six Rich views separate worker collection from pure rendering. Dashboard banned-IP classification reuses its rule snapshot. No cross-engine parallelism is implemented; one UFW engine cannot benefit from cross-engine scheduling. Mutable engine operations remain serialized with saves.
+`network_manager/tui_firewall.py`: six Rich views separate worker collection from pure rendering. Dashboard banned-IP classification reuses its rule snapshot. No cross-engine parallelism is implemented; one UFW engine cannot benefit from cross-engine scheduling. Mutable engine operations remain serialized with saves.
 
 ## Expensive custom-view contract
 
