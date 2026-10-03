@@ -122,6 +122,10 @@ CORE_USER_DEFS = {
         "Dusky Clipboard Manager",
         "Unified Wayland clipboard history and persistence daemon (cliphist + wl-clip-persist). Seamlessly records copied text and images to SQLite history, preserves clipboard selections even after source apps close, and supports live RAM/disk persistence switching without reboot.",
     ),
+    "dusky_vdagent.service": (
+        "VM Clipboard Sharing",
+        "Shares text and images between this Wayland guest and its host through the virt-manager or virt-viewer SPICE console. Enable to start clipboard sharing with graphical sessions; disable to stop it. File sharing is handled separately by the guest's virtiofs mount.",
+    ),
     "dusky_ram_monitor.service": (
         "Dusky RAM Monitor",
         "Background monitor that alerts you if physical RAM usage exceeds 95% or ZRAM swap occupancy exceeds 90%. Clicking the alert opens an interactive Rofi menu to select and terminate memory-heavy processes before a system crash.",
@@ -341,7 +345,8 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _fast_exec:
 CORE_USER_SECTIONS = (
     ("Desktop & Session", (
         "hyprsunset.service", "hypridle.service", "osd_lock.service",
-        "dusky_polkit.service", "dusky_clipboard.service", "dusky_oom_shield.service",
+        "dusky_polkit.service", "dusky_clipboard.service", "dusky_vdagent.service",
+        "dusky_oom_shield.service",
         "wireplumber.service",
     )),
     ("Remote Displays & Streaming", (
