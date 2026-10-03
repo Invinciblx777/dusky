@@ -2,7 +2,7 @@
 # Rofi capture controls and INI configuration for gpu-screen-recorder on Wayland.
 set -euo pipefail
 
-readonly CFG="${XDG_CONFIG_HOME:-$HOME/.config}/dusky_recorder/config.conf"
+readonly CFG="${XDG_CONFIG_HOME:-$HOME/.config}/dusky/settings/dusky_recorder/config.conf"
 readonly ROFI_THEME_STR='window { padding: 20px 12px; border: 2px; } inputbar { spacing: 1ch; padding: 12px; } element { padding: 8px 12px; children: [element-text]; } listview { lines: 8; }'
 readonly RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$UID}"
 readonly RECORDER_STATE_DIR="$RUNTIME_DIR/dusky-recorder"
@@ -37,6 +37,9 @@ load_config() {
     done < "$CFG"
 }
 shopt -s extglob
+if [[ ! -f "$CFG" ]]; then
+    python3 "$(dirname -- "${BASH_SOURCE[0]}")/recorder_config.py"
+fi
 load_config
 
 window=${window:-screen}
@@ -56,7 +59,7 @@ output_dir=${output_dir:-$HOME/Videos}
 if [[ "$output_dir" == '~' || "$output_dir" == '~/'* ]]; then
     output_dir="$HOME${output_dir:1}"
 fi
-audio_codec=${audio_codec:-opus}
+audio_codec=${audio_codec:-aac}
 audio_bitrate=${audio_bitrate:-128}
 audio_output=${audio_output:-default_output}
 audio_input=${audio_input:-none}
