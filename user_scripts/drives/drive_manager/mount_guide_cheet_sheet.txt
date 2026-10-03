@@ -1,7 +1,8 @@
 ================================================================================
  UNIVERSAL DRIVE MANAGER & MOUNT ARCHITECTURE CHEAT SHEET (ARCH LINUX 2026.09)
 ================================================================================
-Normative reference for Linux 7.2+, util-linux 2.42+, cryptsetup 2.8+, Python 3.14+.
+Runtime reference for Linux 7.3+, util-linux 2.42+, cryptsetup 2.8+, systemd 262.
+Planned ISO Python floor: 3.15.rc3; current machine: 3.14.7 (verify final ISO).
 
 --------------------------------------------------------------------------------
  1. CLI USAGE & RUNTIME BEHAVIOUR
@@ -131,6 +132,13 @@ f2fs    | flash only    | atgc,gc_merge,lazytime,compress_algorithm=zstd:6 | nee
   preallocated_size= (not 'prealloc').
 * Lifecycle Hooks: drives.toml supports 'post_unlock', 'pre_lock', and 'post_lock' commands
   (strings or lists of strings, executed unprivileged with $DRIVE_NAME and $DRIVE_MOUNTPOINT).
+  Any hook failure returns failure; failed pre_lock aborts before unmount. Browser unlock
+  uses systemctl start (idempotent); pre_lock stops the unit and verifies RAM unsync.
+  Close Firefox before locking browser; --force no longer bypasses its profile lock.
+  The Firefox service uses --disk-fallback: insufficient RAM/disk headroom or an active
+  disk profile keeps Firefox on disk without failing unlock. The resync timer skips
+  these disk profiles. Changed checkpoint files use atomic replacement, requiring
+  temporary space; a failed checkpoint retains RAM data and the previous disk files.
 * Teardown ladder: cancel queued TRIM unit (best-effort) -> pre_lock hooks -> umount -i (5x,
   busy resolver, foreign mounts refused) -> blockdev --flushbufs -> cryptsetup close
   -> 5x retry -> cryptsetup close --deferred (reported as FAILURE until gone) -> post_lock hooks

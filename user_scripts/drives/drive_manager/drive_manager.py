@@ -692,7 +692,7 @@ def clear_attempts(name: str) -> None:
 #  KEYRING (SECRET SERVICE) — every D-Bus wait is bounded
 # ------------------------------------------------------------------------------
 def is_gui_available() -> bool:
-    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    return bool(os.environ.get("WAYLAND_DISPLAY"))
 
 
 def _secret_service_collection():
@@ -732,7 +732,7 @@ def ensure_keyring_unlocked() -> bool:
     if coll is None or not coll.is_locked():
         return True
     if not is_gui_available():
-        log("Keyring is locked and no DISPLAY/WAYLAND_DISPLAY is set (TTY/headless). Using terminal prompt.")
+        log("Keyring is locked and no WAYLAND_DISPLAY is set (TTY/headless). Using terminal prompt.")
         return False
     log("Keyring is locked. Requesting unlock through the desktop Secret Service prompt...")
     try:
@@ -1336,8 +1336,7 @@ def do_unlock(drive: Drive, secret: str | None, *, interactive: bool, all_mountp
         if not reconcile_integrations(drive):
             return Outcome.FAILED
         success(f"'{drive.name}' is already mounted at {escape(str(target))}.")
-        run_hooks(drive, "post_unlock", drive.post_unlock)
-        return Outcome.OK
+        return Outcome.OK if run_hooks(drive, "post_unlock", drive.post_unlock) else Outcome.FAILED
     for stale in mounts:
         log(f"'{drive.name}' is mounted at divergent path {escape(str(stale))}; relocating to {escape(str(target))}...")
         if not unmount_path(stale, fs_dev, expected, interactive=interactive):
@@ -1443,14 +1442,15 @@ def do_unlock(drive: Drive, secret: str | None, *, interactive: bool, all_mountp
         return Outcome.FAILED
     dispatch_trim(drive, source_dev, fstype, rotational, mounted)
     if not run_hooks(drive, "post_unlock", drive.post_unlock):
-        warn(f"One or more post_unlock hooks for '{drive.name}' failed.")
+        return Outcome.FAILED
     return Outcome.OK
 
 
 def do_lock(drive: Drive, *, interactive: bool, all_mountpoints: set[Path]) -> Outcome:
     log(f"Lock sequence for '{drive.name}' started.")
     if not run_hooks(drive, "pre_lock", drive.pre_lock):
-        warn(f"One or more pre_lock hooks for '{drive.name}' failed.")
+        err(f"Aborting lock of '{drive.name}': pre_lock hook failed; filesystem remains mounted.")
+        return Outcome.FAILED
     stop_trim(drive)  # best-effort: a queued TRIM must not run on a later fs at this path
 
     # --- Step 1: unmount everywhere ----------------------------------------------------------
@@ -1477,8 +1477,7 @@ def do_lock(drive: Drive, *, interactive: bool, all_mountpoints: set[Path]) -> O
 
     if drive.type is DriveType.SIMPLE:
         success(f"'{drive.name}' released.")
-        run_hooks(drive, "post_lock", drive.post_lock)
-        return Outcome.OK
+        return Outcome.OK if run_hooks(drive, "post_lock", drive.post_lock) else Outcome.FAILED
 
     # --- Step 2: close crypt container -------------------------------------------------------
     outer_dev = resolve_device(drive.outer_uuid)
@@ -1488,8 +1487,7 @@ def do_lock(drive: Drive, *, interactive: bool, all_mountpoints: set[Path]) -> O
             success(f"'{drive.name}' is physically absent and no mapping remains.")
         else:
             success(f"Container of '{drive.name}' is already locked.")
-        run_hooks(drive, "post_lock", drive.post_lock)
-        return Outcome.OK
+        return Outcome.OK if run_hooks(drive, "post_lock", drive.post_lock) else Outcome.FAILED
     if outer_dev is None:
         warn(f"Physical device gone but ghost mapping /dev/mapper/{mapping.name} remains; forcing teardown.")
 
@@ -1497,14 +1495,12 @@ def do_lock(drive: Drive, *, interactive: bool, all_mountpoints: set[Path]) -> O
     log(f"Closing crypt node {mapping.name}...")
     if close_container(mapping.name):
         success(f"'{drive.name}' locked.")
-        run_hooks(drive, "post_lock", drive.post_lock)
-        return Outcome.OK
+        return Outcome.OK if run_hooks(drive, "post_lock", drive.post_lock) else Outcome.FAILED
     for attempt in range(1, LOCK_MAX_RETRIES + 1):
         time.sleep(LOCK_RETRY_DELAY)
         if close_container(mapping.name):
             success(f"'{drive.name}' locked (attempt {attempt + 1}).")
-            run_hooks(drive, "post_lock", drive.post_lock)
-            return Outcome.OK
+            return Outcome.OK if run_hooks(drive, "post_lock", drive.post_lock) else Outcome.FAILED
         log(f"Close attempt {attempt}/{LOCK_MAX_RETRIES} for '{drive.name}' failed; retrying...")
     log(f"'{drive.name}' is still held; requesting deferred close (kernel removes it when the last opener exits)...")
     if close_container(mapping.name, deferred=True):
@@ -1793,7 +1789,8 @@ def load_config(override: Path | None) -> dict[str, Drive]:
                            *((f"symlink {s}", str(s)) for s in d.symlinks)):
             if key is None:
                 continue
-            k = f"{label.split()[0]}::{key}"
+            namespace = "uuid" if label in {"outer_uuid", "inner_uuid"} else "symlink"
+            k = f"{namespace}::{key}"
             if k in seen and seen[k] != d.name:
                 err(f"Config error: {label} '{key}' is shared by drives '{seen[k]}' and '{d.name}'")
                 sys.exit(EXIT_FAIL)

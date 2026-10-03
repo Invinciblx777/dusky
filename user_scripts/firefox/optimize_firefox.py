@@ -1,7 +1,7 @@
-#!/usr/bin/env python3.14
+#!/usr/bin/env python3
 """
 optimize_firefox.py - Bleeding-edge Firefox 156+ HTTP cache-policy & RAM profile manager.
-Target: Arch Linux (kernel 7.2+, rolling), Python 3.14.7+, Firefox 156+ only.
+Target: Arch Linux (kernel 7.3+, rolling), Python 3.14.7+, Firefox 156+ only.
 
 Zero backwards-compatibility shims for legacy Python (< 3.14) or legacy Firefox (< 156).
 
@@ -14,10 +14,12 @@ Capabilities:
     --cache-mode default (or --disable)
         Restore the exact baseline user.js and managed prefs.js saved by this tool.
 
-    --sync [--sync-mode auto|overlay|copy]
+    --sync [--sync-mode auto|overlay|copy] [--disk-fallback]
         Synchronize Firefox profile(s) into volatile RAM (tmpfs).
         Eliminates SSD write amplification from SQLite (cookies, places, sessionstore).
         Uses fuse-overlayfs when available for zero-copy startup and minimal RAM usage.
+        --disk-fallback keeps profiles on disk when resources are insufficient or
+        Firefox is already using the disk profile; intended for service automation.
 
     --unsync [--force]
         Synchronize latest profile state from volatile RAM back to persistent disk,
@@ -25,7 +27,8 @@ Capabilities:
 
     --resync
         Perform an incremental one-shot sync from active RAM profile to disk backing.
-        Fully safe to run while Firefox is actively running in RAM.
+        May run while Firefox is active; live copies are best-effort checkpoints,
+        not transactionally consistent SQLite snapshots.
 
     --daemon [--interval SECONDS]
         Run persistent background daemon: syncs on start, resyncs periodically (default 3600s),
@@ -47,7 +50,7 @@ Capabilities:
 
 Architectural highlights:
     * Integrated Profile Sync Daemon (PSD) Engine: Native Python 3.14+ implementation
-      of transparent RAM profile relocation with fuse-overlayfs and atomic rsync.
+      of transparent RAM profile relocation with fuse-overlayfs and rsync checkpoints.
     * Linux Open File Description (OFD) locking (fcntl.F_OFD_SETLK):
       True mutual exclusion with Firefox's nsProfileLock (F_SETLK), immune to POSIX
       record-lock release-on-close hazards. Probes holding PID with F_OFD_GETLK (exit 3).
@@ -57,7 +60,7 @@ Architectural highlights:
     * Directory-pinned atomic replacement (openat / renameat): TOCTOU-resistant file updates.
     * Strict umask independence: explicit 0600 file modes and 0700 directory modes.
     * Autonomous crash-recovery: detects ungraceful reboots/power loss and restores
-      the latest disk checkpoint automatically without data loss.
+      the latest completed disk checkpoint; changes since it may be lost.
 """
 
 from __future__ import annotations
@@ -77,7 +80,7 @@ if not sys.platform.startswith("linux"):
 
 import argparse
 import configparser
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 import fcntl
 import hashlib
@@ -273,6 +276,10 @@ def configure_logging(verbose: bool) -> None:
 
 class SafetyError(RuntimeError):
     """An unsafe, invalid, or conflicting condition was detected."""
+
+
+class RamSyncUnavailable(SafetyError):
+    """Optional RAM relocation cannot start with the available resources."""
 
 
 class ProfileLockedError(SafetyError):
@@ -586,7 +593,7 @@ def probe_lock_holder(fd: int) -> int | None:
     lock_type, _, _, _, holder = _FLOCK.unpack_from(raw)
     if lock_type == fcntl.F_UNLCK:
         return None
-    return holder if holder > 0 else None
+    return holder if holder > 0 else -1
 
 
 def symlink_lock_holder(dir_fd: int) -> tuple[str, int, bool] | None:
@@ -631,8 +638,8 @@ def probe_profile_lock(profile_path: Path) -> int | None:
                 return probe_lock_holder(fd) or -1
         finally:
             os.close(fd)
-    except OSError:
-        return None
+    except OSError as error:
+        raise SafetyError(f"Cannot inspect profile lock at {parentlock}: {oserror_detail(error)}") from error
 
 
 @contextmanager
@@ -1120,18 +1127,21 @@ class Profile:
         return hashlib.sha256(os.fsencode(self.path)).hexdigest()[:24]
 
 
-def validate_profile(candidate: Path, table: Sequence[MountEntry]) -> Profile:
+def validate_profile(candidate: Path, table: Sequence[MountEntry], *, recover: bool = False) -> Profile:
     expanded = candidate.expanduser()
     if not expanded.is_absolute():
         expanded = Path.cwd() / expanded
 
+    if recover:
+        check_and_recover_ungraceful_state(expanded, table)
+    expanded = expanded.parent.resolve() / expanded.name
     is_synced, vtarget, smode = is_profile_synced(expanded)
 
     try:
         resolved = expanded.resolve(strict=True)
     except FileNotFoundError as error:
         # Check if this is an ungraceful crash state where symlink is broken
-        if check_and_recover_ungraceful_state(expanded, table):
+        if recover and check_and_recover_ungraceful_state(expanded, table):
             resolved = expanded.resolve(strict=True)
         else:
             raise SafetyError(f"Profile directory does not exist: {expanded}") from error
@@ -1167,19 +1177,19 @@ def validate_profile(candidate: Path, table: Sequence[MountEntry]) -> Profile:
     return Profile(expanded, info.st_dev, info.st_ino, fstype)
 
 
-def select_profiles(explicit: Sequence[Path], table: Sequence[MountEntry]) -> list[Profile]:
+def select_profiles(explicit: Sequence[Path], table: Sequence[MountEntry], *, recover: bool = False) -> list[Profile]:
     if explicit:
-        profiles_found = [validate_profile(path, table) for path in explicit]
+        profiles_found = [validate_profile(path, table, recover=recover) for path in explicit]
     else:
         profiles_found = []
         for root in profile_roots():
             for candidate in registered_profiles(root):
                 try:
-                    profiles_found.append(validate_profile(candidate, table))
+                    profiles_found.append(validate_profile(candidate, table, recover=recover))
                 except UninitializedProfileError as error:
                     LOGGER.warning("Skipping: %s", error)
                 except SafetyError as error:
-                    LOGGER.warning("Skipping registered profile %s: %s", candidate, error)
+                    raise SafetyError(f"Cannot use registered profile {candidate}: {error}") from error
 
     by_path: dict[Path, Profile] = {}
     for prof in profiles_found:
@@ -1338,24 +1348,22 @@ def prepare_profile(
         )
 
     state = decode_state(state_text)
-    expected_applied = generated_user_js(state.original_user_js, capacity_override)
-
-    if sha256_text(expected_applied) != state.applied_sha256 and capacity_override is None:
-        fail(
-            f"{profile.path}: rollback state hash does not match emitted block. "
-            "Reconcile with backup and rerun."
-        )
-
-    if user_js not in (state.original_user_js, expected_applied):
-        fail(
-            f"{profile.path}: user.js modified outside this tool. "
-            "Reconcile edits with backup and rerun."
-        )
-
+    if user_js != state.original_user_js and sha256_text(user_js) != state.applied_sha256:
+        fail(f"{profile.path}: user.js modified outside this tool; reconcile edits with backup and rerun.")
     if memory_mode:
+        expected_applied = (
+            user_js if capacity_override is None and sha256_text(user_js) == state.applied_sha256
+            else generated_user_js(state.original_user_js, capacity_override)
+        )
+        new_state = state_text
+        if sha256_text(expected_applied) != state.applied_sha256:
+            new_state = encode_state(RollbackState(
+                state.original_user_js, state.baseline_prefs,
+                sha256_text(expected_applied), state.migrated_from_legacy,
+            ), profile)
         return ProfilePlan(
             profile, user_js, prefs_js, state_text,
-            expected_applied, prefs_js, state_text, advisories,
+            expected_applied, prefs_js, new_state, advisories,
         )
 
     return ProfilePlan(
@@ -1749,20 +1757,21 @@ class PsdPaths:
     state_file: Path
 
 
-def get_volatile_root() -> Path:
+def get_volatile_root(*, create: bool = False) -> Path:
     xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
     if xdg_runtime:
         base = Path(xdg_runtime)
     else:
         base = Path(f"/run/user/{os.geteuid()}")
         if not base.is_dir():
-            base = Path("/dev/shm")
+            base = Path("/dev/shm") / f"firefox-sync-uid{os.geteuid()}"
     vroot = base / VOLATILE_SUBDIR
-    try:
-        vroot.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(vroot, 0o700)
-    except OSError as err:
-        fail(f"Cannot create volatile RAM directory {vroot}: {oserror_detail(err)}")
+    if create:
+        try:
+            vroot.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chmod(vroot, 0o700)
+        except OSError as err:
+            fail(f"Cannot create volatile RAM directory {vroot}: {oserror_detail(err)}")
     return vroot
 
 
@@ -1774,9 +1783,17 @@ def get_psd_paths(profile_path: Path) -> PsdPaths:
 
     vroot = get_volatile_root()
     user = os.environ.get("USER") or f"uid{os.geteuid()}"
-    suffix = f"{user}-firefox-{name}"
+    identity = hashlib.sha256(os.fsencode(profile_path.parent.resolve() / name)).hexdigest()[:16]
+    suffix = f"{user}-firefox-{name}-{identity}"
 
     v_mount = vroot / suffix
+    if profile_path.is_symlink():
+        target = profile_path.readlink()
+        if not target.is_absolute():
+            target = (profile_path.parent / target).resolve()
+        if target.is_relative_to(vroot):
+            v_mount = target
+            suffix = target.name
     v_upper = vroot / f"{suffix}-rw"
     v_work = vroot / f".{suffix}-work"
     flag = v_mount / PSD_FLAG_FILE
@@ -1802,108 +1819,107 @@ def is_profile_synced(profile_path: Path) -> tuple[bool, Path | None, str | None
             if not target.is_absolute():
                 target = (profile_path.parent / target).resolve()
             if target.is_relative_to(vroot) or str(target).startswith("/run/user/") or str(target).startswith("/dev/shm/"):
+                if not target.exists():
+                    return True, target, None  # A reboot can leave a broken RAM link.
                 state_file = target / PSD_STATE_FILE
-                mode = "overlay"
-                if state_file.is_file():
-                    try:
-                        doc = json.loads(state_file.read_text("utf-8"))
-                        mode = doc.get("mode", "overlay")
-                    except Exception:
-                        pass
+                try:
+                    doc = json.loads(state_file.read_text("utf-8"))
+                except (OSError, ValueError) as error:
+                    raise SafetyError(f"Cannot read RAM sync state at {state_file}; profile preserved: {error}") from error
+                if not isinstance(doc, dict) or doc.get("tool") != TOOL_ID or doc.get("mode") not in {"copy", "overlay"}:
+                    fail(f"Invalid RAM sync state at {state_file}; profile preserved.")
+                mode = doc["mode"]
                 return True, target, mode
     except OSError:
         pass
     return False, None, None
 
 
+@contextmanager
+def psd_operation_lock() -> Iterator[None]:
+    """Serialize profile discovery/recovery, relocation and checkpoints."""
+    root = get_volatile_root(create=True)
+    fd = os.open(root / ".operation.lock", os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise SafetyError("Another Firefox optimizer operation is running; retry after it finishes.") from error
+        yield
+    finally:
+        os.close(fd)
+
+
 def sync_directories(src: Path, dst: Path, exclude: Sequence[str] = (), delete: bool = True) -> None:
-    """Fast, atomic directory tree sync using rsync or fallback pure-Python walker."""
+    """Replace completed files atomically and propagate every transfer failure.
+
+    Changed files need temporary disk space; a live tree is not an atomic snapshot.
+    """
     rsync = shutil.which("rsync")
-    if rsync:
-        cmd = [rsync, "-aX", "--inplace", "--no-whole-file"]
-        if delete:
-            cmd.append("--delete-after")
-        for ex in exclude:
-            cmd.extend(["--exclude", ex])
-        cmd.extend([f"{src}/", f"{dst}/"])
-        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if res.returncode != 0:
-            raise SafetyError(f"rsync failed (code {res.returncode}): {res.stderr.strip()}")
-    else:
-        # Fallback pure-Python synchronization
-        dst.mkdir(parents=True, exist_ok=True)
-        exclude_set = set(exclude)
-        src_files = set()
-        for root, dirs, files in os.walk(src):
-            rel_dir = Path(root).relative_to(src)
-            target_dir = dst / rel_dir
-            target_dir.mkdir(parents=True, exist_ok=True)
-            for f in files:
-                if f in exclude_set:
-                    continue
-                s_file = Path(root) / f
-                d_file = target_dir / f
-                src_files.add(str(d_file.relative_to(dst)))
-                try:
-                    shutil.copy2(s_file, d_file, follow_symlinks=False)
-                except Exception:
-                    pass
-        if delete:
-            for root, dirs, files in os.walk(dst):
-                for f in files:
-                    d_file = Path(root) / f
-                    rel = str(d_file.relative_to(dst))
-                    if rel not in src_files and f not in exclude_set:
-                        with suppress(OSError):
-                            d_file.unlink(missing_ok=True)
+    if rsync is None:
+        fail("rsync is required for profile RAM synchronization.")
+    if not src.is_dir():
+        fail(f"Sync source directory is missing: {src}")
+    cmd = [rsync, "-aX", "--fsync"]
+    if delete:
+        cmd.append("--delete-after")
+    for ex in sorted(set(exclude) | {PARENTLOCK, SYMLINK_LOCK, PSD_FLAG_FILE, PSD_STATE_FILE}):
+        cmd.extend(["--exclude", f"/{ex}"])
+    cmd.extend(["--", f"{src}/", f"{dst}/"])
+    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if res.returncode != 0:
+        raise SafetyError(f"rsync failed (code {res.returncode}): {res.stderr.strip()}")
+    fsync_directory_path(dst)
 
 
 def check_and_recover_ungraceful_state(profile_path: Path, table: Sequence[MountEntry]) -> bool:
+    """Restore a missing RAM profile by renaming its backing, without duplicating it."""
     paths = get_psd_paths(profile_path)
-
     if profile_path.is_symlink():
-        target = profile_path.resolve()
-        if not target.exists() or not (target / PSD_FLAG_FILE).exists():
-            LOGGER.warning("Ungraceful state detected for %s (broken or unflagged RAM link)", profile_path)
-            profile_path.unlink(missing_ok=True)
-        else:
+        synced, target, _ = is_profile_synced(profile_path)
+        if not synced:
+            return False  # An ordinary profile symlink is not RAM-sync state.
+        if target is not None and target.is_dir():
+            if not (target / PSD_FLAG_FILE).is_file():
+                fail(f"Unflagged RAM profile at {target}; preserve it and inspect before recovery.")
             return False
+    elif profile_path.exists():
+        if paths.backup_path.exists():
+            fail(f"Both profile and backing exist: {profile_path}, {paths.backup_path}; reconcile them first.")
+        return False
 
-    if paths.backup_path.is_dir():
-        now_str = time.strftime("%Y%m%d_%H%M%S")
-        if profile_path.is_dir() and not profile_path.is_symlink():
-            old_prof = profile_path.parent / f"{profile_path.name}-conflict-{now_str}"
-            LOGGER.warning("Both %s and backup exist. Rotating existing to %s", profile_path, old_prof)
-            profile_path.rename(old_prof)
-
-        if paths.back_ovfs_path.is_dir():
-            has_files = False
-            try:
-                has_files = any(paths.back_ovfs_path.iterdir())
-            except Exception:
-                pass
-            if has_files:
-                with suppress(Exception):
-                    sync_directories(paths.back_ovfs_path, paths.backup_path, delete=False)
-            shutil.rmtree(paths.back_ovfs_path, ignore_errors=True)
-
-        target_to_keep = paths.backup_path
-        LOGGER.info("Recovering profile from persistent snapshot %s -> %s", target_to_keep.name, profile_path.name)
-        crash_snap = profile_path.parent / f"{profile_path.name}{CRASH_RECOVERY_PREFIX}{now_str}"
-        try:
-            shutil.copytree(target_to_keep, crash_snap, symlinks=True)
-            LOGGER.info("Created crash-recovery snapshot: %s", crash_snap.name)
-        except Exception as e:
-            LOGGER.warning("Could not create crash-recovery snapshot: %s", e)
-
-        target_to_keep.rename(profile_path)
+    if not paths.backup_path.is_dir():
+        return False
+    restored = paths.backup_path
+    if paths.back_ovfs_path.is_dir() and any(paths.back_ovfs_path.iterdir()):
+        if not (paths.back_ovfs_path / PSD_STATE_FILE).is_file():
+            fail(f"Incomplete overlay checkpoint at {paths.back_ovfs_path}; preserve both disk copies for inspection.")
+        # A completed merged checkpoint can be restored directly, including deletions.
+        restored = paths.back_ovfs_path
+    LOGGER.warning("Restoring %s from its last disk checkpoint; newer RAM changes may be lost.", profile_path)
+    if profile_path.is_symlink():
+        profile_path.unlink()
+    restored.rename(profile_path)
+    fsync_directory_path(profile_path.parent)
+    if restored == paths.back_ovfs_path:
         shutil.rmtree(paths.backup_path, ignore_errors=True)
-        return True
-
-    return False
+    else:
+        shutil.rmtree(paths.back_ovfs_path, ignore_errors=True)
+    return True
 
 
 def sync_profile_to_ram(profile: Profile, mode: str = "auto", table: Sequence[MountEntry] | None = None) -> dict:
+    if is_profile_synced(profile.path)[0]:
+        return _sync_profile_to_ram(profile, mode, table)
+    dir_fd = open_directory(profile.path.resolve())
+    try:
+        with locked_profile(profile, dir_fd):
+            return _sync_profile_to_ram(profile, mode, table)
+    finally:
+        os.close(dir_fd)
+
+
+def _sync_profile_to_ram(profile: Profile, mode: str = "auto", table: Sequence[MountEntry] | None = None) -> dict:
     tbl = table or read_mount_table()
     paths = get_psd_paths(profile.path)
 
@@ -1914,68 +1930,39 @@ def sync_profile_to_ram(profile: Profile, mode: str = "auto", table: Sequence[Mo
         LOGGER.info("Profile %s is already synced to RAM at %s (mode: %s)", profile.path.name, vtarget, cur_mode)
         return {"status": "already_synced", "volatile": str(vtarget), "mode": cur_mode}
 
-    holder = probe_profile_lock(profile.path)
-    if holder is not None:
-        pname = process_name(holder) or "unknown"
-        raise ProfileLockedError(
-            f"Cannot sync profile {profile.path.name} to RAM while Firefox is running (PID {holder} '{pname}'). "
-            "Close Firefox completely and rerun."
-        )
-
-    # Check RAM capacity advisory (< 8 GB)
-    try:
-        with open("/proc/meminfo", "r") as mf:
-            for line in mf:
-                if line.startswith("MemTotal:"):
-                    mem_kb = int(line.split()[1])
-                    if mem_kb < 8 * 1024 * 1024:
-                        LOGGER.warning(
-                            "Host has %s RAM (< 8 GiB). Proceeding with RAM sync; overlay mode is recommended to minimize memory usage.",
-                            human_bytes(mem_kb * 1024),
-                        )
-                    break
-    except Exception:
-        pass
-
     has_fuse_ovfs = shutil.which("fuse-overlayfs") is not None
+    if mount_for(tbl, get_volatile_root()).fstype != "tmpfs":
+        raise RamSyncUnavailable("RAM profile storage must be on tmpfs.")
+    prof_size = dir_size(profile.path)
+    ram_free = shutil.disk_usage(get_volatile_root()).free
     if mode == "auto":
-        # 'copy' (direct tmpfs) is the premier engine: native Linux tmpfs memory speed (no FUSE IPC),
-        # zero disk bloat (no duplicate profile replica on disk), and maximum stability.
-        # 'overlay' is used if explicitly selected via --sync-mode overlay, or if RAM is < 4 GiB
-        # and disk partition has at least 2.5x free space to accommodate staging replicas.
-        mem_kb = 16 * 1024 * 1024
-        try:
-            with open("/proc/meminfo", "r") as mf:
-                for line in mf:
-                    if line.startswith("MemTotal:"):
-                        mem_kb = int(line.split()[1])
-                        break
-        except Exception:
-            pass
-
-        try:
-            prof_size = get_dir_size(profile.path)
-            disk_free = shutil.disk_usage(profile.path.parent).free
-        except Exception:
-            prof_size = 0
-            disk_free = 10**12
-
-        if mem_kb < 4 * 1024 * 1024 and has_fuse_ovfs and disk_free >= int(prof_size * 2.5):
-            mode = "overlay"
-        else:
-            mode = "copy"
-    elif mode == "overlay" and not has_fuse_ovfs:
-        fail("fuse-overlayfs requested but binary is not found on PATH.")
+        mode = "copy" if ram_free >= prof_size + BACKUP_HEADROOM_BYTES else "overlay"
+    if mode == "overlay" and not has_fuse_ovfs:
+        raise RamSyncUnavailable("Insufficient tmpfs capacity for copy mode and/or fuse-overlayfs is unavailable.")
+    if mode == "overlay" and shutil.which("fusermount3") is None:
+        raise RamSyncUnavailable("fusermount3 is required for overlay teardown.")
+    if mode == "copy" and ram_free < prof_size + BACKUP_HEADROOM_BYTES:
+        raise RamSyncUnavailable(f"Insufficient RAM filesystem space: {human_bytes(ram_free)} available for {human_bytes(prof_size)} profile.")
+    if shutil.disk_usage(profile.path.parent).free < BACKUP_HEADROOM_BYTES:
+        raise RamSyncUnavailable(f"Insufficient disk headroom at {profile.path.parent}; free at least {human_bytes(BACKUP_HEADROOM_BYTES)} before RAM sync.")
+    if mode == "overlay" and shutil.disk_usage(profile.path.parent).free < prof_size + BACKUP_HEADROOM_BYTES:
+        raise RamSyncUnavailable("Overlay mode requires disk space for a full merged checkpoint in addition to its lower profile.")
+    if shutil.which("rsync") is None:
+        raise RamSyncUnavailable("rsync is required for profile RAM synchronization.")
 
     LOGGER.info("Syncing %s to RAM (engine: %s)...", profile.path.name, mode)
 
     if paths.backup_path.exists():
         fail(f"Backup path {paths.backup_path} already exists. Inconsistent state; check backups.")
 
-    profile.path.rename(paths.backup_path)
-    fsync_directory_path(profile.path.parent)
-
+    temp_link = profile.path.parent / f".tmp-psd-link-{uuid.uuid7().hex}"
+    moved = False
     try:
+        # Allocate the link before moving or copying a potentially large profile.
+        os.symlink(paths.volatile_mount, temp_link)
+        profile.path.rename(paths.backup_path)
+        moved = True
+        fsync_directory_path(profile.path.parent)
         paths.volatile_mount.mkdir(mode=0o700, parents=True, exist_ok=True)
 
         if mode == "overlay":
@@ -2005,18 +1992,21 @@ def sync_profile_to_ram(profile: Profile, mode: str = "auto", table: Sequence[Mo
         paths.state_file.write_text(json.dumps(state_data, indent=2), encoding="utf-8")
         paths.flag_file.touch(mode=0o600)
 
-        temp_link = profile.path.parent / f".tmp-psd-link-{uuid.uuid7().hex}"
-        os.symlink(paths.volatile_mount, temp_link)
         os.replace(temp_link, profile.path)
         fsync_directory_path(profile.path.parent)
 
         LOGGER.info("Successfully synced %s to RAM (%s)", profile.path.name, paths.volatile_mount)
         return {"status": "synced", "volatile": str(paths.volatile_mount), "mode": mode}
 
-    except Exception as e:
+    except BaseException as e:
+        temp_link.unlink(missing_ok=True)
+        if not moved:
+            raise
         LOGGER.error("Failed to sync to RAM: %s. Rolling back...", e)
         if mode == "overlay" and is_mountpoint(paths.volatile_mount):
-            subprocess.run(["fusermount3", "-u", str(paths.volatile_mount)], check=False)
+            result = subprocess.run(["fusermount3", "-u", str(paths.volatile_mount)], capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                raise SafetyError(f"Rollback unmount failed; RAM and backing preserved: {result.stderr.strip()}") from e
         shutil.rmtree(paths.volatile_mount, ignore_errors=True)
         shutil.rmtree(paths.volatile_upper, ignore_errors=True)
         shutil.rmtree(paths.volatile_work, ignore_errors=True)
@@ -2028,17 +2018,31 @@ def sync_profile_to_ram(profile: Profile, mode: str = "auto", table: Sequence[Mo
         raise
 
 
+def checkpoint_overlay(source: Path, destination: Path) -> None:
+    destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+    marker = destination / PSD_STATE_FILE
+    marker.unlink(missing_ok=True)
+    fsync_directory_path(destination)
+    sync_directories(source, destination)
+    dir_fd = open_directory(destination)
+    try:
+        write_config(dir_fd, PSD_STATE_FILE, json.dumps({"completed_at": time.time()}))
+    finally:
+        os.close(dir_fd)
+
+
 def resync_profile(profile_path: Path, table: Sequence[MountEntry] | None = None) -> dict:
     paths = get_psd_paths(profile_path)
     is_synced, vtarget, mode = is_profile_synced(profile_path)
     if not is_synced or vtarget is None:
         raise SafetyError(f"Profile {profile_path.name} is not currently synced to RAM.")
 
+    if not paths.backup_path.is_dir():
+        fail(f"Disk backing is missing: {paths.backup_path}; RAM profile preserved.")
     LOGGER.info("Resyncing %s from RAM to disk backing...", profile_path.name)
 
     if mode == "overlay":
-        paths.back_ovfs_path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        sync_directories(vtarget, paths.back_ovfs_path, exclude=[PSD_FLAG_FILE])
+        checkpoint_overlay(vtarget, paths.back_ovfs_path)
     else:
         sync_directories(vtarget, paths.backup_path, exclude=[PSD_FLAG_FILE])
 
@@ -2057,50 +2061,45 @@ def resync_profile(profile_path: Path, table: Sequence[MountEntry] | None = None
 
 def unsync_profile_from_ram(profile_path: Path, force: bool = False, table: Sequence[MountEntry] | None = None) -> dict:
     paths = get_psd_paths(profile_path)
-    is_synced, vtarget, mode = is_profile_synced(profile_path)
-    if not is_synced or vtarget is None:
-        LOGGER.info("Profile %s is not synced to RAM (already on persistent disk).", profile_path.name)
+    synced, vtarget, mode = is_profile_synced(profile_path)
+    if not synced or vtarget is None:
+        LOGGER.info("Profile %s is already on persistent disk.", profile_path.name)
         return {"status": "not_synced"}
-
-    holder = probe_profile_lock(profile_path)
-    if holder is not None and not force:
-        pname = process_name(holder) or "unknown"
-        raise ProfileLockedError(
-            f"Cannot unsync profile {profile_path.name} from RAM while Firefox is running (PID {holder} '{pname}'). "
-            "Close Firefox first, or specify --force."
-        )
-
-    LOGGER.info("Unsyncing %s from RAM back to disk...", profile_path.name)
-
+    if not paths.backup_path.is_dir():
+        fail(f"Disk backing is missing: {paths.backup_path}; RAM profile preserved.")
+    # A force flag cannot make moving an open Firefox profile reliable.
+    info = vtarget.stat()
+    profile = Profile(profile_path, info.st_dev, info.st_ino, "tmpfs")
+    dir_fd = open_directory(vtarget)
+    try:
+        with locked_profile(profile, dir_fd):
+            LOGGER.info("Unsyncing %s from RAM back to disk...", profile_path.name)
+            if mode == "overlay":
+                checkpoint_overlay(vtarget, paths.back_ovfs_path)
+            else:
+                sync_directories(vtarget, paths.backup_path)
+    finally:
+        os.close(dir_fd)
+    # Our directory and lock descriptors must be closed before a normal FUSE unmount.
+    restored = paths.backup_path
     if mode == "overlay":
-        if paths.back_ovfs_path.is_dir():
-            sync_directories(vtarget, paths.back_ovfs_path, exclude=[PSD_FLAG_FILE], delete=True)
-            sync_directories(paths.back_ovfs_path, paths.backup_path, exclude=[PSD_FLAG_FILE], delete=False)
-        else:
-            sync_directories(vtarget, paths.backup_path, exclude=[PSD_FLAG_FILE], delete=True)
-
-        if is_mountpoint(vtarget):
-            res = subprocess.run(["fusermount3", "-u", str(vtarget)], capture_output=True, text=True, check=False)
-            if res.returncode != 0:
-                subprocess.run(["fusermount3", "-u", "-z", str(vtarget)], check=False)
-
-        shutil.rmtree(paths.volatile_mount, ignore_errors=True)
-        shutil.rmtree(paths.volatile_upper, ignore_errors=True)
-        shutil.rmtree(paths.volatile_work, ignore_errors=True)
-        shutil.rmtree(paths.back_ovfs_path, ignore_errors=True)
-
-    else:
-        sync_directories(vtarget, paths.backup_path, exclude=[PSD_FLAG_FILE])
-        shutil.rmtree(paths.volatile_mount, ignore_errors=True)
-
-    profile_path.unlink(missing_ok=True)
-
-    if paths.backup_path.is_dir():
-        paths.backup_path.rename(profile_path)
+        result = subprocess.run(["fusermount3", "-u", str(vtarget)], capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            fail(f"Cannot unmount RAM profile; all data preserved: {result.stderr.strip()}")
+        restored = paths.back_ovfs_path
+    profile_path.unlink()
+    try:
+        restored.rename(profile_path)
         fsync_directory_path(profile_path.parent)
-    else:
-        fail(f"Critical error: backup directory {paths.backup_path} is missing during unsync!")
-
+    except BaseException:
+        if not profile_path.exists() and mode == "copy":
+            profile_path.symlink_to(vtarget)
+        raise
+    shutil.rmtree(paths.volatile_mount, ignore_errors=True)
+    shutil.rmtree(paths.volatile_upper, ignore_errors=True)
+    shutil.rmtree(paths.volatile_work, ignore_errors=True)
+    if mode == "overlay":
+        shutil.rmtree(paths.backup_path, ignore_errors=True)
     LOGGER.info("Successfully restored %s to persistent disk.", profile_path.name)
     return {"status": "unsynced"}
 
@@ -2109,6 +2108,7 @@ def psd_daemon_loop(profiles: Sequence[Profile], interval_sec: int) -> int:
     LOGGER.info("Starting Profile RAM Sync Daemon (resync interval: %ds)...", interval_sec)
 
     running = True
+    failed = False
 
     def sig_handler(signum, _):
         nonlocal running
@@ -2124,32 +2124,34 @@ def psd_daemon_loop(profiles: Sequence[Profile], interval_sec: int) -> int:
         try:
             sync_profile_to_ram(prof)
         except Exception as e:
+            failed = True
             LOGGER.error("Initial sync failed for %s: %s", prof.path.name, e)
 
     LOGGER.info("Daemon active. Monitoring and syncing on %ds interval.", interval_sec)
 
-    last_resync = time.time()
+    last_resync = time.monotonic()
     while running:
         time.sleep(1.0)
         if not running:
             break
-        if time.time() - last_resync >= interval_sec:
+        if time.monotonic() - last_resync >= interval_sec:
             for prof in profiles:
                 try:
                     resync_profile(prof.path)
                 except Exception as e:
                     LOGGER.warning("Scheduled resync error for %s: %s", prof.path.name, e)
-            last_resync = time.time()
+            last_resync = time.monotonic()
 
     LOGGER.info("Shutting down daemon: performing final unsync back to disk...")
     for prof in profiles:
         try:
             unsync_profile_from_ram(prof.path, force=True)
         except Exception as e:
+            failed = True
             LOGGER.error("Final unsync failed for %s: %s", prof.path.name, e)
 
-    LOGGER.info("Daemon finished cleanly.")
-    return 0
+    LOGGER.info("Daemon finished%s.", " with failures" if failed else " cleanly")
+    return 1 if failed else 0
 
 
 # ===========================================================================
@@ -2166,7 +2168,11 @@ def get_systemd_user_dir() -> Path:
 
 def install_systemd_service(script_path: Path) -> int:
     s_dir = get_systemd_user_dir()
-    py_bin = sys.executable
+    def exec_quote(value: str) -> str:
+        return json.dumps(value).replace("%", "%%").replace("$", "$$")
+
+    py_bin = exec_quote(sys.executable)
+    script_arg = exec_quote(str(script_path))
 
     service_file = s_dir / SYSTEMD_SERVICE_NAME
     resync_service_file = s_dir / SYSTEMD_RESYNC_SERVICE_NAME
@@ -2176,13 +2182,12 @@ def install_systemd_service(script_path: Path) -> int:
 Description=Firefox Profile RAM Sync (optimize_firefox.py)
 Documentation=file://{script_path}
 Wants={SYSTEMD_RESYNC_TIMER_NAME}
-After=default.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart={py_bin} {script_path} --sync
-ExecStop={py_bin} {script_path} --unsync --force
+ExecStart={py_bin} {script_arg} --sync --disk-fallback
+ExecStop={py_bin} {script_arg} --unsync
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
@@ -2196,7 +2201,7 @@ BindsTo={SYSTEMD_SERVICE_NAME}
 
 [Service]
 Type=oneshot
-ExecStart={py_bin} {script_path} --resync
+ExecStart={py_bin} {script_arg} --resync --disk-fallback
 Environment=PYTHONUNBUFFERED=1
 """
 
@@ -2219,7 +2224,7 @@ WantedBy=timers.target
     LOGGER.info("Wrote systemd user units to %s", s_dir)
 
     if shutil.which("systemctl"):
-        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
         res = subprocess.run(
             ["systemctl", "--user", "enable", SYSTEMD_SERVICE_NAME, SYSTEMD_RESYNC_TIMER_NAME],
             capture_output=True, text=True, check=False
@@ -2228,7 +2233,7 @@ WantedBy=timers.target
             LOGGER.info("Successfully enabled %s and %s", SYSTEMD_SERVICE_NAME, SYSTEMD_RESYNC_TIMER_NAME)
             LOGGER.info("Start immediately with: systemctl --user start %s", SYSTEMD_SERVICE_NAME)
         else:
-            LOGGER.warning("Could not enable systemd units: %s", res.stderr.strip())
+            fail(f"Could not enable systemd units: {res.stderr.strip()}")
 
     return 0
 
@@ -2242,14 +2247,15 @@ def remove_systemd_service() -> int:
     if shutil.which("systemctl"):
         subprocess.run(
             ["systemctl", "--user", "disable", "--now", SYSTEMD_SERVICE_NAME, SYSTEMD_RESYNC_TIMER_NAME],
-            check=False
+            check=True
         )
-        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
 
     service_file.unlink(missing_ok=True)
     resync_service_file.unlink(missing_ok=True)
     timer_file.unlink(missing_ok=True)
 
+    if shutil.which("systemctl"):
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
     LOGGER.info("Removed systemd user units from %s", s_dir)
     return 0
 
@@ -2294,15 +2300,13 @@ def cache2_info(profile: Profile, prefs_js: str | None) -> tuple[Path, int, int]
 
 def dir_size(path: Path) -> int:
     total = 0
-    try:
-        for root, _, files in os.walk(path):
-            for f in files:
-                try:
-                    total += (Path(root) / f).stat().st_size
-                except OSError:
-                    pass
-    except OSError:
-        pass
+    def walk_error(error: OSError) -> None:
+        raise error
+    for root, _, files in os.walk(path, onerror=walk_error):
+        for name in files:
+            info = (Path(root) / name).lstat()
+            if stat.S_ISREG(info.st_mode):
+                total += info.st_size
     return total
 
 
@@ -2557,19 +2561,12 @@ def run_verification_suite(verbose: bool) -> int:
             )
         return proc
 
-    def ff_headless(target_dir: Path, timeout_sec=30):
-        try:
-            subprocess.run(
-                [
-                    "firefox", "--no-remote", "--profile", str(target_dir), "--headless",
-                    "--screenshot", str(work_dir / "shot.png"), "about:blank"
-                ],
-                capture_output=True,
-                timeout=timeout_sec,
-                check=False,
-            )
-        except Exception:
-            pass
+    def ff_headless(target_dir: Path, timeout_sec: int = 30) -> None:
+        subprocess.run(
+            ["firefox", "--no-remote", "--profile", str(target_dir), "--headless",
+             "--screenshot", str(work_dir / "shot.png"), "about:blank"],
+            capture_output=True, timeout=timeout_sec, check=True,
+        )
 
     try:
         # 2. Disposable test profile
@@ -2580,9 +2577,7 @@ def run_verification_suite(verbose: bool) -> int:
         if (profile_dir / "prefs.js").is_file():
             vok("prefs.js generated by Firefox")
         else:
-            (profile_dir / "prefs.js").write_text('user_pref("app.update.enabled", false);\n', encoding="utf-8")
-            (profile_dir / ".parentlock").touch()
-            vok("prefs.js initialized")
+            raise AssertionError("Firefox did not initialize prefs.js; cannot verify its lifecycle")
 
         # 3. Dry-Run Purity
         vlog("3. Dry-Run Purity Verification")
@@ -2714,8 +2709,9 @@ def run_verification_suite(verbose: bool) -> int:
         if fake_vtarget and is_mountpoint(fake_vtarget):
             subprocess.run(["fusermount3", "-u", str(fake_vtarget)], check=False)
         shutil.rmtree(fake_vtarget, ignore_errors=True)
-        # Step C: Profile is now a broken symlink. Run tool to trigger auto-recovery
-        status_res = run_sub("--status", "--profile", str(profile_dir))
+        # Step C: Mutating sync recovers the broken link; status remains read-only.
+        status_res = run_sub("--sync", "--profile", str(profile_dir))
+        run_sub("--unsync", "--profile", str(profile_dir))
         if profile_dir.is_dir() and not profile_dir.is_symlink():
             vok("Ungraceful state automatically detected and recovered disk backup without data loss")
         else:
@@ -2740,10 +2736,13 @@ def run_verification_suite(verbose: bool) -> int:
         conn.close()
         t_delta = time.time() - t0
         run_sub("--unsync", "--profile", str(profile_dir))
-        if (profile_dir / "stress_test.sqlite").is_file():
-            vok(f"1,000 synchronous SQLite WAL transactions executed in RAM ({t_delta:.3f}s) and cleanly restored to disk")
+        with sqlite3.connect(profile_dir / "stress_test.sqlite") as restored_db:
+            rows = restored_db.execute("SELECT COUNT(*) FROM stress").fetchone()[0]
+            integrity = restored_db.execute("PRAGMA integrity_check").fetchone()[0]
+        if rows == 1000 and integrity == "ok":
+            vok(f"1,000 SQLite WAL inserts executed in RAM ({t_delta:.3f}s); restored row count and integrity verified")
         else:
-            vfail("Stress test database missing after unsync")
+            vfail(f"Restored stress database failed verification: rows={rows}, integrity={integrity}")
 
     finally:
         # Cleanup
@@ -2812,8 +2811,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Initialized profile directory (repeatable). Explicit paths replace discovery.",
     )
     parser.add_argument(
+        "--disk-fallback", action="store_true",
+        help="For --sync, keep disk profiles when RAM relocation is unavailable; for --resync, skip disk profiles.",
+    )
+    parser.add_argument(
         "--sync-mode", choices=("auto", "overlay", "copy"), default="auto",
-        help="RAM sync engine: 'auto' (use fuse-overlayfs if available), 'overlay', 'copy'.",
+        help="RAM sync engine: 'auto' (copy when tmpfs has capacity, otherwise overlay), 'overlay', 'copy'.",
     )
     parser.add_argument(
         "--interval", type=int, default=3600,
@@ -2821,7 +2824,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--force", action="store_true",
-        help="Force operation even if warnings or process locks exist.",
+        help="Legacy option; active Firefox locks are always respected during unsync.",
     )
     parser.add_argument(
         "--backup-dir", type=Path,
@@ -2851,7 +2854,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.disk_fallback and not (args.sync or args.resync):
+        parser.error("--disk-fallback requires --sync or --resync")
+    if args.interval <= 0:
+        parser.error("--interval must be positive")
+    if args.memory_capacity is not None and not -1 <= args.memory_capacity < 2 ** 31:
+        parser.error("--memory-capacity must be -1 or a nonnegative 32-bit integer")
+    if args.dry_run and (args.sync or args.unsync or args.resync or args.daemon or args.install_service or args.remove_service or args.verify):
+        parser.error("--dry-run is supported only for cache policy changes and status")
+
     configure_logging(args.verbose)
+    if args.json:
+        LOGGER.setLevel(logging.WARNING)
 
     if args.verify:
         return run_verification_suite(args.verbose)
@@ -2873,118 +2887,133 @@ def main(argv: Sequence[str] | None = None) -> int:
     if os.geteuid() == 0:
         fail("Running as root or via sudo is refused. Run as the Firefox profile owner.")
 
-    table = read_mount_table()
+    with nullcontext() if args.status or args.dry_run else psd_operation_lock():
+        table = read_mount_table()
 
-    explicit_profiles = [Path(p) for p in args.profile] if args.profile else []
-    profiles = select_profiles(explicit_profiles, table)
+        explicit_profiles = [Path(p) for p in args.profile] if args.profile else []
+        profiles = select_profiles(explicit_profiles, table, recover=not (args.status or args.dry_run))
 
-    if args.status:
-        return report_status(profiles, args.json)
+        if args.status:
+            return report_status(profiles, args.json)
 
-    # ------------------------------------------------------------- PSD Actions
-    if args.sync:
-        for prof in profiles:
-            sync_profile_to_ram(prof, mode=args.sync_mode, table=table)
-        LOGGER.info("All profiles synchronized to RAM successfully.")
-        return 0
+        # ------------------------------------------------------------- PSD Actions
+        if args.sync:
+            disk_profiles = 0
+            for prof in profiles:
+                try:
+                    sync_profile_to_ram(prof, mode=args.sync_mode, table=table)
+                except (RamSyncUnavailable, ProfileLockedError) as error:
+                    if not args.disk_fallback:
+                        raise
+                    # Fallback applies only to an intact disk profile, never uncertain RAM state.
+                    if is_profile_synced(prof.path)[0] or not prof.path.is_dir():
+                        raise
+                    disk_profiles += 1
+                    LOGGER.warning("Keeping %s on persistent disk: %s", prof.path.name, error)
+            LOGGER.info("Profile setup complete: %d in RAM, %d kept on disk.", len(profiles) - disk_profiles, disk_profiles)
+            return 0
 
-    if args.unsync:
-        for prof in profiles:
-            unsync_profile_from_ram(prof.path, force=args.force, table=table)
-        LOGGER.info("All profiles unsynchronized and restored to disk successfully.")
-        return 0
+        if args.unsync:
+            for prof in profiles:
+                unsync_profile_from_ram(prof.path, force=args.force, table=table)
+            LOGGER.info("All profiles unsynchronized and restored to disk successfully.")
+            return 0
 
-    if args.resync:
-        for prof in profiles:
-            resync_profile(prof.path, table=table)
-        LOGGER.info("All profiles resynchronized successfully.")
-        return 0
-
-    if args.daemon:
-        return psd_daemon_loop(profiles, args.interval)
-
-    # ------------------------------------------------ Cache Preferences Policy
-    if not args.skip_maintenance_check:
-        require_inactive_maintenance_services()
-
-    memory_mode = not args.disable and args.cache_mode == "memory"
-    LOGGER.info(
-        "Requested action: %s",
-        "memory-only HTTP cache policy" if memory_mode else "restore baseline configuration",
-    )
-
-    if args.dry_run:
-        LOGGER.info("[Dry Run] Simulating without taking locks or writing files:")
-        for prof in profiles:
-            dir_fd = open_directory(prof.path.resolve())
-            try:
-                plan = prepare_profile(prof, dir_fd, memory_mode, args.memory_capacity)
-                if not plan.changed:
-                    LOGGER.info("[Dry Run] %s: already in requested state (no-op)", prof.path)
+        if args.resync:
+            for prof in profiles:
+                if args.disk_fallback and not is_profile_synced(prof.path)[0]:
+                    LOGGER.info("Skipping %s: profile is already on persistent disk.", prof.path.name)
                     continue
+                resync_profile(prof.path, table=table)
+            LOGGER.info("All profiles resynchronized successfully.")
+            return 0
 
-                if plan.is_migration:
-                    LOGGER.info("[Dry Run] %s: legacy optimizer block will be migrated", prof.path)
+        if args.daemon:
+            return psd_daemon_loop(profiles, args.interval)
 
-                if not args.no_backup:
-                    dest = resolve_backup_destination(prof, args.backup_dir, profiles, table, create=False)
-                    entries, size = (
-                        targeted_entries(prof) if args.backup_scope == "targeted" else full_entries(prof, table)
-                    )
-                    LOGGER.info(
-                        "[Dry Run] %s: would create %s backup (%d entries, ~%s) at %s",
-                        prof.path, args.backup_scope, len(entries), human_bytes(size), dest,
-                    )
-                else:
-                    LOGGER.info("[Dry Run] %s: backup creation skipped (--no-backup)", prof.path)
-                LOGGER.info("[Dry Run] %s: would apply updated user.js / prefs.js", prof.path)
-            finally:
-                os.close(dir_fd)
-        LOGGER.info("[Dry Run] Completed successfully.")
-        return 0
-
-    with ExitStack() as stack:
-        dir_fds: dict[Profile, int] = {}
-        for prof in profiles:
-            resolved_p = prof.path.resolve()
-            dfd = stack.enter_context(contextmanager(lambda p=resolved_p: (yield open_directory(p)))())
-            dir_fds[prof] = dfd
-            stack.enter_context(locked_profile(prof, dfd))
-
+        # ------------------------------------------------ Cache Preferences Policy
         if not args.skip_maintenance_check:
             require_inactive_maintenance_services()
 
-        plans = [
-            prepare_profile(prof, dir_fds[prof], memory_mode, args.memory_capacity)
-            for prof in profiles
-        ]
-        changes = [p for p in plans if p.changed]
+        memory_mode = not args.disable and args.cache_mode == "memory"
+        LOGGER.info(
+            "Requested action: %s",
+            "memory-only HTTP cache policy" if memory_mode else "restore baseline configuration",
+        )
 
-        if not changes:
-            LOGGER.info("All profiles are already in the requested state. No changes required.")
+        if args.dry_run:
+            LOGGER.info("[Dry Run] Simulating without taking locks or writing files:")
+            for prof in profiles:
+                dir_fd = open_directory(prof.path.resolve())
+                try:
+                    plan = prepare_profile(prof, dir_fd, memory_mode, args.memory_capacity)
+                    if not plan.changed:
+                        LOGGER.info("[Dry Run] %s: already in requested state (no-op)", prof.path)
+                        continue
+
+                    if plan.is_migration:
+                        LOGGER.info("[Dry Run] %s: legacy optimizer block will be migrated", prof.path)
+
+                    if not args.no_backup:
+                        dest = resolve_backup_destination(prof, args.backup_dir, profiles, table, create=False)
+                        entries, size = (
+                            targeted_entries(prof) if args.backup_scope == "targeted" else full_entries(prof, table)
+                        )
+                        LOGGER.info(
+                            "[Dry Run] %s: would create %s backup (%d entries, ~%s) at %s",
+                            prof.path, args.backup_scope, len(entries), human_bytes(size), dest,
+                        )
+                    else:
+                        LOGGER.info("[Dry Run] %s: backup creation skipped (--no-backup)", prof.path)
+                    LOGGER.info("[Dry Run] %s: would apply updated user.js / prefs.js", prof.path)
+                finally:
+                    os.close(dir_fd)
+            LOGGER.info("[Dry Run] Completed successfully.")
             return 0
 
-        if not args.no_backup:
+        with ExitStack() as stack:
+            dir_fds: dict[Profile, int] = {}
+            for prof in profiles:
+                resolved_p = prof.path.resolve()
+                dfd = open_directory(resolved_p)
+                stack.callback(os.close, dfd)
+                dir_fds[prof] = dfd
+                stack.enter_context(locked_profile(prof, dfd))
+
+            if not args.skip_maintenance_check:
+                require_inactive_maintenance_services()
+
+            plans = [
+                prepare_profile(prof, dir_fds[prof], memory_mode, args.memory_capacity)
+                for prof in profiles
+            ]
+            changes = [p for p in plans if p.changed]
+
+            if not changes:
+                LOGGER.info("All profiles are already in the requested state. No changes required.")
+                return 0
+
+            if not args.no_backup:
+                for plan in changes:
+                    dest = resolve_backup_destination(
+                        plan.profile, args.backup_dir, profiles, table, create=True
+                    )
+                    backup_profile(plan.profile, dest, args.backup_scope, table)
+            else:
+                LOGGER.info("Skipping backup creation (--no-backup specified).")
+
             for plan in changes:
-                dest = resolve_backup_destination(
-                    plan.profile, args.backup_dir, profiles, table, create=True
-                )
-                backup_profile(plan.profile, dest, args.backup_scope, table)
-        else:
-            LOGGER.info("Skipping backup creation (--no-backup specified).")
+                apply_plan(plan, dir_fds[plan.profile])
+                verify_applied(plan, dir_fds[plan.profile])
 
-        for plan in changes:
-            apply_plan(plan, dir_fds[plan.profile])
-            verify_applied(plan, dir_fds[plan.profile])
+                # If profile is currently synced to RAM, immediately resync so changes are persisted to disk backing
+                is_synced, _, _ = is_profile_synced(plan.profile.path)
+                if is_synced:
+                    resync_profile(plan.profile.path, table=table)
 
-            # If profile is currently synced to RAM, immediately resync so changes are persisted to disk backing
-            is_synced, _, _ = is_profile_synced(plan.profile.path)
-            if is_synced:
-                resync_profile(plan.profile.path, table=table)
-
-    LOGGER.info("Requested cache-policy changes applied successfully.")
-    LOGGER.info("Start Firefox normally to run with the updated cache configuration.")
-    return 0
+        LOGGER.info("Requested cache-policy changes applied successfully.")
+        LOGGER.info("Start Firefox normally to run with the updated cache configuration.")
+        return 0
 
 
 if __name__ == "__main__":
