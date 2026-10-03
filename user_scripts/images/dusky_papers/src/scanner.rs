@@ -90,7 +90,22 @@ pub fn scan_wallpapers(
         .and_then(|id| Path::new(id).canonicalize().ok());
 
     for entry in WalkDir::new(wallpapers_dir).follow_links(true) {
-        let entry = entry.map_err(|error| format!("Could not scan wallpapers: {error}"))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error)
+                if error
+                    .io_error()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                    && error.path().is_some_and(|path| {
+                        path.symlink_metadata()
+                            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                    }) =>
+            {
+                // A missing link target must not hide the rest of the gallery.
+                continue;
+            }
+            Err(error) => return Err(format!("Could not scan wallpapers: {error}")),
+        };
         let path = entry.path();
         if entry.file_type().is_file() && is_supported_image(path) {
             let relative = path
@@ -146,4 +161,76 @@ pub fn scan_wallpapers(
         natural_cmp(&a.relative, &b.relative).then_with(|| a.relative.cmp(&b.relative))
     });
     Ok(items)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "dusky-papers-scan-{}-{}",
+                std::process::id(),
+                fastrand::u64(..)
+            ));
+            fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn follows_image_and_directory_links_and_skips_broken_links() {
+        let fixture = Fixture::new();
+        let root = &fixture.0;
+        let wallpapers = root.join("wallpapers");
+        let external = root.join("external");
+        fs::create_dir(&wallpapers).unwrap();
+        fs::create_dir(&external).unwrap();
+        fs::write(wallpapers.join("local.png"), []).unwrap();
+        fs::write(external.join("linked.PNG"), []).unwrap();
+        symlink(&external, wallpapers.join("linked directory")).unwrap();
+        symlink(
+            external.join("linked.PNG"),
+            wallpapers.join("linked image.png"),
+        )
+        .unwrap();
+        symlink(root.join("missing.png"), wallpapers.join("broken.png")).unwrap();
+        symlink(
+            root.join("missing directory"),
+            wallpapers.join("broken directory"),
+        )
+        .unwrap();
+
+        let items = scan_wallpapers(&wallpapers, &root.join("thumbs"), &HashSet::new(), None)
+            .expect("broken links must not abort the scan");
+        let relative: Vec<_> = items.iter().map(|item| item.relative.as_str()).collect();
+        assert_eq!(
+            relative,
+            [
+                "linked directory/linked.PNG",
+                "linked image.png",
+                "local.png"
+            ]
+        );
+    }
+
+    #[test]
+    fn directory_link_loops_still_fail_the_scan() {
+        let fixture = Fixture::new();
+        symlink(&fixture.0, fixture.0.join("loop")).unwrap();
+        let error = scan_wallpapers(&fixture.0, &fixture.0.join("thumbs"), &HashSet::new(), None)
+            .expect_err("a directory loop must remain visible");
+        assert!(error.contains("Could not scan wallpapers:"));
+    }
 }
