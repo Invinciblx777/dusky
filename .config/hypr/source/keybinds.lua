@@ -712,6 +712,18 @@ hl.bind(
     { description = "Window Maximize" }
 )
 
+-- Leave fullscreen even when an application inhibits shortcuts or captures input.
+hl.bind(
+    "SUPER + Escape",
+    hl.dsp.window.fullscreen({ mode = "fullscreen", action = "unset" }),
+    {
+        description = "Leave Fullscreen",
+        dont_inhibit = true,
+        allow_input_capture = true,
+        submap_universal = true,
+    }
+)
+
 hl.bind(
     "SUPER + X",
     hl.dsp.window.pin(),
