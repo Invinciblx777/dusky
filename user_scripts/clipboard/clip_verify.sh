@@ -586,7 +586,7 @@ while True: time.sleep(1)
         f.close()
 
 
-def persistence():
+def persistence(*, combined=False):
     """Real switching CLI + real store callbacks; Wayland/systemd are isolated."""
     import shlex
     import types
@@ -702,21 +702,48 @@ else:
             assert (f.root/'session-env').read_text()=='CLIPHIST_DB_PATH='+str(f.db)
         print('PASS failed environment update and service-health change roll back both settings and session path')
         original_ram=set(payloads(f.db));original_disk=set(payloads(disk))
-        expected={f'concurrent-copy-{i:03d}'.encode() for i in range(100)}
+        copy_count,switch_count=(400,200) if combined else (100,80)
+        expected={f'concurrent-copy-{i:03d}'.encode() for i in range(copy_count)}
         def produce():
             completions=[]
             for i,data in enumerate(sorted(expected)):
                 completions.append(emit('text',i+10,data));time.sleep(.002)
             for done in completions:wait_for(done.exists,seconds=20)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+        def frontend_switches():
+            selector=ROOT.parent/'arch_setup_scripts/scripts/460_switch_clipboard.sh'
+            for i in range(256):run([str(selector),'--rofi' if i%2 else '--terminal','--force'],f.env)
+        def vim_updates():
+            for _ in range(256):f.ui('--toggle-vim')
+        def rofi_lists():
+            frontend=ROOT.parent/'rofi/rofi_clipboard.sh'
+            for _ in range(32):
+                out=run([str(frontend)],f.env).stdout
+                assert b'\0data\x1f' in out and b'\0no-custom\x1ftrue' in out
+        settings_before=f.state.read_text()
+        state_lock=f.settings/'.clipboard_state.lock'
+        state_lock.touch(exist_ok=True)
+        state_inode=state_lock.stat().st_ino
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8 if combined else 5) as pool:
             jobs=[pool.submit(produce)]
-            jobs += [pool.submit(switch,'ram' if i%2 else 'disk') for i in range(80)]
-            for job in jobs:job.result(timeout=30)
+            if combined:
+                jobs += [pool.submit(fn) for fn in (frontend_switches,vim_updates,rofi_lists)]
+            jobs += [pool.submit(switch,'ram' if i%2 else 'disk') for i in range(switch_count)]
+            # The larger run performs thousands of real subprocess operations.
+            for job in jobs:job.result(timeout=90 if combined else 30)
         ram=set(payloads(f.db));disc=set(payloads(disk))
         assert expected <= ram|disc and not(expected & ram & disc)
         assert original_ram <= ram and original_disk <= disc
         assert Path(f'/proc/{main_before}/task/{main_before}/children').read_text().split()==children_before
-        print('PASS 80 concurrent switches + 100 new copies: no lost copies, cross-database duplicates, or watcher restarts')
+        if combined:
+            after=f.state.read_text()
+            for line in settings_before.splitlines():assert line in after.splitlines()
+            assert sum(line in ('True','False') for line in after.splitlines())==1
+            assert state_lock.stat().st_ino==state_inode
+            assert not list(f.settings.glob('.clipboard-mode.*'))
+            assert not list((f.root/'cache/rofi-cliphist/thumbs').glob('.menu.*'))
+            print('PASS combined stress: 200 storage switches, 400 copies, 256 frontend switches, 256 Vim updates and 32 Rofi menus; no lost settings/payloads, duplicate copies or watcher restarts')
+        else:
+            print('PASS 80 concurrent switches + 100 new copies: no lost copies, cross-database duplicates, or watcher restarts')
         for state in ('sensitive','clear','nil',''):
             run([str(ROOT/'dusky_clipboard_daemon.sh'),'--store'],f.env|{'CLIPBOARD_STATE':state},b'must-not-store')
         assert set(payloads(f.db))==ram and set(payloads(disk))==disc
@@ -938,6 +965,92 @@ def integration():
         f.close()
 
 
+def frontend():
+    """Frontend preference, Lua consumer, settings lock and reload failures."""
+    f=Fixture(ROOT/'terminal_clipboard.sh')
+    switcher=ROOT.parent/'arch_setup_scripts/scripts/460_switch_clipboard.sh'
+    try:
+        f.env.pop('HYPRLAND_INSTANCE_SIGNATURE',None)
+        def call(*args,extra=None,check=True):
+            return run([str(switcher),*args],f.env|(extra or {}),check=check)
+        keys=(Path.home()/'.config/hypr/source/keybinds.lua').read_text()
+        begin=keys.index('local clipboard_config_home')
+        block=keys[begin:keys.index('\n\nhl.bind(',begin)]
+        lua='dusky_scripts=os.getenv("HOME").."/user_scripts/"; hl={bind=function(k,v) io.write(type(v)=="function" and "terminal" or "rofi") end,dsp={exec_cmd=function(s) return s end}}; '+block
+        settings=b'# False means Rofi; True means Terminal\nVIM_MODE="true"\nPREVIEW_LAYOUT="right,65%,wrap"\nPREVIEW_LAST="right,65%,wrap"\nCUSTOM="False is literal data"\n'
+        for markers,expected in [(b'',b'terminal'),(b'False\n',b'rofi'),
+                                 (b'False\n True \n',b'terminal'),
+                                 (b'True\r\n False\t\r\n',b'rofi')]:
+            f.state.write_bytes(markers+settings)
+            before=(f.state.read_bytes(),f.state.stat().st_mtime_ns)
+            assert call('--status').stdout.strip()==expected
+            assert run(['lua','-e',lua],f.env).stdout==expected
+            assert (f.state.read_bytes(),f.state.stat().st_mtime_ns)==before
+        missing=f.root/'absent config'
+        assert call('--status',extra={'XDG_CONFIG_HOME':str(missing)}).stdout==b'terminal\n'
+        assert not missing.exists()
+        print('PASS frontend status and Lua agree: comments, literal False, CRLF, duplicate markers; status is read-only')
+        f.executable('hyprctl','#!/bin/bash\nprintf "%s\\n" "$*" >> "$AUDIT_ROOT/reloads"\nexit "${AUDIT_RELOAD_RC:-0}"\n')
+        live={'HYPRLAND_INSTANCE_SIGNATURE':'fixture'}
+        f.state.write_bytes(settings)
+        for mode,marker in [('rofi',b'False'),('terminal',b'True')]:
+            call('--'+mode,extra=live)
+            assert f.state.read_bytes()==marker+b'\n'+settings
+        assert (f.root/'reloads').read_text().splitlines()==['reload config-only']*2
+        call('--terminal',extra=live)
+        assert len((f.root/'reloads').read_text().splitlines())==2
+        call('--terminal','--force',extra=live)
+        assert len((f.root/'reloads').read_text().splitlines())==3
+        before=f.state.read_bytes()
+        for args in [('--terminal','--rofi'),('--status','--force'),('--unknown',),()]:
+            assert call(*args,check=False).returncode!=0
+            assert f.state.read_bytes()==before
+        assert call('--help').returncode==0
+        print('PASS frontend switches preserve settings; config-only reload and force; invalid arguments do not mutate state')
+        call('--rofi')
+        result=call('--terminal',extra=live|{'AUDIT_RELOAD_RC':'1'},check=False)
+        assert result.returncode!=0 and b'Preference saved' in result.stderr
+        assert call('--status').stdout==b'terminal\n'
+        call('--terminal','--force',extra=live)
+        print('PASS offline preference and reload failure/retry retain consistent saved mode')
+        before=f.state.read_bytes()
+        f.executable('mv','#!/bin/sh\nexit 1\n')
+        assert call('--rofi',check=False).returncode!=0
+        assert f.state.read_bytes()==before and not list(f.settings.glob('.clipboard-mode.*'))
+        (f.bin/'mv').unlink()
+        print('PASS failed frontend publication keeps old settings and cleans its temporary file')
+        lock=f.settings/'.clipboard_state.lock';inode=lock.stat().st_ino
+        with open(lock,'r+b') as handle:
+            fcntl.flock(handle,fcntl.LOCK_EX)
+            assert call('--status').stdout==b'terminal\n'
+            start=time.monotonic()
+            assert call('--rofi',check=False).returncode!=0
+            assert 2.8<time.monotonic()-start<5 and f.state.read_bytes()==before
+        print('PASS frontend lock timeout is bounded; status remains readable while a writer holds the lock')
+        f.executable('hyprctl','#!/bin/bash\ntrap "" TERM\nprintf "%s" "$$" > "$AUDIT_ROOT/stalled-reload"\nexec sleep 30\n')
+        start=time.monotonic()
+        result=call('--rofi',extra=live,check=False)
+        assert result.returncode!=0 and 4.8<time.monotonic()-start<8
+        pid=int((f.root/'stalled-reload').read_text())
+        with open(lock,'r+b') as handle:fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        # A killed orphan can briefly be a zombie until its reaper collects it.
+        proc=Path(f'/proc/{pid}/stat')
+        if proc.exists():assert proc.read_text().split(') ',1)[1].startswith('Z ')
+        print('PASS stalled reload is terminated and releases the settings lock within six seconds')
+        jobs=[('mode',i) for i in range(64)]+[('vim',i) for i in range(64)]
+        def work(job):
+            kind,i=job
+            return call('--rofi' if i%2 else '--terminal','--force') if kind=='mode' else f.ui('--toggle-vim')
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:list(pool.map(work,jobs))
+        text=f.state.read_text()
+        for line in settings.decode().splitlines():assert line in text.splitlines()
+        assert sum(line in ('True','False') for line in text.splitlines())==1
+        assert lock.stat().st_ino==inode and not list(f.settings.glob('.clipboard-mode.*'))
+        assert call('--status').stdout.strip()==run(['lua','-e',lua],f.env).stdout
+        print('PASS 64 frontend switches + 64 Vim updates preserve every setting and a stable lock inode')
+    finally:f.close()
+
+
 def stat_mode(path):
     return path.stat().st_mode & 0o777
 
@@ -949,7 +1062,15 @@ if __name__=='__main__':
     parser.add_argument('--runs',type=int,default=30)
     parser.add_argument('--persistence-only',action='store_true')
     parser.add_argument('--integration-only',action='store_true')
+    parser.add_argument('--frontend-only',action='store_true')
+    parser.add_argument('--ecosystem-stress',action='store_true')
     args=parser.parse_args()
+    if args.ecosystem_stress:
+        persistence(combined=True)
+        sys.exit(0)
+    if args.frontend_only:
+        frontend()
+        sys.exit(0)
     if args.integration_only:
         integration()
         sys.exit(0)
@@ -964,4 +1085,5 @@ if __name__=='__main__':
         daemon()
         persistence()
         integration()
+        frontend()
 CLIP_VERIFY_PYTHON

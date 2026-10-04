@@ -487,8 +487,14 @@ local f_state = io.open(clipboard_state_file, "r")
 if f_state then
     local content = f_state:read("*all")
     f_state:close()
-    if content:match("False") then
-        use_terminal_clipboard = false
+    -- Read only standalone frontend markers; comments and other settings may
+    -- mention True/False. Last marker wins, matching the frontend switcher.
+    for line in content:gmatch("[^\r\n]+") do
+        if line:match("^%s*False%s*$") then
+            use_terminal_clipboard = false
+        elseif line:match("^%s*True%s*$") then
+            use_terminal_clipboard = true
+        end
     end
 end
 
