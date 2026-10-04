@@ -58,6 +58,7 @@ def parse_args():
     parser.add_argument("--manual", "-m", action="store_true", help="Manual mode: prompt before each script")
     parser.add_argument("--stop-on-fail", action="store_true", help="Halt execution if any script fails")
     parser.add_argument("--auto", action="store_true", help="Automatically decide orchestration prompts")
+    parser.add_argument("--exit-on-complete", action="store_true", help="Exit after installation instead of showing the completion menu")
     parser.add_argument("--online", action="store_true", help="Select the online recovery profile")
     parser.add_argument("--profile", type=str, help="Specify profile TOML to execute")
     parser.add_argument("--list-profiles", action="store_true", help="List all available installer profiles and exit")
@@ -121,7 +122,7 @@ except (importlib_metadata.PackageNotFoundError, RuntimeError) as exc:
 # ==============================================================================
 # CONSTANTS & CONFIGURATION LOAD
 # ==============================================================================
-VERSION = "19.0.2"
+VERSION = "19.0.3"
 SCRIPT_DIR: Path = Path(__file__).resolve().parent
 PROFILES_DIR: Path = Path(
     os.environ.get("DUSKY_PROFILES_DIR", SCRIPT_DIR / "profiles")
@@ -2004,6 +2005,7 @@ class DuskyOrchestratorApp(App):
         dry_run: bool = False,
         is_final_phase: bool = True,
         auto_mode: bool = False,
+        exit_on_complete: bool = False,
     ):
         super().__init__()
         self.tasks = tasks
@@ -2019,6 +2021,7 @@ class DuskyOrchestratorApp(App):
         self.persistence_failed = False
         self.dry_run = dry_run
         self.auto_mode = auto_mode
+        self.exit_on_complete = exit_on_complete
         self.phase_start_time = PROCESS_STARTED
         inherited_start = float(os.environ.get("DUSKY_INSTALL_STARTED_MONOTONIC", PROCESS_STARTED))
         if not math.isfinite(inherited_start) or inherited_start < 0 or inherited_start > time.monotonic():
@@ -2743,7 +2746,7 @@ class DuskyOrchestratorApp(App):
                 self.exit(return_code=0)
             return
 
-        if self.auto_mode:
+        if self.exit_on_complete:
             self.exit(return_code=int(bool(failed_tasks) or self.persistence_failed or self.logger.failed_write))
             return
 
@@ -3308,6 +3311,7 @@ def main():
             once_store=once_store,
             is_final_phase=bool(phase2),
             auto_mode=args.auto,
+            exit_on_complete=args.exit_on_complete,
         )
         app.run()
         sys.exit(app.return_code if app.return_code is not None else 1)
