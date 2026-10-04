@@ -5549,6 +5549,14 @@ Tooltip {
                     self._save_failure_pending = True
             except Exception:
                 self._save_failure_pending = True
+            # Some engines select a record or normalize dependent values on save.
+            # Refresh once this task no longer marks its own setting as pending.
+            states = {
+                key: engine.cache for key, engine in self.engine_pool.items()
+                if getattr(engine, "refresh_after_write", False)
+            }
+            if states:
+                self._apply_refreshed_states(states)
         self._maybe_finish_quit()
 
     async def _run_save_io(self, func: Any, /, *args: Any, **kwargs: Any) -> Any:
@@ -5981,6 +5989,11 @@ Tooltip {
                     if "AUTH_REQUIRED" in msg:
                         auth_required = True
                         break
+
+                    if getattr(engine, "atomic_batches", False):
+                        final_success = False
+                        error_msgs.append(msg)
+                        continue
 
                     engine_success_count = 0
                     committed_ueks = set()
