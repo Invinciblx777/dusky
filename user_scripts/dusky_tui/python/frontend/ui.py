@@ -5090,6 +5090,9 @@ Tooltip {
     def play_reset_sound(self) -> None:
         global _AUDIO_PLAYER_CACHE
 
+        if self._action_shutdown_started:
+            return
+
         sound_path = "/usr/share/sounds/freedesktop/stereo/dialog-information.oga"
 
         if Path(sound_path).exists():
@@ -5108,11 +5111,24 @@ Tooltip {
                 if player.endswith("mpv"):
                     cmd.extend(["--no-video", "--really-quiet"])
 
-                subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
+                async def play() -> None:
+                    proc = None
+                    spawn = asyncio.create_task(asyncio.create_subprocess_exec(
+                        *cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    ))
+                    try:
+                        proc = await asyncio.shield(spawn)
+                        self._action_procs.add(proc)
+                        await proc.wait()
+                    except OSError as error:
+                        LOGGER.debug("Unable to play notification sound: %s", error)
+                    finally:
+                        self._track_action_cleanup(asyncio.create_task(
+                            self._cleanup_action_resources(proc, [], spawn)
+                        ))
+
+                self._track_action_task(asyncio.create_task(play()))
 
     # =========================================================================
     # WRITE GENERATION / AUTOSAVE SAFETY
