@@ -4,12 +4,12 @@
 # ==============================================================================
 # DUSKY ARCH LINUX MASTER ORCHESTRATOR
 # ==============================================================================
-# Target: Arch Linux bleeding edge | Python 3.14+ | Textual 8.2.8+ | systemd 262+
+# Target: Arch Linux bleeding edge | Python 3.14.7+ | Textual 8.2.8+ | systemd 262+
 # ==============================================================================
 import sys
 
-if sys.version_info < (3, 14):
-    sys.stderr.write("[FATAL] Python 3.14+ is required.\n")
+if sys.version_info < (3, 14, 7):
+    sys.stderr.write("[FATAL] Python 3.14.7+ is required.\n")
     sys.exit(1)
 
 import argparse
@@ -48,7 +48,7 @@ from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Literal
 
-VERSION = "19.0.1"
+VERSION = "19.0.2"
 
 
 def parse_command_line() -> argparse.Namespace:
@@ -274,8 +274,8 @@ def version_tuple(value: str) -> tuple[int, ...]:
 
 
 def check_runtime_versions() -> None:
-    if sys.version_info < (3, 14):
-        sys.stderr.write("[FATAL] Python 3.14+ is required.\n")
+    if sys.version_info < (3, 14, 7):
+        sys.stderr.write("[FATAL] Python 3.14.7+ is required.\n")
         sys.exit(1)
 
     try:
@@ -2850,8 +2850,6 @@ class ConditionEvaluator:
         "vm",
         "baremetal",
         "gpu",
-        "group",
-        "env",
     }
 
     @staticmethod
@@ -4923,6 +4921,7 @@ class DuskyOrchestratorApp(App):
 
         self._durations: list[float] = []
         self._always_handled: set[str] = set()
+        self._previous_signal_handlers: dict[int, Any] = {}
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top_header"):
@@ -4964,6 +4963,10 @@ class DuskyOrchestratorApp(App):
         yield AppFooter()
 
     def on_mount(self) -> None:
+        loop = asyncio.get_running_loop()
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            self._previous_signal_handlers[signum] = signal.getsignal(signum)
+            loop.add_signal_handler(signum, self._terminate, signum)
         with suppress(Exception):
             self.query_one("#log_switcher", ContentSwitcher).current = "pty_log"
 
@@ -4992,6 +4995,10 @@ class DuskyOrchestratorApp(App):
         self._update_overall_status()
         self.run_execution_pipeline()
 
+    def _terminate(self, signum: int) -> None:
+        self.log_system(f"Termination requested: {signal.Signals(signum).name}")
+        self.exit(return_code=128 + signum)
+
     def _pause_stopwatch(self) -> None:
         if self._prompt_pause_level == 0:
             self._pause_start = time.monotonic()
@@ -5001,12 +5008,13 @@ class DuskyOrchestratorApp(App):
         if self._prompt_pause_level > 0:
             self._prompt_pause_level -= 1
             if self._prompt_pause_level == 0 and self._pause_start is not None:
-                self._total_paused_time += (time.monotonic() - self._pause_start)
+                end_t = self.finished_time if self.finished_time is not None else time.monotonic()
+                self._total_paused_time += max(0.0, end_t - self._pause_start)
                 self._pause_start = None
 
     def get_elapsed_seconds(self) -> float:
         end_t = self.finished_time if self.finished_time is not None else time.monotonic()
-        current_pause = (end_t - self._pause_start) if self._pause_start is not None else 0.0
+        current_pause = max(0.0, end_t - self._pause_start) if self._pause_start is not None else 0.0
         return max(0.0, end_t - self.start_time - self._total_paused_time - current_pause)
 
     @staticmethod
@@ -5028,6 +5036,11 @@ class DuskyOrchestratorApp(App):
             self._resume_stopwatch()
 
     def on_unmount(self) -> None:
+        loop = asyncio.get_running_loop()
+        for signum, previous in self._previous_signal_handlers.items():
+            loop.remove_signal_handler(signum)
+            signal.signal(signum, previous)
+        self._previous_signal_handlers.clear()
         self._kill_active_child_sync()
         self.logger.close_all()
         self.state.close()
@@ -5931,6 +5944,9 @@ class DuskyOrchestratorApp(App):
                 os.kill(pid, signal.SIGKILL)
 
     async def _kill_active_child_async(self) -> None:
+        if self._active_pty_proc is not None:
+            await self._kill_proc(self._active_pty_proc)
+            return
         pid = self.active_child_pid
         if pid is None:
             return
@@ -6395,6 +6411,18 @@ class DuskyOrchestratorApp(App):
             return await self._execute_suspended(task, cmd, env, timeout=timeout, refresh_sudo=refresh_sudo)
         return await self.execute_pty_command(cmd, env, timeout=timeout, refresh_sudo=refresh_sudo)
 
+    async def _execute_timed_task(
+        self, task: OrchestratorTask, cmd: list[str], env: dict[str, str],
+        *, suspended: bool = False,
+    ) -> tuple[bool, int | None, str]:
+        start = time.monotonic()
+        try:
+            if suspended:
+                return await self._execute_suspended(task, cmd, env)
+            return await self._execute_task_cmd(task, cmd, env)
+        finally:
+            task.duration += time.monotonic() - start
+
     def finish_task(
         self,
         task: OrchestratorTask,
@@ -6537,11 +6565,10 @@ class DuskyOrchestratorApp(App):
         self._prompt_last.clear()
 
         retries_left = max(0, task.retry)
+        task.duration = 0.0
 
         while True:
-            start = time.monotonic()
-            success, code, last = await self._execute_task_cmd(task, cmd, env)
-            task.duration = time.monotonic() - start
+            success, code, last = await self._execute_timed_task(task, cmd, env)
 
             if success:
                 self.finish_task(task, "completed", code, "")
@@ -6592,7 +6619,7 @@ class DuskyOrchestratorApp(App):
 
             if policy == "manual":
                 self.log_system(f"Manual intervention TTY: {task.script_name}...")
-                m_success, m_code, m_last = await self._execute_suspended(task, cmd, env)
+                m_success, m_code, m_last = await self._execute_timed_task(task, cmd, env, suspended=True)
                 if m_success:
                     self.finish_task(task, "manual", m_code, "manual override")
                     self.active_task = None
@@ -6618,9 +6645,7 @@ class DuskyOrchestratorApp(App):
                     case "retry":
                         self.log_system(f"Retrying task: {task.script_name}...")
                         self.update_task_node_by_key(task.state_key, TaskStatus.RUNNING)
-                        start = time.monotonic()
-                        success, code, last = await self._execute_task_cmd(task, cmd, env)
-                        task.duration = time.monotonic() - start
+                        success, code, last = await self._execute_timed_task(task, cmd, env)
 
                         if success:
                             self.finish_task(task, "completed", code, "")
@@ -6641,7 +6666,7 @@ class DuskyOrchestratorApp(App):
 
                     case "manual":
                         self.log_system(f"Manual intervention TTY: {task.script_name}...")
-                        m_success, m_code, m_last = await self._execute_suspended(task, cmd, env)
+                        m_success, m_code, m_last = await self._execute_timed_task(task, cmd, env, suspended=True)
 
                         if m_success:
                             self.finish_task(task, "manual", m_code, "manual override")
@@ -6661,6 +6686,7 @@ class DuskyOrchestratorApp(App):
                         return "skipped"
 
                     case _:
+                        self.finish_task(task, "failed", code, last)
                         self.log_system("User aborted execution sequence.", is_err=True)
                         self.exit(return_code=1)
                         self.active_task = None
@@ -6689,7 +6715,7 @@ class DuskyOrchestratorApp(App):
                         if key in handled:
                             continue
 
-                        if task.once and self.once_store:
+                        if task.once and not task.always and self.once_store:
                             once_status = self.once_store.check_marker_status(task, self.profile.name)
                             if once_status == "notify_sealed":
                                 self.log_system(
@@ -6830,7 +6856,11 @@ class DuskyOrchestratorApp(App):
                 break
 
         finally:
+            if self.active_task is not None:
+                self.finish_task(self.active_task, "failed", self.return_code or 130, "execution interrupted")
             self.active_task = None
+            if self.finished_time is None:
+                self.logger.write_report(self.profile, self.tasks, self.statuses, self._compute_counters())
             self._flush_ui()
 
             if self.sudo_task is not None:
@@ -6920,7 +6950,7 @@ def print_explain(profile: ProfileConfig) -> None:
         volatile = cond._volatile(t.condition)
         once_marker = once_store.marker_valid(t, profile.name) if t.once else False
 
-        if t.once and once_marker:
+        if t.once and once_marker and not t.always:
             action = "skip(once)"
         elif StateStore.is_done(status) and not t.always:
             action = "skip(done)"
@@ -7151,7 +7181,7 @@ def main() -> None:
     has_sudo = (
         any(t.mode == "S" for t in selected_profile.tasks)
         or any(
-            not (t.once and once_store.marker_valid(t, selected_profile.name))
+            not (t.once and not t.always and once_store.marker_valid(t, selected_profile.name))
             and (
                 t.always
                 or not StateStore.is_done(statuses.get(t.state_key))

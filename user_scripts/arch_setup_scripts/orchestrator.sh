@@ -117,7 +117,7 @@ require_internet() {
 }
 
 python_ok() {
-    "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 14) else 1)' >/dev/null 2>&1
+    "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 14, 7) else 1)' >/dev/null 2>&1
 }
 
 choose_python() {
@@ -163,7 +163,7 @@ main() {
     if (( info_only )); then
         local info_python
         if ! info_python="$(choose_python)"; then
-            log ERROR "Python 3.14+ is required for this command."
+            log ERROR "Python 3.14.7+ is required for this command."
             exit 1
         fi
         launch_python "$info_python" "$@"
@@ -221,7 +221,7 @@ main() {
 
     local PYTHON_BIN
     if ! PYTHON_BIN="$(choose_python)"; then
-        log ERROR "Python 3.14+ interpreter not found after dependency bootstrap."
+        log ERROR "Python 3.14.7+ interpreter not found after dependency bootstrap."
         exit 1
     fi
 
