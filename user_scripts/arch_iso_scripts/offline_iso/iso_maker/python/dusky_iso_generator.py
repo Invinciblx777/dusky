@@ -40,11 +40,12 @@ from pathlib import Path
 from typing import NoReturn
 
 # ═══════════════════════════════════ configuration ═══════════════════════════════════
-VERSION = "8.0.3-py314-2026.09"
+VERSION = "8.0.5-py314-2026.10"
 REPO_NAME = "archrepo"
 DB_NAME = f"{REPO_NAME}.db.tar.zst"
 FILES_NAME = f"{REPO_NAME}.files.tar.zst"
 CUSTOM_PACKAGES_FILE = "custom_packages.txt"
+CUSTOM_BUILDS_FILE = "custom_builds.json"
 AUR_RPC = "https://aur.archlinux.org/rpc/v5/info"
 AUR_RPC_BATCH = 80
 MAX_RPC_BYTES = 4 << 20
@@ -171,8 +172,10 @@ SRCEXT='.src.tar.gz'
 
 MAKEPKG_ENV_SCRUB = (
     "CFLAGS", "CXXFLAGS", "CPPFLAGS", "FFLAGS", "FCFLAGS", "LDFLAGS", "LTOFLAGS", "RUSTFLAGS",
-    "MAKEFLAGS", "NINJAFLAGS", "NPROC", "CARGO_BUILD_RUSTFLAGS", "CARGO_TARGET_CPU", "MAKEPKG_CONF",
+    "MAKEFLAGS", "NINJAFLAGS", "NPROC", "CARGO_BUILD_RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS",
+    "CARGO_TARGET_CPU", "MAKEPKG_CONF",
     "CARCH", "CHOST", "DEBUG_CFLAGS", "DEBUG_CXXFLAGS", "DEBUG_RUSTFLAGS", "GOAMD64",
+    "PKGDEST", "SRCDEST", "SRCPKGDEST", "LOGDEST", "BUILDDIR", "PKGEXT", "SRCEXT",
 )
 
 # Injected at the top of mkarchiso's _build_iso_image(): runs after pacstrap/mksquashfs, before
@@ -370,6 +373,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
                         help=f"ISO output directory (default: {ZRAM_CANDIDATE} if mounted, else ~/dusky_isos)")
     parser.add_argument("--source-dir", type=Path, metavar="DIR",
                         help="installer payload (default: ~/user_scripts/arch_iso_scripts/offline_iso)")
+    parser.add_argument("--rebuild-local", action="store_true",
+                        help="rebuild all local ISO recipes even when cached inputs match")
     parser.add_argument("--auto", action="store_true", help="non-interactive; default action official_iso")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser.parse_args(argv)
@@ -497,11 +502,11 @@ def _kill_group(proc: subprocess.Popen[str], grace: float = 10.0) -> None:
     proc.wait()
 
 
-def terminate_children() -> None:
+def terminate_children(sig: int = signal.SIGTERM) -> None:
     with _children_lock:
         procs = tuple(_children)
     for proc in procs:
-        _signal_group(proc, signal.SIGTERM)
+        _signal_group(proc, sig)
 
 
 def _on_signal(signum: int, _frame: object) -> None:
@@ -570,6 +575,10 @@ def parallel_map[T, R](fn: Callable[[T], R], items: Sequence[T], workers: int) -
     try:
         return list(ex.map(fn, items))
     except BaseException:
+        # Worker threads do not receive the main thread's exception. Descendants can
+        # ignore SIGTERM and keep captured pipes open indefinitely; stop their groups
+        # before waiting for executor shutdown or removing shard/workspace directories.
+        terminate_children(signal.SIGKILL)
         ex.shutdown(wait=True, cancel_futures=True)
         raise
     finally:
@@ -875,7 +884,7 @@ def vercmp(a: str, b: str) -> int:
 
 
 def parse_pkg_filename(name: str) -> tuple[str, str, str] | None:
-    """'name-[epoch:]ver-rel-arch.pkg.tar[.ext]' -> (name, 'epoch:ver-rel', arch)."""
+    """Parse the archive filename; makepkg normally omits the epoch from its version."""
     m = PKGFILE_RE.fullmatch(name)
     return (m["name"], m["ver"], m["arch"]) if m else None
 
@@ -889,16 +898,49 @@ def is_aur_candidate(name: str) -> bool:
     return bool(PKGNAME_RE.fullmatch(name)) and not SO_DEP_RE.search(name)
 
 
-def newest_files(filenames: Iterable[str], arches: Collection[str] = ("x86_64", "any")) -> dict[str, str]:
+def newest_files(filenames: Iterable[str], arches: Collection[str] = ("x86_64", "any"),
+                 *, versions: dict[str, str] | None = None) -> dict[str, str]:
     """pkgname -> filename of its newest version (vercmp), ignoring foreign arches."""
     best: dict[str, tuple[str, str]] = {}
     for fn in filenames:
         if (parsed := parse_pkg_filename(fn)) is None or parsed[2] not in arches:
             continue
         name, ver, _ = parsed
+        if versions is not None:
+            ver = versions.get(fn, ver)  # package metadata includes epochs; filenames do not
         if (cur := best.get(name)) is None or vercmp(ver, cur[0]) > 0:
             best[name] = (ver, fn)
     return {name: fn for name, (_, fn) in best.items()}
+
+
+def package_version(path: Path) -> str:
+    """Read the epoch-aware version from the built archive's .PKGINFO."""
+    with tarfile.open(path, "r|*") as tf:
+        for member in tf:
+            if member.name == ".PKGINFO" and (fh := tf.extractfile(member)) is not None:
+                for line in fh.read().decode("utf-8").splitlines():
+                    if line.startswith("pkgver = "):
+                        return line.removeprefix("pkgver = ")
+                break
+    die(f"{path}: .PKGINFO has no package version")
+
+
+def version_satisfies(version: str, dependency: str) -> bool:
+    if (constraint := re.search(r"(<=|>=|=|<|>)(.+)$", dependency)) is None:
+        return True
+    comparison = vercmp(version, constraint[2])
+    match constraint[1]:
+        case "=":
+            return comparison == 0
+        case ">":
+            return comparison > 0
+        case "<":
+            return comparison < 0
+        case ">=":
+            return comparison >= 0
+        case "<=":
+            return comparison <= 0
+    return False
 
 
 def package_files(repo: Path) -> list[str]:
@@ -974,6 +1016,11 @@ def load_db_by_filename(repo: Path) -> dict[str, DbEntry]:
         return {}
 
 
+def repo_db_links_ok(repo: Path) -> bool:
+    return all((repo / link).is_symlink() and os.readlink(repo / link) == target
+               for link, target in ((f"{REPO_NAME}.db", DB_NAME), (f"{REPO_NAME}.files", FILES_NAME)))
+
+
 def write_repo_db(repo: Path, entries: Iterable[DbEntry], *, durable: bool = True) -> None:
     """Write archrepo.db.tar.zst (desc only) and archrepo.files.tar.zst (all members) atomically,
     plus the archrepo.db / archrepo.files symlinks pacman fetches."""
@@ -988,8 +1035,11 @@ def write_repo_db(repo: Path, entries: Iterable[DbEntry], *, durable: bool = Tru
                         db_tf.addfile(info_, None if data is None else io.BytesIO(data))
     for link, target in ((f"{REPO_NAME}.db", DB_NAME), (f"{REPO_NAME}.files", FILES_NAME)):
         tmp_link = repo / f".{link}.{secrets.token_hex(4)}.tmp"
-        os.symlink(target, tmp_link)
-        os.replace(tmp_link, repo / link)
+        try:
+            os.symlink(target, tmp_link)
+            os.replace(tmp_link, repo / link)
+        finally:
+            tmp_link.unlink(missing_ok=True)
     if durable:
         fsync_dir(repo)
 
@@ -1024,10 +1074,10 @@ def repo_add_entries(paths: Sequence[Path]) -> dict[str, DbEntry]:
 
 
 def update_repo_db(repo: Path, want: Collection[str], old: dict[str, DbEntry] | None = None,
-                   force_write: bool = False) -> dict[str, DbEntry]:
+                   force_write: bool = False, *, persist: bool = True) -> dict[str, DbEntry]:
     """Make the repo DB describe exactly `want` (filenames in `repo`). Entries whose filename and
     size still match are reused; only new files go through repo-add; unchanged DBs are not
-    rewritten at all."""
+    rewritten at all. With persist=False, return the indexed view without changing the repo."""
     if old is None:
         old = load_db_by_filename(repo)
     keep: dict[str, DbEntry] = {}
@@ -1042,7 +1092,9 @@ def update_repo_db(repo: Path, want: Collection[str], old: dict[str, DbEntry] | 
             keep[entry.name] = entry
         else:
             fresh.append(path)
-    links_ok = all((repo / n).is_file() for n in (DB_NAME, FILES_NAME, f"{REPO_NAME}.db", f"{REPO_NAME}.files"))
+    if not persist and not fresh:
+        return keep
+    links_ok = repo_db_links_ok(repo) and all((repo / n).is_file() for n in (DB_NAME, FILES_NAME))
     if not force_write and not fresh and len(keep) == len(old) and links_ok:
         ok(f"{repo.name} DB unchanged ({len(keep)} packages)")
         return keep
@@ -1054,20 +1106,30 @@ def update_repo_db(repo: Path, want: Collection[str], old: dict[str, DbEntry] | 
             keep[name] = entry
         step(f"repo-add indexed {len(fresh)} new file(s) in {time.perf_counter() - t0:.1f}s; "
              f"reused {len(keep) - len(fresh)} entries")
-    write_repo_db(repo, keep.values())
-    ok(f"{repo.name} DB written ({len(keep)} packages)")
+    if persist:
+        write_repo_db(repo, keep.values())
+        ok(f"{repo.name} DB written ({len(keep)} packages)")
     return keep
 
 
 def ensure_repo_db(repo: Path) -> bool:
     """True if `repo` has a DB afterwards (indexing its newest files when the DB is missing or out of sync)."""
-    files = set(newest_files(package_files(repo)).values())
+    old = load_db_by_filename(repo)
+    files = set(newest_files(package_files(repo), versions={fn: e.version for fn, e in old.items()}).values())
     if not files:
         return False
     if (repo / FILES_NAME).is_file():
-        old = load_db_by_filename(repo)
+        # .files is authoritative. An interruption between the two atomic renames can
+        # leave .db older, and a damaged .db must also be rebuilt from .files.
+        try:
+            db_entries = read_repo_db(repo / DB_NAME)
+            db_matches = {
+                (e.name, e.version, e.filename, e.csize, e.sha256) for e in db_entries.values()
+            } == {(e.name, e.version, e.filename, e.csize, e.sha256) for e in old.values()}
+        except (OSError, tarfile.TarError, FactoryError, ValueError):
+            db_matches = False
         if (set(old) == files and all(file_size(repo / fn) == e.csize for fn, e in old.items())
-                and all((repo / n).is_file() for n in (DB_NAME, f"{REPO_NAME}.db", f"{REPO_NAME}.files"))):
+                and db_matches and repo_db_links_ok(repo)):
             return True
         warn(f"{repo}: DB out of sync with disk ({len(files)} files on disk, {len(old)} in DB); updating index")
         update_repo_db(repo, files, old, force_write=True)
@@ -1487,8 +1549,14 @@ class AurRpc:
                 if len(raw) > MAX_RPC_BYTES:
                     raise ValueError("response too large")
                 data = json.loads(raw)
+                if not isinstance(data, dict):
+                    raise ValueError("invalid AUR RPC response")
                 if data.get("type") == "error":
                     raise ValueError(str(data.get("error")))
+                if not isinstance(data.get("results"), list):
+                    raise ValueError("invalid AUR RPC response")
+                if not all(isinstance(row, dict) for row in data["results"]):
+                    raise ValueError("invalid AUR RPC result")
                 return data
             except urllib.error.HTTPError as exc:
                 last = f"HTTP {exc.code}"
@@ -1499,7 +1567,8 @@ class AurRpc:
                         delay = 5.0
             except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
                 last = str(exc)
-            time.sleep(delay + random.uniform(0, 1))
+            if attempt < 4:
+                time.sleep(max(0.0, min(30.0, delay)) + random.uniform(0, 1))
         die(f"AUR RPC unreachable: {last}")
 
 
@@ -1511,7 +1580,7 @@ class SrcInfo:
     makedepends: list[str] = field(default_factory=list)
 
 
-# checkdepends are irrelevant: BUILDENV has !check and makepkg runs with --nodeps
+# checkdepends are irrelevant: makepkg runs with --nocheck and --nodeps
 _SRCINFO_DEPS = {"depends": "depends", "depends_x86_64": "depends",
                  "makedepends": "makedepends", "makedepends_x86_64": "makedepends"}
 
@@ -1580,14 +1649,19 @@ class AurBuilder:
         self.logs.mkdir()
         self.makepkg_conf = write_factory_makepkg_conf(self.work / "dusky-makepkg.conf")
         self.index: dict[str, list[tuple[str, str]]] = {}  # pkgname -> [(ver, filename)]
+        metadata = load_db_by_filename(repo)
         for fn in package_files(repo):
             name, ver, arch = parse_pkg_filename(fn)  # type: ignore[misc]
             if arch in ("x86_64", "any"):
+                entry = metadata.get(fn)
+                if entry is not None and file_size(repo / fn) == entry.csize:
+                    ver = entry.version
                 self.index.setdefault(name, []).append((ver, fn))
         self.clones: dict[str, Path] = {}  # pkgbase -> clone, kept across deferrals
         self.keep_names: set[str] = set()  # requested packages that belong in the repo
         self.built = self.skipped = 0
         self.rebuilt_files: set[str] = set()
+        self.built_bases: set[str] = set()
         self.failed: list[str] = []
         self.queue: list[str] = []
 
@@ -1627,7 +1701,7 @@ class AurBuilder:
                 except Exception as exc:  # one broken package must not stop the queue
                     err(f"{pkg}: {exc}")
                     status, new_deps = "failed", []
-                fresh = [d for d in new_deps if d not in known]
+                fresh = list(dict.fromkeys(d for d in new_deps if d not in known))
                 known.update(fresh)
                 queue += fresh
                 if fresh:
@@ -1667,6 +1741,9 @@ class AurBuilder:
                 self.keep_names.add(pkg)
                 return "official", []
             die("not found on the AUR")
+        if meta.pkgbase in self.built_bases and self.newest(pkg) is not None:
+            self.keep_names.add(pkg)
+            return "current", []
         if not pkg.endswith(VCS_SUFFIXES) and any(
                 vercmp(ver, meta.version) >= 0 for ver, _ in self.index.get(pkg, ())):
             step(f"{pkg} already up to date in the repo")
@@ -1700,10 +1777,13 @@ class AurBuilder:
         aur_files: list[Path] = []
         for dep in aur_deps:
             if dep in unsatisfied:
-                if (fn := self.newest(dep_name(dep))) is not None:
+                name = dep_name(dep)
+                fn = self.newest(name)
+                versions = {filename: version for version, filename in self.index.get(name, ())}
+                if fn is not None and version_satisfies(versions[fn], dep):
                     aur_files.append(self.repo / fn)
                 else:
-                    blocked.append(dep_name(dep))
+                    blocked.append(name)
         if dead := [b for b in blocked if b in self.failed]:
             die(f"AUR dependency failed: {', '.join(dead)}")  # don't spin through MAX_DEFER revisits
         if blocked:
@@ -1730,6 +1810,7 @@ class AurBuilder:
                 die(f"build dependencies remain unsatisfied:\n{pacman_errors(r)}")
 
         self._publish(self._build(meta.pkgbase, clone))
+        self.built_bases.add(meta.pkgbase)
         self.keep_names.add(pkg)
         remove_tree(self.clones.pop(meta.pkgbase))
         return "built", queued
@@ -1768,7 +1849,7 @@ class AurBuilder:
         env = makepkg_env(self.user, PKGDEST=str(pkgdest), BUILDDIR=str(build), SRCDEST=str(srcdest),
                           GRADLE_OPTS="-Dorg.gradle.daemon=false -Dorg.gradle.console=plain",
                           GRADLE_USER_HOME=str(build / ".gradle"))
-        base = ["makepkg", "--config", self.makepkg_conf, "--nodeps", "--noconfirm", "--skippgpcheck"]
+        base = ["makepkg", "--config", self.makepkg_conf, "--nodeps", "--nocheck", "--noconfirm", "--skippgpcheck"]
         step(f"makepkg {pkgbase} (log: {log})")
         # Only the network part is retried; a compile failure is deterministic.
         for attempt in range(1, SOURCE_ATTEMPTS + 1):
@@ -1789,9 +1870,11 @@ class AurBuilder:
 
     def _publish(self, built: Sequence[Path]) -> None:
         for bf in built:
+            name, _, _ = parse_pkg_filename(bf.name)  # type: ignore[misc]
+            ver = package_version(bf)
             with atomic_path(self.repo / bf.name) as tmp:
                 shutil.copyfile(bf, tmp)  # copy_file_range/sendfile: no userspace buffers
-            name, ver, _ = parse_pkg_filename(bf.name)  # type: ignore[misc]
+            (self.repo / f"{bf.name}.sig").unlink(missing_ok=True)
             self.rebuilt_files.add(bf.name)
             self.index.setdefault(name, []).append((ver, bf.name))
             self.keep_names.add(name)
@@ -1807,9 +1890,11 @@ def finalize_aur_repo(db: IsolatedDB, repo: Path, official: Path | None, keep_na
     old = load_db_by_filename(repo)
     # VCS pkgver can stay unchanged while its contents change. Even equal-sized replacements
     # must go through repo-add again to refresh checksums and runtime dependencies.
+    versions = {fn: entry.version for fn, entry in old.items()}
     for fn in rebuilt_files:
         old.pop(fn, None)
-    newest = newest_files(package_files(repo))
+        versions[fn] = package_version(repo / fn)
+    newest = newest_files(package_files(repo), versions=versions)
     aur_names = {n for n in newest if n not in db.index.names}  # official deps kept here are re-resolved
     if not keep_names:
         warn("no AUR phase packages to retain")
@@ -1870,6 +1955,7 @@ class IsoConfig:
     official_repo: Path
     aur_repo: Path | None
     final_dest: Path
+    rebuild_local: bool = False
 
     @property
     def profile_dir(self) -> Path:
@@ -1977,15 +2063,21 @@ def inject_dotfiles(cfg: IsoConfig) -> None:
     repo = tmp / "dusky"
     git_env = os.environ | {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never", "GIT_ASKPASS": "/bin/true"}
     try:
-        for attempt in range(1, 4):
+        detail = ""
+        for attempt in range(1, CLONE_ATTEMPTS + 1):
             remove_tree(repo)
-            r = run(["git", "clone", "--quiet", "--depth", "1", "https://github.com/dusklinux/dusky", repo],
-                    env=git_env, capture=True, merge=True, timeout=CLONE_TIMEOUT_S)
-            if r.returncode == 0:
-                break
-            if attempt == 3:
-                die(f"git clone dusky failed: {(r.stdout or '').strip()[-500:]}")
-            backoff(attempt)
+            try:
+                r = run(["git", "clone", "--quiet", "--depth", "1", "https://github.com/dusklinux/dusky", repo],
+                        env=git_env, capture=True, merge=True, timeout=CLONE_TIMEOUT_S)
+                if r.returncode == 0:
+                    break
+                detail = (r.stdout or "").strip()[-500:]
+            except subprocess.TimeoutExpired:
+                detail = f"timed out after {CLONE_TIMEOUT_S}s"
+            if attempt < CLONE_ATTEMPTS:
+                backoff(attempt)
+        else:
+            die(f"git clone dusky failed: {detail}")
         pin = os.environ.get("DUSKY_DOTFILES_PIN", "").strip()
         expect_sha = os.environ.get("DUSKY_DOTFILES_SHA", "").strip().lower()
         if pin:
@@ -2062,8 +2154,54 @@ def inject_dotfiles(cfg: IsoConfig) -> None:
     ok(f"dotfiles injected ({len(perms)} executable(s) registered)")
 
 
+def tree_digest(root: Path, *, permissions: bool = True) -> str:
+    """Hash the tree as copytree(symlinks=False) sees it; ignore timestamps and ownership."""
+    digest = hashlib.sha256()
+
+    def visit(path: Path, relative: Path, ancestors: frozenset[Path]) -> None:
+        resolved = path.resolve(strict=True)
+        st = path.stat()
+        digest.update(os.fsencode(relative) + b"\0")
+        if permissions:
+            digest.update(f"{st.st_mode & 0o7777:o}\0".encode())
+        if path.is_dir():
+            if resolved in ancestors:
+                die(f"cyclic source directory link: {path}")
+            digest.update(b"dir\0")
+            for child in sorted(path.iterdir()):
+                visit(child, relative / child.name, ancestors | {resolved})
+        elif path.is_file():
+            digest.update(b"file\0")
+            with path.open("rb") as fh:
+                digest.update(hashlib.file_digest(fh, "sha256").digest())
+        else:
+            die(f"unsupported build input: {path}")
+
+    visit(root, Path("."), frozenset())
+    return digest.hexdigest()
+
+
+def load_custom_builds(repo: Path | None) -> dict[str, dict[str, str]]:
+    """A missing or damaged cache record requires a rebuild, never unproven reuse."""
+    if repo is None or not (repo / CUSTOM_BUILDS_FILE).is_file():
+        return {}
+    try:
+        data = json.loads((repo / CUSTOM_BUILDS_FILE).read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or any(
+            not isinstance(name, str) or not PKGNAME_RE.fullmatch(name)
+            or not isinstance(record, dict)
+            or not all(isinstance(record.get(key), str) for key in ("fingerprint", "filename", "sha256"))
+            for name, record in data.items()
+        ):
+            raise ValueError("invalid build cache records")
+        return data
+    except (OSError, ValueError) as exc:
+        warn(f"custom build cache unreadable ({exc}); rebuilding local packages")
+        return {}
+
+
 def build_local_packages(cfg: IsoConfig, user: RealUser) -> None:
-    """Build every recipe into an indexed, generic x86-64 repository for the ISO."""
+    """Reuse verified builds with matching inputs; build only missing or changed recipes."""
     skel = cfg.profile_dir / "airootfs" / "etc" / "skel"
     recipes_dir = skel / "user_scripts" / "arch_iso_scripts" / "offline_iso" / "iso_maker" / "python" / "dusky_packages_compile"
     local_dir = cfg.source_dir / "iso_maker" / "python" / "dusky_packages_compile"
@@ -2073,19 +2211,24 @@ def build_local_packages(cfg: IsoConfig, user: RealUser) -> None:
         if recipes_dir.is_dir() else []
     if [p.name for p in local_recipes] != [p.name for p in recipes]:
         die("local package recipes differ from the injected Git checkout; commit and push the recipes")
-    for local, staged in zip(local_recipes, recipes):
-        for filename in ("recipe.toml", "PKGBUILD"):
-            if not (local / filename).is_file() or not (staged / filename).is_file() \
-                    or (local / filename).read_bytes() != (staged / filename).read_bytes():
-                die(f"{local.name}/{filename} differs from the injected Git checkout; commit and push it")
+    for local, staged in zip(local_recipes, recipes, strict=True):
+        # Git does not preserve arbitrary local permissions or directory modes.
+        if tree_digest(local, permissions=False) != tree_digest(staged, permissions=False):
+            die(f"{local.name}: recipe files differ from the injected Git checkout; commit and push them")
     names: list[str] = []
     artifacts: list[tuple[str, str]] = []
+    cache = load_custom_builds(cfg.aur_repo)
+    cached_entries = load_db_by_filename(cfg.aur_repo) if cfg.aur_repo is not None else {}
+    reused: dict[str, DbEntry] = {}
+    fingerprints: dict[str, str] = {}
+    config: Path | None = None
     if recipes:
         if user.is_root:
             die("local ISO packages require a non-root invoking user; run via sudo from your user account")
         require_tool("makepkg", "pacman")
         require_tool("repo-add", "pacman")
-        info(f"Building {len(recipes)} local ISO package(s)")
+        info(f"Preparing {len(recipes)} local ISO recipe(s)")
+        config = write_factory_makepkg_conf(cfg.workspace / "local-makepkg.conf")
     repo = cfg.workspace / "local_repo"
     for recipe in recipes:
         if not (recipe / "PKGBUILD").is_file():
@@ -2102,18 +2245,44 @@ def build_local_packages(cfg: IsoConfig, user: RealUser) -> None:
                 or not all(isinstance(tool, str) and re.fullmatch(r"[A-Za-z0-9._+-]+", tool) for tool in tools)
                 or source_rel.is_absolute() or ".." in source_rel.parts):
             die(f"{recipe}: invalid package name, tools, or source path")
-        for tool in tools:
-            require_tool(tool, f"required by {name}")
         source = (skel / source_rel).resolve()
         if not source.is_dir() or not source.is_relative_to(skel.resolve()):
             die(f"{recipe}: source {source_rel} is missing from the ISO dotfiles checkout")
 
+        assert config is not None
+        fingerprint = hashlib.sha256(
+            b"dusky-local-build-v1\0" + bytes.fromhex(tree_digest(recipe))
+            + bytes.fromhex(tree_digest(source)) + config.read_bytes()
+        ).hexdigest()
+        fingerprints[name] = fingerprint
+        record = cache.get(name, {})
+        entry = cached_entries.get(record.get("filename", ""))
+        if (not cfg.rebuild_local and record.get("fingerprint") == fingerprint and entry is not None
+                and entry.name == name and record.get("sha256") == entry.sha256
+                and (parsed := parse_pkg_filename(entry.filename)) is not None
+                and parsed[2] in ("x86_64", "any")):
+            assert cfg.aur_repo is not None
+            repo.mkdir(exist_ok=True)
+            dest = repo / entry.filename
+            problem = _copy_verified_one(cfg.aur_repo / entry.filename, dest, entry)
+            if problem is None:
+                reused[entry.filename] = entry
+                names.append(name)
+                artifacts.append((name, entry.filename))
+                ok(f"reused local ISO package: {entry.filename} (inputs unchanged)")
+                continue
+            dest.unlink(missing_ok=True)
+            warn(f"cached {name} failed verification ({problem}); rebuilding")
+        step(f"{name}: " + ("forced rebuild" if cfg.rebuild_local else "inputs changed or no verified build cached"))
+        for tool in tools:
+            require_tool(tool, f"required by {name}")
         work = make_tempdir(f"dusky-package-{name}-", owner=user)
         shutil.copytree(source, work / "source", symlinks=False)
         shutil.copytree(recipe, work / "recipe", symlinks=False)
         for sub in ("packages", "build", "cargo-target"):
             (work / sub).mkdir()
-        config = write_factory_makepkg_conf(work / "makepkg.conf")
+        build_config = work / "makepkg.conf"
+        shutil.copyfile(config, build_config)
         restore_ownership(work, user)
         env = makepkg_env(
             user, DUSKY_PACKAGE_SOURCE=str(work / "source"), PKGDEST=str(work / "packages"),
@@ -2123,7 +2292,7 @@ def build_local_packages(cfg: IsoConfig, user: RealUser) -> None:
         step(f"makepkg {name} (log: {log})")
         try:
             result = run(
-                ["makepkg", "--config", config, "--nodeps", "--noconfirm", "--skippgpcheck", "--cleanbuild"],
+                ["makepkg", "--config", build_config, "--nodeps", "--nocheck", "--noconfirm", "--skippgpcheck", "--cleanbuild"],
                 user=user, env=env, cwd=work / "recipe", log=log, timeout=BUILD_TIMEOUT_S,
             )
         except subprocess.TimeoutExpired:
@@ -2137,9 +2306,9 @@ def build_local_packages(cfg: IsoConfig, user: RealUser) -> None:
             die(f"makepkg {name} failed (exit {result.returncode}); log: {saved_log}\n{tail_text(log)}")
         built = [p for p in (work / "packages").iterdir()
                  if (parsed := parse_pkg_filename(p.name)) is not None and parsed[0] == name
-                 and parsed[2] == "x86_64"]
+                 and parsed[2] in ("x86_64", "any") and p.is_file()]
         if len(built) != 1:
-            die(f"{recipe}: expected one x86_64 package named {name}, found {len(built)}")
+            die(f"{recipe}: expected one x86_64/any package named {name}, found {len(built)}")
         repo.mkdir(exist_ok=True)
         with atomic_path(repo / built[0].name) as tmp:
             shutil.copyfile(built[0], tmp)
@@ -2151,7 +2320,11 @@ def build_local_packages(cfg: IsoConfig, user: RealUser) -> None:
     manifest = cfg.profile_dir / "airootfs" / "root" / "arch_install" / "compiled_packages.txt"
     manifest.write_text("".join(f"{name}\t{filename}\n" for name, filename in artifacts), encoding="utf-8")
     if names:
-        update_repo_db(repo, set(package_files(repo)))
+        entries = update_repo_db(repo, set(package_files(repo)), reused)
+        records = {name: {"fingerprint": fingerprints[name], "filename": entry.filename,
+                          "sha256": entry.sha256} for name, entry in entries.items()
+                   if entry.filename not in reused}
+        (repo / CUSTOM_BUILDS_FILE).write_text(json.dumps(records, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def publish_local_packages(cfg: IsoConfig, user: RealUser) -> None:
@@ -2165,21 +2338,29 @@ def publish_local_packages(cfg: IsoConfig, user: RealUser) -> None:
     assert_conf_safe(repo)
     repo.mkdir(parents=True, exist_ok=True)
     entries = read_repo_db(local / FILES_NAME)
-    ensure_disk_space(repo, sum(e.csize for e in entries.values()), "custom package publication")
     old = load_db_by_filename(repo)
+    builds = load_custom_builds(local)
+    cache = load_custom_builds(repo)
+    # Fresh builds are always published, including byte-identical repairs of corrupt archives.
+    changed = [e for e in entries.values() if e.name in builds or (previous := old.get(e.filename)) is None
+               or previous.sha256 != e.sha256 or file_size(repo / e.filename) != e.csize]
+    if not changed and all(cache.get(name) == record for name, record in builds.items()):
+        step("custom package repository already current; skipping publication")
+        return
+    ensure_disk_space(repo, sum(e.csize for e in changed), "custom package publication")
     names = custom_package_names(repo) | entries.keys()
     # Record retention before copying so an interrupted publication cannot cause a subsequent
     # AUR-only run to prune an already published custom build.
     with atomic_path(repo / CUSTOM_PACKAGES_FILE) as tmp:
         tmp.write_text("".join(f"{name}\n" for name in sorted(names)), encoding="utf-8")
     fsync_dir(repo)
-    for entry in entries.values():
+    for entry in changed:
         with atomic_path(repo / entry.filename) as tmp:
             shutil.copyfile(local / entry.filename, tmp)
         # These builds are unsigned; an old detached signature must not survive replacement.
         (repo / f"{entry.filename}.sig").unlink(missing_ok=True)
         old[entry.filename] = entry  # fresh metadata, even for equal-sized same-version rebuilds
-    winners = newest_files(package_files(repo))
+    winners = newest_files(package_files(repo), versions={fn: e.version for fn, e in old.items()})
     winners.update((name, e.filename) for name, e in entries.items())
     update_repo_db(repo, set(winners.values()), old, force_write=True)
     # Remove only superseded custom versions, after the new index is durable.
@@ -2187,9 +2368,13 @@ def publish_local_packages(cfg: IsoConfig, user: RealUser) -> None:
         if (parsed := parse_pkg_filename(fn)) is not None and parsed[0] in entries and fn != winners[parsed[0]]:
             (repo / fn).unlink()
             (repo / f"{fn}.sig").unlink(missing_ok=True)
+    # Commit provenance only after the archives and repository index are durable.
+    cache.update(builds)
+    with atomic_path(repo / CUSTOM_BUILDS_FILE) as tmp:
+        tmp.write_text(json.dumps(cache, sort_keys=True) + "\n", encoding="utf-8")
     fsync_dir(repo)
     restore_ownership(repo, user)
-    ok(f"published {len(entries)} custom package(s) to {repo}")
+    ok(f"published {len(changed)} custom package(s) to {repo}")
 
 
 _copy_buf = threading.local()
@@ -2234,20 +2419,29 @@ def stage_iso_repo(cfg: IsoConfig) -> dict[str, DbEntry]:
     info("Staging merged offline repository (verified single-pass copy)")
     merged: dict[str, tuple[DbEntry, Path]] = {
         n: (e, cfg.official_repo) for n, e in read_repo_db(cfg.official_repo / FILES_NAME).items()}
-    if cfg.aur_repo is not None and (cfg.aur_repo / FILES_NAME).is_file():
-        for name, entry in read_repo_db(cfg.aur_repo / FILES_NAME).items():
+    local_repo = cfg.workspace / "local_repo"
+    local_entries = read_repo_db(local_repo / FILES_NAME) if (local_repo / FILES_NAME).is_file() else {}
+    custom_names = custom_package_names(cfg.aur_repo) if cfg.aur_repo is not None else set()
+    if cfg.aur_repo is not None:
+        # Local recipes have already repaired their own archives in the workspace.
+        # Do not parse a broken persistent custom archive before its replacement is
+        # dependency-checked; publication follows the verified merged staging step.
+        excluded = custom_names & local_entries.keys()
+        aur_metadata = load_db_by_filename(cfg.aur_repo)
+        wanted = {fn for name, fn in newest_files(
+            package_files(cfg.aur_repo), versions={fn: e.version for fn, e in aur_metadata.items()}
+        ).items() if name not in excluded}
+        aur_entries = update_repo_db(cfg.aur_repo, wanted, aur_metadata, persist=False)
+        for name, entry in aur_entries.items():
             cur = merged.get(name)
             if cur is None or vercmp(entry.version, cur[0].version) > 0:
                 if cur is not None:
                     warn(f"{name}: AUR repo {entry.version} supersedes official {cur[0].version}")
                 merged[name] = (entry, cfg.aur_repo)
-    local_repo = cfg.workspace / "local_repo"
-    if (local_repo / FILES_NAME).is_file():
-        custom_names = custom_package_names(cfg.aur_repo) if cfg.aur_repo is not None else set()
-        for name, entry in read_repo_db(local_repo / FILES_NAME).items():
-            if name in merged and (name not in custom_names or merged[name][1] != cfg.aur_repo):
-                die(f"local ISO package {name} conflicts with an official or AUR package")
-            merged[name] = (entry, local_repo)
+    for name, entry in local_entries.items():
+        if name in merged and (name not in custom_names or merged[name][1] != cfg.aur_repo):
+            die(f"local ISO package {name} conflicts with an official or AUR package")
+        merged[name] = (entry, local_repo)
     if not merged:
         die("merged ISO repository is empty")
     total = sum(e.csize for e, _ in merged.values())
@@ -2417,6 +2611,12 @@ def iso_phase(cfg: IsoConfig, user: RealUser) -> tuple[Path, str]:
     info("=== ISO BUILD ===")
     for tool in ("mkarchiso", "git"):
         require_tool(tool)
+    workspace = cfg.workspace.resolve()
+    for path in (cfg.source_dir, cfg.official_repo, cfg.aur_repo, cfg.final_dest):
+        if path is not None and path.resolve().is_relative_to(workspace):
+            die(f"ISO workspace would delete an input or output directory: {path}")
+    if workspace.is_relative_to(cfg.source_dir.resolve()):
+        die("ISO workspace cannot be inside the installer payload directory")
     if not cfg.official_repo.is_dir():
         die(f"official repo missing at {cfg.official_repo} — build it first")
     assert_conf_safe(cfg.official_repo)
@@ -2424,8 +2624,6 @@ def iso_phase(cfg: IsoConfig, user: RealUser) -> tuple[Path, str]:
         die(f"{cfg.official_repo} holds no packages — run the official phase first")
     if cfg.aur_repo is not None:
         assert_conf_safe(cfg.aur_repo)
-        if not ensure_repo_db(cfg.aur_repo):
-            step(f"{cfg.aur_repo} holds no packages yet")
     try:
         setup_clean_room(cfg)
         stage_payloads(cfg)
@@ -2434,6 +2632,8 @@ def iso_phase(cfg: IsoConfig, user: RealUser) -> tuple[Path, str]:
         build_local_packages(cfg, user)
         entries = stage_iso_repo(cfg)
         publish_local_packages(cfg, user)
+        if cfg.aur_repo is not None:
+            ensure_repo_db(cfg.aur_repo)  # custom repairs are durable now; also index manual additions
         configure_iso_pacman_conf(cfg)
         sanitize_live_packages(cfg, entries)
         return build_iso_image(cfg, user)
@@ -2487,6 +2687,9 @@ def main(args: argparse.Namespace) -> None:
         aur_repo = prompt_path("AUR repo path", aur_repo)
     official_repo, aur_repo, source_dir = (p.resolve() for p in (official_repo, aur_repo, source_dir))
 
+    if official_repo == aur_repo:
+        die("official and AUR repositories must use different directories (their pruning rules differ)")
+
     zram = ZRAM_CANDIDATE.is_mount()
     workspace_base: Path | None = args.workspace
     if do_iso and workspace_base is None:
@@ -2517,6 +2720,7 @@ def main(args: argparse.Namespace) -> None:
             source_dir=source_dir,
             official_repo=official_repo,
             aur_repo=aur_repo,
+            rebuild_local=args.rebuild_local,
             final_dest=(args.output_dir or (ZRAM_CANDIDATE if zram else user.home / "dusky_isos"))
                        .expanduser().resolve(),
         )

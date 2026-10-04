@@ -260,7 +260,8 @@ install_compiled_iso_packages() {
   while IFS=$'\t' read -r pkg filename extra || [[ -n $pkg || -n $filename ]]; do
     [[ -n $pkg || -n $filename || -n $extra ]] || continue
     if [[ -n $extra || ! $pkg =~ ^[a-z0-9@_+][a-z0-9@._+-]*$ ||
-          $filename != "$pkg"-* || $filename != *-x86_64.pkg.tar.zst ||
+          $filename != "$pkg"-* ||
+          ( $filename != *-x86_64.pkg.tar.zst && $filename != *-any.pkg.tar.zst ) ||
           $filename == */* || $filename == *..* ]]; then
       die "Invalid compiled ISO package manifest entry: ${pkg} ${filename}"
     fi
