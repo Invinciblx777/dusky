@@ -1,27 +1,12 @@
 #!/usr/bin/env python3
-"""Dusky Kernel Compiler v6.2.0 -- bespoke kernel compilation engine for Arch Linux.
+"""Build hardware-tailored stock Linux 7.3+ kernels for x86-64 Arch Linux.
 
-Target stack (no legacy paths exist in this program):
-  * Arch Linux rolling (September 2026 spec), Linux 7.2+ and 7.3-rc, Python 3.14+
-  * LLVM/Clang 21+ (ThinLTO with persistent disk cache, monolithic full LTO, kCFI, AutoFDO/Propeller)
-  * Rust-for-Linux (scripts/rustavailable validation), sched_ext BPF schedulers, Cache-Aware Scheduling
-  * PREEMPT_LAZY / PREEMPT_DYNAMIC, AMD P-State EPP autonomy, in-tree NTSync, ZRAM multi-compression
+Workflow: collect modules -> select profile/release -> configure and verify ->
+make pacman-pkg -> install locally or transfer packages to the target.
+RAM builds prefer /mnt/zram1, checkpointing objects to persistent storage.
+No kernel feature patches or third-party module source modifications.
 
-Pipeline (one profile -> two pacman packages):
-  profile.toml -> host telemetry -> release selection (kernel.org releases.json) -> tarball + SHA256/PGP
-  -> source tree (per patch-set) -> scheduler patches (BORE/BMQ) -> Kconfig.hz injection (500/600/750 Hz)
-  -> seed .config (snapshot | Arch upstream config | /proc/config.gz | headers | defconfig)
-  -> olddefconfig -> localmodconfig(LSMOD=modprobed.db, strict|expanded) -> Kconfig index scan
-  -> declarative Kconfig matrix (batched scripts/config) -> olddefconfig -> contract verification
-  -> make pacman-pkg (linux-dusky-<flavor> + linux-dusky-<flavor>-headers) -> pacman -U
-  -> bootloader refresh (systemd-boot entries, GRUB, rEFInd, Limine, kernel-install)
-
-Quick start:
-  ./dusky_kernal_compile.py --write-default-profiles
-  ./dusky_kernal_compile.py --doctor
-  ./dusky_kernal_compile.py --profile battery             # asks: use defaults exactly? [Y/n]
-  ./dusky_kernal_compile.py --profile battery --wizard      # force the granular questionnaire
-  ./dusky_kernal_compile.py --profile battery --configure-only --print-matrix
+Use --help for CLI options or run without arguments for the guided menu.
 """
 
 import sys
@@ -38,7 +23,6 @@ import fcntl
 from contextlib import ExitStack, contextmanager
 import gzip
 import hashlib
-import itertools
 import json
 import lzma
 import os
@@ -57,7 +41,7 @@ import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -71,9 +55,9 @@ type Json = dict[str, Any]
 # Constants & filesystem layout (XDG aware, env-overridable)
 # ---------------------------------------------------------------------------------------------------
 APP_NAME: Final = "Dusky Kernel Compiler"
-APP_VERSION: Final = "6.2.0"
-APP_TAGLINE: Final = "Tailored Arch Linux kernels (Linux 7.2+ / 7.3-rc)"
-MIN_KERNEL: Final = (7, 2)
+APP_VERSION: Final = "7.0.0"
+APP_TAGLINE: Final = "Tailored Arch Linux kernels (stock Linux 7.3+)"
+MIN_KERNEL: Final = (7, 3)
 SCRIPT_DIR: Final = Path(__file__).resolve().parent
 XDG_CONFIG: Final = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
 XDG_CACHE: Final = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
@@ -95,7 +79,6 @@ def _detect_default_build_dir() -> Path:
 BUILD_DIR: Path = _detect_default_build_dir()
 SRC_DIR: Path = BUILD_DIR / "src"
 TARBALL_DIR: Path = Path(os.environ.get("DUSKY_TARBALL_DIR") or XDG_CACHE / "dusky-kernel" / "tarballs")
-PATCH_CACHE: Path = Path(os.environ.get("DUSKY_PATCH_CACHE") or XDG_CACHE / "dusky-kernel" / "patches")
 THINLTO_CACHE_DIR: Path = Path(os.environ.get("DUSKY_THINLTO_CACHE") or XDG_CACHE / "dusky-kernel" / "thinlto-cache")
 PKGDEST_DIR: Path = Path(os.environ.get("DUSKY_PKGDEST") or BUILD_DIR / "packages")
 IMPORT_DIR: Final = STATE_DIR / "imports"
@@ -105,16 +88,15 @@ RAM_RESERVE_GIB: int = 0
 
 
 def set_build_dir(new_path: Path | str) -> None:
-    global BUILD_DIR, SRC_DIR, TARBALL_DIR, PATCH_CACHE, THINLTO_CACHE_DIR, PKGDEST_DIR
+    global BUILD_DIR, SRC_DIR, TARBALL_DIR, THINLTO_CACHE_DIR, PKGDEST_DIR
     BUILD_DIR = Path(new_path).expanduser().resolve()
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
     SRC_DIR = BUILD_DIR / "src"
     TARBALL_DIR = Path(os.environ.get("DUSKY_TARBALL_DIR") or STORAGE.get("persistent_dir", XDG_CACHE / "dusky-kernel") / "tarballs")
-    PATCH_CACHE = Path(os.environ.get("DUSKY_PATCH_CACHE") or STORAGE.get("persistent_dir", XDG_CACHE / "dusky-kernel") / "patches")
     THINLTO_CACHE_DIR = STORAGE.get("thinlto_dir", Path(os.environ.get("DUSKY_THINLTO_CACHE") or XDG_CACHE / "dusky-kernel" / "thinlto-cache"))
     PKGDEST_DIR = STORAGE.get("packages_dir", Path(os.environ.get("DUSKY_PKGDEST") or XDG_CACHE / "dusky-kernel" / "packages"))
     IMPORT_DIR.mkdir(parents=True, exist_ok=True)
-    for d in (SRC_DIR, TARBALL_DIR, PATCH_CACHE, THINLTO_CACHE_DIR, PKGDEST_DIR, BUILD_DIR / "seeds"):
+    for d in (SRC_DIR, TARBALL_DIR, THINLTO_CACHE_DIR, PKGDEST_DIR, BUILD_DIR / "seeds"):
         d.mkdir(parents=True, exist_ok=True)
 LOG_DIR: Final = STATE_DIR / "logs"
 HISTORY_FILE: Final = STATE_DIR / "history.json"
@@ -583,46 +565,16 @@ class AbortError(DuskyError):
 # ---------------------------------------------------------------------------------------------------
 from kernel_profiles.schema import (
     HZ_CHOICES,
-    HZ_UPSTREAM,
-    TICKLESS_CHOICES,
-    PREEMPT_CHOICES,
     SCHED_CHOICES,
-    SCX_CHOICES,
     CHANNEL_CHOICES,
     LTO_CHOICES,
-    OPT_CHOICES,
-    FDO_CHOICES,
-    THP_CHOICES,
-    THP_DEFRAG_CHOICES,
-    THP_SHMEM_CHOICES,
-    SWAP_BACKEND_CHOICES,
-    ZRAM_ALGO_CHOICES,
-    ZSWAP_COMP_CHOICES,
     FOOTPRINT_CHOICES,
-    TRACING_CHOICES,
-    GOV_CHOICES,
-    EPP_CHOICES,
-    PSTATE_CHOICES,
-    MITIGATION_CHOICES,
-    IDLE_GOV_CHOICES,
-    PCIE_ASPM_CHOICES,
-    CONG_CHOICES,
-    QDISC_CHOICES,
     TOOLCHAIN_CHOICES,
     HEADERS_CHOICES,
     MODULES_MODE_CHOICES,
-    COMPRESS_CHOICES,
-    DEBUG_CHOICES,
-    SECURITY_PROFILES,
-    STACKPROTECTOR_CHOICES,
-    IOSCHED_CHOICES,
-    SEED_CHOICES,
-    CMDLINE_CHOICES,
     CHOICE_HELP,
     FieldSpec,
-    F,
     PROFILE_SPEC,
-    WizardStep,
     WIZARD_STEPS,
     SECURITY_BUNDLES,
     FOOTPRINT_RANK,
@@ -763,6 +715,8 @@ def validate_profile(p: KernelProfile) -> None:
     for key, value in p.g("dusky", "extra_config").items():
         if not re.fullmatch(r"(?:CONFIG_)?[A-Za-z0-9_]+", key) or type(value) not in (bool, int, str):
             raise ProfileError(f"Invalid Kconfig override: {key}")
+        if isinstance(value, str) and ('\n' in value or '\r' in value):
+            raise ProfileError(f"Kconfig string override {key} must fit on one line")
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", p.suffix):
         raise ProfileError(f"{p.path.name}: meta.suffix '{p.suffix}' must match [a-z0-9][a-z0-9-]*")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", p.name):
@@ -783,14 +737,12 @@ def normalize_profile(p: KernelProfile) -> list[str]:
         force("compiler", "lto", "none", "LTO requires LLVM")
         force("compiler", "kcfi", False, "kCFI requires clang")
         force("compiler", "fdo", "none", "AutoFDO/Propeller require clang")
-        force("compiler", "polly", False, "Polly requires clang/LLVM")
     if s["compiler"]["lto"] != "thin":
         force("compiler", "thinlto_cache", False, "ThinLTO cache only applies to lto=thin")
+    if s["compiler"]["fdo"] != "none":
+        force("compiler", "debug_info", "full", "FDO profile collection needs debug line information")
     if s["timing"]["preempt"] == "rt":
         force("timing", "preempt_dynamic", False, "PREEMPT_RT excludes PREEMPT_DYNAMIC")
-    if s["scheduler"]["type"] == "bmq":
-        force("scheduler", "scx", "none", "Project C replaces EEVDF; sched_ext unavailable")
-        force("scheduler", "scx_enable_class", False, "Project C replaces EEVDF; sched_ext unavailable")
     if s["scheduler"]["scx"] != "none":
         force("memory", "tracing", "full", "sched_ext daemon probes need function tracing")
         force("scheduler", "scx_enable_class", True, "a BPF scheduler daemon needs SCHED_CLASS_EXT")
@@ -839,7 +791,7 @@ def cross_validate(p: KernelProfile, facts: "HostFacts | None" = None, *, force:
         pinned = KVer.parse(s["release"]["pin"])
         if pinned is None:
             raise ProfileError(f"release.pin '{s['release']['pin']}' is not a kernel version")
-        if pinned.key() < max(floor.key(), KVer(*MIN_KERNEL).key()):
+        if pinned.key() < max(floor.key(), KVer(*MIN_KERNEL, rc=0).key()):
             raise ProfileError(f"release.pin {s['release']['pin']} is below the {MIN_KERNEL[0]}.{MIN_KERNEL[1]} floor")
         if pinned.rc is not None and not s["release"]["allow_rc"]:
             raise ProfileError("release.pin selects an RC but release.allow_rc=false")
@@ -1090,12 +1042,8 @@ def field_relevant(s: Sections, sec: str, key: str) -> bool:
     match (sec, key):
         case ("release", "allow_rc"):
             return s["release"]["channel"] == "mainline" or bool(s["release"]["pin"])
-        case ("scheduler", "scx") | ("scheduler", "scx_enable_class"):
-            return s["scheduler"]["type"] != "bmq"
         case ("scheduler", "scx_flags"):
             return s["scheduler"]["scx"] != "none"
-        case ("scheduler", "require_patch") | ("scheduler", "allow_vanilla_fallback"):
-            return s["scheduler"]["type"] != "eevdf"
         case ("cache", "llc_aggr_tolerance") | ("cache", "llc_overaggr_pct"):
             return bool(s["cache"]["sched_cache"])
         case ("rseq", "slice_ext_nsec"):
@@ -1373,7 +1321,7 @@ def wizard_review_loop(p: KernelProfile, facts: "HostFacts | None", diff: list[s
             err(str(e))
             if not interactive():
                 raise
-            raw = ask("Revisit wizard step number (1-11) or 'q' to abort", "q")
+            raw = ask(f"Revisit wizard step number (1-{len(WIZARD_STEPS)}) or 'q' to abort", "q")
             if raw.lower() == "q":
                 raise AbortError("Aborted in wizard") from e
             if raw.isdigit() and 1 <= int(raw) <= len(WIZARD_STEPS):
@@ -1402,20 +1350,15 @@ def offer_save_profile(p: KernelProfile) -> None:
 
 
 def configure_profile_interactively(p: KernelProfile, facts: "HostFacts | None", args: argparse.Namespace) -> list[str]:
-    """Top-level gate: use defaults exactly, or enter the granular wizard."""
+    """Apply defaults and overrides; the granular wizard is explicitly requested."""
     cli_diff = apply_overrides(p, Overrides.from_env_and_args(args))
-    force_wizard = bool(getattr(args, "wizard", False))
-    skip_wizard = bool(getattr(args, "no_prompt", False)) or ASSUME_YES or not interactive()
     diff = list(cli_diff)
-    if force_wizard or not skip_wizard:
-        use_defaults = True if skip_wizard and not force_wizard else ask_yes(
-            f"Do you want to use the profile defaults exactly as configured in '{p.name}'?", True)
-        if force_wizard or not use_defaults:
-            diff.extend(run_wizard(p, facts))
-            diff = wizard_review_loop(p, facts, diff, force=bool(getattr(args, "force", False)))
-            if diff:
-                offer_save_profile(p)
-            return diff
+    if getattr(args, "wizard", False):
+        diff.extend(run_wizard(p, facts))
+        diff = wizard_review_loop(p, facts, diff, force=bool(getattr(args, "force", False)))
+        if diff:
+            offer_save_profile(p)
+        return diff
     notes = normalize_profile(p)
     validate_profile(p)
     cross_validate(p, facts, force=bool(getattr(args, "force", False)))
@@ -1511,9 +1454,19 @@ def run(cmd: Sequence[str], *, cwd: Path | None = None, env: Mapping[str, str] |
     except subprocess.TimeoutExpired as e:
         if pgid is not None:
             terminate_process_group(pgid)
+        else:
+            proc.kill()
         proc.wait()
         raise BuildError(f"Command timed out after {timeout}s: {shlex.join(cmd)}") from e
     finally:
+        if proc.poll() is None:
+            if pgid is not None:
+                terminate_process_group(pgid)
+            else:
+                proc.kill()
+            proc.wait()
+        if proc.stdout is not None:
+            proc.stdout.close()
         _unregister(pgid)
     out = out or ""
     if out and capture:
@@ -1594,13 +1547,14 @@ class Privilege:
 
     def ensure(self) -> None:
         tool = self.detect()
-        if tool != "sudo" or self._thread is not None:
+        if tool != "sudo" or (self._thread is not None and self._thread.is_alive()):
             return
         info("Privileged steps ahead (sudo)")
         try:
             subprocess.run(["sudo", "-v"], check=True)
         except (subprocess.CalledProcessError, OSError) as e:
             raise DependencyError("sudo credentials required") from e
+        self._stop.clear()
         self._thread = threading.Thread(target=self._keepalive, name="sudo-keepalive", daemon=True)
         self._thread.start()
 
@@ -1617,14 +1571,14 @@ class Privilege:
             case "doas":
                 return ["doas", *cmd]
             case _:
-                return ["run0", "--background=", *cmd]
+                return ["run0", *cmd]
 
     def run(self, cmd: Sequence[str], *, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess[str]:
         self.ensure()
         return run(self.argv(cmd), check=check, capture=capture, own_group=False, stdin_null=False)
 
     def write_files(self, files: Mapping[Path, tuple[str, str]]) -> None:
-        """Install {dest: (content, mode)} atomically with one privileged shell invocation."""
+        """Install {dest: (content, mode)} with one privileged shell invocation."""
         if not files:
             return
         self.ensure()
@@ -1643,6 +1597,10 @@ class Privilege:
 
     def stop(self) -> None:
         self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+            if not self._thread.is_alive():
+                self._thread = None
 
 
 
@@ -2238,7 +2196,7 @@ def target_facts_for_profile(p: KernelProfile, host: HostFacts) -> HostFacts:
             raise ValueError("re-export the target using this script (bundle v3 required)")
         values = {key: data[key] for key in HostFacts.__slots__}
         for key in ("threads", "cores", "llc_domains", "llc_kib", "numa_nodes", "psabi_level"):
-            if type(values[key]) is not int or values[key] < (0 if key == "llc_kib" else 1):
+            if type(values[key]) is not int or values[key] < (0 if key in ("llc_kib", "llc_domains") else 1):
                 raise ValueError(f"invalid target {key}")
         if values["psabi_level"] not in (1, 2, 3, 4):
             raise ValueError("invalid target ISA level")
@@ -2355,7 +2313,7 @@ def fetch_releases() -> list[Release]:
 
 def candidates_for(releases: Sequence[Release], channel: str, allow_rc: bool, min_ver: str) -> list[Release]:
     floor = KVer.parse(min_ver) or KVer(*MIN_KERNEL)
-    floor = max(floor, KVer(*MIN_KERNEL), key=lambda k: k.key())
+    floor = max(floor, KVer(*MIN_KERNEL, rc=0), key=lambda k: k.key())
     effective_allow_rc = allow_rc
     cands: list[Release] = []
     for r in releases:
@@ -2401,7 +2359,7 @@ def choose_release(p: KernelProfile, releases: Sequence[Release], exact_pin: boo
         if not cands:
             raise NetworkError(f"No kernel >= {MIN_KERNEL[0]}.{MIN_KERNEL[1]} found in channel '{channel}' (allow_rc={p.g('release', 'allow_rc')})")
         return cands[0]
-    floor = max(KVer.parse(p.g("release", "min_version")) or KVer(*MIN_KERNEL), KVer(*MIN_KERNEL), key=lambda k: k.key())
+    floor = max(KVer.parse(p.g("release", "min_version")) or KVer(*MIN_KERNEL), KVer(*MIN_KERNEL, rc=0), key=lambda k: k.key())
     listed = {r.version: r for r in releases if r.moniker in CHANNEL_CHOICES and r.kver.key() >= floor.key()}
     if preferred:
         listed.setdefault(preferred.version, preferred)
@@ -2542,22 +2500,39 @@ def verify_pgp(tarball: Path, pgp_url: str) -> bool | None:
             warn(f"Signature download failed: {e}")
             return None
     decomp = ["xz", "-cd", str(tarball)] if tarball.suffix == ".xz" else ["gzip", "-cd", str(tarball)]
-    xz = subprocess.Popen(decomp, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
-    gpg = subprocess.Popen(["gpg", "--batch", "--status-fd", "1", "--verify", str(sig), "-"], stdin=xz.stdout, stdout=subprocess.PIPE,
-                           stderr=subprocess.DEVNULL, text=True, start_new_session=True)
-    pg1, pg2 = _register(xz, True), _register(gpg, True)
+    decompressor = subprocess.Popen(decomp, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
+    pg1 = _register(decompressor, True)
+    verifier = None
+    pg2 = None
     try:
-        assert xz.stdout is not None
-        xz.stdout.close()
-        out, _ = gpg.communicate()
-        xz.wait()
+        verifier = subprocess.Popen(["gpg", "--batch", "--status-fd", "1", "--verify", str(sig), "-"],
+                                    stdin=decompressor.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    text=True, start_new_session=True)
+        pg2 = _register(verifier, True)
+        assert decompressor.stdout is not None
+        decompressor.stdout.close()
+        out, _ = verifier.communicate()
+        decompressor.wait()
     finally:
-        _unregister(pg1)
-        _unregister(pg2)
-    fprs = {m.group(1) for m in re.finditer(r"\[GNUPG:\] VALIDSIG (\w+)", out or "")}
-    if xz.returncode != 0 or gpg.returncode != 0 or not fprs:
+        for proc, pgid in ((verifier, pg2), (decompressor, pg1)):
+            if proc is not None:
+                if proc.poll() is None:
+                    terminate_process_group(proc.pid)
+                    proc.wait()
+                if proc.stdout is not None:
+                    proc.stdout.close()
+            _unregister(pgid)
+    if decompressor.returncode or verifier.returncode:
         return False
-    return bool(fprs & KERNEL_SIGNING_FPRS)
+    # GnuPG's optional final VALIDSIG field identifies a signing subkey's
+    # primary key. Kernel release signatures can legitimately use subkeys.
+    for line in out.splitlines():
+        fields = line.split()
+        if fields[:2] == ["[GNUPG:]", "VALIDSIG"] and len(fields) >= 11:
+            primary = fields[11] if len(fields) >= 12 else fields[2]
+            if primary in KERNEL_SIGNING_FPRS:
+                return True
+    return False
 
 
 def obtain_tarball(rel: Release, require_signature: bool) -> Path:
@@ -2618,17 +2593,19 @@ def tree_version(tree: Path) -> str:
     return res
 
 
-def tree_dir_for(rel: Release, patchset: str) -> Path:
-    return SRC_DIR / (f"linux-{rel.version}" + (f"+{patchset}" if patchset else ""))
+def tree_dir_for(rel: Release, identity: str) -> Path:
+    return SRC_DIR / (f"linux-{rel.version}" + (f"+{identity}" if identity else ""))
 
 
-def unpack(tarball: Path, rel: Release, patchset: str, fresh: bool) -> Path:
+def unpack(tarball: Path, rel: Release, identity: str, fresh: bool) -> Path:
     SRC_DIR.mkdir(parents=True, exist_ok=True)
-    dest = tree_dir_for(rel, patchset)
+    dest = tree_dir_for(rel, identity)
     if fresh and dest.exists():
         info(f"--fresh: removing {dest}")
         shutil.rmtree(dest)
     if is_valid_kernel_tree(dest):
+        if KVer.parse(tree_version(dest)) != rel.kver:
+            raise BuildError(f"Cached source version differs from {rel.version}; use --fresh")
         ok(f"Reusing source tree {dest.name} (incremental build)")
         return dest
     rule(f"Extracting {tarball.name}")
@@ -2643,219 +2620,12 @@ def unpack(tarball: Path, rel: Release, patchset: str, fresh: bool) -> Path:
         (dest / ".dusky").mkdir(exist_ok=True)
         (dest / ".dusky" / "source-epoch").write_text(str(int((dest / "Makefile").stat().st_mtime)))
     kv = KVer.parse(tree_version(dest).split("-dusky")[0])
-    if kv is None or kv.key() < KVer(*MIN_KERNEL).key():
+    if kv != rel.kver:
+        raise VerifyError(f"Archive reports Linux {tree_version(dest)}, expected {rel.version}")
+    if kv is None or kv.key() < KVer(*MIN_KERNEL, rc=0).key():
         raise ProfileError(f"Extracted tree reports {tree_version(dest)}, below the {MIN_KERNEL[0]}.{MIN_KERNEL[1]} floor")
     ok(f"Extracted Linux {tree_version(dest)} -> {dest}")
     return dest
-
-# ---------------------------------------------------------------------------------------------------
-# Out-of-tree scheduler patches (BORE / Project C BMQ)
-# ---------------------------------------------------------------------------------------------------
-CACHYOS_RAW: Final = "https://raw.githubusercontent.com/CachyOS/kernel-patches/master"
-
-
-def github_dir_patches(owner_repo: str, path: str) -> list[str]:
-    data = json.loads(http_get(f"https://api.github.com/repos/{owner_repo}/contents/{path}").decode("utf-8"))
-    if not isinstance(data, list):
-        return []
-    return sorted(str(e["download_url"]) for e in data if isinstance(e, dict) and str(e.get("name", "")).endswith(".patch") and e.get("download_url"))
-
-
-def gitlab_dir_patches(project: str, path: str) -> list[str]:
-    api = f"https://gitlab.com/api/v4/projects/{urllib.parse.quote_plus(project)}/repository/tree?path={urllib.parse.quote(path)}&per_page=100"
-    data = json.loads(http_get(api).decode("utf-8"))
-    names = sorted(str(e["name"]) for e in data if isinstance(e, dict) and e.get("type") == "blob" and str(e["name"]).endswith(".patch"))
-    return [f"https://gitlab.com/{project}/-/raw/master/{path}/{n}" for n in names]
-
-
-def resolve_patch_urls(sched: str, mm: str, is_rc: bool, sources: Sequence[str]) -> list[tuple[str, str]]:
-    urls: list[tuple[str, str]] = []
-    for src in sources:
-        match (sched, src):
-            case ("bore", "cachyos"):
-                urls += [("cachyos", f"{CACHYOS_RAW}/{mm}/sched/0001-bore.patch"), ("cachyos", f"{CACHYOS_RAW}/{mm}/sched/0001-bore-cachy.patch")]
-            case ("bore", "upstream_author"):
-                subdirs = [f"patches/stable/linux-{mm}-bore", f"patches/testing/linux-{mm}-rc-bore"]
-                if is_rc:
-                    subdirs.reverse()
-                for sub in subdirs:
-                    try:
-                        urls += [("firelzrd", u) for u in github_dir_patches("firelzrd/bore-scheduler", sub)]
-                    except (NetworkError, ValueError, KeyError):
-                        continue
-            case ("bore", "tkg"):
-                urls.append(("tkg", f"https://raw.githubusercontent.com/Frogging-Family/linux-tkg/master/linux-tkg-patches/{mm}/0001-bore.patch"))
-            case ("bmq", "cachyos"):
-                urls += [("cachyos", f"{CACHYOS_RAW}/{mm}/sched/0001-prjc.patch"), ("cachyos", f"{CACHYOS_RAW}/{mm}/sched/0001-prjc-cachy.patch")]
-            case ("bmq", "upstream_author"):
-                try:
-                    urls += [("projectc", u) for u in reversed(gitlab_dir_patches("alfredchen/projectc", mm))]
-                except (NetworkError, ValueError, KeyError):
-                    pass
-            case _:
-                if src.startswith(("http://", "https://", "/", "file://")):
-                    urls.append(("custom", src.replace("{mm}", mm)))
-    return urls
-
-
-def fetch_patch(url: str, sched: str, mm: str) -> Path | None:
-    dest = PATCH_CACHE / sched / mm / (hashlib.sha256(url.encode()).hexdigest()[:12] + "-" + Path(urllib.parse.urlparse(url).path).name)
-    if dest.is_file() and dest.stat().st_size > 0:
-        return dest
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if url.startswith("/") or url.startswith("file://"):
-        local_p = Path(url.removeprefix("file://"))
-        if local_p.is_file():
-            data = local_p.read_bytes()
-            if b"diff --git" in data or b"\n+++ " in data:
-                dest.write_bytes(data)
-                return dest
-        return None
-    try:
-        data = http_get(url, timeout=60)
-    except NetworkError:
-        return None
-    if b"diff --git" not in data and b"\n+++ " not in data:
-        return None
-    dest.write_bytes(data)
-    return dest
-
-
-def _patch_state(tree: Path) -> Json:
-    try:
-        return json.loads((tree / ".dusky" / "patches.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {"applied": []}
-
-
-def _save_patch_state(tree: Path, state: Json) -> None:
-    (tree / ".dusky").mkdir(exist_ok=True)
-    (tree / ".dusky" / "patches.json").write_text(json.dumps(state, indent=1), encoding="utf-8")
-
-
-def apply_scheduler_patch(tree: Path, p: KernelProfile, rel: Release) -> str:
-    """Returns the effective base scheduler after patching ('eevdf' | 'bore' | 'bmq')."""
-    sched = p.g("scheduler", "type")
-    if sched == "eevdf":
-        return "eevdf"
-    state = _patch_state(tree)
-    if sched in state.get("applied", []):
-        ok(f"{sched.upper()} patch already applied to {tree.name}")
-        return sched
-    rule(f"Out-of-tree scheduler patch: {sched.upper()}")
-    kv = rel.kver
-    mm = f"{kv.major}.{kv.minor}"
-    for origin, url in resolve_patch_urls(sched, mm, rel.is_rc, p.g("scheduler", "patch_sources")):
-        pf = fetch_patch(url, sched, mm)
-        if pf is None:
-            debug(f"no patch at {url}")
-            continue
-        dry = run(["patch", "-p1", "-N", "--dry-run", "-F0", "-i", str(pf)], cwd=tree, check=False)
-        if dry.returncode != 0:
-            warn(f"{origin}: {pf.name} does not apply exactly to Linux {mm}; trying the next source")
-            continue
-        run(["patch", "--batch", "-p1", "-N", "-F0", "-i", str(pf)], cwd=tree)
-        state.setdefault("applied", []).append(sched)
-        state[sched] = {"url": url, "file": pf.name, "applied_at": datetime.now(UTC).isoformat()}
-        _save_patch_state(tree, state)
-        ok(f"Applied {origin} {pf.name}")
-        return sched
-    if p.g("scheduler", "require_patch"):
-        raise BuildError(f"No applicable {sched.upper()} patch found for Linux {mm} (require_patch=true)")
-    if p.g("scheduler", "allow_vanilla_fallback"):
-        warn(f"No applicable {sched.upper()} patch for Linux {mm}; falling back to vanilla EEVDF")
-        p.set("scheduler", "type", "eevdf", explicit=False)
-        return "eevdf"
-    raise BuildError(f"No applicable {sched.upper()} patch for Linux {mm} and vanilla fallback is disabled")
-
-
-# ---------------------------------------------------------------------------------------------------
-# Built-in kernel enhancement patches (Linux 7.2 / 7.3+)
-# ---------------------------------------------------------------------------------------------------
-
-
-def apply_patch_content(tree: Path, name: str, patch_text: str) -> bool:
-    """Applies an embedded patch to the kernel source tree, with idempotency and reverse-dry-run checks."""
-    state = _patch_state(tree)
-    if name in state.get("applied", []):
-        ok(f"Patch '{name}' already applied to {tree.name}")
-        return True
-
-    dusky_dir = tree / ".dusky"
-    dusky_dir.mkdir(parents=True, exist_ok=True)
-    pfile = dusky_dir / f"{name}.patch"
-    pfile.write_text(patch_text, encoding="utf-8")
-
-    dry = run(["patch", "-p1", "-N", "--dry-run", "-F0", "-i", str(pfile)], cwd=tree, check=False)
-    if dry.returncode != 0:
-        rev = run(["patch", "--batch", "-p1", "-R", "--dry-run", "-F0", "-i", str(pfile)], cwd=tree, check=False)
-        if rev.returncode != 0:
-            warn(f"Patch '{name}' does not apply exactly to {tree.name}; skipped")
-            return False
-        ok(f"Patch '{name}' already present in source tree")
-        return True
-    run(["patch", "--batch", "-p1", "-N", "-F0", "-i", str(pfile)], cwd=tree)
-    state.setdefault("applied", []).append(name)
-    state[name] = {"builtin": True, "applied_at": datetime.now(UTC).isoformat()}
-    _save_patch_state(tree, state)
-    ok(f"Applied built-in patch: {name}")
-    return True
-
-
-def apply_enhancement_patches(tree: Path, p: KernelProfile, rel: Release, facts: HostFacts) -> None:
-    """Applies high-value performance, responsiveness, and safety enhancement patches."""
-    rule("Kernel enhancement patches")
-    applied_count = 0
-
-    if p.g("dusky", "patch_sched_inline"):
-        if apply_patch_content(tree, "sched_inline", (SCRIPT_DIR / "patches" / "sched_inline.patch").read_text(encoding="utf-8")):
-            applied_count += 1
-
-    if p.g("dusky", "patch_evdev_rcu"):
-        if apply_patch_content(tree, "evdev_rcu", (SCRIPT_DIR / "patches" / "evdev_rcu.patch").read_text(encoding="utf-8")):
-            applied_count += 1
-
-    if p.g("dusky", "patch_pci_pme"):
-        if apply_patch_content(tree, "pci_pme", (SCRIPT_DIR / "patches" / "pci_pme.patch").read_text(encoding="utf-8")):
-            applied_count += 1
-
-    if p.g("compiler", "polly") and p.g("compiler", "toolchain") == "llvm":
-        if apply_patch_content(tree, "clang_polly", (SCRIPT_DIR / "patches" / "clang_polly.patch").read_text(encoding="utf-8")):
-            applied_count += 1
-
-    if p.g("boot", "acs_override"):
-        if apply_patch_content(tree, "acs_override", (SCRIPT_DIR / "patches" / "acs_override.patch").read_text(encoding="utf-8")):
-            applied_count += 1
-
-    if applied_count == 0:
-        info("No additional enhancement patches selected for this profile")
-    else:
-        ok(f"Applied/verified {applied_count} enhancement patch(es)")
-
-
-def ensure_hz_choice(tree: Path, hz: int) -> bool:
-    """Vanilla trees only offer 100/250/300/1000 Hz. Add a Kconfig choice member for other values (idempotent)."""
-    if hz in HZ_UPSTREAM:
-        return False
-    kfile = tree / "kernel" / "Kconfig.hz"
-    txt = kfile.read_text(encoding="utf-8")
-    if re.search(rf"^\s*config HZ_{hz}\s*$", txt, re.M):
-        return False
-    m = re.search(r"^(\s*)config HZ_1000\s*$", txt, re.M)
-    if m is None:
-        raise BuildError("kernel/Kconfig.hz layout unrecognized; cannot inject HZ choice")
-    ind = m.group(1)
-    entry = (f"{ind}config HZ_{hz}\n{ind}\tbool \"{hz} HZ\"\n{ind}\thelp\n{ind}\t {hz} Hz timer frequency injected by {APP_NAME}: a middle ground between\n"
-             f"{ind}\t 250 Hz throughput and 1000 Hz desktop latency.\n\n")
-    txt = txt[:m.start()] + entry + txt[m.start():]
-    dm = re.search(r"^(\s*)default 1000 if HZ_1000\s*$", txt, re.M)
-    if dm is None:
-        raise BuildError("kernel/Kconfig.hz default table unrecognized; cannot inject HZ choice")
-    txt = txt[:dm.start()] + f"{dm.group(1)}default {hz} if HZ_{hz}\n" + txt[dm.start():]
-    kfile.write_text(txt, encoding="utf-8")
-    ok(f"Injected HZ_{hz} into kernel/Kconfig.hz")
-    return True
-
 
 # ---------------------------------------------------------------------------------------------------
 # .config seeding, modprobed-db and localmodconfig pruning
@@ -3036,7 +2806,7 @@ def _generate_modprobed_db_from_lsmod() -> Path | None:
     return dest if dest.is_file() and dest.stat().st_size > 0 else None
 
 
-def localmodconfig(tree: Path, p: KernelProfile, db: Path | None, env: Mapping[str, str]) -> None:
+def localmodconfig(tree: Path, p: KernelProfile, db: Path | None, env: Mapping[str, str]) -> set[str]:
     mode = p.g("modules", "mode")
     if p.g("meta", "manifest_path") and db is None:
         raise ProfileError("Remote pruning requires a usable module census from the target")
@@ -3061,9 +2831,26 @@ def localmodconfig(tree: Path, p: KernelProfile, db: Path | None, env: Mapping[s
         lm_env["LMC_KEEP"] = ":".join((*LMC_KEEP_BASE, *p.g("modules", "lmc_keep_extra")))
     target = "localyesconfig" if p.g("modules", "localyesconfig") else "localmodconfig"
     before = sum(1 for line in _read(tree / ".config").splitlines() if line.endswith("=m"))
-    run(["make", target], cwd=tree, env=lm_env)
+    result = run(["make", target], cwd=tree, env=lm_env)
     after = sum(1 for line in _read(tree / ".config").splitlines() if line.endswith("=m"))
     ok(f"{target}: modules {before} -> {after}")
+    missing = set(re.findall(r"(?m)^(\w+) config not found!", result.stdout))
+    # Upstream streamline_config only recognizes obj-$(CONFIG_*). Intel's
+    # generated intel-target-* modules need their source-declared mapping.
+    restored: set[str] = set()
+    makefile = _read(tree / "drivers/platform/x86/intel/Makefile")
+    for symbol, objects in re.findall(r"(?m)^intel-target-\$\(CONFIG_(\w+)\)\s*\+=\s*(.+)$", makefile):
+        if any("intel_" + name.removesuffix(".o").replace("-", "_") in missing
+               for name in objects.split() if name.endswith(".o")):
+            restored.add(symbol)
+    if restored:
+        note("Restoring target census drivers missed by upstream localmodconfig: " + ", ".join(sorted(restored)))
+    unresolved = missing - {"intel_" + name.removesuffix(".o").replace("-", "_")
+                            for symbol, objects in re.findall(r"(?m)^intel-target-\$\(CONFIG_(\w+)\)\s*\+=\s*(.+)$", makefile)
+                            if symbol in restored for name in objects.split()}
+    if unresolved:
+        note("Census entries not mapped by localmodconfig (may be built-in or external): " + ", ".join(sorted(unresolved)))
+    return restored
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -3131,7 +2918,8 @@ class Op:
             case "val":
                 return f"CONFIG_{self.symbol}={self.value}"
             case _:
-                return f"CONFIG_{self.symbol}={json.dumps(str(self.value))}"
+                value = str(self.value).replace('\\', '\\\\').replace('"', '\\"')
+                return f'CONFIG_{self.symbol}="{value}"'
 
 
 class Matrix:
@@ -3206,17 +2994,18 @@ class Derived:
     seed_source: str = ""
     compile_duration: float = 0.0
     compile_steps: int = 0
+    census_symbols: set[str] = field(default_factory=set)
 
     @property
     def scx_class(self) -> bool:
-        return self.sched != "bmq"
+        return self.sched == "eevdf"
 
 
 def derive(p: KernelProfile, facts: HostFacts, idx: KconfigIndex, tree: Path, sched: str, rust_available: bool, rust_output: str) -> Derived:
     s = p.sections
     toolchain = s["compiler"]["toolchain"]
     lto = s["compiler"]["lto"] if toolchain == "llvm" else "none"
-    scx_class = bool(s["scheduler"]["scx_enable_class"]) and sched != "bmq"
+    scx_class = bool(s["scheduler"]["scx_enable_class"])
     tracing = s["memory"]["tracing"]
     if tracing == "auto":
         tracing = "full" if (s["scheduler"]["scx"] != "none" or not p.lean("lean")) else "minimal"
@@ -3234,11 +3023,11 @@ def derive(p: KernelProfile, facts: HostFacts, idx: KconfigIndex, tree: Path, sc
         if toolchain != "llvm":
             fdo, fdo_reason = "none", "AutoFDO requires clang"
         elif not (pdir / "kernel.afdo").is_file():
-            fdo, fdo_reason = "none", f"missing {pdir / 'kernel.afdo'} (record one with --fdo-record)"
+            fdo, fdo_reason = "autofdo", "Profile collection build without feedback; boot this kernel and use --fdo-record"
         elif fdo == "autofdo_propeller" and not ((pdir / "propeller_cc_profile.txt").is_file() and (pdir / "propeller_ld_profile.txt").is_file()):
             fdo, fdo_reason = "autofdo", f"Propeller profiles missing in {pdir}; using AutoFDO only"
     if s["timing"]["preempt"] == "lazy" and not idx.has("PREEMPT_LAZY"):
-        raise ProfileError("This tree has no PREEMPT_LAZY -- it is not a Linux >= 7.2 x86-64 tree")
+        raise ProfileError("This tree has no PREEMPT_LAZY -- it is not a Linux >= 7.3 x86-64 tree")
     if s["cache"]["sched_cache"] and not idx.has("SCHED_CACHE"):
         warn("CONFIG_SCHED_CACHE (cache-aware scheduling) is not present in this tree; CAS knobs become no-ops")
     if s["gaming"]["ntsync"] and not idx.has("NTSYNC"):
@@ -3288,7 +3077,7 @@ def flavor_cmdline(p: KernelProfile, facts: HostFacts) -> list[str]:
             out.append("mitigations=auto,nosmt")
     if not s["cpu"]["smt"]:
         out.append("nosmt")
-    if facts.vendor == "amd" or s["meta"]["portable_package"]:
+    if facts.vendor == "amd" or broad_hardware(p):
         mode = s["cpu"]["amd_pstate"]
         if mode != "undefined":
             out.append(f"amd_pstate={mode}")
@@ -3314,8 +3103,6 @@ def flavor_cmdline(p: KernelProfile, facts: HostFacts) -> list[str]:
     out.append(f"transparent_hugepage={s['memory']['thp']}")
     if s["power"]["rcu_lazy"]:
         out.append("rcutree.enable_rcu_lazy=1")
-    if s["boot"].get("acs_override", False):
-        out.append("pcie_acs_override=downstream,multifunction")
     out += shlex.split(s["boot"]["cmdline_extra"])
     return out
 
@@ -3331,9 +3118,9 @@ def _ops_uarch(mx: Matrix, p: KernelProfile, d: Derived) -> None:
         mx.y("GENERIC_CPU", optional=True)
         level = {"generic": 1, "generic_v2": 2, "generic_v3": 3, "generic_v4": 4}.get(arch, 1)
         mx.val("X86_64_VERSION", min(level, d.idx.x86_64_version_max), optional=True)
-        d.kcflags += [f"-march={d.march}", f"-mtune={d.mtune}"]
+        d.kcflags = [f"-march={d.march}", f"-mtune={d.mtune}"]
         if d.rust:
-            d.krustflags += [f"-Ctarget-cpu={d.march}", f"-Ztune-cpu={d.mtune}"]
+            d.krustflags = [f"-Ctarget-cpu={d.march}", f"-Ztune-cpu={d.mtune}"]
 
 
 def _ops_core(mx: Matrix, p: KernelProfile, d: Derived) -> None:
@@ -3384,15 +3171,6 @@ def _ops_core(mx: Matrix, p: KernelProfile, d: Derived) -> None:
 
 def _ops_sched(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     s = p.sections
-    for sym in ("SCHED_BORE", "SCHED_ALT", "SCHED_BMQ", "SCHED_PDS"):
-        mx.n(sym, optional=True)
-    match d.sched:
-        case "bore":
-            mx.y("SCHED_BORE", why="BORE patch")
-            mx.val("MIN_BASE_SLICE_NS", 1000000, optional=True)
-        case "bmq":
-            mx.y("SCHED_ALT", why="Project C")
-            mx.y("SCHED_BMQ")
     mx.flag("SCHED_AUTOGROUP", s["scheduler"]["autogroup"])
     mx.flag("RT_GROUP_SCHED", s["scheduler"]["rt_group"])
     mx.flag("SCHED_CORE", s["scheduler"]["sched_core"])
@@ -3549,9 +3327,11 @@ def _ops_memory(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     hardened, extreme = sec["profile"] == "hardened", sec["profile"] == "extreme"
     vm = _virt_guest(f)[0]
     thp = m["thp"]
+    # In-tree GPU SVM helpers use huge-page definitions even with runtime THP
+    # disabled. Keep support available; NEVER disables automatic THP allocation.
     mx.y("TRANSPARENT_HUGEPAGE")
     mx.choice(("TRANSPARENT_HUGEPAGE_ALWAYS", "TRANSPARENT_HUGEPAGE_MADVISE", "TRANSPARENT_HUGEPAGE_NEVER"), f"TRANSPARENT_HUGEPAGE_{thp.upper()}", why=f"thp={thp}")
-    mx.flag("THP_SWAP", thp != "never", optional=True, why="def_bool y in Kconfig when THP and SWAP are enabled")
+    mx.y("THP_SWAP", optional=True, why="def_bool y in Kconfig when THP and SWAP are enabled")
     mx.flag("READ_ONLY_THP_FOR_FS", thp != "never" and not lean)
     mx.flag("HUGETLBFS", m["hugetlbfs"])
     mx.flag("HUGETLB_PAGE", m["hugetlbfs"])
@@ -3566,8 +3346,8 @@ def _ops_memory(mx: Matrix, p: KernelProfile, d: Derived) -> None:
         case "zram":
             algos = {m["zram_algo"], m["zram_recomp_algo"] if m["zram_multi_comp"] else m["zram_algo"]}
             mx.y("ZRAM", why="swap_backend=zram")
-            mx.y("ZRAM_BACKEND_ZSTD")
-            mx.y("ZRAM_BACKEND_LZ4")
+            mx.flag("ZRAM_BACKEND_ZSTD", "zstd" in algos)
+            mx.flag("ZRAM_BACKEND_LZ4", "lz4" in algos)
             mx.flag("ZRAM_BACKEND_LZ4HC", "lz4hc" in algos)
             mx.flag("ZRAM_BACKEND_LZO", "lzo-rle" in algos)
             mx.n("ZRAM_BACKEND_DEFLATE")
@@ -3616,7 +3396,7 @@ def _ops_memory(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     for sym in ("DAMON", "DAMON_VADDR", "DAMON_PADDR", "DAMON_SYSFS", "DAMON_RECLAIM", "DAMON_LRU_SORT"):
         mx.flag(sym, m["damon"])
     mx.flag("PAGE_REPORTING", m["page_reporting"], optional=True, why="also selected by retained balloon drivers")
-    if m["numa"]:
+    if m["numa"] and (f.numa_nodes > 1 or broad_hardware(p)):
         mx.y("NUMA")
         mx.y("X86_64_ACPI_NUMA")
         mx.val("NODES_SHIFT", m["nodes_shift"] or max(1, (f.numa_nodes - 1).bit_length()))
@@ -3681,8 +3461,6 @@ def _ops_compiler(mx: Matrix, p: KernelProfile, d: Derived) -> None:
         mx.choice(("CC_OPTIMIZE_FOR_PERFORMANCE", "CC_OPTIMIZE_FOR_SIZE"), "CC_OPTIMIZE_FOR_SIZE", why="optimize=size")
     else:
         mx.choice(("CC_OPTIMIZE_FOR_PERFORMANCE", "CC_OPTIMIZE_FOR_SIZE"), "CC_OPTIMIZE_FOR_PERFORMANCE", why="optimize=o2")
-    if bool(c.get("polly", False)) and d.toolchain == "llvm":
-        mx.y("POLLY_CLANG", optional=True, why="Clang Polly loop optimizer")
     if d.toolchain == "llvm":
         mx.choice(("LTO_NONE", "LTO_CLANG_THIN", "LTO_CLANG_THIN_DIST", "LTO_CLANG_FULL"), {"none": "LTO_NONE", "thin": "LTO_CLANG_THIN", "thin_dist": "LTO_CLANG_THIN_DIST", "full": "LTO_CLANG_FULL"}[d.lto], why=f"lto={d.lto}")
     if d.toolchain == "gcc":
@@ -4060,6 +3838,8 @@ def _ops_gpu(mx: Matrix, p: KernelProfile, d: Derived) -> None:
 
 
 def _ops_extra(mx: Matrix, p: KernelProfile, d: Derived) -> None:
+    for symbol in sorted(d.census_symbols):
+        mx.m(symbol, why="target census driver missed by upstream localmodconfig")
     for sym in p.g("modules", "keep_symbols"):
         symbol = str(sym).removeprefix("CONFIG_")
         if d.idx.types.get(symbol) == "bool":
@@ -4100,28 +3880,20 @@ def build_config_matrix(p: KernelProfile, d: Derived) -> Matrix:
 # ---------------------------------------------------------------------------------------------------
 # Apply / finalize / verify the configuration
 # ---------------------------------------------------------------------------------------------------
-def _op_args(op: Op) -> list[str]:
-    match op.action:
-        case "y":
-            return ["-e", op.symbol]
-        case "n":
-            return ["-d", op.symbol]
-        case "m":
-            return ["-m", op.symbol]
-        case "val":
-            return ["--set-val", op.symbol, str(op.value)]
-        case _:
-            return ["--set-str", op.symbol, str(op.value)]
-
-
 def apply_matrix(tree: Path, mx: Matrix) -> None:
     rule("Apply Kconfig matrix")
-    cfg = tree / "scripts" / "config"
+    cfg = tree / ".config"
     ops = mx.ops
-    for batch in itertools.batched(ops, 250):
-        args = [arg for op in batch for arg in _op_args(op)]
-        run([str(cfg), "--file", str(tree / ".config"), *args], cwd=tree)
-    ok(f"Applied {len(ops)} Kconfig operations in {max(1, (len(ops) + 249) // 250)} batched scripts/config invocations")
+    symbols = {op.symbol for op in ops}
+    retained = []
+    for line in cfg.read_text(encoding="utf-8").splitlines():
+        match = re.match(r"^(?:# )?CONFIG_([A-Za-z0-9_]+)(?:=| is not set$)", line)
+        if match is None or match[1] not in symbols:
+            retained.append(line)
+    # Write the same documented .config entries scripts/config produces, once.
+    # olddefconfig still owns all choice and dependency resolution afterwards.
+    cfg.write_text("\n".join((*retained, *(op.render() for op in ops))) + "\n", encoding="utf-8")
+    ok(f"Applied {len(ops)} Kconfig operations in one file update")
     if mx.skipped:
         seen = sorted({op.symbol for op in mx.skipped})
         note(f"{len(seen)} symbols not offered by this tree were skipped: {', '.join(seen[:14])}{' ...' if len(seen) > 14 else ''}")
@@ -4140,7 +3912,7 @@ def parse_dotconfig(text: str) -> dict[str, str]:
         if line.startswith("CONFIG_"):
             key, _, val = line[7:].partition("=")
             if val.startswith('"') and val.endswith('"') and len(val) >= 2:
-                val = val[1:-1]
+                val = re.sub(r'\\(["\\])', r'\1', val[1:-1])
             out[key] = val
         elif line.startswith("# CONFIG_") and line.endswith(" is not set"):
             out[line[9:-11]] = "n"
@@ -4149,8 +3921,6 @@ def parse_dotconfig(text: str) -> dict[str, str]:
 
 VERIFY_HINTS: Final[dict[str, str]] = {
     "RUST": "Rust unavailable: see 'make LLVM=1 rustavailable'; RUST also requires !DEBUG_INFO_BTF || !LTO and !MODVERSIONS || GENDWARFKSYMS",
-    "SCHED_BORE": "the BORE patch was not applied to this tree",
-    "SCHED_ALT": "the Project C patch was not applied to this tree",
     "SCHED_CACHE": "cache-aware scheduling symbol missing or gated (needs SMP + SCHED_MC)",
     "PREEMPT_LAZY": "requires ARCH_HAS_PREEMPT_LAZY (x86-64 Linux >= 6.13)",
     "CFI": "kCFI needs clang -fsanitize=kcfi and is incompatible with GCC / FUNCTION_GRAPH_TRACER on some trees",
@@ -4167,9 +3937,6 @@ VERIFY_HINTS: Final[dict[str, str]] = {
     "ZRAM_MULTI_COMP": "requires ZRAM=y|m",
     "RCU_LAZY": "requires RCU_NOCB_CPU (RCU_EXPERT)",
     "PREEMPT_DYNAMIC": "requires HAVE_PREEMPT_DYNAMIC and !PREEMPT_RT",
-    "HZ_500": "HZ choice injection into kernel/Kconfig.hz failed",
-    "HZ_600": "HZ choice injection into kernel/Kconfig.hz failed",
-    "HZ_750": "HZ choice injection into kernel/Kconfig.hz failed",
     "MPTCP_IPV6": "requires IPV6=y",
     "TRIM_UNUSED_KSYMS": "requires !COMPILE_TEST and MODULES",
     "PER_VMA_LOCK": "def_bool driven by ARCH_SUPPORTS_PER_VMA_LOCK && SMP",
@@ -4385,7 +4152,8 @@ def build_env(p: KernelProfile, d: Derived, facts: HostFacts, epoch: float) -> d
         env["KRUSTFLAGS"] = " ".join(rustflags)
     if d.fdo != "none":
         pdir = Path(p.g("compiler", "fdo_profile_dir")).expanduser() if p.g("compiler", "fdo_profile_dir") else STATE_DIR / "fdo" / p.name
-        env["CLANG_AUTOFDO_PROFILE"] = str(pdir / "kernel.afdo")
+        if (pdir / "kernel.afdo").is_file():
+            env["CLANG_AUTOFDO_PROFILE"] = str(pdir / "kernel.afdo")
         if d.fdo == "autofdo_propeller":
             env["CLANG_PROPELLER_PROFILE_PREFIX"] = str(pdir / "propeller")
     jobs = p.g("compiler", "jobs") or auto_jobs(facts, d.lto)
@@ -4467,8 +4235,6 @@ def check_dependencies(p: KernelProfile, facts: HostFacts, d_toolchain: str, wan
         packages.add("ccache")
     if want_rust:
         packages.update({"rust", "rust-src", "rust-bindgen"})
-    if p.g("compiler", "polly"):
-        packages.add("polly")
     missing = [pkg for pkg in sorted(packages) if run(["pacman", "-Q", pkg], check=False).returncode]
     if missing:
         if not (interactive() or ASSUME_YES):
@@ -4488,23 +4254,6 @@ def check_dependencies(p: KernelProfile, facts: HostFacts, d_toolchain: str, wan
         raise DependencyError("Clang 21+ required; update the Arch toolchain")
     if p.g("compiler", "ccache") and have("ccache"):
         note("ccache available")
-    if p.g("compiler", "polly") and d_toolchain == "llvm":
-        polly_found = any(Path(loc).is_file() for loc in [
-            "/usr/lib/LLVMPolly.so",
-            "/usr/lib/llvm/lib/LLVMPolly.so",
-            *Path("/usr/lib").glob("llvm*/lib/LLVMPolly.so"),
-        ])
-        if not polly_found:
-            warn("Clang Polly optimization is enabled, but LLVMPolly.so was not found (Arch package: polly)")
-            if interactive() and ask_yes("Install polly now with pacman -S --needed polly?", True):
-                PRIV.run(["pacman", "-S", "--needed", "--noconfirm", "polly"], capture=False)
-                polly_found = any(Path(loc).is_file() for loc in [
-                    "/usr/lib/LLVMPolly.so",
-                    "/usr/lib/llvm/lib/LLVMPolly.so",
-                    *Path("/usr/lib").glob("llvm*/lib/LLVMPolly.so"),
-                ])
-            if not polly_found:
-                raise DependencyError("Clang Polly requires the 'polly' package: sudo pacman -S --needed polly")
     clang_v = facts.tools.get("clang", "")
     if d_toolchain == "llvm" and clang_v and version_tuple(clang_v) < (19,):
         warn(f"clang {clang_v} detected; Linux 7.x LTO/kCFI/AutoFDO paths are validated with clang >= 21")
@@ -4747,41 +4496,9 @@ def ensure_install_dependencies(p: KernelProfile) -> None:
         PRIV.run(["pacman", "-S", "--needed", "--noconfirm", *missing], capture=False)
 
 
-def prepare_nvidia_615_for_linux_73(kernelrelease: str) -> None:
-    """Adapt NVIDIA 615's old dmem API and runtime PM before pacman's DKMS hook runs."""
-    if version_tuple(kernelrelease) < (7, 3):
-        return
-    source = next(Path("/usr/src").glob("nvidia-615*"), Path("/usr/src/nvidia-615.71.09"))
-    if not (source / "kernel-open/nvidia/os-interface.c").is_file():
-        return
-    patch_file = SCRIPT_DIR / "compat/nvidia-615.71.09-linux-7.3.patch"
-    if not have("patch") or not patch_file.is_file():
-        raise DependencyError("NVIDIA 615 Linux 7.3 compatibility patch or patch tool is missing")
-    cmd = ["patch", "--batch", "--silent", "--dry-run", "-d", str(source), "-p1", "-i", str(patch_file)]
-    if run([*cmd, "--reverse"], check=False).returncode == 0:
-        pass
-    elif run([*cmd, "--forward"], check=False).returncode:
-        raise BuildError("NVIDIA 615 source does not match the validated Linux 7.3 compatibility patch; installation stopped before replacing boot images")
-    else:
-        PRIV.run(["patch", "--batch", "--forward", "-d", str(source), "-p1", "-i", str(patch_file)])
-        ok("Adapted NVIDIA 615 dmem cgroup API and runtime PM for Linux 7.3+ DKMS")
-
-    extra_files: dict[Path, tuple[str, str]] = {}
-    power_conf = SCRIPT_DIR / "extra/nvidia-power.conf"
-    if power_conf.is_file() and not Path("/etc/modprobe.d/nvidia-power.conf").is_file():
-        extra_files[Path("/etc/modprobe.d/nvidia-power.conf")] = (power_conf.read_text(encoding="utf-8"), "0644")
-    pm_rules = SCRIPT_DIR / "extra/80-nvidia-pm.rules"
-    if pm_rules.is_file() and not Path("/etc/udev/rules.d/80-nvidia-pm.rules").is_file():
-        extra_files[Path("/etc/udev/rules.d/80-nvidia-pm.rules")] = (pm_rules.read_text(encoding="utf-8"), "0644")
-    if extra_files:
-        PRIV.write_files(extra_files)
-        ok("Installed NVIDIA dynamic power management configurations from extra/")
-
-
 def install_packages(pkgs: Sequence[Path], profile: KernelProfile, kernelrelease: str) -> None:
     rule("Install packages (pacman -U)")
     ensure_install_dependencies(profile)
-    prepare_nvidia_615_for_linux_73(kernelrelease)
     PRIV.ensure()
     # Ensure /etc/mkinitcpio.d/<pkgbase>.preset exists so the pacman mkinitcpio hook runs for this kernel
     preset_path = Path(f"/etc/mkinitcpio.d/{profile.pkgbase}.preset")
@@ -4935,6 +4652,8 @@ def refresh_boot(p: KernelProfile, facts: HostFacts, d: Derived, *, kernel_insta
 def do_export_bundle(dest: Path | None, profile_name: str | None = None) -> Path:
     banner()
     rule("Export hardware bundle")
+    if platform.machine() != "x86_64":
+        raise ProfileError("Hardware bundles currently target x86-64 machines only")
     facts = host_facts()
     if not facts.uarch:
         if have("pacman") and (interactive() or ASSUME_YES) and ask_yes("Install clang to identify the target CPU precisely before exporting?", True):
@@ -4944,19 +4663,22 @@ def do_export_bundle(dest: Path | None, profile_name: str | None = None) -> Path
         if not facts.uarch:
             warn("Precise CPU name unavailable; export will use the target ISA baseline. Install a current compiler on the target and re-export for exact CPU tuning.")
     hname = re.sub(r"[^a-z0-9]+", "_", platform.node().lower()).strip("_") or "machine"
-    out = dest or (Path.home() / f"dusky_bundle_{hname}.tar.gz")
+    out = dest or (Path.home() / f"dusky_bundle_{hname}.tar.zst")
     out.parent.mkdir(parents=True, exist_ok=True)
     if have("modprobed-db"):
         run(["modprobed-db", "store"], check=False, timeout=60)
 
-    db_src = resolve_modprobed_db()
+    selected = select_profile(ensure_profiles_exist(), profile_name, facts) if profile_name else None
+    custom_db = selected.g("modules", "modprobed_db_path") if selected else ""
+    if custom_db and not Path(custom_db).expanduser().is_absolute():
+        custom_db = str(selected.path.parent / custom_db)
+    db_src = resolve_modprobed_db(custom_db or None)
     manifest = facts.as_json() | {"format": "dusky_bundle_v3", "hostname": hname,
                                  "created_at": datetime.now(UTC).isoformat(), "app_version": APP_VERSION}
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         (tmp / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        if profile_name:
-            selected = select_profile(ensure_profiles_exist(), profile_name, facts)
+        if selected is not None:
             (tmp / "profile.toml").write_text(render_profile_toml(selected.sections))
         if db_src is not None and _is_usable_db(db_src):
             try:
@@ -4973,7 +4695,7 @@ def do_export_bundle(dest: Path | None, profile_name: str | None = None) -> Path
             (tmp / "lspci.txt").write_text(run(["lspci", "-nn"], check=False).stdout or "", encoding="utf-8")
         if have("lsmod"):
             (tmp / "lsmod.txt").write_text(run(["lsmod"], check=False).stdout or "", encoding="utf-8")
-        with tarfile.open(out, "w:gz") as tar:
+        with tarfile.open(out, "w:zst") as tar:
             for f in sorted(tmp.iterdir()):
                 tar.add(f, arcname=f.name)
     n = count_db_modules(db_src) if db_src else 0
@@ -4990,13 +4712,20 @@ def do_import_bundle(src: Path, profile_name: str | None = None) -> str:
     bundled_profile = None
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        with tarfile.open(src, "r:*") as tar:
-            tar.extractall(tmp, filter="data")
+        try:
+            with tarfile.open(src, "r:*") as tar:
+                tar.extractall(tmp, filter="data")
+        except (OSError, tarfile.TarError, EOFError) as e:
+            raise ProfileError(f"Cannot read hardware bundle {src}: {e}") from e
         if (tmp / "profile.toml").is_file():
             bundled_profile = load_profile(tmp / "profile.toml")
         mf = tmp / "manifest.json"
         if not mf.is_file():
             raise DuskyError("Invalid bundle: manifest.json missing")
+        # Validate before persisting imports or interpreting hardware fields.
+        probe = profile_from_tweaks("import-check", "Validate bundle", "import-check", {})
+        probe.set("meta", "manifest_path", str(mf))
+        target = target_facts_for_profile(probe, host_facts())
         manifest = json.loads(mf.read_text(encoding="utf-8"))
         hname = re.sub(r"[^a-z0-9]+", "_", str(manifest.get("hostname", "remote"))).strip("_") or "remote"
         import_dir = IMPORT_DIR / (hname + "-" + sha256_file(src)[:12])
@@ -5013,10 +4742,6 @@ def do_import_bundle(src: Path, profile_name: str | None = None) -> str:
                 m = _extract_module_name(line)
                 if m:
                     mods.add(m)
-        is_virt = manifest.get("virt", "none") != "none" or any("virtio" in g for g in manifest.get("gpus", []))
-        if is_virt:
-            for vmod in ("virtio", "virtio_ring", "virtio_pci", "virtio_pci_legacy_dev", "virtio_pci_modern_dev", "virtio_net", "virtio_blk", "virtio-gpu", "virtio_dma_buf", "virtio_console", "virtio_balloon", "virtio_scsi"):
-                mods.add(vmod)
         if mods:
             (import_dir / "modprobed.db").write_text("\n".join(sorted(mods)) + "\n", encoding="utf-8")
             db_path = str(import_dir / "modprobed.db")
@@ -5030,7 +4755,7 @@ def do_import_bundle(src: Path, profile_name: str | None = None) -> str:
         raise ProfileError("No target module census; collect modules on the target and export again")
     prof = (bundled_profile if bundled_profile is not None and profile_name is None else
             select_profile(ensure_profiles_exist(), profile_name, host_facts())).clone()
-    arch = manifest.get("uarch") or {1: "generic", 2: "generic_v2", 3: "generic_v3", 4: "generic_v4"}[manifest["psabi_level"]]
+    arch = target.uarch or {1: "generic", 2: "generic_v2", 3: "generic_v3", 4: "generic_v4"}[target.psabi_level]
     target_suffix = prof.suffix + "-" + hname.replace("_", "-")
     pname = f"remote_{hname}_{prof.name}"
     prof.set("meta", "name", pname)
@@ -5166,17 +4891,11 @@ def storage_session(use_ram: bool, tree_name: str):
         RAM_RESERVE_GIB = 0
 
 
-def choose_ram_build(args: argparse.Namespace) -> bool:
-    use_ram = False
-    if interactive():
-        # Deliberately bypass ASSUME_YES: volatile storage always needs this run's choice.
-        if kernel_storage.ram_mount(STORAGE["zram_dir"]):
-            use_ram = input(f"Use RAM workspace {STORAGE['zram_dir']} for this build? [y/N] ").strip().lower() in ("y", "yes")
-        else:
-            note(f"RAM workspace unavailable: {STORAGE['zram_dir']}; using persistent disk")
-    elif getattr(args, "ram_build", False):
-        use_ram = True
-    return use_ram
+def choose_ram_build(args: argparse.Namespace, lto: str = "thin", tree_name: str = "") -> bool:
+    """Prefer RAM automatically when the mount and measured capacity permit it."""
+    ready, detail = kernel_storage.ram_capacity(STORAGE, lto, tree_name)
+    note(detail)
+    return ready
 
 
 def do_build(args: argparse.Namespace) -> int:
@@ -5192,8 +4911,7 @@ def do_build(args: argparse.Namespace) -> int:
 
     set_build_dir(args.build_dir or STORAGE.get("persistent_dir", BUILD_DIR))
     if kernel_storage.ram_mount(BUILD_DIR):
-        raise ProfileError("Persistent build directory is RAM-backed; configure storage.zram_dir and use the RAM prompt instead")
-    use_ram = choose_ram_build(args)
+        raise ProfileError("Persistent build directory is RAM-backed; configure storage.zram_dir for automatic RAM selection instead")
 
     while True:
         show_configuration(profile, diff)
@@ -5233,23 +4951,22 @@ def do_build(args: argparse.Namespace) -> int:
         if release.is_rc:
             profile.set("release", "allow_rc", True)
         tarball = obtain_tarball(release, bool(profile.g("release", "require_signature")))
-        identity = json.dumps({"profile": profile.sections, "target": target_facts.as_json(),
-                               "engine": sha256_file(Path(__file__)),
-                               "schema": sha256_file(SCRIPT_DIR / "kernel_profiles/schema.py"),
-                               "runtime": sha256_file(SCRIPT_DIR / "kernel_runtime.py"),
-                               "patches": {f.name: sha256_file(f) for f in sorted((SCRIPT_DIR / "patches").glob("*.patch"))}}, sort_keys=True)
-        patchset = profile.name + "-" + hashlib.sha256(identity.encode()).hexdigest()[:16]
-        workspace.enter_context(storage_session(use_ram, tree_dir_for(release, patchset).name))
+        # Stock sources can reuse Make's configuration/command dependencies
+        # across orchestration updates. Hardware/toolchain facts isolate native
+        # objects; runtime payloads and build-file additions are restaged below.
+        identity = json.dumps({"profile": profile.sections, "target": target_facts.as_json()}, sort_keys=True)
+        build_id = profile.name + "-" + hashlib.sha256(identity.encode()).hexdigest()[:16]
+        tree_name = tree_dir_for(release, build_id).name
+        use_ram = choose_ram_build(args, profile.g("compiler", "lto"), tree_name)
+        workspace.enter_context(storage_session(use_ram, tree_name))
         check_disk_space(profile.g("compiler", "lto"), installing=not args.no_install and not args.configure_only)
-        tree = unpack(tarball, release, patchset, bool(args.fresh))
-        sched = apply_scheduler_patch(tree, profile, release)
-        apply_enhancement_patches(tree, profile, release, target_facts)
-        ensure_hz_choice(tree, int(profile.g("timing", "hz")))
+        tree = unpack(tarball, release, build_id, bool(args.fresh))
+        sched = "eevdf"
         env0 = toolchain_env(profile)
         seed_source = seed_config(tree, profile, env0, Path(args.seed_config).expanduser() if args.seed_config else None)
         run(["make", "olddefconfig"], cwd=tree, env=env0)
         db = ensure_modprobed_db(profile)
-        localmodconfig(tree, profile, db, env0)
+        census_symbols = localmodconfig(tree, profile, db, env0)
         idx = KconfigIndex.scan(tree)
         note(f"Kconfig index: {len(idx.symbols):,} symbols (x86 view), X86_64_VERSION range max {idx.x86_64_version_max}")
         target_facts = target_facts_for_profile(profile, facts)
@@ -5257,6 +4974,7 @@ def do_build(args: argparse.Namespace) -> int:
             note(f"Target hardware profile: {target_facts.model} ({target_facts.vendor}), {target_facts.threads} threads, uarch={target_facts.uarch or 'generic_v' + str(target_facts.psabi_level)}, gpus={', '.join(target_facts.gpus) or 'none'}, virt={target_facts.virt}")
         rust_ok, rust_out = (rust_probe(tree, env0) if profile.g("compiler", "rust") else (False, ""))
         d = derive(profile, target_facts, idx, tree, sched, rust_ok, rust_out)
+        d.census_symbols = census_symbols
         validate_rust_cpu(d)
         d.seed_source = seed_source
         mx = build_config_matrix(profile, d)
@@ -5278,24 +4996,21 @@ def do_build(args: argparse.Namespace) -> int:
             ok(f"Configuration complete (--configure-only). Tree: {tree}")
             return 0
         link_thinlto_cache(tree, profile, d)
-        compile_wall_start = time.time()
+        compile_wall_start = time.monotonic()
         pkgs = compile_kernel(tree, profile, d, env, facts)
         d.kernelrelease = kernelrelease(tree, env)
         if args.no_install:
-            total_wall = time.time() - compile_wall_start
             rule("Done")
-            ok(f"Packages built in {fmt_duration(d.compile_duration)} (--no-install). Install later with: sudo pacman -U " + " ".join(str(x) for x in pkgs))
-            say(f"  {C.CYAN}⏱ Kernel compilation:{C.RESET} {fmt_duration(d.compile_duration)}" + (f" ({d.compile_steps:,} steps)" if d.compile_steps else ""))
-            say(f"  {C.CYAN}⏱ Total process time:{C.RESET} {fmt_duration(total_wall)}")
+            ok(f"Packages built in {fmt_duration(d.compile_duration)} (--no-install). Install on the target with: python dusky_kernal_compile.py --install-pkg " + " ".join(shlex.quote(str(x)) for x in pkgs))
             send_notification("Kernel build complete", f"{d.kernelrelease} ({profile.name}) compiled in {fmt_duration(d.compile_duration)}", icon="dialog-information")
             return 0
         install_packages(pkgs, profile, d.kernelrelease)
         refresh_boot(profile, facts, d, kernel_install=bool(args.kernel_install))
-        total_wall = time.time() - compile_wall_start
+        total_wall = time.monotonic() - compile_wall_start
         rule("Done")
         ok(f"{d.kernelrelease} ({profile.name}) installed as {profile.pkgbase}.")
-        say(f"  {C.CYAN}⏱ Kernel compilation:{C.RESET} {fmt_duration(d.compile_duration)}" + (f" ({d.compile_steps:,} steps)" if d.compile_steps else ""))
-        say(f"  {C.CYAN}⏱ Total process time:{C.RESET} {fmt_duration(total_wall)} (compilation + packaging + install + initramfs)")
+        say(f"  {C.CYAN}⏱ Build and packaging:{C.RESET} {fmt_duration(d.compile_duration)}" + (f" ({d.compile_steps:,} steps)" if d.compile_steps else ""))
+        say(f"  {C.CYAN}⏱ Build through boot setup:{C.RESET} {fmt_duration(total_wall)}")
         say(f"  {C.DIM}Reboot to test; roll back with --uninstall {profile.suffix}.{C.RESET}")
         send_notification("Kernel build complete", f"{d.kernelrelease} ({profile.name}) compiled in {fmt_duration(d.compile_duration)} (total: {fmt_duration(total_wall)})", icon="dialog-information")
         return 0
@@ -5309,6 +5024,8 @@ def do_list(_: argparse.Namespace) -> int:
 def do_show(args: argparse.Namespace) -> int:
     p = select_profile(ensure_profiles_exist(), args.profile, host_facts()).clone()
     diff = apply_overrides(p, Overrides.from_env_and_args(args)) + normalize_profile(p)
+    validate_profile(p)
+    cross_validate(p, target_facts_for_profile(p, host_facts()), force=bool(args.force))
     if args.json:
         say(json.dumps({"profile": p.name, "sections": p.sections, "diff": diff}, indent=2))
         return 0
@@ -5353,7 +5070,7 @@ def do_matrix(args: argparse.Namespace) -> int:
     p = select_profile(ensure_profiles_exist(), args.profile, facts).clone()
     diff = apply_overrides(p, Overrides.from_env_and_args(args)) + normalize_profile(p)
     validate_profile(p)
-    tree = latest_tree()
+    tree = latest_tree(p.name)
     if tree is not None:
         idx = KconfigIndex.scan(tree)
         note(f"Using Kconfig index of {tree.name} ({len(idx.symbols):,} symbols)")
@@ -5457,7 +5174,7 @@ def do_clean(args: argparse.Namespace) -> int:
     banner()
     rule("Clean artifacts")
     what = args.clean or "all"
-    targets = {"src": SRC_DIR, "tarballs": TARBALL_DIR, "patches": PATCH_CACHE, "packages": PKGDEST_DIR, "thinlto": THINLTO_CACHE_DIR, "logs": LOG_DIR, "seeds": BUILD_DIR / "seeds"}
+    targets = {"src": SRC_DIR, "tarballs": TARBALL_DIR, "packages": PKGDEST_DIR, "thinlto": THINLTO_CACHE_DIR, "logs": LOG_DIR, "seeds": BUILD_DIR / "seeds"}
     chosen = list(targets) if what == "all" else [w.strip() for w in what.split(",")]
     with build_workspace_lock():
         for name in chosen:
@@ -5571,7 +5288,8 @@ def _resolve_install_profile(pkgbase: str, wanted: str | None, facts: HostFacts)
             return p.clone()
     suffix = pkgbase.removeprefix("linux-")
     info(f"No profile with pkgbase {pkgbase}; using defaults for boot entries (base cmdline only)")
-    return profile_from_tweaks(f"install-{suffix}", f"Reinstall {pkgbase} from saved packages", suffix, {}, 90)
+    return profile_from_tweaks(f"install-{suffix}", f"Reinstall {pkgbase} from saved packages", suffix,
+                               {"boot": {"cmdline": "print"}}, 90)
 
 
 def packaged_profile(pkgs: Sequence[Path], pkgbase: str) -> KernelProfile | None:
@@ -5651,10 +5369,14 @@ def do_install_pkg(args: argparse.Namespace) -> int:
 def do_fdo_record(args: argparse.Namespace) -> int:
     banner()
     rule("AutoFDO / Propeller profile recording")
+    if args.fdo_record <= 0:
+        raise ProfileError("FDO recording duration must be positive")
     facts = host_facts()
     p = select_profile(ensure_profiles_exist(), args.profile, facts)
-    if not have("perf") or not have("create_llvm_prof"):
-        raise DependencyError("perf and create_llvm_prof are required (pacman -S perf; build create_llvm_prof from google/autofdo)")
+    if not have("perf") or not (have("llvm-profgen") or have("create_llvm_prof")):
+        raise DependencyError("perf and llvm-profgen (Arch llvm package) or create_llvm_prof are required")
+    if args.fdo_propeller and not have("create_llvm_prof"):
+        raise DependencyError("Propeller conversion requires create_llvm_prof from google/autofdo")
     tree = latest_tree(p.name)
     vmlinux = tree / "vmlinux" if tree else None
     if vmlinux is None or not vmlinux.is_file():
@@ -5662,17 +5384,23 @@ def do_fdo_record(args: argparse.Namespace) -> int:
     metadata = json.loads((tree / ".dusky" / "build.json").read_text())
     if metadata["kernelrelease"] != os.uname().release:
         raise ProfileError("FDO recording requires booting the matching built kernel first")
-    if int(args.fdo_record) <= 0:
-        raise ProfileError("FDO recording duration must be positive")
     outdir = Path(p.g("compiler", "fdo_profile_dir")).expanduser() if p.g("compiler", "fdo_profile_dir") else STATE_DIR / "fdo" / p.name
     outdir.mkdir(parents=True, exist_ok=True)
-    seconds = int(args.fdo_record)
+    seconds = args.fdo_record
     perf_data = outdir / "perf.data"
-    event = ["-e", "BR_INST_RETIRED.NEAR_TAKEN:k"] if facts.vendor == "intel" else ["--pfm-events", "RETIRED_TAKEN_BRANCH_INSTRUCTIONS:k"]
+    if facts.vendor == "intel":
+        event = ["-e", "BR_INST_RETIRED.NEAR_TAKEN:k"]
+    elif facts.vendor == "amd" and facts.flags & {"brs", "amd_lbr_v2"}:
+        event = ["--pfm-events", "RETIRED_TAKEN_BRANCH_INSTRUCTIONS:k"]
+    else:
+        raise ProfileError("FDO recording requires Intel branch sampling or AMD BRS/amd_lbr_v2 support")
     info(f"Recording {seconds}s of system-wide kernel branch samples; run your representative workload now")
     PRIV.run(["perf", "record", *event, "-a", "-N", "-b", "-c", "500009", "-o", str(perf_data), "--", "sleep", str(seconds)], capture=False)
     PRIV.run(["chown", f"{os.getuid()}:{os.getgid()}", str(perf_data)], check=False)
-    run(["create_llvm_prof", f"--binary={vmlinux}", f"--profile={perf_data}", "--format=extbinary", f"--out={outdir / 'kernel.afdo'}"], capture=False)
+    if have("llvm-profgen"):
+        run(["llvm-profgen", "--kernel", f"--binary={vmlinux}", f"--perfdata={perf_data}", "-o", str(outdir / "kernel.afdo")], capture=False)
+    else:
+        run(["create_llvm_prof", f"--binary={vmlinux}", f"--profile={perf_data}", "--format=extbinary", f"--out={outdir / 'kernel.afdo'}"], capture=False)
     ok(f"AutoFDO profile written: {outdir / 'kernel.afdo'}")
     if args.fdo_propeller:
         run(["create_llvm_prof", f"--binary={vmlinux}", f"--profile={perf_data}", "--format=propeller", "--propeller_output_module_name",
@@ -5689,13 +5417,13 @@ EPILOG: Final = textwrap.dedent(f"""\
     examples:
       %(prog)s --write-default-profiles        write the profile template
       %(prog)s --doctor                        host telemetry, toolchain and bootloader diagnostics
-      %(prog)s -p battery                      build; answers 'use defaults exactly?' [Y/n] first
+      %(prog)s -p battery                      review the profile, then build and install
       %(prog)s -p battery --wizard --no-install walk every knob, build packages only
       %(prog)s -p battery --configure-only --print-matrix
       %(prog)s --export-bundle / --import-bundle FILE   cross-machine hardware bundles
       %(prog)s --uninstall dusky-gaming        remove packages and boot entries
       %(prog)s --install-pkg PKG...          install saved packages + preset/initramfs/DKMS/boot entries
-    environment: DUSKY_PROFILES_DIR DUSKY_BUILD_DIR DUSKY_PATCH_CACHE DUSKY_THINLTO_CACHE DUSKY_PKGDEST DUSKY_CPU_ARCH DUSKY_LTO DUSKY_JOBS ...
+    environment: DUSKY_PROFILES_DIR DUSKY_BUILD_DIR DUSKY_THINLTO_CACHE DUSKY_PKGDEST DUSKY_CPU_ARCH DUSKY_LTO DUSKY_JOBS ...
     exit codes: 1 generic, 2 profile, 3 network, 4 verification, 5 build, 6 dependency, 130 aborted
     """)
 
@@ -5712,16 +5440,16 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--spec", action="store_true", help="print the profile schema")
     mode.add_argument("--print-matrix", action="store_true", help="print the Kconfig matrix (dry-run without a build, or after configuration during a build)")
     mode.add_argument("--doctor", action="store_true", help="system diagnostics")
-    mode.add_argument("--clean", metavar="WHAT", nargs="?", const="all", help="clean all|src|tarballs|patches|packages|thinlto|logs|seeds (comma separated)")
+    mode.add_argument("--clean", metavar="WHAT", nargs="?", const="all", help="clean all|src|tarballs|packages|thinlto|logs|seeds (comma separated)")
     mode.add_argument("--write-default-profiles", action="store_true", help="write the profile template")
     mode.add_argument("--export-bundle", nargs="?", const="", default=None, metavar="FILE", help="export a hardware bundle for remote builds")
     mode.add_argument("--import-bundle", type=Path, metavar="FILE", help="import a hardware bundle and register remote_<host>")
     mode.add_argument("--uninstall", metavar="FLAVOR", help="remove linux-<flavor>{,-headers} and boot entries")
     mode.add_argument("--install-pkg", nargs="+", metavar="PKG", help="install saved kernel packages by path (pacman -U), then refresh preset/initramfs, DKMS audit and bootloader entries")
-    mode.add_argument("--fdo-record", metavar="SECONDS", help="record an AutoFDO profile for --profile (needs perf + create_llvm_prof)")
+    mode.add_argument("--fdo-record", type=int, metavar="SECONDS", help="record an AutoFDO profile for --profile (needs perf + llvm-profgen or create_llvm_prof)")
     mode.add_argument("--fdo-propeller", action="store_true", help="with --fdo-record: also emit Propeller profiles")
     mode.add_argument("--menu", action="store_true", help="interactive main menu")
-    ov = ap.add_argument_group("overrides (applied before the wizard question)")
+    ov = ap.add_argument_group("profile overrides")
     ov.add_argument("--cpu-arch", metavar="ARCH")
     ov.add_argument("--modules-mode", choices=list(MODULES_MODE_CHOICES))
     ov.add_argument("--toolchain", choices=list(TOOLCHAIN_CHOICES))
@@ -5738,10 +5466,10 @@ def build_parser() -> argparse.ArgumentParser:
     ov.add_argument("--no-rust", action="store_true")
     bh = ap.add_argument_group("build behaviour")
     bh.add_argument("--settings", type=Path, help="machine storage TOML (default: kernel_profiles/settings/kernel_settings.toml)")
-    bh.add_argument("--ram-build", action="store_true", help="explicit RAM choice for noninteractive runs; interactive runs still ask")
+    bh.add_argument("--ram-build", action="store_true", help=argparse.SUPPRESS)
     bh.add_argument("--build-dir", type=Path, metavar="DIR", help="persistent build directory; RAM workspace is configured separately")
     bh.add_argument("--wizard", action="store_true", help="always enter the granular configuration wizard")
-    bh.add_argument("--no-prompt", action="store_true", help="never ask the wizard question (use profile defaults)")
+    bh.add_argument("--no-prompt", action="store_true", help="build without the configuration review prompt")
     bh.add_argument("--fresh", action="store_true", help="re-extract the source tree")
     bh.add_argument("--seed-config", metavar="FILE", help="seed .config from FILE")
     bh.add_argument("--configure-only", action="store_true", help="stop after configuration + verification")
@@ -5884,11 +5612,15 @@ def interactive_menu() -> int:
     while True:
         say("")
         banner()
-        say(f"{C.ACCENT}  Main menu{C.RESET}")
-        say(" 1) Install toolchains & snapshot the hardware profiler (modprobed-db)\n 2) Live hardware telemetry\n 3) Diagnostics (--doctor)\n 4) Configuration manager & profiles\n"
-            " 5) Export / import remote hardware bundle\n 6) Compile & install a kernel (profile picker)\n 7) Uninstall a Dusky flavor\n 8) Install saved kernel packages\n 9) Clean caches\n 10) Exit\n")
+        say(f"{C.ACCENT}  Build a kernel in three steps{C.RESET}")
+        say(" 1) Prepare: install tools and collect this machine's modules\n"
+            " 2) Build: select a profile, review settings, compile and install\n"
+            " 3) Build elsewhere: export / import target hardware\n"
+            " 4) Install: use saved packages on this machine\n"
+            " 5) Advanced: profiles, diagnostics and maintenance\n"
+            " 6) Exit\n")
         try:
-            choice = ask_index("Select", 10, 6)
+            choice = ask_index("Select", 6, 2)
         except KeyboardInterrupt:
             return 0
         try:
@@ -5896,27 +5628,31 @@ def interactive_menu() -> int:
                 case 1:
                     initialize_toolchains()
                 case 2:
-                    live_telemetry()
-                case 3:
-                    do_doctor(argparse.Namespace(json=False))
-                case 4:
-                    config_manager_menu()
-                    continue
-                case 5:
-                    bundle_manager_menu()
-                case 6:
                     args = build_parser().parse_args([])
                     do_build(args)
-                case 7:
-                    flavor = ask("Flavor suffix to uninstall (e.g. dusky-gaming)", "")
-                    if flavor:
-                        do_uninstall(argparse.Namespace(uninstall=flavor))
-                case 8:
+                case 3:
+                    bundle_manager_menu()
+                case 4:
                     paths = ask("Saved package files (space-separated)", "")
                     if paths:
-                        do_install_pkg(argparse.Namespace(install_pkg=paths.split(), profile=None, kernel_install=False))
-                case 9:
-                    do_clean(argparse.Namespace(clean=ask("What to clean (all|src|tarballs|patches|packages|thinlto|logs|seeds)", "packages,logs")))
+                        do_install_pkg(argparse.Namespace(install_pkg=shlex.split(paths), profile=None, kernel_install=False))
+                case 5:
+                    say(" 1) Profiles\n 2) Diagnostics\n 3) Live telemetry\n 4) Uninstall a kernel\n 5) Clean caches\n 6) Back\n")
+                    match ask_index("Select", 6, 6):
+                        case 1:
+                            config_manager_menu()
+                        case 2:
+                            do_doctor(argparse.Namespace(json=False))
+                        case 3:
+                            live_telemetry()
+                        case 4:
+                            flavor = ask("Flavor suffix to uninstall (e.g. dusky-performance)", "")
+                            if flavor:
+                                do_uninstall(argparse.Namespace(uninstall=flavor))
+                        case 5:
+                            do_clean(argparse.Namespace(clean=ask("What to clean (all|src|tarballs|packages|thinlto|logs|seeds)", "packages,logs")))
+                        case _:
+                            continue
                 case _:
                     return 0
         except KeyboardInterrupt:
@@ -5953,7 +5689,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return do_uninstall(args)
         if args.install_pkg:
             return do_install_pkg(args)
-        if args.fdo_record:
+        if args.fdo_record is not None:
             return do_fdo_record(args)
         if args.spec:
             return do_spec(args)

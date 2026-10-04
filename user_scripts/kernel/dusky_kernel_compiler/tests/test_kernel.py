@@ -38,6 +38,45 @@ def derived(p=None, f=None, idx=None, tree=Path('.')):
 
 
 class AuditTests(unittest.TestCase):
+    def test_included_profiles_preserve_zstd_and_native_thinlto(self):
+        for name in ('battery', 'performance', 'extreme_power', 'low_memory'):
+            with self.subTest(profile=name):
+                p = k.load_profile(k.SCRIPT_DIR / 'kernel_profiles' / f'{name}.toml')
+                self.assertEqual(p.g('cpu', 'arch'), 'native')
+                self.assertEqual(p.g('compiler', 'lto'), 'thin')
+                self.assertEqual(p.g('compiler', 'optimize'), 'size' if name == 'low_memory' else 'o2')
+                self.assertEqual(p.g('compiler', 'module_compress'), 'zstd')
+                for key in ('zram_algo', 'zram_recomp_algo', 'zswap_compressor'):
+                    self.assertEqual(p.g('memory', key), 'zstd')
+
+    def test_matrix_single_update_preserves_config_and_escapes_strings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = Path(directory)
+            cfg = tree / '.config'
+            cfg.write_text('# Heading\nCONFIG_KEEP=y\nCONFIG_SWITCH=m\n'
+                           '# CONFIG_SWITCH is not set\nCONFIG_TEXT="old"\n')
+            mx = k.Matrix(k.KconfigIndex(frozenset(), 4))
+            mx.y('SWITCH')
+            value = 'path\\name "quoted" café'
+            mx.s('TEXT', value)
+            mx.n('OFF')
+            mx.val('COUNT', 42)
+            with contextlib.redirect_stdout(io.StringIO()):
+                k.apply_matrix(tree, mx)
+            result = cfg.read_text()
+            self.assertIn('# Heading\nCONFIG_KEEP=y\n', result)
+            self.assertEqual(result.count('CONFIG_SWITCH'), 1)
+            self.assertEqual(k.parse_dotconfig(result),
+                             {'KEEP': 'y', 'SWITCH': 'y', 'TEXT': value, 'OFF': 'n', 'COUNT': '42'})
+
+    def test_multiline_kconfig_string_is_rejected(self):
+        p = profile()
+        for value in ('first\nsecond', 'first\rsecond'):
+            with self.subTest(value=value):
+                p.set('dusky', 'extra_config', {'TEST': value})
+                with self.assertRaises(k.ProfileError):
+                    k.validate_profile(p)
+
     def setUp(self):
         self.silence = contextlib.redirect_stdout(io.StringIO())
         self.silence.__enter__()
@@ -78,7 +117,7 @@ class AuditTests(unittest.TestCase):
 
     def test_included_profiles_default_to_stable_without_automatic_rc(self):
         releases = [k.Release('7.3-rc4', 'mainline', '', 'rc', None),
-                    k.Release('7.2.7', 'stable', '', 'stable', None)]
+                    k.Release('7.3.7', 'stable', '', 'stable', None)]
         for name in ('battery', 'performance', 'extreme_power', 'low_memory'):
             with self.subTest(profile=name):
                 p = k.load_profile(k.SCRIPT_DIR / 'kernel_profiles' / f'{name}.toml')
@@ -86,9 +125,9 @@ class AuditTests(unittest.TestCase):
                 self.assertFalse(p.g('release', 'allow_rc'))
                 with patch.object(k, 'interactive', return_value=True), patch.object(k, 'table'), \
                      patch.object(k, 'ask_index', side_effect=lambda _label, _maximum, default: default):
-                    self.assertEqual(k.choose_release(p, releases).version, '7.2.7')
+                    self.assertEqual(k.choose_release(p, releases).version, '7.3.7')
                 with patch.object(k, 'interactive', return_value=False):
-                    self.assertEqual(k.choose_release(p, releases).version, '7.2.7')
+                    self.assertEqual(k.choose_release(p, releases).version, '7.3.7')
 
     def test_cli_rc_opt_in_selects_latest_without_changing_saved_profile(self):
         p = profile()
@@ -104,8 +143,8 @@ class AuditTests(unittest.TestCase):
         self.assertFalse(profile().g('release', 'allow_rc'))
 
     def test_release_picker_shows_supported_channels_and_profile_default(self):
-        releases = [k.Release('7.3-rc4', 'mainline', '2026-09-20', 'rc', None),
-                    k.Release('7.2.7', 'stable', '2026-09-21', 'stable', None),
+        releases = [k.Release('7.4-rc4', 'mainline', '2026-09-20', 'rc', None),
+                    k.Release('7.3.7', 'stable', '2026-09-21', 'stable', None),
                     k.Release('6.18.53', 'longterm', '2026-09-21', 'lts', None)]
         p = profile(); p.set('release', 'channel', 'stable')
         seen = {}
@@ -117,21 +156,21 @@ class AuditTests(unittest.TestCase):
         with patch.object(k, 'interactive', return_value=True), patch.object(k, 'table', side_effect=capture_table), \
              patch.object(k, 'ask_index', side_effect=choose):
             selected = k.choose_release(p, releases)
-        self.assertEqual(selected.version, '7.3-rc4')
-        self.assertEqual([row[1] for row in seen['rows']], ['7.3-rc4', '7.2.7', '6.18.53'])
+        self.assertEqual(selected.version, '7.4-rc4')
+        self.assertEqual([row[1] for row in seen['rows']], ['7.4-rc4', '7.3.7', '6.18.53'])
         self.assertIn('profile default', seen['rows'][1][4])
         self.assertEqual(seen['rows'][2][0], '–')
 
     def test_release_picker_respects_exact_cli_pin_and_unattended_default(self):
-        releases = [k.Release('7.3-rc4', 'mainline', '', 'rc', None),
-                    k.Release('7.2.7', 'stable', '', 'stable', None)]
-        p = profile(); p.set('release', 'channel', 'stable'); p.set('release', 'pin', '7.3-rc4')
+        releases = [k.Release('7.4-rc4', 'mainline', '', 'rc', None),
+                    k.Release('7.3.7', 'stable', '', 'stable', None)]
+        p = profile(); p.set('release', 'channel', 'stable'); p.set('release', 'pin', '7.4-rc4')
         with patch.object(k, 'interactive', return_value=True), patch.object(k, 'ask_index') as ask:
-            self.assertEqual(k.choose_release(p, releases, exact_pin=True).version, '7.3-rc4')
+            self.assertEqual(k.choose_release(p, releases, exact_pin=True).version, '7.4-rc4')
             ask.assert_not_called()
         p.set('release', 'pin', '')
         with patch.object(k, 'interactive', return_value=False):
-            self.assertEqual(k.choose_release(p, releases).version, '7.2.7')
+            self.assertEqual(k.choose_release(p, releases).version, '7.3.7')
 
     def test_future_supported_lts_is_selectable_without_code_changes(self):
         releases = [k.Release('7.4.12', 'longterm', '2027-03-01', 'future-lts', None),
@@ -285,17 +324,19 @@ class AuditTests(unittest.TestCase):
 
     def test_new_ntfs_driver(self):
         p=profile(); mx=k.build_config_matrix(p,derived(p))
-        self.assertIn('ntfs',p.g('storage','extra_filesystems'))
+        p.set('storage', 'extra_filesystems', ['ntfs']); mx=k.build_config_matrix(p,derived(p))
         self.assertIn('NTFS_FS',{o.symbol for o in mx.ops})
         self.assertNotIn('NTFS3_FS',{o.symbol for o in mx.ops})
 
-    def test_disabled_patches_never_call_patch(self):
-        p=profile()
-        for key in ('patch_sched_inline','patch_evdev_rcu','patch_pci_pme'): p.set('dusky',key,False)
-        p.set('compiler','optimize','o2')
-        with patch.object(k,'apply_patch_content') as apply:
-            k.apply_enhancement_patches(Path('.'),p,k.Release('7.3','stable','','',None),facts())
-            apply.assert_not_called()
+    def test_stock_profiles_offer_no_patch_paths(self):
+        self.assertEqual(k.SCHED_CHOICES, ('eevdf',))
+        self.assertEqual(k.HZ_CHOICES, (100, 250, 300, 1000))
+        for name in ('battery', 'performance', 'extreme_power', 'low_memory'):
+            p = k.load_profile(k.SCRIPT_DIR / 'kernel_profiles' / f'{name}.toml')
+            self.assertEqual(p.g('modules', 'keep_symbols'), [])
+            self.assertEqual(p.g('dusky', 'extra_config'), {})
+        with self.assertRaises(k.ProfileError):
+            k.coerce({'dusky': {'patch_sched_inline': True}}, Path('old.toml'))
 
     def test_scheduler_requires_tracing(self):
         p=profile();p.set('scheduler','scx','scx_lavd');p.set('memory','tracing','minimal')
@@ -453,7 +494,7 @@ class AuditTests(unittest.TestCase):
                 obj.parent.mkdir(parents=True); obj.write_bytes(name.encode())
             values = dict(STORAGE=cfg, BUILD_DIR=disk, SRC_DIR=disk / 'src',
                           THINLTO_CACHE_DIR=cfg['thinlto_dir'], CCACHE_DIR=cfg['ccache_dir'],
-                          TARBALL_DIR=disk / 'tarballs', PATCH_CACHE=disk / 'patches',
+                          TARBALL_DIR=disk / 'tarballs',
                           PKGDEST_DIR=cfg['packages_dir'], IMPORT_DIR=root / 'imports', RAM_RESERVE_GIB=0)
             def rsync(argv):
                 return subprocess.run(argv, check=True, capture_output=True)
@@ -475,14 +516,11 @@ class AuditTests(unittest.TestCase):
             self.assertEqual((disk / 'src/linux-selected/test.o').read_bytes(), b'checkpointed')
             self.assertEqual((disk / 'src/linux-other/test.o').read_bytes(), b'linux-other')
 
-    def test_ram_choice_always_asks_and_defaults_to_disk(self):
-        args = k.build_parser().parse_args(['--yes', '--no-prompt', '--ram-build'])
-        with patch.object(k, 'STORAGE', {'zram_dir': Path('/ram/work')}), patch.object(k, 'interactive', return_value=True), patch.object(k, 'ASSUME_YES', True), patch.object(k.kernel_storage, 'ram_mount', return_value=True), patch('builtins.input', return_value='') as prompt:
-            self.assertFalse(k.choose_ram_build(args))
-            prompt.assert_called_once()
-        with patch.object(k, 'interactive', return_value=False):
-            self.assertTrue(k.choose_ram_build(args))
-            self.assertFalse(k.choose_ram_build(k.build_parser().parse_args([])))
+    def test_ram_choice_uses_capacity_without_prompt(self):
+        args = k.build_parser().parse_args([])
+        for ready in (True, False):
+            with patch.object(k.kernel_storage, 'ram_capacity', return_value=(ready, 'measured')), patch('builtins.input', side_effect=AssertionError('no prompt')):
+                self.assertEqual(k.choose_ram_build(args), ready)
 
     def test_checkpoint_runs_after_abort(self):
         k._ABORT.set()
@@ -501,10 +539,11 @@ class AuditTests(unittest.TestCase):
             root = Path(td)
             target = facts(threads=2, uarch='core2', psabi_level=1)
             db = root / 'modprobed.db'; db.write_text('ext4\nahci\n')
-            bundle = root / 'bundle.tar.gz'
+            bundle = root / 'bundle.tar.zst'
             custom = profile(); custom.set('timing', 'hz', 1000)
             with patch.object(k, 'host_facts', return_value=target), patch.object(k, 'have', return_value=False), patch.object(k, 'resolve_modprobed_db', return_value=db), patch.object(k, 'ensure_profiles_exist', return_value=[custom]):
                 k.do_export_bundle(bundle, 'battery')
+            self.assertEqual(bundle.read_bytes()[:4], bytes.fromhex('28b52ffd'))
             with tarfile.open(bundle) as tf:
                 self.assertIn('profile.toml', tf.getnames())
             profiles = root / 'profiles'; profiles.mkdir()
@@ -527,8 +566,6 @@ class AuditTests(unittest.TestCase):
             self.assertEqual(p.g('boot', 'cmdline_extra'), '')
             self.assertEqual(p.g('modules', 'keep_symbols'), [])
             self.assertEqual(p.g('dusky', 'extra_config'), {})
-            for key in ('patch_sched_inline', 'patch_evdev_rcu', 'patch_pci_pme'):
-                self.assertFalse(p.g('dusky', key))
 
     def test_sparse_possible_cpu_ids_size_all_slots(self):
         with patch.object(k, '_read', return_value='0-3,8-11'):
@@ -663,6 +700,83 @@ class AuditTests(unittest.TestCase):
             p = profile(); p.set('meta', 'manifest_path', str(path))
             with self.assertRaisesRegex(k.ProfileError, 'invalid target threads'):
                 k.target_facts_for_profile(p, facts())
+
+    def test_census_repairs_generated_intel_drivers_and_respects_override(self):
+        with tempfile.TemporaryDirectory() as td:
+            tree = Path(td)
+            (tree / '.config').write_text('CONFIG_INTEL_HID_EVENT=m\nCONFIG_DRM_I915=m\n')
+            makefile = tree / 'drivers/platform/x86/intel/Makefile'
+            makefile.parent.mkdir(parents=True)
+            makefile.write_text('intel-target-$(CONFIG_INTEL_HID_EVENT) += hid.o\nintel-target-$(CONFIG_INTEL_VSEC) += vsec.o\n')
+            p = profile()
+            result = subprocess.CompletedProcess([], 0, 'intel_hid config not found!\nacpi_call config not found!\n')
+            with patch.object(k, 'run', return_value=result):
+                restored = k.localmodconfig(tree, p, tree / 'db', {})
+            self.assertEqual(restored, {'INTEL_HID_EVENT'})
+            d = derived(p, tree=tree); d.census_symbols = restored
+            ops = {o.symbol: o.action for o in k.build_config_matrix(p, d).ops}
+            self.assertEqual(ops['INTEL_HID_EVENT'], 'm')
+            p.set('dusky', 'extra_config', {'INTEL_HID_EVENT': False})
+            ops = {o.symbol: o.action for o in k.build_config_matrix(p, d).ops}
+            self.assertEqual(ops['INTEL_HID_EVENT'], 'n')
+
+    def test_never_thp_policy_keeps_gpu_support_and_prunes_unused_zram_backends(self):
+        p = profile(); p.set('memory', 'zram_algo', 'zstd')
+        ops = {o.symbol: o.action for o in k.build_config_matrix(p, derived(p)).ops}
+        self.assertEqual(ops['TRANSPARENT_HUGEPAGE'], 'y')
+        self.assertEqual(ops['TRANSPARENT_HUGEPAGE_NEVER'], 'y')
+        self.assertEqual(ops['ZRAM_BACKEND_LZ4'], 'n')
+        self.assertEqual(ops['ZRAM_BACKEND_ZSTD'], 'y')
+
+    def test_single_numa_node_does_not_compile_numa(self):
+        p = profile(); p.set('memory', 'numa', True)
+        for nodes, expected in ((1, 'n'), (2, 'y')):
+            ops = {o.symbol: o.action for o in k.build_config_matrix(p, derived(p, facts(numa_nodes=nodes))).ops}
+            self.assertEqual(ops['NUMA'], expected)
+
+    def test_vm_manifest_with_no_l3_is_valid(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'manifest.json'
+            path.write_text(json.dumps(facts(virt='kvm', llc_domains=0, llc_kib=0).as_json() | {'format': 'dusky_bundle_v3'}))
+            p = profile(); p.set('meta', 'manifest_path', str(path))
+            self.assertEqual(k.target_facts_for_profile(p, facts()).llc_domains, 0)
+
+    def test_fdo_first_pass_keeps_line_information_without_profile(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = profile(); p.set('compiler', 'fdo', 'autofdo'); p.set('compiler', 'fdo_profile_dir', td)
+            k.normalize_profile(p)
+            self.assertEqual(p.g('compiler', 'debug_info'), 'full')
+            d = derived(p)
+            self.assertEqual(d.fdo, 'autofdo')
+            env = k.build_env(p, d, facts(), 0)
+            self.assertNotIn('CLANG_AUTOFDO_PROFILE', env)
+
+    def test_timeout_without_process_group_reaps_child(self):
+        processes = []; popen = subprocess.Popen
+        def child(*args, **kwargs):
+            proc = popen(*args, **kwargs); processes.append(proc); return proc
+        with patch.object(k.subprocess, 'Popen', side_effect=child):
+            with self.assertRaises(k.BuildError):
+                k.run([sys.executable, '-c', 'import time; time.sleep(60)'], timeout=0.05, own_group=False)
+        self.assertIsNotNone(processes[0].poll())
+
+    def test_gpg_signing_subkey_uses_primary_fingerprint(self):
+        import gzip
+        primary = next(iter(k.KERNEL_SIGNING_FPRS))
+        for signer, expected in ((primary, True), ('A'*40, False)):
+            with tempfile.TemporaryDirectory() as td:
+                archive = Path(td) / 'linux.tar.gz'
+                archive.write_bytes(gzip.compress(b'kernel source'))
+                (Path(td) / 'linux.tar.sign').write_bytes(b'test signature')
+                popen = subprocess.Popen
+                def process(cmd, **kwargs):
+                    if cmd[0] == 'gpg':
+                        status = f'[GNUPG:] VALIDSIG {"B"*40} 2026-10-04 1 0 4 0 1 10 00 {signer}'
+                        cmd = [sys.executable, '-c', f'import sys; sys.stdin.buffer.read(); print({status!r})']
+                    return popen(cmd, **kwargs)
+                with patch.object(k, 'ensure_kernel_keys', return_value=True), patch.object(k.subprocess, 'Popen', side_effect=process):
+                    self.assertEqual(k.verify_pgp(archive, 'https://example/linux.tar.sign'), expected)
+                self.assertEqual(k._CHILD_PGIDS, set())
 
     def test_wizard_schema_references(self):
         for step in k.WIZARD_STEPS:

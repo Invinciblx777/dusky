@@ -55,6 +55,43 @@ def ram_mount(path: Path) -> bool:
     return bool(rows and (rows[0]['fstype'] == 'tmpfs' or rows[0]['source'].startswith('/dev/zram')))
 
 
+def tree_bytes(path: Path) -> int:
+    """Allocated bytes, excluding symlinks and disposable package staging."""
+    if not path.exists():
+        return 0
+    total = 0
+    for parent, dirs, files in path.walk():
+        dirs[:] = [name for name in dirs if name != 'pacman']
+        for name in files:
+            item = parent / name
+            if not item.is_symlink() and '.pkg.tar' not in name:
+                total += item.stat().st_blocks * 512
+    return total
+
+
+def ram_capacity(settings: dict, lto: str, tree_name: str) -> tuple[bool, str]:
+    path = settings['zram_dir']
+    if not ram_mount(path):
+        return False, f'RAM mount unavailable at {path}; using persistent disk'
+    parent = path
+    while not parent.exists():
+        parent = parent.parent
+    source_size = tree_bytes(settings['persistent_dir'] / 'src' / tree_name) if tree_name else 0
+    cache_size = sum(tree_bytes(settings[key]) for key in ('thinlto_dir', 'ccache_dir'))
+    needed = max((30 if lto == 'full' else 22) << 30, source_size) + cache_size
+    ram = path / hashlib.sha256(str(settings['persistent_dir']).encode()).hexdigest()[:12]
+    # Completed work already occupies this mount. It can be reused or discarded
+    # by ram_workspace, so do not count it twice when checking the next build.
+    reusable = tree_bytes(ram) if not (ram / '.unsaved').exists() else 0
+    free = shutil.disk_usage(parent).free
+    available = next(int(line.split()[1]) * 1024 for line in Path('/proc/meminfo').read_text().splitlines()
+                     if line.startswith('MemAvailable:'))
+    budget = min(free + reusable, max(0, available + reusable - (settings['ram_reserve_gib'] << 30)))
+    if budget < needed:
+        return False, f'RAM capacity {budget / (1 << 30):.1f} GiB < estimated workspace {needed / (1 << 30):.1f} GiB; using persistent disk'
+    return True, f'Using RAM workspace {path} ({budget / (1 << 30):.1f} GiB budget, {needed / (1 << 30):.1f} GiB estimated)'
+
+
 def sync_tree(source: Path, dest: Path, run) -> None:
     source.mkdir(parents=True, exist_ok=True)
     dest.mkdir(parents=True, exist_ok=True)

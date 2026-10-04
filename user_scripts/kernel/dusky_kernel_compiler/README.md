@@ -1,103 +1,90 @@
 # Dusky kernel compiler
 
-Arch Linux, x86-64, Linux 7.2+, Python 3.14+, LLVM 21+ or current GCC. Keep this directory together: the engine loads its schema, runtime helper and optional patch files from adjacent paths.
+Build a stock upstream Linux kernel for the exact x86-64 hardware that will run it. Requires Arch Linux, Python 3.14+, Linux 7.3+ (including explicitly selected 7.3 RCs), and LLVM 21+ or the current GCC toolchain. Keep the compiler, schema, storage helper and runtime helper together.
 
-```sh
-python3 dusky_kernal_compile.py                         # Interactive menu
-python3 dusky_kernal_compile.py --doctor
-python3 dusky_kernal_compile.py -p battery --wizard      # Review/override any exposed tuning option
-python3 dusky_kernal_compile.py -p battery --no-install  # Build packages without installation
-python3 dusky_kernal_compile.py -p battery --configure-only --print-matrix
-```
+## 1. Prepare the target
 
-A build prompts to install missing Arch build dependencies and, when needed, modprobed-db from AUR. `--yes` authorizes automatic dependency installation. Strict pruning needs a census collected on the target with its relevant hardware/peripherals in use. The bundled `modules/modprobed.db` is never selected automatically for another machine.
+Run `python dusky_kernal_compile.py` and choose **Prepare**. This installs build tools and enables the modprobed-db user service. Use the target normally with its relevant peripherals, network/VPN, sound and graphics enabled before building. Strict pruning uses the accumulated target module census; it cannot infer hardware that has never been used.
 
-## Profiles and patches
+`--doctor` reports hardware and installed tools. The bundled `modules/modprobed.db` is never selected automatically.
 
-Only TOML files in `kernel_profiles/` and the user's XDG profile directory are selectable. No named preset is embedded in the engine. `kernel_profiles/schema.py` contains field defaults, validation limits and wizard metadata. `--write-default-profiles` creates a new `custom.toml` without overwriting an existing file. `--spec` prints the schema; `--show --dump-toml -p NAME` prints a fully resolved profile.
+## 2. Select and build
 
-The battery profile defaults to stable. For the newest release candidate in an unattended build, use `-p battery --channel mainline --allow-rc --yes`; add `--pin VERSION` to select an exact RC. These overrides apply only to this run. CPU names accepted by the selected compiler work without updating a script allowlist. Use `cpu.arch = "native"` for a local build. `cpu.march` accepts additional `-march=CPU` and `-mtune=CPU` overrides.
+Choose **Build** in the menu, review the profile and release, then proceed. Choose **edit** at the review if needed; `--wizard` opens all advanced settings directly. Profiles store only differences from defaults; `--show --dump-toml -p NAME` displays the complete resolved configuration, and `--spec` explains every field.
 
-At each interactive build, the release picker lists the current mainline, stable and longterm entries from kernel.org. All included profiles and new profiles default to the newest stable release, so pressing Enter selects stable; choose an RC explicitly for that build. An explicit RC choice works even when `release.allow_rc = false`; that setting controls automatic selection. `--pin VERSION` bypasses the picker, while `--yes` or unattended builds use the profile's pin or newest allowed release in its channel. Versions below the compiler's 7.2 minimum appear as unavailable, including current older LTS branches. The feed lists current channel releases, not every historical patch release; use `--pin VERSION` for an older supported version.
-
-If a source download fails, interactive builds offer retry, alternate host (when available), or cancel. Kernel.org partial downloads can resume. The GitHub release-candidate fallback does not support byte-range resume, so retrying that host restarts its transfer; switching back to kernel.org retains its separate partial download.
-
-All performance patches are optional: `dusky.patch_sched_inline`, `dusky.patch_evdev_rcu`, `dusky.patch_pci_pme`, `compiler.polly`, and `boot.acs_override`. New profiles default to no enhancement patches. Existing battery selections are retained. Patches must apply with zero fuzz; incompatible optional patches are reported and skipped. Scheduler patches have their separate `require_patch` / `allow_vanilla_fallback` controls. No patch is required for vanilla EEVDF, native CPU tuning or LTO. O3 uses compiler flags rather than a source patch with unrelated optimization changes.
-
-The new NTFS driver is selected by `storage.extra_filesystems = ["ntfs"]` (`CONFIG_NTFS_FS`). `ntfs3` remains a distinct driver choice for systems explicitly using it.
-
-## Included profiles
-
-All four default to **strict target-census pruning**, native local CPU targeting and ThinLTO. Imports replace native with the exported target CPU. Explicit keep lists and Kconfig overrides are still available for peripherals or workload features absent from the census.
-
-| Profile | Intended use | Main tradeoffs |
+| Profile | Purpose | Main choices |
 |---|---|---|
-| `battery` | Your existing tuned laptop setup | Keeps its gaming, VFIO, vendor-specific keep list and forced-ASPM choice. |
-| `performance` | Responsive desktop and sustained performance | Performance governor/EPP, 1000 Hz, full preemption, THP on request, O2; increased power use. |
-| `extreme_power` | Aggressive power saving | Power-focused CPU settings, 100 Hz, lazy preemption/RCU, aggressive ASPM without force; no IA32 or NTSync. |
-| `low_memory` | Memory-constrained desktop | Size optimization, 250 Hz, smaller buffers, prompt RCU reclamation, ZSTD swap and stronger reclaim; no IA32, NTSync or hibernation. |
+| battery | Laptop battery use | 300 Hz, lazy preemption/RCU, power EPP, automatic THP disabled |
+| performance | Responsive desktop | 1000 Hz, full preemption, performance EPP, THP on request |
+| extreme_power | Aggressive power saving | 100 Hz, lazy RCU, aggressive ASPM, no IA32/NTSync |
+| low_memory | Memory-constrained desktop | Size optimization, 250 Hz, ZSTD swap, automatic THP disabled; no IA32/NTSync/hibernation |
 
-The three new profiles have no enhancement patches, scheduler daemon/BTF requirement, vendor-specific driver lists or forced PCIe ASPM. They retain the scalable SLUB allocator rather than forcing SLUB_TINY. Native O2 is intentional for performance: O3 is available, but does not universally improve workloads. No measured speed, wattage or idle-RAM targets are implied.
-
-Pruning preserves root filesystem support, essential userspace facilities and explicit profile features. When the upstream Arch configuration is unavailable, an installed Arch `linux` headers configuration is preferred over an already-pruned running kernel. Intel i915/xe selection follows the pruned target configuration; a missing census driver requires an explicit keep or a corrected census. Recorded TCP/qdisc implementations remain available as modules while the profile selects the default; unrecorded alternatives are not forced on. Automatic CPU/NUMA limits follow the target topology.
-
-## Build elsewhere for an older computer
-
-On the target:
+All use strict census pruning and native local CPU targeting. None has a vendor-specific keep list or blanket VM driver overrides. The battery profile no longer enables sched_ext/BTF solely for an unused daemon or forces PCIe ASPM against firmware restrictions. CPU mitigations and other existing security preferences remain profile settings.
 
 ```sh
-python3 dusky_kernal_compile.py -p battery --export-bundle ~/target.tar.gz
+python dusky_kernal_compile.py -p battery --no-install
+python dusky_kernal_compile.py -p battery --configure-only --print-matrix
+# Until a stable 7.3+ release is available, explicitly select the newest mainline RC:
+python dusky_kernal_compile.py -p battery --channel mainline --allow-rc --no-install
+# Or select an exact version (7.3-rc5 was latest at the audit):
+python dusky_kernal_compile.py -p battery --pin 7.3-rc5 --allow-rc --no-install
 ```
 
-On the build computer, import the bundled profile (or pass `-p NAME` to override it with a local profile):
+Stable remains the default channel. The interactive picker permits explicit RC selection; unattended RC builds require `--allow-rc`. `--pin VERSION` bypasses the release picker. No kernel older than the 7.3 series is accepted. Release snapshots have no kernel.org archive signature/checksum; the script reports this limitation.
+
+No scheduler/enhancement/ACS/Polly patches, custom HZ injection, or NVIDIA source modifications are applied. Old profile patch fields are rejected as unknown settings: remove them rather than expecting silent fallback. Adjacent old patch artifacts remain on disk but are unused. Timer choices are upstream's 100/250/300/1000 Hz. The kernel stays EEVDF; optional sched_ext uses the in-tree BPF interface.
+
+ThinLTO, native tuning and stripped/compressed module packaging are retained. All supplied profiles use ZSTD for the kernel image, modules and compressed swap. Package compression follows makepkg settings (Arch defaults to ZSTD); the audited packages are `.pkg.tar.zst`. Exported hardware bundles use ZSTD through Python 3.14. Existing initramfs settings are respected (mkinitcpio defaults to ZSTD). Upstream hibernation supports only LZO/LZ4, so its existing LZ4 setting remains; firmware and archive readers retain other codecs for compatibility. O2 remains the performance default; O3 and full LTO have workload-dependent tradeoffs. `thp="never"` disables automatic THP allocation while retaining support required by upstream GPU SVM helpers; only selected ZRAM compression backends are compiled. Single-node targets omit NUMA even when the profile permits it. Strict pruning restores census-listed Intel generated platform drivers missed by upstream localmodconfig. Explicit `modules.keep_symbols` and `dusky.extra_config` remain available for deliberate workload features.
+
+A kernel package contains its resolved profile and optional kernel-specific boot tuning service. Runtime tuning runs once, only on the matching kernel; another power manager can subsequently override it. Existing ZRAM swap is left to its current manager. Selecting recompression algorithms does not schedule periodic recompression.
+
+## 3. Install or transfer
+
+A normal local build installs the resulting packages and refreshes supported bootloader integration. `--no-install` builds packages only. Saved packages should be installed through this tool so it checks DKMS, initramfs and boot integration:
 
 ```sh
-python3 dusky_kernal_compile.py --import-bundle target.tar.gz
-python3 dusky_kernal_compile.py -p remote_HOST --no-install
+python dusky_kernal_compile.py --install-pkg /path/to/linux-dusky-*.pkg.tar.zst
 ```
 
-Import reports the exact generated profile name, such as `remote_oldpc_performance`. Package suffixes include both the source profile and target name, so target variants can coexist. Bundles require the current v3 format; re-export old bundles. They preserve CPU, memory, NUMA, GPU, filesystems, DKMS and module-census data. Unknown target CPUs fall back to the target's reported ISA level; export with Clang/GCC installed to capture the precise compiler CPU name. Remote builds automatically disable installation on the build computer. They cannot use `native` or fall back to the build computer's module list. Build parallelism uses the build computer's resources.
+Headers are built automatically when the target needs DKMS, or explicitly with `--headers always`. Existing third-party modules remain the target user's responsibility; the compiler does not patch or add their sources. An unsuccessful DKMS audit stops boot-entry promotion. Use the existing working kernel if a new driver/kernel combination needs separate maintenance.
 
-Copy the resulting kernel and headers packages to the target and install there:
+`boot.write_entries` and `boot.set_default` separately control systemd-boot entries and default selection. GRUB/rEFInd/Limine/UKI command-line integration still depends on the target setup. No service starts on the build computer during compilation.
+
+## Build on a stronger computer
+
+Export from the target (including a chosen tuning profile):
 
 ```sh
-python3 dusky_kernal_compile.py --install-pkg /path/to/linux-*.pkg.tar.zst
+python dusky_kernal_compile.py -p low_memory --export-bundle ~/target.tar.zst
 ```
 
-Saved packages carry their resolved profile, including boot-entry preferences. Headers are required for target DKMS modules. Exact CPU targeting is for that target computer, not a general-purpose binary kernel.
-
-## Optional RAM builds and persistent storage
-
-Edit `kernel_profiles/settings/kernel_settings.toml` for machine storage policy; keep kernel tuning in the profile. `--settings FILE` selects another settings file. Empty persistent paths default to `~/.cache/dusky-kernel` (respecting XDG_CACHE_HOME).
-
-- `persistent_dir`: saved source trees, object files, seeds, downloads and patches.
-- `packages_dir`: completed packages; defaults to `persistent_dir/packages`.
-- `ccache_dir` / `thinlto_dir`: persistent compiler/linker caches.
-- `zram_dir`: optional RAM workspace; defaults to `/mnt/zram1/dusky_kernel`.
-- `ram_reserve_gib`: memory withheld from automatic job sizing for additional RAM-filesystem growth (default 8 GiB). It is a planning allowance, not an enforced memory limit.
-
-Every interactive build with an available RAM mount asks **Use RAM workspace? [y/N]**, even with `--yes` or `--no-prompt`. Declining builds on disk. Noninteractive runs default to disk; `--ram-build` explicitly chooses RAM. The script never creates or reformats a RAM device. `--build-dir` overrides the persistent root, not the RAM workspace.
-
-RAM mode chooses the release and exact version/profile/configuration build identity first, then restores only that source/object tree and shared compiler/linker caches, preserving timestamps. Previous checkpointed trees are removed from RAM while their disk copies remain intact. Changed files are checkpointed to disk on completion, failure or Ctrl-C. Let the save finish before rebooting. Interrupted saves leave an `.unsaved` marker and block an older disk copy from overwriting the RAM work. Packages are written directly to persistent storage. Disposable package staging files are excluded from checkpoints. Downloads and patch caches stay on disk.
-
-A power loss, forced kill or reboot before checkpoint completion can lose new RAM-only work. Checkpointing writes changed output to disk, so this reduces intermediate write traffic rather than eliminating SSD writes. Switching between disk and RAM paths can invalidate some build/cache entries; repeated builds at the same path have the best reuse. Only one build tree occupies RAM, but shared caches and compilation still consume additional memory. Symlinking a writable build tree to disk would send its intermediate writes to disk; it would not provide a RAM build.
-
-The mount name does not establish its storage type: `/mnt/zram1` on the audited machine is **tmpfs**. Tmpfs can swap; systems with disk-backed swap can therefore still write to the SSD. Choose disk on memory-constrained systems. Manual `compiler.jobs` overrides remain your responsibility.
-
-## Runtime tuning
-
-`runtime.enabled` controls a packaged, kernel-specific systemd service. It applies EPP/governor, VM/network sysctls, THP/MGLRU/KSM settings, scheduler debugfs settings and block scheduling once at boot. Missing hardware interfaces are reported in the journal. Other power-management software can subsequently override these settings; this helper does not poll or fight it.
-
-`runtime.manage_zram` creates compressed swap only when no ZRAM swap is already active. Existing swap is never reset or resized. Recompression support/algorithm selection does not periodically recompress pages. `scheduler.scx` optionally installs a separate scheduler service; it is not started for the battery profile's `none` selection. Package dependencies include the necessary runtime tools.
-
-`boot.write_entries` controls systemd-boot entries; `boot.set_default` separately controls changing the default boot selection. GRUB/UKI installations retain their existing command-line integration. No runtime service is started on the build host during compilation.
-
-For LLVM/ThinLTO builds, generated headers force `ld.lld` for external modules even when a DKMS wrapper passes `LD=ld`. Before installing Linux 7.3+ with NVIDIA 615.71.09, the installer applies the exact-match compatibility patch in `compat/` for the changed dmem cgroup API; it stops before replacing boot images if that source no longer matches. A newer NVIDIA release may need different compatibility work. DKMS and boot success still need verification on each target machine.
-
-## Validation
+Import and build on the stronger x86-64 Arch computer:
 
 ```sh
-python -m unittest discover -s tests -v
+python dusky_kernal_compile.py --import-bundle target.tar.zst
+python dusky_kernal_compile.py -p remote_HOST_low_memory --channel mainline --allow-rc --no-install
 ```
 
-See [the audit report](audit/AUDIT.md) and [the RC5 build and guest-boot audit](audit/RC5_AUDIT_2026-09-30.md) for findings, checks performed and remaining limits. Configuration checks do not establish runtime speed, battery life, DKMS compatibility or successful boot on untested hardware.
+Use the exact profile name reported by import. `-p NAME --import-bundle FILE` chooses local tuning instead of the bundled profile. Bundles retain target CPU, topology, GPU, filesystem, VM and module information; they never prune against the builder's modules. Import replaces `native` with the target compiler CPU name or its ISA baseline and disables installation on the builder. Build jobs use the builder's resources. Copy packages back and use **Install** on the target. Guest targets use the same export/import workflow.
+
+## RAM workspace and persistence
+
+Builds automatically prefer `/mnt/zram1/dusky_kernel`, beneath the existing `/mnt/zram1` mount. If the mount is absent or measured filesystem/memory capacity is insufficient, they use persistent disk. The script does not create or format a RAM device and no longer asks a RAM-storage question.
+
+`kernel_profiles/settings/kernel_settings.toml` controls storage paths. Empty persistent paths use `$XDG_CACHE_HOME/dusky-kernel` (normally `~/.cache/dusky-kernel`). `--build-dir DIR` overrides the persistent root. Completed packages always go to disk.
+
+Capacity planning allows 22 GiB (30 GiB for full LTO), the existing selected tree when larger, shared caches, and the configured memory reserve. Completed RAM contents are credited for reuse. This is an estimate, not a memory/disk limit; unusually large configurations or concurrent workloads can still exhaust resources.
+
+Only the selected source/object tree and shared caches are restored into RAM. Checkpoints save changed files to disk after success, failure or Ctrl-C, preserving other persistent builds. Let checkpointing finish before rebooting. A failed checkpoint leaves `.unsaved` to prevent overwriting newer RAM work with older disk data. Power loss or forced termination before saving can lose RAM-only work. Tmpfs can swap, so RAM builds do not guarantee zero SSD writes.
+
+Stock-source cache identity includes the resolved profile and target hardware/toolchain facts. Changes to UI or orchestration code reuse the tree; configuration and compiler command changes are tracked by Make. Runtime payloads are repackaged each build.
+
+## Validation and optional FDO
+
+```sh
+python -W error::ResourceWarning -m unittest discover -s tests -v
+```
+
+For optional AutoFDO, set `compiler.fdo="autofdo"` for an initial profile-collection build, boot that kernel, then run `--fdo-record SECONDS` with a representative workload. Missing feedback retains AutoFDO line information without passing a nonexistent profile to Clang. Conversion uses the installed `llvm-profgen`, or `create_llvm_prof` when available. Propeller additionally needs `create_llvm_prof`; recording needs supported hardware branch sampling.
+
+See [the current audit](audit/STOCK_AUDIT_2026-10-04.md) for measured checks and remaining limits. Configuration/build tests do not establish optimal speed, battery life, or compatibility with every target's external drivers.

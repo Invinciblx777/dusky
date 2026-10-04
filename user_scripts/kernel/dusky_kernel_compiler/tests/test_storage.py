@@ -146,3 +146,27 @@ class StorageTests(unittest.TestCase):
             bad.write_text(template.read_text().replace('ram_reserve_gib = 8', 'ram_reserve_gib = true'))
             with self.assertRaises(s.StorageError):
                 s.load_settings(bad, Path(tmp))
+
+
+class CapacityTests(unittest.TestCase):
+    def test_missing_mount_selects_disk(self):
+        with patch.object(s, 'ram_mount', return_value=False):
+            ready, _ = s.ram_capacity({'zram_dir': Path('/ram')}, 'thin', 'linux')
+            self.assertFalse(ready)
+
+    def test_capacity_accounts_for_caches_memory_and_reusable_workspace(self):
+        from types import SimpleNamespace
+        cfg = dict(zram_dir=Path('/tmp'), persistent_dir=Path('/disk'),
+                   thinlto_dir=Path('/cache/lto'), ccache_dir=Path('/cache/ccache'), ram_reserve_gib=8)
+        gib = 1 << 30
+        for free, memory, reusable, expected in ((40, 40, 0, True), (20, 40, 0, False),
+                                                  (40, 20, 0, False), (10, 18, 20, True)):
+            with self.subTest(free=free, memory=memory, reusable=reusable):
+                def size(path):
+                    if path in (cfg['thinlto_dir'], cfg['ccache_dir']): return 2 * gib
+                    if path.parent == cfg['zram_dir']: return reusable * gib
+                    return 0
+                with patch.object(s, 'ram_mount', return_value=True), patch.object(s, 'tree_bytes', side_effect=size), \
+                     patch.object(s.shutil, 'disk_usage', return_value=SimpleNamespace(free=free*gib)), \
+                     patch.object(Path, 'read_text', return_value=f'MemAvailable: {memory * 1048576} kB\n'):
+                    self.assertEqual(s.ram_capacity(cfg, 'thin', 'linux')[0], expected)
