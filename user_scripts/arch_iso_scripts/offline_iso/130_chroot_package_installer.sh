@@ -178,13 +178,13 @@ RED=''
 CYAN=''
 RESET=''
 
-if [[ -z ${NO_COLOR-} ]] && [[ -n ${TERM-} ]] && [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && tput colors >/dev/null 2>&1; then
-  BOLD=$(tput bold)
-  GREEN=$(tput setaf 2)
-  YELLOW=$(tput setaf 3)
-  RED=$(tput setaf 1)
-  CYAN=$(tput setaf 6)
-  RESET=$(tput sgr0)
+if [[ -z ${NO_COLOR-} ]] && [[ -n ${TERM-} ]] && [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && colors=$(tput colors 2>/dev/null) && (( colors >= 8 )); then
+  BOLD=$(tput bold 2>/dev/null || true)
+  GREEN=$(tput setaf 2 2>/dev/null || true)
+  YELLOW=$(tput setaf 3 2>/dev/null || true)
+  RED=$(tput setaf 1 2>/dev/null || true)
+  CYAN=$(tput setaf 6 2>/dev/null || true)
+  RESET=$(tput sgr0 2>/dev/null || true)
 fi
 
 readonly BOLD GREEN YELLOW RED CYAN RESET

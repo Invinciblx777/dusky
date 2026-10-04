@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# DUSKY_BOOTSTRAP_PACKAGES: python python-textual python-rich git
+# DUSKY_BOOTSTRAP_PACKAGES: python python-textual python-rich
 # dusky_interactive=true
 # ==============================================================================
 #  ARCH LINUX ISO TEXTUAL ORCHESTRATOR (v19.0 - Async PTY Engine + Auto-Prompt)
@@ -9,15 +9,17 @@
 # Compatibility: Python 3.14+ | Textual 8.2+ | Arch Linux ISO (2026+)
 # ==============================================================================
 
-VERSION = "19.0.0"
-
 import os
 import sys
-if sys.version_info < (3, 14):
-    sys.stderr.write("[FATAL] Python 3.14+ is required.\n")
+if sys.version_info < (3, 14, 7):
+    sys.stderr.write("[FATAL] Python 3.14.7+ is required.\n")
     sys.exit(1)
 import subprocess
 import time
+
+PROCESS_STARTED = time.monotonic()
+
+import codecs
 import fcntl
 import hashlib
 import tarfile
@@ -38,12 +40,57 @@ import signal
 import json
 import math
 import sqlite3
+import uuid
 from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from importlib import metadata as importlib_metadata
-from typing import List, Dict, Optional, Tuple, Any
-from contextlib import suppress, contextmanager, nullcontext
+from typing import Any
+from contextlib import suppress, contextmanager
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Dusky Arch ISO Textual Orchestrator", allow_abbrev=False)
+    parser.add_argument("--phase1", action="store_true", help="Run Phase 1 (ISO Environment)")
+    parser.add_argument("--phase2", action="store_true", help="Run Phase 2 (Chroot Environment)")
+    parser.add_argument("--reset", action="store_true", help="Reset execution state for the current phase")
+    parser.add_argument("--dry-run", "-d", action="store_true", help="Dry run: validate scripts presence and exit")
+    parser.add_argument("--force", action="store_true", help="Pass --force flag to subscripts")
+    parser.add_argument("--manual", "-m", action="store_true", help="Manual mode: prompt before each script")
+    parser.add_argument("--stop-on-fail", action="store_true", help="Halt execution if any script fails")
+    parser.add_argument("--auto", action="store_true", help="Automatically decide orchestration prompts")
+    parser.add_argument("--online", action="store_true", help="Select the online recovery profile")
+    parser.add_argument("--profile", type=str, help="Specify profile TOML to execute")
+    parser.add_argument("--list-profiles", action="store_true", help="List all available installer profiles and exit")
+    parser.add_argument("--list-scripts", action="store_true", help="List all tasks in the selected profile and exit")
+    parser.add_argument("--list-once", action="store_true", help="List recorded once-markers and exit")
+    parser.add_argument("--forget-once", type=str, help="Remove recorded once-marker(s) for a script and exit")
+    parser.add_argument("--doctor", action="store_true", help="Check orchestrator and profile health and exit")
+    parser.add_argument("--explain", action="store_true", help="Explain what would happen for each task and exit")
+    parser.add_argument("--task-timeout", type=float, default=None, help="Default per-task timeout in seconds (0 = no timeout)")
+    parser.add_argument("--no-audio", action="store_true", help="Disable audio notifications")
+    parser.add_argument("--no-notify", action="store_true", help="Disable desktop notifications")
+    args = parser.parse_args()
+    if args.auto and args.manual:
+        parser.error("--auto and --manual conflict")
+    if args.phase1 and args.phase2:
+        parser.error("--phase1 and --phase2 conflict")
+    inspection = [args.list_profiles, args.list_scripts, args.list_once, args.doctor,
+                  args.explain, args.dry_run, bool(args.forget_once)]
+    if sum(bool(item) for item in inspection) > 1 or (args.reset and any(inspection)):
+        parser.error("inspection modes cannot be combined with each other or --reset")
+    if args.task_timeout is not None and (not math.isfinite(args.task_timeout) or args.task_timeout < 0):
+        parser.error("--task-timeout must be nonnegative and finite")
+    if args.online:
+        if args.profile is not None:
+            parser.error("--online cannot be combined with --profile")
+        args.profile = "Online"
+    return args
+
+
+EARLY_ARGS = parse_args() if __name__ == "__main__" else None
+if EARLY_ARGS is not None and os.environ.get("DUSKY_VALIDATE_ARGS_ONLY") == "1":
+    sys.exit(0)
+
 
 try:
     from rich.console import Console
@@ -53,7 +100,7 @@ try:
 
     from textual.app import App, ComposeResult
     from textual.containers import Container, Horizontal, Vertical
-    from textual.widgets import Header, Footer, Static, RichLog, ProgressBar, Button, Label, Input, OptionList, Tree, ContentSwitcher
+    from textual.widgets import Footer, Static, RichLog, ProgressBar, Button, Label, Tree, ContentSwitcher
     from textual.widgets.tree import TreeNode
     from textual.binding import Binding
     from textual.screen import ModalScreen
@@ -64,7 +111,7 @@ except ImportError as exc:
     sys.exit(8)
 
 try:
-    version_parts = tuple(int(part) for part in re.findall(r"\d+", importlib_metadata.version("textual"))[:3])
+    version_parts = (tuple(int(part) for part in re.findall(r"\d+", importlib_metadata.version("textual"))[:3]) + (0, 0, 0))[:3]
     if version_parts < (8, 2, 8):
         raise RuntimeError(f"Textual 8.2.8+ required; installed {importlib_metadata.version('textual')}")
 except (importlib_metadata.PackageNotFoundError, RuntimeError) as exc:
@@ -74,7 +121,7 @@ except (importlib_metadata.PackageNotFoundError, RuntimeError) as exc:
 # ==============================================================================
 # CONSTANTS & CONFIGURATION LOAD
 # ==============================================================================
-VERSION = "19.0.0"
+VERSION = "19.0.1"
 SCRIPT_DIR: Path = Path(__file__).resolve().parent
 PROFILES_DIR: Path = Path(
     os.environ.get("DUSKY_PROFILES_DIR", SCRIPT_DIR / "profiles")
@@ -92,14 +139,67 @@ def load_global_config() -> dict:
     return {}
 
 
+def validate_global_config(config: dict) -> dict:
+    for name in ("ui", "paths", "logging", "execution", "conditions", "notifications", "prompts"):
+        if not isinstance(config.get(name, {}), dict):
+            raise ValueError(f"[{name}] must be a TOML table")
+    fields = {
+        "ui": {"ascii_mode": bool, "left_pane_width": int, "min_left_pane_width": int,
+               "max_left_pane_width": int, "max_log_lines": int,
+               "fallback_pty_columns": int, "fallback_pty_lines": int},
+        "paths": {"documents_dir": str, "state_subdir": str, "logs_subdir": str},
+        "logging": {"enabled": bool, "write_task_logs": bool, "write_reports": bool},
+        "execution": {"db_busy_timeout": int, "default_interpreter": str},
+        "notifications": {"audio_enabled": bool, "desktop_enabled": bool,
+                          "app_name": str, "fallback_sound": str},
+    }
+    for section, specs in fields.items():
+        for key, kind in specs.items():
+            value = config.get(section, {}).get(key)
+            if value is None:
+                continue
+            if type(value) is not kind or (kind is int and (value < 0 or (value == 0 and key != "db_busy_timeout"))) or (kind is str and not value):
+                raise ValueError(f"[{section}].{key} has an invalid value")
+    ui = config.get("ui", {})
+    if not 1 <= ui.get("min_left_pane_width", 15) <= ui.get("left_pane_width", 27) <= ui.get("max_left_pane_width", 80) <= 99:
+        raise ValueError("Invalid sidebar width limits")
+    footer = ui.get("show_keybinds_footer", "auto")
+    if type(footer) is not bool and footer != "auto":
+        raise ValueError("[ui].show_keybinds_footer must be a boolean or 'auto'")
+    for section, keys in {
+        "conditions": ("package_check_cmd", "service_active_cmd"),
+        "notifications": ("audio_players",),
+    }.items():
+        for key in keys:
+            value = config.get(section, {}).get(key)
+            if value is not None and (not isinstance(value, list) or (not value and key != "audio_players") or
+                                      any(not isinstance(item, str) or not item for item in value)):
+                raise ValueError(f"[{section}].{key} must be a nonempty command array")
+    for section, keys in {
+        "ui": ("unicode_symbols", "ascii_symbols"),
+        "execution": ("extension_interpreters",),
+        "conditions": ("gpu_vendor_map",),
+        "notifications": ("sound_map",),
+    }.items():
+        for key in keys:
+            value = config.get(section, {}).get(key)
+            if value is not None and (not isinstance(value, dict) or
+                                      any(not isinstance(v, str) for v in value.values())):
+                raise ValueError(f"[{section}].{key} must be a string table")
+    rules = config.get("prompts", {}).get("rules", [])
+    if not isinstance(rules, list) or any(not isinstance(rule, dict) or
+        not all(isinstance(rule.get(key), str) for key in ("name", "pattern", "kind")) for rule in rules):
+        raise ValueError("[prompts].rules contains an invalid prompt rule")
+    return config
+
+
 try:
-    GLOBAL_CONFIG = load_global_config()
-except RuntimeError as exc:
+    GLOBAL_CONFIG = validate_global_config(load_global_config())
+except (RuntimeError, ValueError) as exc:
     sys.stderr.write(f"[FATAL] {exc}\n")
     sys.exit(2)
 
 ASCII_MODE = GLOBAL_CONFIG.get("ui", {}).get("ascii_mode", False)
-MAX_DEFER_PASSES = GLOBAL_CONFIG.get("execution", {}).get("max_defer_passes", 3)
 
 UNICODE_SYMBOLS = GLOBAL_CONFIG.get(
     "ui",
@@ -136,16 +236,15 @@ ASCII_SYMBOLS = GLOBAL_CONFIG.get(
 
 def S(key: str) -> str:
     syms = ASCII_SYMBOLS if ASCII_MODE else UNICODE_SYMBOLS
-    return syms.get(key, "")
+    return syms.get(key, key)
 
 
 # High-Performance Regexes
 ANSI_STRIP_REGEX = re.compile(
-    r'\x1B(?:[@-Z\\-_]|\[(?>(?:[0-?]*+)[ -/]*+[@-~])|\](?>\d*;.*?)(?:\x07|\x1B\\)|\]8;;.*?(?:\x07|\x1B\\)|\x1B\(B)'
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[()][0-2A-Z]|[@-Z\\-_])"
 )
-PCT_REGEX = re.compile(r'(?<![0-9])(?>\d{1,2}|100)%')
-SPEED_ETA_REGEX = re.compile(r'(\d+(?:\.\d+)?\s+[KMG]?i?B/s)\s+([\d:]+)', re.IGNORECASE)
-PROGRESS_BAR_REGEX = re.compile(r'\[[#=\- oO@%:.0123456789━─░▒▓█▏▎▍▌▋▊▉●○◉◌]{3,}\]|\b\d{1,3}%\b')
+PCT_REGEX = re.compile(r"(?<!\d)(?:100(?:\.0+)?|\d{1,2}(?:\.\d+)?)%")
+SPEED_ETA_REGEX = re.compile(r"(\d+(?:\.\d+)?\s*[KMG]?i?B/s)\s+([\d:]+)", re.IGNORECASE)
 INTERACTIVE_RE = re.compile(r'^\s*#\s*dusky_interactive\s*=\s*(?:true|1)\b', re.IGNORECASE)
 
 
@@ -163,15 +262,18 @@ def _build_prompt_rules() -> list[tuple[str, re.Pattern[str], str]]:
     for item in items_to_parse:
         if isinstance(item, dict):
             name, pattern, kind = item["name"], item["pattern"], item["kind"]
-            resp = "y\n" if kind in ("yes", "y") else f"{kind}\n"
+            resp = {"yes": "y\n", "y": "y\n", "no": "n\n", "enter": "\n"}.get(kind, f"{kind}\n")
         else:
             name, pattern, resp = item
         rules.append((name, re.compile(pattern, re.MULTILINE), resp))
     return rules
 
 
-PROMPT_RULES = _build_prompt_rules()
-_LOCK_FD: Optional[int] = None
+try:
+    PROMPT_RULES = _build_prompt_rules()
+except re.PatternError as exc:
+    raise SystemExit(f"[FATAL] Invalid prompt regex: {exc}") from exc
+_LOCK_FD: int | None = None
 
 # ==============================================================================
 # PATH RESOLUTION HELPERS
@@ -454,6 +556,8 @@ class RunLogger:
         tasks: list[Any],
         statuses: dict[str, str],
         counters: dict[str, int],
+        elapsed: float,
+        phase_duration: float,
     ) -> None:
         if not self.enabled or not self.write_reports or self.root is None:
             return
@@ -466,6 +570,8 @@ class RunLogger:
             "python": sys.version,
             "user": "root" if os.geteuid() == 0 else os.environ.get("USER", "user"),
             "counters": counters,
+            "elapsed_seconds": elapsed,
+            "phase_duration_seconds": phase_duration,
             "tasks": [],
         }
 
@@ -476,6 +582,8 @@ class RunLogger:
             f"- Generated: `{now_iso()}`",
             f"- Profile: `{profile_name}`",
             f"- Version: `{VERSION}`",
+            f"- Installation elapsed: {elapsed:.2f}s",
+            f"- Phase duration: {phase_duration:.2f}s",
             "",
             "## Summary",
             "",
@@ -494,6 +602,8 @@ class RunLogger:
                 "status": st,
                 "mode": t.mode,
                 "condition": t.condition or "always",
+                "duration_seconds": t.duration,
+                "detail": t.error_msg,
             })
             lines.append(f"| {t.index} | `{t.script_name}` | {st} | {t.mode} | `{t.condition or 'always'}` |")
 
@@ -505,25 +615,31 @@ class RunLogger:
             sys.stderr.write(f"[ERROR] Report write failed: {exc}\n")
 
 
+    def close_all(self) -> None:
+        files = list(self._task_files.values())
+        self._task_files.clear()
+        if self._main is not None:
+            files.append(self._main)
+            self._main = None
+        for stream in files:
+            try:
+                stream.close()
+            except OSError as exc:
+                self.failed_write = True
+                sys.stderr.write(f"[ERROR] Log close failed: {exc}\n")
+
+
 # ==============================================================================
 # CONDITION EVALUATOR
 # ==============================================================================
 class ConditionEvaluator:
-    def __init__(self):
-        self.cache: dict[str, bool] = {}
-
     def check(self, cond: str | None) -> bool:
         if not cond or cond.strip().lower() in ("always", "true", "yes"):
             return True
         if cond.strip().lower() in ("never", "false", "no"):
             return False
         cond_clean = cond.strip()
-        if cond_clean in self.cache:
-            return self.cache[cond_clean]
-
-        res = self._eval(cond_clean)
-        self.cache[cond_clean] = res
-        return res
+        return self._eval(cond_clean)
 
     def _eval(self, cond: str) -> bool:
         if "," in cond:
@@ -543,10 +659,8 @@ class ConditionEvaluator:
             return not self.check(value)
         if kind == "wayland":
             return bool(os.environ.get("WAYLAND_DISPLAY"))
-        if kind == "x11":
-            return bool(os.environ.get("DISPLAY"))
         if kind == "graphical":
-            return bool(os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"))
+            return bool(os.environ.get("WAYLAND_DISPLAY"))
         if kind in ("command", "cmd"):
             return shutil.which(value) is not None
         if kind == "dir":
@@ -562,7 +676,7 @@ class ConditionEvaluator:
             if not pkg_cmd or not shutil.which(pkg_cmd[0]):
                 return False
             try:
-                return subprocess.run(pkg_cmd + [value], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+                return subprocess.run(pkg_cmd + [value], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10).returncode == 0
             except Exception:
                 return False
         if kind in ("service_active", "service", "svc"):
@@ -571,7 +685,7 @@ class ConditionEvaluator:
                 ["systemctl", "is-active", "--quiet"],
             )
             try:
-                return subprocess.run(cmd + [value], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+                return subprocess.run(cmd + [value], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10).returncode == 0
             except Exception:
                 return False
         if kind == "gpu":
@@ -584,12 +698,12 @@ class ConditionEvaluator:
                 if drm_path.exists():
                     for card in drm_path.glob("card[0-9]*"):
                         vf = card / "device" / "vendor"
-                        if vf.exists() and vf.read_text().strip().lower() == target:
+                        if vf.is_file() and vf.read_text().strip().lower() == target:
                             return True
             if shutil.which("lspci"):
                 try:
-                    out = subprocess.run(["lspci"], capture_output=True, text=True).stdout.lower()
-                    if value.lower() in out:
+                    out = subprocess.run(["lspci"], capture_output=True, text=True, timeout=10).stdout.lower()
+                    if any(value.lower() in line and any(kind in line for kind in ("vga", "3d", "display")) for line in out.splitlines()):
                         return True
                 except Exception:
                     pass
@@ -607,26 +721,27 @@ class TaskStatus(Enum):
     COMPLETED = auto()
     FAILED = auto()
     SKIPPED = auto()
+    IGNORED = auto()
 
 
 @dataclass
 class OrchestratorTask:
     index: int
     script_name: str
-    args: List[str]
+    args: list[str]
     mode: str = "U"
     ignore_fail: bool = False
     interactive: bool = False
-    interactive_override: Optional[bool] = None
+    interactive_override: bool | None = None
     force_flag: bool = False
-    condition: Optional[str] = None
-    timeout: Optional[float] = None
+    condition: str | None = None
+    timeout: float | None = None
     interpreter: str = "bash"
     checksum: str = ""
     state_key: str = ""
-    resolved_path: Optional[Path] = None
+    resolved_path: Path | None = None
     status: TaskStatus = TaskStatus.PENDING
-    error_msg: Optional[str] = None
+    error_msg: str | None = None
     duration: float = 0.0
     always: bool = False
     retry: int = 0
@@ -639,14 +754,14 @@ class OrchestratorTask:
 
 @dataclass
 class ProfileConfig:
-    filepath: Optional[Path]
+    filepath: Path | None
     name: str
     description: str
-    phase1_tasks: List[OrchestratorTask]
-    phase2_tasks: List[OrchestratorTask]
-    search_dirs: List[Path] = field(default_factory=list)
-    conflict_resolutions: Dict[str, str] = field(default_factory=dict)
-    policy: Dict[str, Any] = field(default_factory=dict)
+    phase1_tasks: list[OrchestratorTask]
+    phase2_tasks: list[OrchestratorTask]
+    search_dirs: list[Path] = field(default_factory=list)
+    conflict_resolutions: dict[str, str] = field(default_factory=dict)
+    policy: dict[str, Any] = field(default_factory=dict)
 
 
 # ==============================================================================
@@ -660,11 +775,13 @@ def validate_condition(condition: str | None) -> None:
         if not part:
             raise ValueError(f"Empty condition in {condition!r}")
         if part.lower().startswith("not:"):
+            if not part[4:].strip():
+                raise ValueError(f"Empty negated condition in {condition!r}")
             validate_condition(part[4:])
             continue
         kind, sep, value = part.partition(":")
         kind = kind.strip().lower()
-        if kind in ("always", "true", "yes", "never", "false", "no", "wayland", "x11", "graphical") and not sep:
+        if kind in ("always", "true", "yes", "never", "false", "no", "wayland", "graphical") and not sep:
             continue
         if kind in ("command", "cmd", "dir", "file", "path", "missing", "package", "pkg",
                     "service_active", "service", "svc", "gpu") and sep and value.strip():
@@ -675,288 +792,132 @@ def validate_condition(condition: str | None) -> None:
 def parse_task_entry(raw_entry: str | dict, index: int = 1) -> OrchestratorTask:
     if isinstance(raw_entry, dict):
         return parse_task_table(raw_entry, index)
-
-    raw = raw_entry.strip()
-    parts = [p.strip() for p in raw.split("|", 2)]
-
+    parts = [part.strip() for part in raw_entry.strip().split("|", 2)]
     if len(parts) == 1:
         mode, flags, cmd = "U", "", parts[0]
     elif len(parts) == 2:
         mode, cmd = parts
         flags = ""
-    elif len(parts) == 3:
-        mode, flags, cmd = parts
     else:
-        raise ValueError(f"Malformed entry: {raw_entry}")
-
-    ignore_fail = False
-    interactive = False
-    interactive_override: bool | None = None
-    force_flag = False
-    always = False
-    condition: str | None = None
-    timeout: float | None = None
-    retry = 0
-    retry_delay = 1.0
-    on_failure = "ask"
-    once = False
-    once_mode = "content"
-    once_scope = "profile"
-
-    for flag in flags.split(","):
-        f = flag.strip().lower()
-        if not f:
-            continue
-
-        if f in ("true", "ignore", "ignore-fail"):
-            ignore_fail = True
-        elif f in ("interactive", "tui", "prompt", "fullscreen", "tty", "suspend"):
-            interactive = True
-            interactive_override = True
-        elif f in ("no-interactive", "noninteractive", "inline", "embedded"):
-            interactive = False
-            interactive_override = False
-        elif f in ("force", "--force"):
-            force_flag = True
-        elif f in ("always", "always_run"):
-            always = True
-        elif f in ("once", "run_once", "sticky"):
-            once = True
-        elif f in ("once:content", "once:hash"):
-            once = True
-            once_mode = "content"
-        elif f in ("once:forever", "once:exact", "once:permanent"):
-            once = True
-            once_mode = "forever"
-        elif f in ("once:profile", "once:local"):
-            once = True
-            once_scope = "profile"
-        elif f in ("once:global", "once:machine"):
-            once = True
-            once_scope = "global"
-        elif f.startswith("condition:"):
-            cond_val = flag.strip()[10:]
-            if condition is None:
-                condition = cond_val
-            else:
-                condition = f"{condition},{cond_val}"
-        elif f.startswith("if:"):
-            cond_val = flag.strip()[3:]
-            if condition is None:
-                condition = cond_val
-            else:
-                condition = f"{condition},{cond_val}"
-        elif f.startswith("timeout:"):
-            timeout = float(flag.strip()[8:])
-            if not math.isfinite(timeout) or timeout < 0:
-                raise ValueError(f"Invalid timeout flag: {flag}")
-        elif f.startswith("retry:"):
-            retry = int(flag.strip()[6:])
-            if retry < 0:
-                raise ValueError(f"Invalid retry flag: {flag}")
-        elif f.startswith("retry_delay:"):
-            retry_delay = float(flag.strip()[12:])
-            if not math.isfinite(retry_delay) or retry_delay < 0:
-                raise ValueError(f"Invalid retry delay flag: {flag}")
-        elif f.startswith("on_failure:"):
-            val = flag.strip()[11:].lower()
-            if val not in ("ask", "abort", "continue", "skip", "manual"):
-                raise ValueError(f"Invalid failure policy: {flag}")
-            on_failure = val
-        else:
-            raise ValueError(f"Unknown task flag: {flag}")
-
-    cmd_tokens = shlex.split(cmd.strip())
-    if not cmd_tokens:
+        mode, flags, cmd = parts
+    tokens = shlex.split(cmd)
+    if tokens and tokens[0] == "true" and len(tokens) > 1:
+        flags += ",ignore-fail"
+        tokens = tokens[1:]
+    if not tokens:
         raise ValueError(f"Empty command in entry: {raw_entry}")
-
-    if cmd_tokens[0] == "true" and len(cmd_tokens) > 1:
-        ignore_fail = True
-        cmd_tokens = cmd_tokens[1:]
-
-    if "--force" in cmd_tokens:
-        force_flag = True
-
-    if mode.strip().upper() not in ("U", "S"):
-        raise ValueError(f"Invalid task mode: {mode}")
-    validate_condition(condition)
-
-    return OrchestratorTask(
-        index=index,
-        script_name=cmd_tokens[0],
-        args=cmd_tokens[1:],
-        mode=mode.strip().upper(),
-        ignore_fail=ignore_fail,
-        interactive=interactive,
-        interactive_override=interactive_override,
-        force_flag=force_flag,
-        condition=condition,
-        timeout=timeout,
-        always=always,
-        retry=retry,
-        retry_delay=retry_delay,
-        on_failure=on_failure,
-        once=once,
-        once_mode=once_mode,
-        once_scope=once_scope,
-    )
+    return parse_task_table({"script": tokens[0], "args": tokens[1:],
+                             "mode": mode, "flags": flags}, index)
 
 
 def parse_task_table(table: dict, index: int) -> OrchestratorTask:
-    cmd = str(table.get("cmd") or table.get("script") or table.get("path") or "").strip()
-    if not cmd:
-        raise ValueError(f"Task table at index {index} missing cmd/script/path")
-
+    cmd = table.get("cmd") or table.get("script") or table.get("path") or ""
+    if not isinstance(cmd, str) or not cmd.strip():
+        raise ValueError(f"Task {index}: missing cmd/script/path")
+    cmd = cmd.strip()
     args_raw = table.get("args", [])
     if isinstance(args_raw, str):
         args = shlex.split(args_raw)
-    elif isinstance(args_raw, list):
-        args = [str(x) for x in args_raw]
+    elif isinstance(args_raw, list) and all(isinstance(arg, str) for arg in args_raw):
+        args = list(args_raw)
     else:
-        raise ValueError(f"Task {index}: args must be a string or array")
-    if isinstance(args_raw, list) and any(not isinstance(x, str) for x in args_raw):
-        raise ValueError(f"Task {index}: args must contain strings")
-
-    if not args and " " in cmd:
-        cmd_tokens = shlex.split(cmd)
-        if cmd_tokens:
-            cmd = cmd_tokens[0]
-            args = cmd_tokens[1:]
-
-    if not isinstance(table.get("flags", ""), str):
-        raise ValueError(f"Task {index}: flags must be a string")
-    flags = table.get("flags", "")
+        raise ValueError(f"Task {index}: args must be a string or array of strings")
+    if "cmd" in table:
+        tokens = shlex.split(cmd)
+        if not tokens:
+            raise ValueError(f"Task {index}: empty command")
+        cmd, args = tokens[0], tokens[1:] + args
     for key in ("ignore_fail", "interactive", "force", "always", "once"):
         if key in table and not isinstance(table[key], bool):
             raise ValueError(f"Task {index}: {key} must be a boolean")
-    ignore_fail = table.get("ignore_fail", False)
-
-    interactive_override: bool | None = None
-    if "interactive" in table:
-        interactive = bool(table.get("interactive"))
-        interactive_override = interactive
-    else:
-        interactive = False
-
-    force_flag = bool(table.get("force", False))
-    always = bool(table.get("always", False))
+    flags = table.get("flags", "")
+    if not isinstance(flags, str):
+        raise ValueError(f"Task {index}: flags must be a string")
     condition = table.get("condition")
     if condition is not None and not isinstance(condition, str):
         raise ValueError(f"Task {index}: condition must be a string")
-    timeout = table.get("timeout")
-
     retry = table.get("retry", 0)
-    if not isinstance(retry, int) or isinstance(retry, bool) or retry < 0:
+    if type(retry) is not int or retry < 0:
         raise ValueError(f"Task {index}: retry must be a nonnegative integer")
-    retry_delay = table.get("retry_delay", 1.0)
-    if not isinstance(retry_delay, (int, float)) or isinstance(retry_delay, bool) or not math.isfinite(retry_delay) or retry_delay < 0:
-        raise ValueError(f"Task {index}: retry_delay must be nonnegative and finite")
-
-    on_failure = str(table.get("on_failure", "ask")).lower()
-    if on_failure not in ("ask", "abort", "continue", "skip", "manual"):
-        raise ValueError(f"Task {index}: invalid on_failure policy")
-
-    once = bool(table.get("once", False))
-    once_mode = str(table.get("once_mode", "content")).lower()
-    if once_mode not in ("content", "forever"):
-        raise ValueError(f"Task {index}: invalid once_mode")
-
-    once_scope = str(table.get("once_scope", "profile")).lower()
-    if once_scope not in ("profile", "global"):
-        raise ValueError(f"Task {index}: invalid once_scope")
-
-    for flag in flags.split(","):
-        f = flag.strip().lower()
-        if not f:
+    task = OrchestratorTask(
+        index=index, script_name=cmd, args=args,
+        mode=str(table.get("mode", "U")).strip().upper(),
+        ignore_fail=table.get("ignore_fail", False),
+        interactive=table.get("interactive", False),
+        interactive_override=table.get("interactive"),
+        force_flag=table.get("force", False) or "--force" in args,
+        condition=condition, timeout=table.get("timeout"),
+        always=table.get("always", False), retry=retry,
+        retry_delay=table.get("retry_delay", 1.0),
+        on_failure=str(table.get("on_failure", "ask")).lower(),
+        once=table.get("once", False),
+        once_mode=str(table.get("once_mode", "content")).lower(),
+        once_scope=str(table.get("once_scope", "profile")).lower(),
+    )
+    for raw_flag in flags.split(","):
+        flag = raw_flag.strip()
+        key = flag.lower()
+        if not key:
             continue
-
-        if f in ("true", "ignore", "ignore-fail"):
-            ignore_fail = True
-        elif f in ("interactive", "tui", "prompt", "fullscreen", "tty", "suspend"):
-            interactive = True
-            interactive_override = True
-        elif f in ("no-interactive", "noninteractive", "inline", "embedded"):
-            interactive = False
-            interactive_override = False
-        elif f in ("force", "--force"):
-            force_flag = True
-        elif f in ("always", "always_run"):
-            always = True
-        elif f in ("once", "run_once", "sticky"):
-            once = True
-        elif f in ("once:content", "once:hash"):
-            once = True
-            once_mode = "content"
-        elif f in ("once:forever", "once:exact", "once:permanent"):
-            once = True
-            once_mode = "forever"
-        elif f in ("once:profile", "once:local"):
-            once = True
-            once_scope = "profile"
-        elif f in ("once:global", "once:machine"):
-            once = True
-            once_scope = "global"
-        elif f.startswith("condition:"):
-            cond_val = flag.strip()[10:]
-            if condition is None:
-                condition = cond_val
+        if key in ("true", "ignore", "ignore-fail"):
+            task.ignore_fail = True
+        elif key in ("interactive", "tui", "prompt", "fullscreen", "tty", "suspend"):
+            task.interactive = task.interactive_override = True
+        elif key in ("no-interactive", "noninteractive", "inline", "embedded"):
+            task.interactive = task.interactive_override = False
+        elif key in ("force", "--force"):
+            task.force_flag = True
+        elif key in ("always", "always_run"):
+            task.always = True
+        elif key in ("once", "run_once", "sticky"):
+            task.once = True
+        elif key.startswith("once:"):
+            value = key[5:]
+            modes = {"content": "content", "hash": "content", "forever": "forever",
+                     "exact": "forever", "permanent": "forever"}
+            scopes = {"profile": "profile", "local": "profile", "global": "global", "machine": "global"}
+            if value in modes:
+                task.once_mode = modes[value]
+            elif value in scopes:
+                task.once_scope = scopes[value]
             else:
-                condition = f"{condition},{cond_val}"
-        elif f.startswith("if:"):
-            cond_val = flag.strip()[3:]
-            if condition is None:
-                condition = cond_val
-            else:
-                condition = f"{condition},{cond_val}"
-        elif f.startswith("timeout:"):
-            timeout = float(flag.strip()[8:])
-        elif f.startswith("retry:"):
-            retry = int(flag.strip()[6:])
-        elif f.startswith("retry_delay:"):
-            retry_delay = float(flag.strip()[12:])
-        elif f.startswith("on_failure:"):
-            val = flag.strip()[11:].lower()
-            if val not in ("ask", "abort", "continue", "skip", "manual"):
-                raise ValueError(f"Task {index}: invalid on_failure policy")
-            on_failure = val
+                raise ValueError(f"Task {index}: invalid flag {flag}")
+            task.once = True
+        elif key.startswith(("condition:", "if:")):
+            value = flag.partition(":")[2]
+            task.condition = f"{task.condition},{value}" if task.condition else value
+        elif key.startswith("timeout:"):
+            task.timeout = float(flag[8:])
+        elif key.startswith("retry:"):
+            task.retry = int(flag[6:])
+        elif key.startswith("retry_delay:"):
+            task.retry_delay = float(flag[12:])
+        elif key.startswith("on_failure:"):
+            task.on_failure = key[11:]
         else:
             raise ValueError(f"Task {index}: unknown flag {flag}")
-
-    if "--force" in args:
-        force_flag = True
-
-    timeout_value = float(timeout) if timeout is not None else None
-    if timeout_value is not None and (not math.isfinite(timeout_value) or timeout_value < 0):
-        raise ValueError(f"Task {index}: timeout must be nonnegative and finite")
-    if retry < 0 or retry_delay < 0 or not math.isfinite(retry_delay):
-        raise ValueError(f"Task {index}: invalid retry configuration")
-    mode = str(table.get("mode", "U")).strip().upper()
-    if mode not in ("U", "S"):
-        raise ValueError(f"Task {index}: invalid mode {mode}")
-    validate_condition(str(condition).strip() if condition else None)
-
-    return OrchestratorTask(
-        index=index,
-        script_name=cmd,
-        args=args,
-        mode=mode,
-        ignore_fail=ignore_fail,
-        interactive=interactive,
-        interactive_override=interactive_override,
-        force_flag=force_flag,
-        condition=str(condition).strip() if condition else None,
-        timeout=timeout_value,
-        always=always,
-        retry=retry,
-        retry_delay=retry_delay,
-        on_failure=on_failure,
-        once=once,
-        once_mode=once_mode,
-        once_scope=once_scope,
-    )
+    for name in ("timeout", "retry_delay"):
+        value = getattr(task, name)
+        if value is not None:
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ValueError(f"Task {index}: {name} must be nonnegative and finite")
+            setattr(task, name, float(value))
+    if task.retry < 0 or task.mode not in ("U", "S"):
+        raise ValueError(f"Task {index}: invalid retry or mode")
+    if task.on_failure not in ("ask", "abort", "continue", "skip", "manual"):
+        raise ValueError(f"Task {index}: invalid failure policy")
+    if task.once_mode not in ("content", "forever") or task.once_scope not in ("profile", "global"):
+        raise ValueError(f"Task {index}: invalid once mode or scope")
+    validate_condition(task.condition)
+    return task
 
 
 def repair_missing_commas(text: str) -> tuple[str, int]:
+    """Repair omitted commas in memory after strict TOML parsing fails.
+
+    The caller accepts the repair only if strict parsing then succeeds.
+    Returns the repaired text and number of inserted commas.
+    """
     _NUM_BOOL_RE = re.compile(
         r"[+-]?(?:\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?"
         r"|0[xX][0-9a-fA-F_]+|0[oO][0-7_]+|0[bB][01_]+)"
@@ -1010,14 +971,14 @@ def repair_missing_commas(text: str) -> tuple[str, int]:
             if text.startswith(quote * 3, i):
                 i += 3
                 while i < n and not text.startswith(quote * 3, i):
-                    if text[i] == '\\':
+                    if quote == '"' and text[i] == '\\':
                         i += 1
                     i += 1
                 i = min(i + 3, n)
             else:
                 i += 1
                 while i < n and text[i] != quote:
-                    if text[i] == '\\':
+                    if quote == '"' and text[i] == '\\':
                         i += 1
                     i += 1
                 i += 1
@@ -1051,6 +1012,9 @@ def repair_missing_commas(text: str) -> tuple[str, int]:
                 pending_value = True
                 pending_is_word = False
                 value_end = len(out)
+            else:
+                pending_value = False
+                pending_is_word = False
             continue
 
         if c == ',':
@@ -1065,17 +1029,27 @@ def repair_missing_commas(text: str) -> tuple[str, int]:
             i += 1
             continue
 
-        start_w = i
+        word_start_idx = i
         while i < n and (text[i].isalnum() or text[i] in _WORD_CHARS):
             i += 1
-        word = text[start_w:i]
-        out.append(word)
-        if depth:
-            pending_value = True
-            pending_is_word = True
-            value_end = len(out)
+        if i > word_start_idx:
+            out.append(text[word_start_idx:i])
+            k = i
+            while k < n and text[k] in ' \t':
+                k += 1
+            if depth and (k == n or text[k] != '='):
+                pending_value = True
+                pending_is_word = True
+                value_end = len(out)
+            else:
+                pending_value = False
+                pending_is_word = False
+            continue
 
-    return "".join(out), fixes
+        out.append(c)
+        i += 1
+
+    return ''.join(out), fixes
 
 
 def load_profile(filepath: Path) -> ProfileConfig:
@@ -1105,6 +1079,9 @@ def load_profile(filepath: Path) -> ProfileConfig:
     if not isinstance(dirs, list) or any(not isinstance(item, str) or not item for item in dirs):
         raise ValueError(f"{filepath.name}: [search_dirs].dirs must be an array of paths")
     p_data = data.get("profile", {})
+    for name in ("name", "description"):
+        if name in p_data and not isinstance(p_data[name], str):
+            raise ValueError(f"{filepath.name}: [profile].{name} must be a string")
     ph1_data = data.get("phase1", {})
     ph2_data = data.get("phase2", {})
     s_data = data.get("search_dirs", {})
@@ -1121,7 +1098,7 @@ def load_profile(filepath: Path) -> ProfileConfig:
     ):
         raise ValueError(f"{filepath.name}: [policy].task_timeout must be nonnegative and finite")
 
-    conflict_resolutions: Dict[str, str] = {}
+    conflict_resolutions: dict[str, str] = {}
     for key, val in cr_data.items():
         if isinstance(val, str):
             conflict_resolutions[key] = str(resolve_home(val))
@@ -1130,11 +1107,11 @@ def load_profile(filepath: Path) -> ProfileConfig:
                 if isinstance(sub_val, str):
                     conflict_resolutions[f"{key}.{sub_key}"] = str(resolve_home(sub_val))
 
-    policy: Dict[str, Any] = {}
+    policy: dict[str, Any] = {}
     for key, val in pol_data.items():
         policy[key] = val
 
-    search_dirs: List[Path] = []
+    search_dirs: list[Path] = []
     for d in s_data.get("dirs", []):
         p = Path(str(d)).expanduser()
         if not p.is_absolute():
@@ -1171,7 +1148,7 @@ def load_profile(filepath: Path) -> ProfileConfig:
     )
 
 
-def discover_profiles() -> List[ProfileConfig]:
+def discover_profiles() -> list[ProfileConfig]:
     if not PROFILES_DIR.exists():
         return []
     profiles = []
@@ -1188,7 +1165,7 @@ def discover_profiles() -> List[ProfileConfig]:
     return profiles
 
 
-def recover_iso_block_device() -> Optional[Path]:
+def recover_iso_block_device() -> Path | None:
     """
     Recovers the ISO block device if unmounted due to copytoram or Ventoy abstraction.
     """
@@ -1210,18 +1187,16 @@ def recover_iso_block_device() -> Optional[Path]:
 
     # 3. Check lsblk JSON for iso9660 or archiso labels
     try:
-        r = subprocess.run(["lsblk", "--json", "--paths", "-o", "PATH,TYPE,FSTYPE,LABEL"], capture_output=True, text=True, check=False)
+        r = subprocess.run(["lsblk", "--json", "--paths", "-o", "PATH,TYPE,FSTYPE"], capture_output=True, text=True, check=False)
         if r.stdout:
             data = json.loads(r.stdout)
             for dev in data.get("blockdevices", []):
                 fstype = (dev.get("fstype") or "").lower()
-                label = (dev.get("label") or "").lower()
-                if "iso9660" in fstype or "arch" in label:
+                if fstype == "iso9660":
                     return Path(dev["path"])
                 for child in dev.get("children", []) or []:
                     c_fstype = (child.get("fstype") or "").lower()
-                    c_label = (child.get("label") or "").lower()
-                    if "iso9660" in c_fstype or "arch" in c_label:
+                    if c_fstype == "iso9660":
                         return Path(child["path"])
     except Exception:
         pass
@@ -1229,11 +1204,11 @@ def recover_iso_block_device() -> Optional[Path]:
     return None
 
 
-def verify_offline_repo_fast(repo_dir: Optional[str] = None) -> Tuple[bool, str]:
+def verify_offline_repo_fast(repo_dir: str | None = None) -> tuple[bool, str]:
     """
     Fast verification of offline package repository integrity across candidate paths.
-    Checks archrepo.db tar metadata, file existence, non-zero file sizes,
-    and SHA256 checksums of repository package files.
+    Checks archrepo.db metadata and package file sizes without reading package payloads.
+    Pacman verifies package integrity during installation.
     Returns (is_valid, reason).
     """
     candidates = []
@@ -1247,7 +1222,7 @@ def verify_offline_repo_fast(repo_dir: Optional[str] = None) -> Tuple[bool, str]
         Path("/run/archiso/bootmnt/repo"),
     ])
 
-    r_path: Optional[Path] = None
+    r_path: Path | None = None
     for cand in candidates:
         if cand.is_dir() and (cand / "archrepo.db").is_file():
             r_path = cand
@@ -1272,7 +1247,7 @@ def verify_offline_repo_fast(repo_dir: Optional[str] = None) -> Tuple[bool, str]
 
     db_path = r_path / "archrepo.db"
 
-    expected_pkgs: Dict[str, str] = {}
+    expected_pkgs: dict[str, int | None] = {}
     try:
         with tarfile.open(db_path, "r:*") as tar:
             for member in tar.getmembers():
@@ -1282,44 +1257,44 @@ def verify_offline_repo_fast(repo_dir: Optional[str] = None) -> Tuple[bool, str]
                         continue
                     lines = f.read().decode('utf-8', errors='ignore').splitlines()
                     filename = None
-                    sha256sum = None
+                    compressed_size = None
                     for i, line in enumerate(lines):
                         if line.strip() == "%FILENAME%" and i + 1 < len(lines):
                             filename = lines[i + 1].strip()
-                        elif line.strip() == "%SHA256SUM%" and i + 1 < len(lines):
-                            sha256sum = lines[i + 1].strip()
+                        elif line.strip() == "%CSIZE%" and i + 1 < len(lines):
+                            compressed_size = int(lines[i + 1].strip())
                     if filename:
-                        expected_pkgs[filename] = ""
+                        expected_pkgs[filename] = compressed_size
     except Exception as e:
         return False, f"Failed to parse database '{db_path}': {e}"
 
     if not expected_pkgs:
         return False, "Repository database contains no valid package metadata."
 
-    for filename in expected_pkgs.keys():
+    for filename, expected_size in expected_pkgs.items():
         pkg_file = r_path / filename
         if not pkg_file.is_file():
             return False, f"Missing offline package: {filename}"
         
         try:
             st = pkg_file.stat()
-            if st.st_size == 0:
-                return False, f"Corrupted 0-byte package file: {filename}"
+            if st.st_size == 0 or (expected_size is not None and st.st_size != expected_size):
+                return False, f"Offline package size mismatch: {filename}"
         except Exception:
             return False, f"Cannot stat package file: {filename}"
 
-    return True, "Offline repository clean and verified."
+    return True, "Offline repository metadata and package sizes verified."
 
 
 # ==============================================================================
 # ONCE-STORE (SQLITE)
 # ==============================================================================
 class OnceStore:
-    def __init__(self, db_path: Optional[Path] = None, read_only: bool = False):
+    def __init__(self, db_path: Path | None = None, read_only: bool = False):
         self.db_path = db_path or ((state_dir_path() if read_only else state_dir()) / "once.db")
         busy_timeout = int(GLOBAL_CONFIG.get("execution", {}).get("db_busy_timeout", 5000))
         if read_only and self.db_path.exists():
-            self.conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+            self.conn = sqlite3.connect(self.db_path.resolve().as_uri() + "?mode=ro", uri=True)
         elif read_only:
             self.conn = sqlite3.connect(":memory:")
         else:
@@ -1360,10 +1335,8 @@ class OnceStore:
         self.conn.commit()
 
     def _make_key(self, scope: str, profile_part: str, mode: str, script_name: str,
-                  args_key: str, resolved_path: Path | None = None) -> str:
+                  args_key: str) -> str:
         material = f"once|{scope}|{profile_part}|{mode}|{script_name}|{args_key}"
-        if resolved_path is not None:
-            material += f"|{resolved_path.resolve()}"
         return hashlib.blake2b(material.encode("utf-8"), digest_size=16).hexdigest()
 
     def _scope_value(self, scope: str) -> str:
@@ -1380,26 +1353,19 @@ class OnceStore:
         scope = self._scope_value(task.once_scope)
         profile_part = self._profile_part(profile_name, scope)
         args_key = shlex.join(task.args)
-        key = self._make_key(scope, profile_part, task.mode, task.script_name, args_key,
-                             task.resolved_path)
+        key = self._make_key(scope, profile_part, task.mode, task.script_name, args_key)
         row = self.conn.execute(
             "SELECT mode, once_mode, checksum, resolved_path FROM once_markers WHERE marker_key = ?",
             (key,),
         ).fetchone()
         if row is None:
-            legacy_key = self._make_key(scope, profile_part, task.mode, task.script_name, args_key)
-            row = self.conn.execute(
-                "SELECT mode, once_mode, checksum, resolved_path FROM once_markers WHERE marker_key = ?",
-                (legacy_key,),
-            ).fetchone()
-            if row is None or task.resolved_path is None or row[3] != str(task.resolved_path):
-                return False
-        db_mode, db_once_mode, db_checksum, db_resolved = row
+            return False
+        db_mode, _, db_checksum, _ = row
         if db_mode != task.mode:
             return False
         if task.once_mode == "content":
             current_checksum = task.checksum or file_checksum(task.resolved_path) if task.resolved_path else ""
-            if db_checksum and current_checksum and db_checksum != current_checksum:
+            if not db_checksum or not current_checksum or db_checksum != current_checksum:
                 return False
         return True
 
@@ -1409,8 +1375,7 @@ class OnceStore:
         scope = self._scope_value(task.once_scope)
         profile_part = self._profile_part(profile_name, scope)
         args_key = shlex.join(task.args)
-        key = self._make_key(scope, profile_part, task.mode, task.script_name, args_key,
-                             task.resolved_path)
+        key = self._make_key(scope, profile_part, task.mode, task.script_name, args_key)
         now = time.time()
         checksum = task.checksum or file_checksum(task.resolved_path) if task.resolved_path else ""
         self.conn.execute(
@@ -1444,7 +1409,7 @@ class OnceStore:
         self.conn.commit()
         return cur.rowcount
 
-    def print_list(self, profile_name: Optional[str] = None) -> None:
+    def print_list(self, profile_name: str | None = None) -> None:
         rows = self.conn.execute(
             "SELECT profile, mode, script_name, args_key, once_mode, exit_code, version, updated "
             "FROM once_markers ORDER BY updated"
@@ -1467,43 +1432,6 @@ class OnceStore:
 # ==============================================================================
 # LOCKING & INTERPRETER RESOLUTION
 # ==============================================================================
-def parse_args():
-    parser = argparse.ArgumentParser(description="Dusky Arch ISO Textual Orchestrator")
-    parser.add_argument("--phase1", action="store_true", help="Run Phase 1 (ISO Environment)")
-    parser.add_argument("--phase2", action="store_true", help="Run Phase 2 (Chroot Environment)")
-    parser.add_argument("--reset", action="store_true", help="Reset execution state for the current phase")
-    parser.add_argument("--dry-run", "-d", action="store_true", help="Dry run: validate scripts presence and exit")
-    parser.add_argument("--force", action="store_true", help="Pass --force flag to subscripts")
-    parser.add_argument("--manual", "-m", action="store_true", help="Manual mode: prompt before each script")
-    parser.add_argument("--stop-on-fail", action="store_true", help="Halt execution if any script fails")
-    parser.add_argument("--auto", action="store_true", help="Non-interactive automatic mode")
-    parser.add_argument("--online", action="store_true", help="Select the online recovery profile")
-    parser.add_argument("--profile", type=str, help="Specify profile TOML to execute")
-    parser.add_argument("--list-profiles", action="store_true", help="List all available installer profiles and exit")
-    parser.add_argument("--list-scripts", action="store_true", help="List all tasks in the selected profile and exit")
-    parser.add_argument("--list-once", action="store_true", help="List recorded once-markers and exit")
-    parser.add_argument("--forget-once", type=str, help="Remove recorded once-marker(s) for a script and exit")
-    parser.add_argument("--doctor", action="store_true", help="Check orchestrator and profile health and exit")
-    parser.add_argument("--explain", action="store_true", help="Explain what would happen for each task and exit")
-    parser.add_argument("--task-timeout", type=float, default=None, help="Default per-task timeout in seconds (0 = no timeout)")
-    parser.add_argument("--no-audio", action="store_true", help="Disable audio notifications")
-    parser.add_argument("--no-notify", action="store_true", help="Disable desktop notifications")
-    args = parser.parse_args()
-    if args.phase1 and args.phase2:
-        parser.error("--phase1 and --phase2 conflict")
-    inspection = [args.list_profiles, args.list_scripts, args.list_once, args.doctor,
-                  args.explain, args.dry_run, bool(args.forget_once)]
-    if sum(bool(item) for item in inspection) > 1 or (args.reset and any(inspection)):
-        parser.error("inspection modes cannot be combined with each other or --reset")
-    if args.task_timeout is not None and (not math.isfinite(args.task_timeout) or args.task_timeout < 0):
-        parser.error("--task-timeout must be nonnegative and finite")
-    if args.online:
-        if args.profile is not None:
-            parser.error("--online cannot be combined with --profile")
-        args.profile = "Online"
-    return args
-
-
 def _cleanup_lock(lock_file: Path):
     global _LOCK_FD
     if _LOCK_FD is not None:
@@ -1534,12 +1462,12 @@ def acquire_lock(lock_file: Path) -> bool:
         _LOCK_FD = fd
         atexit.register(lambda: _cleanup_lock(lock_file))
         return True
-    except BlockingIOError:
-        sys.stderr.write(f"\033[1;31m[ERROR]\033[0m Another instance is already running on {lock_file}.\n")
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+    except OSError as exc:
+        if isinstance(exc, BlockingIOError):
+            sys.stderr.write(f"[ERROR] Another instance is already running on {lock_file}.\n")
+        else:
+            sys.stderr.write(f"[ERROR] Cannot acquire lock {lock_file}: {exc}\n")
+        os.close(fd)
         return False
 
 
@@ -1547,7 +1475,7 @@ def release_lock(lock_file: Path | None = None) -> None:
     _cleanup_lock(lock_file)
 
 
-def resolve_interpreter(script_path: Path) -> Tuple[str, bool]:
+def resolve_interpreter(script_path: Path) -> tuple[str, bool]:
     is_interactive = False
     first_line = ""
     try:
@@ -1579,50 +1507,38 @@ def resolve_interpreter(script_path: Path) -> Tuple[str, bool]:
 
 def resolve_script(
     script_name: str,
-    search_dirs: List[Path],
-    conflict_resolutions: Optional[Dict[str, str]] = None,
-) -> Optional[Path]:
-    """Locate a script by name. Order: explicit path (SCRIPT_DIR-relative),
-    then conflict_resolutions, then SCRIPT_DIR, then profile search_dirs
-    (resolved relative to SCRIPT_DIR or absolute); each is searched
-    recursively into subdirectories."""
-    if "/" in script_name or "\\" in script_name:
-        p = SCRIPT_DIR / script_name
-        return p if p.is_file() else None
-
-    if conflict_resolutions:
-        resolved = conflict_resolutions.get(script_name)
-        if resolved:
-            rp = Path(resolved)
-            if rp.is_file():
-                return rp
-
-    roots: List[Path] = [SCRIPT_DIR]
-    for d in search_dirs:
-        if d not in roots:
-            roots.append(d)
-
+    search_dirs: list[Path],
+    conflict_resolutions: dict[str, str] | None = None,
+) -> Path | None:
+    if "/" in script_name:
+        path = resolve_home(script_name)
+        return path.resolve() if path.is_file() else None
+    if conflict_resolutions and script_name in conflict_resolutions:
+        path = Path(conflict_resolutions[script_name])
+        return path.resolve() if path.is_file() else None
+    roots = list(dict.fromkeys([SCRIPT_DIR, *search_dirs]))
     for root in roots:
-        direct = root / script_name
-        if direct.is_file():
-            return direct
-        for sub in root.rglob(script_name):
-            if sub.is_file():
-                return sub
-    return None
+        path = root / script_name
+        if path.is_file():
+            return path.resolve()
+    matches = {path.resolve() for root in roots if root.is_dir()
+               for path in root.rglob(script_name) if path.is_file()}
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous script {script_name}: " + ", ".join(map(str, sorted(matches))))
+    return next(iter(matches), None)
 
 
 def is_rich_or_ssh_terminal() -> bool:
     """
     Check if current execution is in a rich graphical terminal environment
-    (e.g., Wayland, X11, Kitty, Foot, Alacritty) or over an active SSH session,
+    (e.g., Wayland, Kitty, Foot, Alacritty) or over an active SSH session,
     where terminal keybinds (like Alt+Left/Right) do not conflict with Linux VT console switching.
     Returns False in raw Linux console TTYs (/dev/tty1..N, TERM=linux).
     """
     if any(os.environ.get(k) for k in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")):
         return True
 
-    if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"):
+    if os.environ.get("WAYLAND_DISPLAY"):
         return True
 
     term = os.environ.get("TERM", "")
@@ -1658,52 +1574,24 @@ def is_in_chroot() -> bool:
         return False
 
 
-AUTO_POWEROFF_MARKERS = [
-    Path("/tmp/dusky_auto_poweroff"),
-    Path("/etc/dusky_auto_poweroff"),
-    Path("/root/dusky_auto_poweroff"),
-    Path("/root/arch_install_tmp/dusky_auto_poweroff"),
-    Path("/mnt/etc/dusky_auto_poweroff"),
-    Path("/mnt/root/dusky_auto_poweroff"),
-    Path("/mnt/tmp/dusky_auto_poweroff"),
-]
+AUTO_POWEROFF_MARKER = Path("/tmp/dusky_auto_poweroff")
 
 
 def set_auto_poweroff_marker() -> None:
-    for marker_path in AUTO_POWEROFF_MARKERS:
-        with suppress(Exception):
-            marker_path.parent.mkdir(parents=True, exist_ok=True)
-            marker_path.touch()
+    AUTO_POWEROFF_MARKER.touch()
 
 
 def remove_auto_poweroff_marker() -> None:
-    for marker_path in AUTO_POWEROFF_MARKERS:
-        with suppress(Exception):
-            if marker_path.exists():
-                marker_path.unlink()
+    AUTO_POWEROFF_MARKER.unlink(missing_ok=True)
 
 
 def graceful_unmount_and_poweroff(mnt_point: str = "/mnt") -> None:
-    """Performs disk synchronization, swap deactivation, target unmount, and system power off."""
-    try:
-        subprocess.run(["sync"], check=False)
-        subprocess.run(["swapoff", "-a"], check=False)
-        res = subprocess.run(["mountpoint", "-q", mnt_point], check=False)
-        if res.returncode == 0:
-            unmount_res = subprocess.run(["umount", "-R", mnt_point], check=False)
-            if unmount_res.returncode != 0:
-                if shutil.which("fuser"):
-                    subprocess.run(["fuser", "-k", "-TERM", "-m", mnt_point], check=False)
-                    time.sleep(1.5)
-                    subprocess.run(["fuser", "-k", "-KILL", "-m", mnt_point], check=False)
-                    time.sleep(0.5)
-                subprocess.run(["umount", "-R", mnt_point], check=False)
-    except Exception:
-        pass
-    try:
-        subprocess.run(["poweroff"], check=False)
-    except Exception:
-        subprocess.run(["systemctl", "poweroff"], check=False)
+    """For a directly launched Python UI; wrapper launches handle their own shutdown."""
+    subprocess.run(["sync"], check=True)
+    subprocess.run(["swapoff", "-a"], check=False)
+    if subprocess.run(["mountpoint", "-q", mnt_point], check=False).returncode == 0:
+        subprocess.run(["umount", "-R", mnt_point], check=True)
+    subprocess.run(["poweroff"], check=True)
 
 
 # ==============================================================================
@@ -1717,8 +1605,8 @@ class FailureModalScreen(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Container(id="modal_dialog"):
-            yield Label(f"{S('failed')} TASK FAILED: {self.task_name}", id="modal_title")
-            yield Static(self.error_msg, id="error_details")
+            yield Label(f"{S('failed')} TASK FAILED: {self.task_name}", markup=False, id="modal_title")
+            yield Static(self.error_msg, markup=False, id="error_details")
             with Horizontal(id="button_bar"):
                 yield Button("Retry [R]", id="btn_retry")
                 yield Button("Skip [S]", id="btn_skip")
@@ -1758,7 +1646,7 @@ class ManualModalScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         with Container(id="manual_dialog"):
             yield Label(f"{S('logo')} MANUAL STEP REQUIRED", id="manual_title")
-            yield Static(f"About to execute: [bold white]{self.task_name}[/bold white]\nProceed with execution?", id="manual_details")
+            yield Static(f"About to execute: [bold white]{escape(self.task_name)}[/bold white]\nProceed with execution?", id="manual_details")
             with Horizontal(id="button_bar"):
                 yield Button("Proceed [Y]", id="btn_yes")
                 yield Button("Skip [S]", id="btn_skip")
@@ -1815,7 +1703,7 @@ class CompletionDialog(ModalScreen[str]):
 
     def compose(self) -> ComposeResult:
         with Container(id="completion_dialog", classes=f"-{self.level}"):
-            yield Label(self.title_text, id="completion_title")
+            yield Label(self.title_text, markup=False, id="completion_title")
             yield Static(self.message, id="completion_message", markup=False)
             with Horizontal(id="button_bar"):
                 yield Button(" View Logs [V] ", id="btn_completion_view")
@@ -1857,6 +1745,18 @@ class CompletionDialog(ModalScreen[str]):
             self.dismiss("poweroff")
         elif key in ("v", "escape"):
             self.dismiss("view_logs")
+
+
+CHILD_LAUNCHER = """
+import fcntl, os, signal, sys, termios
+if sys.argv[1] == "pty":
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+elif sys.argv[1] == "foreground":
+    signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+    os.tcsetpgrp(0, os.getpgrp())
+    signal.signal(signal.SIGTTOU, signal.SIG_DFL)
+os.execvpe(sys.argv[2], sys.argv[2:], os.environ)
+"""
 
 
 # ==============================================================================
@@ -2092,7 +1992,7 @@ class DuskyOrchestratorApp(App):
 
     def __init__(
         self,
-        tasks: List[OrchestratorTask],
+        tasks: list[OrchestratorTask],
         phase_title: str,
         profile_name: str,
         state_file: Path,
@@ -2100,9 +2000,10 @@ class DuskyOrchestratorApp(App):
         stop_on_fail: bool,
         force: bool,
         task_timeout: float = 0.0,
-        once_store: Optional[OnceStore] = None,
+        once_store: OnceStore | None = None,
         dry_run: bool = False,
         is_final_phase: bool = True,
+        auto_mode: bool = False,
     ):
         super().__init__()
         self.tasks = tasks
@@ -2117,14 +2018,23 @@ class DuskyOrchestratorApp(App):
         self.once_store = once_store or OnceStore()
         self.persistence_failed = False
         self.dry_run = dry_run
-        self.start_time = time.monotonic()
+        self.auto_mode = auto_mode
+        self.phase_start_time = PROCESS_STARTED
+        inherited_start = float(os.environ.get("DUSKY_INSTALL_STARTED_MONOTONIC", PROCESS_STARTED))
+        if not math.isfinite(inherited_start) or inherited_start < 0 or inherited_start > time.monotonic():
+            raise ValueError("Invalid installer start time")
+        self.start_time = inherited_start
+        self.finished_time: float | None = None
+        self.current_pty_master: int | None = None
+        self._status_text = "Ready"
+        self._speed_text = ""
 
         self.current_idx = 0
         self.completed_keys = set()
         self.task_statuses: dict[str, str] = {}
-        self.counters = {"completed": 0, "failed": 0, "skipped": 0, "pending": len(tasks)}
+        self.counters = {"completed": 0, "failed": 0, "skipped": 0, "ignored": 0, "pending": len(tasks)}
         self.conditions = ConditionEvaluator()
-        self.run_id = hashlib.md5(f"{time.time()}:{phase_title}".encode()).hexdigest()[:8]
+        self.run_id = uuid.uuid4().hex[:8]
         self.logger = RunLogger(profile_name, self.run_id)
         for i, t in enumerate(self.tasks, start=1):
             if not getattr(t, "state_key", ""):
@@ -2137,7 +2047,7 @@ class DuskyOrchestratorApp(App):
         else:
             self.show_footer: bool = is_rich_or_ssh_terminal()
 
-        self.active_task: Optional[OrchestratorTask] = None
+        self.active_task: OrchestratorTask | None = None
         self.current_log_key: str | None = None
         self._log_widgets: dict[str | None, RichLog] = {}
         self.tree_nodes_map: dict[str, TreeNode] = {}
@@ -2146,17 +2056,17 @@ class DuskyOrchestratorApp(App):
         if self.state_file.exists():
             try:
                 self.completed_keys = set(self.state_file.read_text().splitlines())
-            except Exception:
-                pass
+            except OSError as exc:
+                raise RuntimeError(f"Cannot load completion state: {exc}") from exc
 
         max_lines = GLOBAL_CONFIG.get("ui", {}).get("max_log_lines", 6000)
         self.log_widget = RichLog(id="pty_log", highlight=False, markup=False, wrap=True, max_lines=max_lines)
         self.progress_bar = ProgressBar(total=len(self.tasks), show_eta=False, id="progress_bar")
         self.header_title = Static(
             f"{S('logo')} DUSKY ARCH INSTALLER  [{self.phase_title}]  (Profile: {self.profile_name})",
-            id="header_title",
+            id="header_title", markup=False,
         )
-        self.header_telemetry = Static("Status: Ready | Telemetry: Idle", id="header_telemetry")
+        self.header_telemetry = Static("Status: Ready | Elapsed: 00:00", markup=False, id="header_telemetry")
 
     def compose(self) -> ComposeResult:
         with Vertical(id="top_header"):
@@ -2198,148 +2108,70 @@ class DuskyOrchestratorApp(App):
 
         self._rebuild_tree()
 
+        self._set_pane_widths(self.left_pane_width)
         for t in self.tasks:
-            if t.state_key in self.completed_keys:
-                t.status = TaskStatus.COMPLETED
-                self.task_statuses[t.state_key] = "COMPLETED"
-                self.counters["completed"] += 1
-                self.counters["pending"] -= 1
-                self.progress_bar.advance(1)
-                self.update_task_status(t.index - 1, TaskStatus.COMPLETED)
+            if t.state_key in self.completed_keys and not t.always:
+                self.set_task_status(t, TaskStatus.COMPLETED)
+        self.set_interval(1.0, self._refresh_telemetry)
+        self._refresh_telemetry()
 
         self.log_system(f"Started Phase: {self.phase_title}")
         self.log_system(f"Active Profile: {self.profile_name}")
         self.log_system(f"Loaded Cached State: {len(self.completed_keys)} tasks completed")
 
-        self.run_worker(self.run_execution_loop())
+        self.run_execution_loop()
 
     def _render_final_overview_block(self) -> None:
-        total_duration = time.monotonic() - (getattr(self, "start_time", None) or time.monotonic())
-        failed_tasks = [t for t in self.tasks if self.task_statuses.get(t.state_key) == "FAILED"]
-        skipped_tasks = [t for t in self.tasks if self.task_statuses.get(t.state_key) == "SKIPPED"]
-
-        if getattr(self, "dry_run", False):
-            v_title, v_color = "DRY-RUN", "#d29922"
-        elif failed_tasks:
-            v_title, v_color = "WARNINGS" if any(t.ignore_fail for t in failed_tasks) else "ABORTED", "#f85149"
-        else:
-            v_title, v_color = "SUCCESS", "#3fb950"
-
-        timed_tasks = sorted([t for t in self.tasks if getattr(t, "duration", 0) > 0], key=lambda x: x.duration, reverse=True)
-        if timed_tasks:
-            top = timed_tasks[:3]
-            slowest_str = ", ".join(f"{t.script_name} ({t.duration:.1f}s)" for t in top)
-        else:
-            slowest_str = "None recorded"
-
-        modes = sorted(list({t.mode for t in self.tasks})) or ["USER", "SUDO"]
-        matrix = {m: {"completed": 0, "failed": 0, "skipped": 0, "total": 0} for m in modes}
-        for task in self.tasks:
-            m = task.mode
-            if m not in matrix:
-                matrix[m] = {"completed": 0, "failed": 0, "skipped": 0, "total": 0}
-            st = self.task_statuses.get(task.state_key, "PENDING")
-            matrix[m]["total"] += 1
-            if st == "COMPLETED":
-                matrix[m]["completed"] += 1
-            elif st == "FAILED":
-                matrix[m]["failed"] += 1
-            else:
-                matrix[m]["skipped"] += 1
-
-        tot_all = len(self.tasks)
-        tot_succ = sum(matrix[m]["completed"] for m in matrix)
-        tot_fail = sum(matrix[m]["failed"] for m in matrix)
-        tot_skip = sum(matrix[m]["skipped"] for m in matrix)
-
-        sep = ASCII_SYMBOLS.get('sep', '|') if ASCII_MODE else UNICODE_SYMBOLS.get('sep', '│')
-
+        failed = self.counters["failed"] or self.persistence_failed or self.logger.failed_write
+        pending = self.counters["pending"]
+        verdict, color = ("FAILED", "#f85149") if failed else (
+            ("INCOMPLETE", "#d29922") if pending else (
+                ("WARNINGS", "#d29922") if self.counters["ignored"] else ("SUCCESS", "#3fb950")))
         lines = [
-            f"════════════════════════════════════════════════════════════════════════════════",
-            f" ◆ FINAL OVERVIEW {sep} [bold #58a6ff]{escape(self.phase_title)}[/] {sep} Verdict: [bold {v_color}]{v_title}[/]",
-            f"════════════════════════════════════════════════════════════════════════════════",
-            f"",
-            f" {S('timing')} TIMING & PERFORMANCE",
-            f"   Total Pipeline Duration : [bold #58a6ff]{total_duration:.2f}s[/]",
-            f"   • Top Bottlenecks               : {slowest_str}",
-            f"",
-            f" {S('matrix')} SCRIPT EXECUTION MATRIX",
-            f"   ┌──────────┬──────────┬──────────┬──────────┬──────────┐",
-            f"   │ MODE     │ SUCCESS  │ FAILED   │ SKIPPED  │ TOTAL    │",
-            f"   ├──────────┼──────────┼──────────┼──────────┼──────────┤",
+            "════════════════════════════════════════════════════════════════════════════════",
+            f" FINAL OVERVIEW │ [bold #58a6ff]{escape(self.phase_title)}[/] │ [bold {color}]{verdict}[/]",
+            "",
+            f" Installation elapsed: [bold #58a6ff]{self.format_elapsed(self.elapsed_seconds())}[/] ({self.elapsed_seconds():.2f}s)",
+            f" This phase: {((self.finished_time or time.monotonic()) - self.phase_start_time):.2f}s",
+            "",
+            " MODE   SUCCESS   FAILED   IGNORED   SKIPPED   PENDING   TOTAL",
         ]
-
-        for mode_name in sorted(matrix.keys()):
-            r = matrix[mode_name]
-            lines.append(
-                f"   │ {mode_name:<8s} │    [bold #3fb950]{r['completed']:2d}[/]    │    [bold #f85149]{r['failed']:2d}[/]    │    [dim #d29922]{r['skipped']:2d}[/]    │    {r['total']:2d}    │"
-            )
-
-        lines.extend([
-            f"   ├──────────┼──────────┼──────────┼──────────┼──────────┤",
-            f"   │ TOTAL    │    [bold #3fb950]{tot_succ:2d}[/]    │    [bold #f85149]{tot_fail:2d}[/]    │    [dim #d29922]{tot_skip:2d}[/]    │    {tot_all:2d}    │",
-            f"   └──────────┴──────────┴──────────┴──────────┴──────────┘",
-            f"",
-        ])
-
-        if failed_tasks:
-            hard_failed = [t for t in failed_tasks if not t.ignore_fail]
-            soft_failed = [t for t in failed_tasks if t.ignore_fail]
-
-            if hard_failed:
-                lines.append(f" [bold #f85149]✗ HARD FAILED TASKS ({len(hard_failed)}):[/]")
-                for t in hard_failed:
-                    lines.append(f"   • [{t.mode}] {escape(t.script_name)} [bold #f85149](Required - Aborted)[/]")
-
-            if soft_failed:
-                lines.append(f" [bold #d29922]⚠ SOFT FAILED TASKS ({len(soft_failed)}):[/]")
-                for t in soft_failed:
-                    lines.append(f"   • [{t.mode}] {escape(t.script_name)} [dim #d29922](Ignored / Allowed to Fail)[/dim]")
-
-            failed_dirs = sorted(list({str(t.resolved_path.parent) for t in failed_tasks if getattr(t, "resolved_path", None)}))
-            if failed_dirs:
-                lines.append(f"   [dim]Debug locations:[/dim]")
-                for d in failed_dirs:
-                    lines.append(f"     └─ [dim]{escape(d)}[/dim]")
-        else:
-            lines.append(f" [dim]✗ FAILED TASKS     : None[/dim]")
-
-        if skipped_tasks:
-            lines.append(f" [bold #d29922]- SKIPPED TASKS ({len(skipped_tasks)}):[/]")
-            for t in skipped_tasks[:12]:
-                reason = "condition false" if t.condition else ("once marker valid" if t.once else "ignored failure")
-                lines.append(f"   • [{t.mode}] {escape(t.script_name)} [dim]({reason})[/dim]")
-            if len(skipped_tasks) > 12:
-                lines.append(f"   • ... and {len(skipped_tasks) - 12} more skipped task(s).")
-        else:
-            lines.append(f" [dim]- SKIPPED TASKS    : None[/dim]")
-
-        lines.extend([
-            f"",
-            f" {S('preflight')} SYSTEM & PREFLIGHT",
-            f"   • User / Home  : {os.environ.get('USER', 'root')} ({Path.home()})",
-            f"   • Log File     : {self.logger.root or 'Logs'}",
-            f"════════════════════════════════════════════════════════════════════════════════\n",
-        ])
-
+        for mode in sorted({task.mode for task in self.tasks}):
+            group = [task for task in self.tasks if task.mode == mode]
+            counts = [sum(task.status == status for task in group) for status in
+                      (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.IGNORED, TaskStatus.SKIPPED)]
+            remaining = sum(task.status in (TaskStatus.PENDING, TaskStatus.RUNNING) for task in group)
+            lines.append(f" {mode:<4}   {counts[0]:>5}   {counts[1]:>6}   {counts[2]:>7}   {counts[3]:>7}   {remaining:>7}   {len(group):>5}")
+        timed = sorted((task for task in self.tasks if task.duration > 0), key=lambda t: t.duration, reverse=True)
+        lines.extend(["", " Slowest tasks (all attempts):"])
+        lines.extend(f" • {escape(task.script_name)}: {task.duration:.2f}s" for task in timed[:3])
+        if not timed:
+            lines.append(" • None recorded in this invocation")
+        for status, label in ((TaskStatus.FAILED, "Failed"), (TaskStatus.IGNORED, "Ignored failure"),
+                              (TaskStatus.SKIPPED, "Skipped")):
+            for task in self.tasks:
+                if task.status == status:
+                    lines.append(f" {label}: {escape(task.script_name)} — {escape(task.error_msg or '')}")
+        if self.persistence_failed:
+            lines.append(" [bold #f85149]State persistence failed; inspect the engine log.[/]")
+        if self.logger.failed_write:
+            lines.append(" [bold #f85149]Log/report write failed.[/]")
+        lines.extend(["", f" Logs: {escape(str(self.logger.root or 'disabled'))}",
+                      "════════════════════════════════════════════════════════════════════════════════"])
         with suppress(Exception):
-            rw = self.query_one("#log_report", RichLog)
-            rw.clear()
+            report_widget = self.query_one("#log_report", RichLog)
+            report_widget.clear()
             for line in lines:
-                rw.write(Text.from_markup(line))
-
-        for line in lines:
-            self.log_widget.write(Text.from_markup(line))
-
+                report_widget.write(Text.from_markup(line))
         self.current_log_key = "report"
         with suppress(Exception):
-            if report_node := self.tree_nodes_map.get("__report__"):
-                self.tree_widget.select_node(report_node)
-                self.tree_widget.scroll_to_node(report_node)
+            if node := self.tree_nodes_map.get("__report__"):
+                self.tree_widget.select_node(node)
+                self.tree_widget.scroll_to_node(node)
             self.query_one("#log_switcher", ContentSwitcher).current = "log_report"
 
     def _task_label(self, task: OrchestratorTask) -> Text:
-        if task.status == TaskStatus.COMPLETED or task.state_key in self.completed_keys:
+        if task.status == TaskStatus.COMPLETED:
             icon = f"[bold #3fb950]{S('completed')}[/]"
             name_style = "bold #3fb950"
         elif not task.resolved_path:
@@ -2351,6 +2183,9 @@ class DuskyOrchestratorApp(App):
         elif task.status == TaskStatus.FAILED:
             icon = f"[bold #f85149]{S('failed')}[/]"
             name_style = "bold #f85149"
+        elif task.status == TaskStatus.IGNORED:
+            icon = "[bold #d29922]![/]"
+            name_style = "bold #d29922"
         elif task.status == TaskStatus.SKIPPED:
             icon = f"[bold #d29922]{S('skipped')}[/]"
             name_style = "dim #d29922"
@@ -2359,7 +2194,7 @@ class DuskyOrchestratorApp(App):
             name_style = "dim #8b949e"
 
         # Clean script name WITHOUT redundant "USER" moniker
-        return Text.from_markup(f" {icon} [{name_style}]{task.script_name}[/]")
+        return Text.from_markup(f" {icon} [{name_style}]{escape(task.script_name)}[/]")
 
     def _rebuild_tree(self) -> None:
         self.tree_nodes_map.clear()
@@ -2476,7 +2311,9 @@ class DuskyOrchestratorApp(App):
             fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
         except Exception:
             try:
-                winsize = struct.pack("HHHH", 40, 120, 0, 0)
+                ui = GLOBAL_CONFIG.get("ui", {})
+                winsize = struct.pack("HHHH", ui.get("fallback_pty_lines", 40),
+                                      ui.get("fallback_pty_columns", 120), 0, 0)
                 fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
             except Exception:
                 pass
@@ -2494,7 +2331,7 @@ class DuskyOrchestratorApp(App):
         with suppress(Exception):
             self.tree_widget.action_cursor_up()
 
-    def _get_active_visible_log(self) -> Optional[RichLog]:
+    def _get_active_visible_log(self) -> RichLog | None:
         with suppress(Exception):
             switcher = self.query_one("#log_switcher", ContentSwitcher)
             if switcher.current:
@@ -2543,7 +2380,7 @@ class DuskyOrchestratorApp(App):
         else:
             self.tree_widget.focus()
 
-    def _get_log_widget(self, key: str | None) -> Optional[RichLog]:
+    def _get_log_widget(self, key: str | None) -> RichLog | None:
         if key in self._log_widgets:
             return self._log_widgets[key]
         widget_id = "#pty_log" if key is None else f"#log_{key}"
@@ -2563,7 +2400,7 @@ class DuskyOrchestratorApp(App):
                 task_w.write(txt)
         self.logger.system(msg)
 
-    def log_task(self, msg: str, task: Optional[OrchestratorTask] = None):
+    def log_task(self, msg: str, task: OrchestratorTask | None = None):
         txt = Text.from_ansi(msg)
         if main_w := self._get_log_widget(None):
             main_w.write(txt)
@@ -2572,51 +2409,72 @@ class DuskyOrchestratorApp(App):
             if task_w := self._get_log_widget(t.state_key):
                 task_w.write(txt)
 
-    def update_telemetry(self, status_str: str, speed_str: str = ""):
-        if speed_str:
-            self.header_telemetry.update(f"Status: {status_str} | Speed/ETA: {speed_str}")
-        else:
-            self.header_telemetry.update(f"Status: {status_str}")
+    def elapsed_seconds(self) -> float:
+        end = self.finished_time if self.finished_time is not None else time.monotonic()
+        return max(0.0, end - self.start_time)
+
+    @staticmethod
+    def format_elapsed(seconds: float) -> str:
+        hours, remainder = divmod(int(seconds), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
+
+    def _refresh_telemetry(self) -> None:
+        text = f"Status: {self._status_text} | Elapsed: {self.format_elapsed(self.elapsed_seconds())}"
+        if self._speed_text:
+            text += f" | Speed/ETA: {self._speed_text}"
+        self.header_telemetry.update(text)
+
+    def update_telemetry(self, status_str: str, speed_str: str = "") -> None:
+        self._status_text, self._speed_text = status_str, speed_str
+        self._refresh_telemetry()
+
+    def set_task_status(self, task: OrchestratorTask, status: TaskStatus) -> None:
+        self.update_task_status(task.index - 1, status)
+        self.task_statuses[task.state_key] = status.name
+        for key in self.counters:
+            if key == "pending":
+                self.counters[key] = sum(t.status in (TaskStatus.PENDING, TaskStatus.RUNNING) for t in self.tasks)
+            else:
+                self.counters[key] = sum(t.status.name.lower() == key for t in self.tasks)
+        done = len(self.tasks) - self.counters["pending"]
+        self.progress_bar.update(progress=done)
+
+    def write_final_report(self) -> None:
+        if self.finished_time is None:
+            self.finished_time = time.monotonic()
+        self.logger.write_report(self.profile_name, self.tasks, self.task_statuses,
+                                 self.counters, self.elapsed_seconds(),
+                                 self.finished_time - self.phase_start_time)
+        self._refresh_telemetry()
+        self._render_final_overview_block()
 
     @contextmanager
     def _suspend_ui(self):
-        suspend = getattr(self, "suspend", None)
-        if callable(suspend):
+        # Textual 8.2.8 resumes its driver only on a normal context exit.
+        error: BaseException | None = None
+        with self.batch_update(), self.suspend():
             try:
-                context = suspend()
-                context.__enter__()
-            except Exception:
-                pass  # An inactive Textual driver cannot be suspended.
-            else:
-                try:
-                    try:
-                        yield
-                    except BaseException:
-                        context.__exit__(*sys.exc_info())
-                        raise
-                    else:
-                        context.__exit__(None, None, None)
-                finally:
-                    with suppress(Exception):
-                        self.screen.refresh(repaint=True, layout=True)
-                return
-
-        driver = getattr(self, "driver", None)
-        if driver is not None and hasattr(driver, "stop_application_mode"):
-            with suppress(Exception):
-                driver.stop_application_mode()
-
-        try:
-            yield
-        finally:
-            if driver is not None and hasattr(driver, "start_application_mode"):
-                with suppress(Exception):
-                    driver.start_application_mode()
+                yield
+            except BaseException as exc:
+                error = exc
+        if error is not None:
+            raise error
 
     @staticmethod
-    def _write_pty(fd: int, data: bytes) -> None:
+    async def _write_pty(fd: int, data: bytes) -> None:
+        loop = asyncio.get_running_loop()
         while data:
-            written = os.write(fd, data)
+            try:
+                written = os.write(fd, data)
+            except BlockingIOError:
+                ready = loop.create_future()
+                loop.add_writer(fd, lambda: not ready.done() and ready.set_result(None))
+                try:
+                    await ready
+                finally:
+                    loop.remove_writer(fd)
+                continue
             if written <= 0:
                 raise OSError("PTY input made no progress")
             data = data[written:]
@@ -2637,46 +2495,34 @@ class DuskyOrchestratorApp(App):
                 await asyncio.wait_for(proc.wait(), 2)
 
     @staticmethod
-    def _interactive_tree(root_pid: int) -> None:
-        # Interactive tasks share our terminal process group, so signal PIDs.
-        members: dict[int, tuple[int, str]] = {}
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit():
-                continue
-            try:
-                fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
-                members[int(entry.name)] = (int(fields[1]), fields[19])
-            except (OSError, ValueError, IndexError):
-                continue
-        selected = {root_pid}
-        while True:
-            found = {pid for pid, (parent, _) in members.items() if parent in selected}
-            if found <= selected:
-                break
-            selected.update(found)
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            for pid in sorted(selected, reverse=True):
-                old = members.get(pid)
-                if old is None:
-                    continue
-                try:
-                    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-                    if (int(fields[1]), fields[19]) == old:
-                        os.kill(pid, sig)
-                except (OSError, ValueError, IndexError):
-                    pass
-            if sig == signal.SIGTERM:
-                time.sleep(0.3)
+    def _set_foreground_group(fd: int, pgid: int) -> None:
+        old_handler = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        try:
+            os.tcsetpgrp(fd, pgid)
+        finally:
+            signal.signal(signal.SIGTTOU, old_handler)
 
     async def _run_interactive(self, cmd: list[str], timeout: float) -> int:
         with self._suspend_ui():
-            proc = subprocess.Popen(cmd)
+            tty_fd = sys.stdin.fileno() if sys.stdin.isatty() else None
+            old_group = os.tcgetpgrp(tty_fd) if tty_fd is not None else None
+            old_attrs = termios.tcgetattr(tty_fd) if tty_fd is not None else None
+            proc = None
             try:
-                return await asyncio.wait_for(asyncio.to_thread(proc.wait), timeout if timeout > 0 else None)
-            except (TimeoutError, asyncio.CancelledError):
-                await asyncio.to_thread(self._interactive_tree, proc.pid)
-                await asyncio.to_thread(proc.wait)
-                raise
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, "-c", CHILD_LAUNCHER,
+                    "foreground" if tty_fd is not None else "plain", *cmd,
+                    cwd=SCRIPT_DIR, process_group=0,
+                )
+                async with asyncio.timeout(timeout if timeout > 0 else None):
+                    return await proc.wait()
+            finally:
+                if proc is not None:
+                    await self._stop_pty_child(proc)
+                if tty_fd is not None:
+                    with suppress(OSError):
+                        self._set_foreground_group(tty_fd, old_group)
+                        termios.tcsetattr(tty_fd, termios.TCSANOW, old_attrs)
 
     async def _run_pty(self, task: OrchestratorTask, cmd: list[str], timeout: float) -> int:
         master_fd, slave_fd = pty.openpty()
@@ -2686,8 +2532,11 @@ class DuskyOrchestratorApp(App):
         read_task: asyncio.Task | None = None
         try:
             self.current_pty_master = master_fd
+            os.set_blocking(master_fd, False)
             self._set_pty_size(master_fd)
-            proc = await asyncio.create_subprocess_exec(*cmd, stdin=slave_fd, stdout=slave_fd,
+            proc = await asyncio.create_subprocess_exec(sys.executable, "-c", CHILD_LAUNCHER,
+                                                        "pty", *cmd, cwd=SCRIPT_DIR,
+                                                        stdin=slave_fd, stdout=slave_fd,
                                                         stderr=slave_fd, close_fds=True,
                                                         start_new_session=True)
             os.close(slave_fd)
@@ -2698,6 +2547,7 @@ class DuskyOrchestratorApp(App):
             transport, _ = await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), file_obj)
             line_buffer = ""
             prompt_buffer = ""
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
             async def read_output() -> None:
                 nonlocal line_buffer, prompt_buffer
@@ -2710,7 +2560,7 @@ class DuskyOrchestratorApp(App):
                         chunk = b""
                     if not chunk:
                         break
-                    text = chunk.decode("utf-8", errors="replace")
+                    text = decoder.decode(chunk)
                     prompt_buffer = (prompt_buffer + ANSI_STRIP_REGEX.sub("", text))[-4096:]
                     for _ in range(8):
                         matches = [(match.start(), i, name, match, response)
@@ -2719,7 +2569,7 @@ class DuskyOrchestratorApp(App):
                         if not matches:
                             break
                         _, _, name, match, response = min(matches, key=lambda item: item[:2])
-                        await asyncio.to_thread(self._write_pty, master_fd, response.encode("utf-8"))
+                        await self._write_pty(master_fd, response.encode("utf-8"))
                         self.log_system(f"Auto-responded to prompt ({name})")
                         prompt_buffer = prompt_buffer[match.end():]
                     speed = SPEED_ETA_REGEX.search(text)
@@ -2741,6 +2591,7 @@ class DuskyOrchestratorApp(App):
                         self.log_task(line_buffer, task)
                         self.logger.write_task(task, ANSI_STRIP_REGEX.sub("", line_buffer))
                         line_buffer = ""
+                line_buffer += decoder.decode(b"", final=True)
                 if line_buffer.strip():
                     self.log_task(line_buffer + "\n", task)
                     self.logger.write_task(task, ANSI_STRIP_REGEX.sub("", line_buffer).strip())
@@ -2754,7 +2605,13 @@ class DuskyOrchestratorApp(App):
                     if read_task in done and read_task.exception() is not None:
                         raise read_task.exception()
                     code = await proc_task
-                    await asyncio.wait_for(read_task, 2)
+                    try:
+                        await asyncio.wait_for(asyncio.shield(read_task), 2)
+                    except TimeoutError:
+                        # A finished child may leave a descendant holding the PTY.
+                        read_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await read_task
                     return code
                 finally:
                     if not proc_task.done():
@@ -2765,7 +2622,7 @@ class DuskyOrchestratorApp(App):
                 await self._stop_pty_child(proc)
             if read_task is not None and not read_task.done():
                 read_task.cancel()
-                with suppress(asyncio.CancelledError):
+                with suppress(asyncio.CancelledError, OSError):
                     await read_task
             self.current_pty_master = None
             if transport is not None:
@@ -2787,46 +2644,55 @@ class DuskyOrchestratorApp(App):
         self.push_screen(screen, callback=_callback)
         return await future
 
-    async def run_execution_loop(self):
-        while self.current_idx < len(self.tasks):
-            task = self.tasks[self.current_idx]
-
-            if task.state_key in self.completed_keys:
-                self.current_idx += 1
-                continue
-
-            if not task.resolved_path:
-                await self.handle_missing_task(task)
-                return
-
-            if task.once and self.once_store.marker_valid(task, self.profile_name):
-                self.log_system(f"Once-marker valid for '{task.script_name}' ({task.once_mode}). Skipping.")
-                self.task_skipped(task)
-                continue
-
-            if task.condition and not self.conditions.check(task.condition):
-                self.log_system(f"Condition '{task.condition}' unfulfilled. Skipping {task.script_name}.")
-                self.task_skipped(task)
-                continue
-
-            if self.manual:
-                res = await self.push_screen_wait(ManualModalScreen(task.script_name))
-                if res == "yes":
-                    pass
-                elif res == "skip":
-                    self.task_skipped(task)
+    @work(name="installer_sequence", exclusive=True)
+    async def run_execution_loop(self) -> None:
+        try:
+            while self.current_idx < len(self.tasks):
+                task = self.tasks[self.current_idx]
+                if task.state_key in self.completed_keys and not task.always:
+                    self.current_idx += 1
                     continue
-                else:
+                if not task.resolved_path or not task.resolved_path.is_file():
+                    self.set_task_status(task, TaskStatus.FAILED)
+                    self.log_system(f"Missing script: {task.script_name}")
                     self.exit(return_code=1)
                     return
+                if not task.always and task.once and self.once_store.marker_valid(task, self.profile_name):
+                    self.task_skipped(task, "once marker valid")
+                    continue
+                if task.condition and not self.conditions.check(task.condition):
+                    self.task_skipped(task, f"condition false: {task.condition}")
+                    continue
+                if self.manual and not self.auto_mode:
+                    res = await self.push_screen_wait(ManualModalScreen(task.script_name))
+                    if res == "skip":
+                        self.task_skipped(task, "manual skip")
+                        continue
+                    if res != "yes":
+                        self.exit(return_code=130)
+                        return
+                if not await self.execute_task(task):
+                    return
+                self.current_idx += 1
+            await self.finish_phase()
+        except asyncio.CancelledError:
+            raise
+        except (OSError, ValueError, RuntimeError, sqlite3.DatabaseError) as exc:
+            self.persistence_failed = True
+            self.log_system(f"Installer execution failed: {exc}")
+            self.exit(return_code=1)
+        finally:
+            self.active_task = None
+            try:
+                self.write_final_report()
+            finally:
+                self.logger.close_all()
+                self.once_store.close()
 
-            await self.execute_task(task)
-            return
-
+    async def finish_phase(self) -> None:
         self.log_system("All tasks in this phase completed.")
         self.update_telemetry("Finished Phase")
-        self.logger.write_report(self.profile_name, self.tasks, self.task_statuses, self.counters)
-        self._render_final_overview_block()
+        self.write_final_report()
 
         failed_tasks = [t for t in self.tasks if self.task_statuses.get(t.state_key) == "FAILED"]
 
@@ -2851,8 +2717,12 @@ class DuskyOrchestratorApp(App):
                 self.exit(return_code=0)
             return
 
+        if self.auto_mode:
+            self.exit(return_code=int(bool(failed_tasks) or self.persistence_failed or self.logger.failed_write))
+            return
+
         # FINAL PHASE (Phase 2: Chroot / Full Installation Complete)
-        if failed_tasks or self.persistence_failed or self.logger.failed_write:
+        if failed_tasks or self.counters["ignored"] or self.persistence_failed or self.logger.failed_write:
             NotificationManager.play_sound("alert")
             NotificationManager.send_desktop(
                 "Installation Finished with Warnings",
@@ -2869,10 +2739,7 @@ class DuskyOrchestratorApp(App):
         completed = self.counters.get("completed", 0)
         failed = self.counters.get("failed", 0)
         skipped = self.counters.get("skipped", 0)
-        total_time = time.monotonic() - (getattr(self, "start_time", None) or time.monotonic())
-        elapsed_m = int(total_time) // 60
-        elapsed_s = int(total_time) % 60
-        elapsed_str = f"{elapsed_m:02d}:{elapsed_s:02d}"
+        elapsed_str = self.format_elapsed(self.elapsed_seconds())
 
         summary_lines = (
             f"Installation: {self.phase_title}\n"
@@ -2880,6 +2747,7 @@ class DuskyOrchestratorApp(App):
             f"Completed: {completed}\n"
             f"Failed: {failed}\n"
             f"Skipped: {skipped}\n"
+            f"Ignored failures: {self.counters['ignored']}\n"
             f"Elapsed: {elapsed_str}\n"
             f"Logs: {self.logger.root or logs_dir()}\n\n"
             "Choose an action:"
@@ -2887,9 +2755,9 @@ class DuskyOrchestratorApp(App):
 
         res = await self.push_screen_wait(
             CompletionDialog(
-                title="INSTALLATION FINISHED WITH WARNINGS" if failed_tasks or self.persistence_failed or self.logger.failed_write else "INSTALLATION COMPLETE",
+                title="INSTALLATION FINISHED WITH WARNINGS" if failed_tasks or self.counters["ignored"] or self.persistence_failed or self.logger.failed_write else "INSTALLATION COMPLETE",
                 message=summary_lines,
-                level="warning" if failed_tasks or self.persistence_failed or self.logger.failed_write else "success",
+                level="warning" if failed_tasks or self.counters["ignored"] or self.persistence_failed or self.logger.failed_write else "success",
             )
         )
         if res == "poweroff":
@@ -2898,172 +2766,109 @@ class DuskyOrchestratorApp(App):
             remove_auto_poweroff_marker()
             self.log_system("Reviewing execution logs. Press 'q' when finished to exit.")
 
-    async def handle_missing_task(self, task: OrchestratorTask):
-        self.update_task_status(self.current_idx, TaskStatus.FAILED)
-        self.log_task(f"\033[1;31m[ERROR] Missing script: {task.script_name}\033[0m")
-        NotificationManager.play_sound("alert")
-
-        if self.stop_on_fail or task.on_failure == "abort":
-            self.log_system("stop-on-fail/abort active. Terminating installer phase.")
-            await asyncio.sleep(1.5)
-            self.exit(return_code=1)
-            return
-        if task.on_failure == "skip":
-            self.task_skipped(task)
-            return
-        if task.on_failure == "continue":
-            self.log_system(f"on_failure=continue active. Proceeding past {task.script_name}.")
-            self.current_idx += 1
-            self.run_worker(self.run_execution_loop())
-            return
-
-        res = await self.push_screen_wait(FailureModalScreen(task.script_name, "Script file not found on disk."))
-        if res == "retry":
-            self.run_worker(self.run_execution_loop())
-        elif res == "skip":
-            self.task_skipped(task)
-        else:
-            self.exit(return_code=1)
-
-    async def execute_task(self, task: OrchestratorTask):
+    async def execute_task(self, task: OrchestratorTask) -> bool:
         self.active_task = task
-        self.update_task_status(self.current_idx, TaskStatus.RUNNING)
         self.select_task_node(task.state_key)
-        start_header = f"\n\033[1;36m>>> PROCESS INITIATED: {task.script_name}\033[0m\n"
-        self.log_task(start_header, task)
-        self.update_telemetry(f"Running {task.script_name}")
-
         args = list(task.args)
         if (self.force_flag or task.force_flag) and "--force" not in args:
             args.append("--force")
-
-        cmd = [task.interpreter, str(task.resolved_path)] + args
+        cmd = [task.interpreter, str(task.resolved_path), *args]
         timeout = task.timeout if task.timeout is not None else self.task_timeout
-        max_attempts = max(1, task.retry + 1)
-
-        for attempt in range(1, max_attempts + 1):
+        attempts_left = task.retry
+        use_interactive = task.interactive
+        while True:
+            self.set_task_status(task, TaskStatus.RUNNING)
+            self.log_system(f">>> PROCESS INITIATED: {task.script_name}")
+            self.update_telemetry(f"Running {task.script_name}")
             self.logger.open_task(task, cmd)
-            start_t = time.time()
-            rc = 1
-            error_msg = ""
-
+            start = time.monotonic()
+            rc, error_msg = 1, ""
             try:
-                if task.interactive:
-                    self.log_system(f"Delegating terminal to interactive process: {task.script_name}")
+                if use_interactive:
                     rc = await self._run_interactive(cmd, timeout or 0.0)
-                    if rc in (130, -signal.SIGINT):
-                        self.exit(return_code=130)
-                        return
                 else:
                     rc = await self._run_pty(task, cmd, timeout or 0.0)
                 if rc != 0:
                     error_msg = f"Process exited with status code {rc}"
             except TimeoutError:
-                rc = 124
-                error_msg = f"Timeout after {timeout}s"
+                rc, error_msg = 124, f"Timeout after {timeout}s"
             except asyncio.CancelledError:
+                rc, error_msg = 130, "Execution cancelled"
+                self.set_task_status(task, TaskStatus.FAILED)
+                task.error_msg = error_msg
                 raise
-            except Exception as exc:
-                rc = 127
-                error_msg = str(exc)
-            dur = time.time() - start_t
-
+            except OSError as exc:
+                rc, error_msg = 127, str(exc)
+            finally:
+                duration = time.monotonic() - start
+                task.duration += duration
+                self.logger.close_task(task, status="COMPLETED" if rc == 0 else "FAILED",
+                                       exit_code=rc, duration=duration)
+            if rc in (130, -signal.SIGINT):
+                self.set_task_status(task, TaskStatus.FAILED)
+                self.exit(return_code=130)
+                return False
             if rc == 0:
-                self.logger.close_task(task, status="COMPLETED", exit_code=0, duration=dur)
+                task.error_msg = None
+                self.set_task_status(task, TaskStatus.COMPLETED)
                 if task.once:
                     self.once_store.mark_success(task, self.profile_name, 0, self.run_id)
-                await self.task_success(task, dur)
-                return
-
-            self.logger.close_task(task, status="FAILED", exit_code=rc or 1, duration=dur)
-
+                with self.state_file.open("a", encoding="utf-8") as stream:
+                    stream.write(task.state_key + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                self.completed_keys.add(task.state_key)
+                self.log_system(">>> EXECUTION SUCCESSFUL")
+                self.active_task = None
+                return True
+            task.error_msg = error_msg
             if task.ignore_fail:
-                self.log_system(f"Task exited with status {rc} but ignore_fail is active. Proceeding.")
-                if task.once:
-                    self.once_store.mark_success(task, self.profile_name, 0, self.run_id)
-                await self.task_success(task, dur)
-                return
-
-            if attempt < max_attempts:
-                self.log_system(f"Attempt {attempt}/{max_attempts} failed. Retrying in {task.retry_delay}s...")
-                NotificationManager.play_sound("alert")
+                self.set_task_status(task, TaskStatus.IGNORED)
+                self.log_system(f"Ignored failure (exit {rc}): {task.script_name}")
+                self.active_task = None
+                return True
+            if attempts_left:
+                attempts_left -= 1
+                self.log_system(f"Retrying {task.script_name} in {task.retry_delay}s ({attempts_left} retries left)")
                 await asyncio.sleep(task.retry_delay)
                 continue
-
-            await self.task_failure(task, error_msg or f"Process exited with status code {rc}", dur)
-            return
-
-    async def task_success(self, task: OrchestratorTask, duration: float = 0.0):
-        self.update_task_status(self.current_idx, TaskStatus.COMPLETED)
-        task.duration = duration
-        self.log_task("\n\033[1;32m>>> EXECUTION SUCCESSFUL\033[0m\n", task)
-        self.completed_keys.add(task.state_key)
-        self.task_statuses[task.state_key] = "COMPLETED"
-        self.counters["completed"] += 1
-        if self.counters["pending"] > 0:
-            self.counters["pending"] -= 1
-        self.logger.close_task(task, status="COMPLETED", exit_code=0, duration=duration)
-
-        try:
-            with open(self.state_file, "a") as f:
-                f.write(task.state_key + "\n")
-        except Exception as e:
-            self.persistence_failed = True
-            self.log_system(f"Failed to record state: {e}")
-
-        self.progress_bar.advance(1)
-        self.current_idx += 1
-        self.run_worker(self.run_execution_loop())
-
-    def task_skipped(self, task: OrchestratorTask):
-        self.update_task_status(self.current_idx, TaskStatus.SKIPPED)
-        self.log_system(f"Skipped task: {task.script_name}")
-        self.task_statuses[task.state_key] = "SKIPPED"
-        self.counters["skipped"] += 1
-        if self.counters["pending"] > 0:
-            self.counters["pending"] -= 1
-        self.logger.close_task(task, status="SKIPPED")
-        self.progress_bar.advance(1)
-        self.current_idx += 1
-        self.run_worker(self.run_execution_loop())
-
-    async def task_failure(self, task: OrchestratorTask, reason: str, duration: float = 0.0):
-        self.update_task_status(self.current_idx, TaskStatus.FAILED)
-        task.duration = duration
-        self.log_task(f"\n\033[1;31m>>> EXECUTION FAILED: {reason}\033[0m\n", task)
-        self.task_statuses[task.state_key] = "FAILED"
-        self.counters["failed"] += 1
-        if self.counters["pending"] > 0:
-            self.counters["pending"] -= 1
-        self.logger.close_task(task, status="FAILED", exit_code=1, duration=duration)
-        NotificationManager.play_sound("alert")
-        NotificationManager.send_desktop("Task Failed", f"Script '{task.script_name}' failed: {reason}", urgency="critical")
-
-        if self.stop_on_fail or task.on_failure == "abort":
-            self.log_system("stop-on-fail/abort active. Terminating installer phase.")
-            await asyncio.sleep(1.5)
-            self.exit(return_code=1)
-        elif task.on_failure == "skip":
-            self.task_skipped(task)
-        elif task.on_failure == "continue":
-            self.log_system(f"on_failure=continue active. Proceeding past {task.script_name}.")
-            self.current_idx += 1
-            self.run_worker(self.run_execution_loop())
-        else:
-            res = await self.push_screen_wait(FailureModalScreen(task.script_name, reason))
-            if res == "retry":
-                self.run_worker(self.run_execution_loop())
-            elif res == "skip":
-                self.task_skipped(task)
-            else:
+            self.set_task_status(task, TaskStatus.FAILED)
+            self.log_system(f">>> EXECUTION FAILED: {error_msg}")
+            NotificationManager.play_sound("alert")
+            policy = "abort" if self.stop_on_fail else task.on_failure
+            if policy == "manual" and not use_interactive and not self.auto_mode:
+                use_interactive = True
+                continue
+            if policy == "skip":
+                self.set_task_status(task, TaskStatus.SKIPPED)
+                self.active_task = None
+                return True
+            if policy == "continue":
+                self.active_task = None
+                return True
+            if policy == "abort" or self.auto_mode:
                 self.exit(return_code=1)
-
-    def action_quit_app(self):
-        if self.current_idx >= len(self.tasks):
-            failed_tasks = [t for t in self.tasks if self.task_statuses.get(t.state_key) == "FAILED"]
-            self.exit(return_code=1 if failed_tasks or self.persistence_failed or self.logger.failed_write else 0)
-        else:
+                return False
+            res = await self.push_screen_wait(FailureModalScreen(task.script_name, error_msg))
+            if res == "retry":
+                continue
+            if res == "skip":
+                self.set_task_status(task, TaskStatus.SKIPPED)
+                self.active_task = None
+                return True
             self.exit(return_code=1)
+            return False
+
+    def task_skipped(self, task: OrchestratorTask, reason: str) -> None:
+        task.error_msg = reason
+        self.set_task_status(task, TaskStatus.SKIPPED)
+        self.log_system(f"Skipped {task.script_name}: {reason}")
+        self.current_idx += 1
+
+    def action_quit_app(self) -> None:
+        failed = any(task.status == TaskStatus.FAILED for task in self.tasks)
+        code = 1 if failed or self.persistence_failed or self.logger.failed_write else 0
+        self.exit(return_code=code if self.current_idx >= len(self.tasks) else 130)
 
     def action_toggle_manual(self):
         self.manual = not self.manual
@@ -3076,7 +2881,7 @@ class DuskyOrchestratorApp(App):
                 self.state_file.unlink()
                 self.completed_keys.clear()
                 self.log_system("Phase completion state reset.")
-            except Exception as e:
+            except OSError as e:
                 self.log_system(f"Failed to reset state: {e}")
 
     def trigger_poweroff(self):
@@ -3084,7 +2889,7 @@ class DuskyOrchestratorApp(App):
         failed_tasks = [t for t in self.tasks if self.task_statuses.get(t.state_key) == "FAILED"]
         exit_code = 1 if failed_tasks or self.persistence_failed or self.logger.failed_write else 0
 
-        if is_in_chroot():
+        if is_in_chroot() or os.environ.get("DUSKY_INSTALL_WRAPPER") == "1":
             self.exit(return_code=exit_code)
             return
 
@@ -3098,7 +2903,7 @@ class DuskyOrchestratorApp(App):
 # MAIN ENTRYPOINT
 # ==============================================================================
 def main():
-    args = parse_args()
+    args = EARLY_ARGS if EARLY_ARGS is not None else parse_args()
 
     if args.list_once:
         store = OnceStore(read_only=True)
@@ -3109,7 +2914,7 @@ def main():
         return
 
     if args.forget_once:
-        lock_file = Path("/tmp/orchestrator_phase2.lock" if args.phase2 else "/tmp/orchestrator_phase1.lock")
+        lock_file = Path("/tmp/orchestrator_phase2.lock" if args.phase2 or (not args.phase1 and is_in_chroot()) else "/tmp/orchestrator_phase1.lock")
         if not acquire_lock(lock_file):
             sys.exit(1)
         store = OnceStore()
@@ -3135,10 +2940,11 @@ def main():
     phase2 = args.phase2
 
     if not phase1 and not phase2:
-        phase1 = True
+        phase2 = is_in_chroot()
+        phase1 = not phase2
 
     profiles = discover_profiles()
-    selected_profile: Optional[ProfileConfig] = None
+    selected_profile: ProfileConfig | None = None
 
     if args.profile:
         for p in profiles:
@@ -3156,8 +2962,14 @@ def main():
                     sys.stderr.write(f"Error loading profile '{args.profile}': {e}\n")
                     sys.exit(1)
 
+    if args.profile and selected_profile is None:
+        raise ValueError(f"Unknown installer profile: {args.profile}")
     inspection = args.list_scripts or args.doctor or args.explain or args.dry_run
-    repo_valid, repo_reason = (True, "inspection") if inspection else verify_offline_repo_fast()
+    if not inspection and os.geteuid() != 0:
+        raise RuntimeError("This installer orchestrator must be run as root")
+    repo_valid, repo_reason = (True, "not required")
+    if not inspection and (selected_profile is None or "offline" in selected_profile.name.lower()):
+        repo_valid, repo_reason = verify_offline_repo_fast()
 
     if not selected_profile and not args.profile:
         for profile_check in [
@@ -3187,12 +2999,7 @@ def main():
                         selected_profile = p
                         break
             else:
-                sys.stderr.write(f"\n[WARN] Offline repository verification failed: {repo_reason}\n")
-                sys.stderr.write("[WARN] Auto-selecting ONLINE profile to prevent pacstrap failures.\n\n")
-                for p in profiles:
-                    if p.filepath and "online" in p.name.lower():
-                        selected_profile = p
-                        break
+                raise RuntimeError(f"Offline repository unavailable: {repo_reason}. Select --online explicitly for online installation.")
             if not selected_profile and profiles:
                 selected_profile = profiles[0]
         else:
@@ -3212,10 +3019,10 @@ def main():
                 is_offline = "offline" in p_name.lower() or (p.filepath and "offline" in p.filepath.name.lower())
 
                 if is_offline and not repo_valid:
-                    status_str = f"[bold red][CORRUPTED - UNAVAILABLE][/bold red]"
+                    status_str = "[bold red][UNAVAILABLE][/bold red]"
                     available = False
                 elif is_offline:
-                    status_str = "[bold green][VERIFIED CLEAN][/bold green]"
+                    status_str = "[bold green][METADATA/SIZES CHECKED][/bold green]"
                     available = True
                 else:
                     status_str = "[bold green][AVAILABLE][/bold green]"
@@ -3237,7 +3044,7 @@ def main():
                     choice = Prompt.ask("\nSelect Profile Number", choices=valid_choices, default=default_idx)
                     if choice.lower() in ("q", "quit"):
                         console.print("\n[yellow]Installation cancelled by user. Returning to live shell.[/yellow]")
-                        sys.exit(0)
+                        sys.exit(130)
 
                     idx = int(choice) - 1
                     p, avail = profile_choices[idx]
@@ -3248,29 +3055,17 @@ def main():
                     break
                 except KeyboardInterrupt:
                     console.print("\n[bold yellow]Installation cancelled (Ctrl+C). Returning to live shell.[/bold yellow]")
-                    sys.exit(0)
+                    sys.exit(130)
                 except EOFError:
-                    console.print(f"\n[yellow]EOF detected. Selected default option ({default_idx}).[/yellow]")
-                    idx = int(default_idx) - 1
-                    selected_profile = profile_choices[idx][0]
-                    break
-                except Exception:
-                    continue
+                    console.print("\n[yellow]Profile selection ended (EOF).[/yellow]")
+                    raise RuntimeError("Profile selection ended before a profile was chosen")
 
     if not selected_profile:
         sys.stderr.write(f"Error: No valid installer profile found in '{PROFILES_DIR}'. Installation aborted.\n")
         sys.exit(1)
 
-    if not inspection and selected_profile and selected_profile.filepath:
-        try:
-            p_name = selected_profile.filepath.name
-            Path("/tmp/dusky_selected_profile.txt").write_text(p_name)
-            if Path("/mnt/etc").is_dir():
-                (Path("/mnt/etc") / "dusky_selected_profile.txt").write_text(p_name)
-            if Path("/mnt/root").is_dir():
-                (Path("/mnt/root") / "dusky_selected_profile.txt").write_text(p_name)
-        except Exception:
-            pass
+    if not inspection and "offline" in selected_profile.name.lower() and not repo_valid:
+        raise RuntimeError(f"Offline repository unavailable: {repo_reason}")
 
     profile_name = selected_profile.name
     policy = selected_profile.policy
@@ -3292,8 +3087,8 @@ def main():
 
     raw_sequence = selected_profile.phase1_tasks if phase1 else selected_profile.phase2_tasks
 
-    tasks: List[OrchestratorTask] = []
-    occurrence: Dict[str, int] = {}
+    tasks: list[OrchestratorTask] = []
+    occurrence: dict[str, int] = {}
     for i, t in enumerate(raw_sequence, start=1):
         resolved_path = resolve_script(t.script_name, selected_profile.search_dirs, selected_profile.conflict_resolutions)
 
@@ -3303,6 +3098,8 @@ def main():
             interpreter, file_interactive = resolve_interpreter(resolved_path)
             if t.interactive_override is None and file_interactive:
                 is_interactive = True
+            if not shutil.which(interpreter):
+                raise RuntimeError(f"Missing interpreter {interpreter!r} for {resolved_path}")
             if resolved_path.suffix.lower() == ".py":
                 try:
                     compile(resolved_path.read_bytes(), str(resolved_path), "exec")
@@ -3358,6 +3155,17 @@ def main():
     if not inspection and os.geteuid() != 0:
         sys.stderr.write("Error: This installer orchestrator must be run as root.\n")
         sys.exit(1)
+    if not inspection and selected_profile.filepath:
+        if phase1 and os.environ.get("DUSKY_INSTALL_WRAPPER") == "1":
+            (SCRIPT_DIR / ".selected_profile").write_text(str(selected_profile.filepath.resolve()))
+        p_name = selected_profile.filepath.name
+        for saved_profile in (Path("/tmp/dusky_selected_profile.txt"),
+                              Path("/mnt/etc/dusky_selected_profile.txt"),
+                              Path("/mnt/root/dusky_selected_profile.txt")):
+            if saved_profile.parent.is_dir():
+                with suppress(OSError):
+                    saved_profile.write_text(p_name)
+
     once_store = OnceStore(read_only=inspection)
 
     if args.list_scripts:
@@ -3397,14 +3205,14 @@ def main():
         print(f"Selected profile '{profile_name}': {len(tasks)} tasks, {len(missing_all)} missing")
         print("Doctor check complete.")
         once_store.close()
-        sys.exit(0)
+        sys.exit(1 if missing_all else 0)
 
     if args.explain:
         print(f"=== EXPLAIN FOR {profile_name} ===")
         for t in tasks:
             reasons = []
             if not t.resolved_path:
-                reasons.append("MISSING SCRIPT -> WILL DEFER")
+                reasons.append("MISSING SCRIPT -> ABORT")
             else:
                 if t.once and once_store.marker_valid(t, profile_name):
                     reasons.append("SKIP (once-marker valid)")
@@ -3450,8 +3258,8 @@ def main():
             try:
                 state_file.unlink()
                 print(f"Reset completion state for {phase_title}")
-            except Exception as e:
-                sys.stderr.write(f"Failed to reset state: {e}\n")
+            except OSError as e:
+                raise RuntimeError(f"Failed to reset state: {e}") from e
         else:
             print(f"No state file found for {phase_title}")
 
@@ -3475,16 +3283,22 @@ def main():
             task_timeout=task_timeout,
             once_store=once_store,
             is_final_phase=bool(phase2),
+            auto_mode=args.auto,
         )
         app.run()
         sys.exit(app.return_code if app.return_code is not None else 1)
     except KeyboardInterrupt:
         sys.exit(130)
+    finally:
+        if "app" in locals():
+            app.logger.close_all()
+        once_store.close()
+        release_lock()
 
 
 if __name__ == "__main__":
     try:
         main()
-    except (ValueError, RuntimeError, subprocess.SubprocessError, OSError) as exc:
+    except (ValueError, RuntimeError, subprocess.SubprocessError, OSError, sqlite3.DatabaseError) as exc:
         sys.stderr.write(f"[ERROR] {exc}\n")
         sys.exit(1)

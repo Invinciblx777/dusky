@@ -59,10 +59,12 @@ printf "%s%s[INFO]%s Staging kernels from /usr/lib/modules to /boot...\n" "${C_B
 
 # The masked ALPM hook (070) never staged vmlinuz; stage it now so preset ALL_kver resolves.
 found_kernel=0
+declare -a required_images=()
 for kdir in /usr/lib/modules/*; do
     if [[ -f "$kdir/vmlinuz" ]] && [[ -f "$kdir/pkgbase" ]]; then
         pkgbase="$(<"$kdir/pkgbase")"
         install -m0644 "$kdir/vmlinuz" "/boot/vmlinuz-${pkgbase}"
+        required_images+=("/boot/initramfs-${pkgbase}.img")
         found_kernel=1
     fi
 done
@@ -85,21 +87,31 @@ if [[ "$mkinitcpio_exit" -ne 0 ]]; then
     printf "%s%s[WARN]%s mkinitcpio exited with status %d (checking image validity)...\n" "${C_BOLD}" "${C_YELLOW}" "${C_RESET}" "$mkinitcpio_exit"
 fi
 
-# Empirical verification: Check that at least one valid non-empty initramfs exists in /boot
+# The bootloader uses each kernel's main image; a fallback alone is insufficient.
+for img in "${required_images[@]}"; do
+    if [[ ! -s "$img" ]]; then
+        printf "%s%s[ERROR]%s Required initramfs is empty or missing: %s\n" "${C_BOLD}" "${C_RED}" "${C_RESET}" "$img"
+        exit 1
+    fi
+done
+
+# Verify all generated images, including any fallback images.
 valid_images=0
+invalid_images=0
 shopt -s nullglob
 for img in /boot/initramfs-*.img; do
     if [[ -s "$img" ]]; then
         valid_images=$((valid_images + 1))
         printf " -> Verified initramfs: %s (%s)\n" "$img" "$(du -h "$img" | cut -f1)"
     else
+        invalid_images=$((invalid_images + 1))
         printf "%s%s[ERROR]%s Generated initramfs is empty or missing: %s\n" "${C_BOLD}" "${C_RED}" "${C_RESET}" "$img"
     fi
 done
 shopt -u nullglob
 
-if [[ "$valid_images" -eq 0 ]]; then
-    printf "%s%s[ERROR]%s No valid initramfs images generated in /boot! Check disk space or preset configuration.\n" "${C_BOLD}" "${C_RED}" "${C_RESET}"
+if (( valid_images == 0 || invalid_images > 0 )); then
+    printf "%s%s[ERROR]%s Initramfs verification failed in /boot! Check disk space or preset configuration.\n" "${C_BOLD}" "${C_RED}" "${C_RESET}"
     exit 1
 fi
 
