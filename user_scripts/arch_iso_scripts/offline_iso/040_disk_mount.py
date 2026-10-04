@@ -1,17 +1,7 @@
 #!/usr/bin/env python3
 """
-040_disk_mount.py - DUSKY Final Fixed - Python 3.14.6 + Rich 15.0.0
-Fixes:
- [2] removeprefix not lstrip - vda -> a bug
- [3] NOCOW: chattr +C alone, clear stale m flag then +C, no btrfs property compression none before +C
- [4] swapoff safe: scan /proc/swaps + swapon --raw, match /mnt/swap/swapfile and /swap/swapfile and basename swapfile under /mnt
- [6] EFI kept hardened fmask=0177,dmask=0077,noexec,nosuid,nodev
- [7] Panel width: Panel.fit + Align.center + safe_box=False fixes full-width +---+ ASCII
- [8] make_console: direct assignment os.environ["TERM"]="linux" not setdefault
- [9] Removed unreachable duplicate return
- [10] Tight centered banners for AUTONOMOUS / INTERACTIVE
- [11] Surgically fixed hidden directory shadowing on @home/.snapshots
- [12] Augmented run() wrapper to expose stderr on CalledProcessError
+Mount the storage layout selected by 030_partitioning.py for offline installation.
+Creates the DUSKY Btrfs subvolumes and swapfile, and preserves existing EFI data.
 """
 
 from __future__ import annotations
@@ -20,16 +10,9 @@ from pathlib import Path
 
 def _ensure_rich():
     import importlib.util
-    try:
-        if importlib.util.find_spec("rich") is not None:
-            return
-    except ModuleNotFoundError:
-        pass
-    if not hasattr(os, "geteuid") or os.geteuid() != 0:
-        print("python-rich missing", file=sys.stderr)
-        sys.exit(1)
-    print(">> Installing python-rich...", file=sys.stderr)
-    subprocess.run(["pacman","-Sy","--needed","--noconfirm","python-rich"], stdout=sys.stderr, stderr=sys.stderr)
+    if importlib.util.find_spec("rich") is None:
+        print("python-rich is required in the offline ISO", file=sys.stderr)
+        raise SystemExit(1)
 
 _ensure_rich()
 from rich.console import Console
@@ -65,27 +48,43 @@ VALID_PART_RE = re.compile(r"^[a-zA-Z0-9_./-]+$")
 
 def run(*cmd, check=True, capture=True, input_text=None, timeout=300):
     argv = [os.fspath(c) for c in cmd]
+    binary = isinstance(input_text, (bytes, bytearray))
     try:
-        if isinstance(input_text, (bytes, bytearray)):
-            return subprocess.run(argv, check=check, text=False, capture_output=capture, input=bytes(input_text), timeout=timeout)
-        elif isinstance(input_text, str):
-            return subprocess.run(argv, check=check, text=True, capture_output=capture, input=input_text, timeout=timeout)
-        return subprocess.run(argv, check=check, text=True, capture_output=capture, timeout=timeout)
-    except subprocess.CalledProcessError as e:
-        if check:
-            console.print(f"[red]Failed {shlex.join([str(x) for x in argv])}[/red]")
-            err = getattr(e, 'stderr', None)
-            if err:
-                if isinstance(err, bytes): err = err.decode('utf-8', 'replace')
-                err = err.strip()
-                if err: console.print(f"[red]Details: {err}[/red]")
+        return subprocess.run(
+            argv, check=check, capture_output=capture, timeout=timeout,
+            env=os.environ | {"LC_ALL": "C"},
+            input=bytes(input_text) if binary else input_text,
+            **({} if binary else {"encoding": "utf-8", "errors": "replace"}),
+        )
+    except subprocess.CalledProcessError as error:
+        console.print(Text(f"Failed {shlex.join(argv)}", style="red"))
+        detail = error.stderr
+        if isinstance(detail, bytes):
+            detail = detail.decode("utf-8", "replace")
+        if detail and detail.strip():
+            console.print(Text(f"Details: {detail.strip()}", style="red"))
         raise
     except OSError:
-        # Best-effort calls (check=False) must not kill the whole installer
-        # when a binary is missing or unreadable - report failure instead.
         if check:
             raise
-        return subprocess.CompletedProcess(argv, 127, stdout="", stderr=f"{argv[0]}: not available")
+        detail = f"{argv[0]}: not available"
+        return subprocess.CompletedProcess(
+            argv, 127, stdout=b"" if binary else "",
+            stderr=detail.encode() if binary else detail,
+        )
+
+
+def mountinfo_targets(text: str, prefix: str = "/mnt") -> list[str]:
+    """Return a mount tree, decoding mountinfo path escapes."""
+    targets = set()
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 6 or " - " not in line:
+            continue
+        target = re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), fields[4])
+        if target == prefix or target.startswith(prefix.rstrip("/") + "/"):
+            targets.add(target)
+    return sorted(targets, key=lambda path: (path.count("/"), len(path)), reverse=True)
 
 def detect_boot_mode():
     try:
@@ -126,7 +125,7 @@ def print_banner(title: str):
 
 def findmnt_json(target="/mnt"):
     try:
-        r = run("findmnt","--json","--list","--submounts","--output","TARGET,SOURCE,FSTYPE,OPTIONS,ID","--target",target, check=False, capture=True)
+        r = run("findmnt","--json","--list","--submounts","--output","TARGET,SOURCE,FSTYPE,OPTIONS,ID","--mountpoint",target, check=False, capture=True)
         if r.returncode==0 and r.stdout.strip():
             return json.loads(r.stdout).get("filesystems",[])
     except:
@@ -179,15 +178,14 @@ def unmount_mount_tree():
         except:
             pass
     try:
-        r = run("findmnt","-rn","-o","TARGET", check=False, capture=True)
-        remaining = [l.strip() for l in r.stdout.splitlines() if l.strip().startswith("/mnt")]
+        remaining = mountinfo_targets(Path("/proc/self/mountinfo").read_text())
         for mp in sorted(remaining, key=lambda p:(p.count("/"),len(p)), reverse=True):
             if run("umount",mp, check=False, capture=True).returncode != 0:
                 run("umount", "-f", "-l", mp, check=False, capture=True)
     except:
         pass
 
-    # Purge systemd 261 slave mount namespaces holding /mnt
+    # Clean up mount namespaces holding /mnt
     try:
         seen_ns_inodes = set()
         for proc_dir in Path("/proc").glob("[0-9]*"):
@@ -202,13 +200,8 @@ def unmount_mount_tree():
                 mi = proc_dir / "mountinfo"
                 if mi.is_file():
                     text = mi.read_text(errors="ignore")
-                    if "/mnt" in text:
-                        for line in text.splitlines():
-                            if "/mnt" in line:
-                                parts = line.split()
-                                if len(parts) >= 5:
-                                    target_mp = parts[4]
-                                    run("nsenter", f"--mount=/proc/{proc_dir.name}/ns/mnt", "umount", "-R", "-f", "-l", target_mp, check=False, capture=True)
+                    for target_mp in mountinfo_targets(text):
+                        run("nsenter", f"--mount=/proc/{proc_dir.name}/ns/mnt", "umount", "-R", "-f", "-l", target_mp, check=False, capture=True)
             except Exception:
                 pass
     except Exception:
@@ -327,7 +320,7 @@ def determine_root_partition(auto_mode):
             sys.exit(1)
     else:
         r=run("lsblk","-l","-o","NAME,SIZE,TYPE,FSTYPE,LABEL,PARTLABEL",check=False,capture=True)
-        console.print(r.stdout)
+        console.print(r.stdout, markup=False)
         while True:
             raw=Prompt.ask("Enter DUSKY BTRFS root (e.g. vda2)",console=console)
             if not VALID_PART_RE.match(raw):
@@ -344,7 +337,7 @@ def determine_root_partition(auto_mode):
                 mapped_root=rp
                 break
             except Exception as e:
-                console.print(f"[red]{e}[/red]")
+                console.print(Text(str(e), style="red"))
     if mapped.exists() and root_part == mapped.resolve():
         root_part = mapper_backing()
     encrypted = run("cryptsetup", "isLuks", str(root_part), check=False).returncode == 0
@@ -421,7 +414,7 @@ def validate_root_state(mapped_root):
         try:
             r2=run("lsblk","-f",str(mapped_root),check=False,capture=True)
             if r2.stdout.strip():
-                console.print(Panel.fit(r2.stdout, title="device details", box=box.ROUNDED, border_style="dim"))
+                console.print(Panel.fit(Text(r2.stdout), title="device details", box=box.ROUNDED, border_style="dim"))
         except Exception:
             pass
         sys.exit(1)
@@ -477,7 +470,7 @@ def auto_detect_efi_partition(root_disk, root_part):
 
 def prompt_for_efi_partition(root_disk):
     r=run("lsblk","-l","-o","NAME,SIZE,TYPE,FSTYPE,PARTTYPE,PARTLABEL,LABEL",str(root_disk),check=False,capture=True)
-    console.print(r.stdout)
+    console.print(r.stdout, markup=False)
     while True:
         raw=Prompt.ask("Enter EFI partition (e.g. vda1)",console=console)
         if not VALID_PART_RE.match(raw):
@@ -491,7 +484,7 @@ def prompt_for_efi_partition(root_disk):
                 return rp
             console.print(f"[red]{rp} no exist[/red]")
         except Exception as e:
-            console.print(f"[red]{e}[/red]")
+            console.print(Text(str(e), style="red"))
 
 def determine_efi_partition(auto_mode,root_disk,root_part):
     if BOOT_MODE!="UEFI":
@@ -572,7 +565,7 @@ def assemble_fhs(mapped_root,efi_part):
         except Exception:
             pass
 
-def sync_secondary_efi_bootloaders(primary_esp_mnt: str = "/mnt/boot", primary_esp_dev: Optional[str] = None):
+def sync_secondary_efi_bootloaders(primary_esp_mnt: str = "/mnt/boot", primary_esp_dev: str | None = None):
     """
     Best-effort copy of vendor EFI dirs from other ESPs (dual-boot / extra USB).
     Must NEVER abort the install: missing secondary media, busy devices, or
@@ -675,7 +668,7 @@ def sync_secondary_efi_bootloaders(primary_esp_mnt: str = "/mnt/boot", primary_e
                     if tmp_dir:
                         run("umount", tmp_dir, check=False, capture=True)
                         try:
-                            shutil.rmtree(tmp_dir, ignore_errors=True)
+                            Path(tmp_dir).rmdir()
                         except Exception:
                             pass
             except Exception as e:
@@ -686,81 +679,52 @@ def sync_secondary_efi_bootloaders(primary_esp_mnt: str = "/mnt/boot", primary_e
         return
 
 def get_free_bytes(path: Path | str) -> int:
-    try:
-        st = os.statvfs(path)
-        return st.f_bavail * st.f_frsize
-    except Exception:
-        return 8 * 1024**3
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize
+
 
 def initialize_swapfile():
     console.print("[yellow]>> Ensuring swapfile...[/yellow]")
-    try:
-        r=run("swapon","--show=NAME","--raw","--noheadings",check=False,capture=True)
-        for line in r.stdout.splitlines():
-            n=line.strip()
-            if not n:
-                continue
-            if Path(n).name=="swapfile" and (n in ("/mnt/swap/swapfile","/swap/swapfile") or n.startswith("/mnt/")):
-                run("swapoff",n,check=False,capture=True)
+    # Never remove an active file when swapoff fails, and leave unrelated swap alone.
+    result = run("swapon", "--show=NAME", "--raw", "--noheadings")
+    for line in result.stdout.splitlines():
+        name = re.sub(r"\\x([0-9a-fA-F]{2})", lambda match: chr(int(match[1], 16)), line.strip())
         try:
-            swaps=Path("/proc/swaps").read_text()
-            for line in swaps.splitlines()[1:]:
-                name=line.split()[0]
-                if Path(name).name=="swapfile":
-                    run("swapoff",name,check=False,capture=True)
-        except:
-            pass
-    except:
-        pass
+            same_file = os.path.samefile(name, SWAPFILE_PATH)
+        except OSError:
+            same_file = name == str(SWAPFILE_PATH)
+        if same_file:
+            run("swapoff", name)
 
     if SWAPFILE_PATH.exists() and not SWAPFILE_PATH.is_file():
-        console.print(f"[red]{SWAPFILE_PATH} not regular file[/red]")
-        sys.exit(1)
+        raise RuntimeError(f"{SWAPFILE_PATH} is not a regular file")
+    try:
+        existing_size = SWAPFILE_PATH.stat().st_size if SWAPFILE_PATH.is_file() else 0
+        available = get_free_bytes(SWAPFILE_PATH.parent) + existing_size
+    except OSError as error:
+        console.print(Text(f"Warning: Cannot determine swap space: {error}", style="yellow"))
+        return
+    minimum = 256 * 1024**2
+    desired_size = min(4 * 1024**3, int(available * 0.8))
+    if desired_size < minimum:
+        console.print("[yellow]Warning: Insufficient space for a swapfile[/yellow]")
+        return
+    size_str = f"{desired_size // (1024**2)}M"
+    if existing_size >= minimum and abs(existing_size - desired_size) < 512 * 1024**2:
+        if run("swapon", str(SWAPFILE_PATH), check=False).returncode == 0:
+            console.print("[green]>> Existing swapfile re-activated[/green]")
+            return
 
-    free_bytes = get_free_bytes("/mnt/swap")
-    desired_size = 4 * 1024**3
-    if free_bytes < 3 * 1024**3:
-        desired_size = max(256 * 1024**2, int(free_bytes * 0.35))
-
-    size_str = f"{max(256, desired_size // (1024**2))}M"
-
-    if SWAPFILE_PATH.is_file():
-        try:
-            cur_sz = SWAPFILE_PATH.stat().st_size
-            if cur_sz >= 256 * 1024**2 and abs(cur_sz - desired_size) < 512 * 1024**2:
-                if run("swapon",str(SWAPFILE_PATH),check=False,capture=True).returncode==0:
-                    console.print(f"[green]>> Swap ({size_str}) re-activated[/green]")
-                    return
-        except:
-            pass
-        try:
-            SWAPFILE_PATH.unlink(missing_ok=True)
-            run("sync", check=False, capture=True)
-            run("udevadm", "settle", "--timeout=5", check=False, capture=True)
-        except Exception as e:
-            console.print(f"[yellow]Warning removing old swapfile: {e}[/yellow]")
-
-    mk_res = run("btrfs","filesystem","mkswapfile","--size",size_str,"--uuid","clear",str(SWAPFILE_PATH),check=False,capture=True)
-    if mk_res.returncode == 0 and SWAPFILE_PATH.is_file():
-        sw_res = run("swapon",str(SWAPFILE_PATH),check=False,capture=True)
-        if sw_res.returncode == 0:
+    SWAPFILE_PATH.unlink(missing_ok=True)
+    result = run("btrfs", "filesystem", "mkswapfile", "--size", size_str,
+                 "--uuid", "clear", str(SWAPFILE_PATH), check=False)
+    if result.returncode == 0 and SWAPFILE_PATH.is_file():
+        if run("swapon", str(SWAPFILE_PATH), check=False).returncode == 0:
             console.print(f"[green]>> Swapfile ({size_str}) created and activated.[/green]")
             return
+    detail = (result.stderr or "").strip()
+    console.print(Text(f"Warning: Swapfile activation skipped. {detail}", style="yellow"))
 
-    try:
-        SWAPFILE_PATH.unlink(missing_ok=True)
-        run("fallocate", "-l", size_str, str(SWAPFILE_PATH), check=False)
-        run("chattr", "+C", str(SWAPFILE_PATH), check=False)
-        run("chmod", "600", str(SWAPFILE_PATH), check=False)
-        run("mkswap", str(SWAPFILE_PATH), check=False)
-        sw_res2 = run("swapon",str(SWAPFILE_PATH),check=False,capture=True)
-        if sw_res2.returncode == 0:
-            console.print(f"[green]>> Swapfile ({size_str}) created via fallback and activated.[/green]")
-            return
-    except Exception as e:
-        console.print(f"[yellow]Warning setting up swapfile: {e}[/yellow]")
-
-    console.print("[yellow]Warning: Swapfile activation skipped[/yellow]")
 
 def teardown_state():
     try:
@@ -782,42 +746,37 @@ def run_common(auto_mode):
                 console.print("[red]ROOT and EFI cannot be the same partition.[/red]")
                 sys.exit(1)
             validate_efi_partition(efi_part)
-            tmp_obj=None
+            temporary = None
             try:
-                mnt=is_mounted(str(efi_part))
-                tp=mnt
-                if not mnt:
-                    tmp_obj=tempfile.TemporaryDirectory(prefix="dusky_efi_check_")
-                    tp=tmp_obj.name
-                    run("mount","--mkdir","-t","vfat","-o","ro,noexec,nosuid,nodev",str(efi_part),tp,check=False,capture=True)
-                if tp and Path(tp,"EFI","Microsoft").is_dir():
-                    console.print(Align.center(Panel.fit(f"[cyan]Dual-boot Windows on {efi_part}, preserving[/cyan]", box=box.ROUNDED, border_style="cyan")))
-                if tmp_obj:
-                    run("umount",tp,check=False,capture=True)
-            except:
-                try:
-                    if tmp_obj:
-                        run("umount",tp,check=False,capture=True)
-                except:
-                    pass
+                mountpoint = is_mounted(str(efi_part))
+                if not mountpoint:
+                    temporary = tempfile.mkdtemp(prefix="dusky_efi_check_")
+                    result = run("mount", "-t", "vfat", "-o", "ro,noexec,nosuid,nodev",
+                                 str(efi_part), temporary, check=False)
+                    mountpoint = temporary if result.returncode == 0 else None
+                if mountpoint and Path(mountpoint, "EFI", "Microsoft").is_dir():
+                    console.print(Text(f"Dual-boot Windows on {efi_part}, preserving", style="cyan"))
+            except (OSError, subprocess.TimeoutExpired) as error:
+                console.print(Text(f"Warning: EFI inspection skipped: {error}", style="yellow"))
             finally:
-                try:
-                    if tmp_obj:
-                        tmp_obj.cleanup()
-                except:
-                    pass
+                if temporary:
+                    run("umount", temporary, check=False)
+                    try:
+                        Path(temporary).rmdir()
+                    except OSError:
+                        pass
     construct_subvolume_matrix(mapped_root)
     assemble_fhs(mapped_root,efi_part)
     initialize_swapfile()
     console.print(Align.center(Panel.fit("[bold green]>> DUSKY Setup Complete[/bold green]", box=box.ROUNDED, border_style="green")))
     try:
         r=run("lsblk","-l","-f",str(root_disk),check=False,capture=True)
-        console.print(Align.center(Panel.fit(r.stdout, title=f"lsblk {root_disk}", box=box.ROUNDED, border_style="dim")))
+        console.print(Align.center(Panel.fit(Text(r.stdout), title=f"lsblk {root_disk}", box=box.ROUNDED, border_style="dim")))
     except:
         pass
     try:
         r=run("findmnt","-R","/mnt",check=False,capture=True)
-        console.print(Align.center(Panel.fit(r.stdout, title="findmnt /mnt", box=box.ROUNDED, border_style="dim")))
+        console.print(Align.center(Panel.fit(Text(r.stdout), title="findmnt /mnt", box=box.ROUNDED, border_style="dim")))
     except:
         pass
 
