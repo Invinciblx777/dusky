@@ -2359,6 +2359,9 @@ def choose_release(p: KernelProfile, releases: Sequence[Release], exact_pin: boo
         if not cands:
             raise NetworkError(f"No kernel >= {MIN_KERNEL[0]}.{MIN_KERNEL[1]} found in channel '{channel}' (allow_rc={p.g('release', 'allow_rc')})")
         return cands[0]
+    # The interactive choice explicitly authorizes an RC. allow_rc controls
+    # unattended selection, not which channel is available in this picker.
+    cands = candidates_for(releases, channel, True, p.g("release", "min_version"))
     floor = max(KVer.parse(p.g("release", "min_version")) or KVer(*MIN_KERNEL), KVer(*MIN_KERNEL, rc=0), key=lambda k: k.key())
     listed = {r.version: r for r in releases if r.moniker in CHANNEL_CHOICES and r.kver.key() >= floor.key()}
     if preferred:
@@ -2371,6 +2374,8 @@ def choose_release(p: KernelProfile, releases: Sequence[Release], exact_pin: boo
     default_index = next(i for i, r in enumerate(selectable, 1) if r.version == default_version)
     rule("Select kernel release (profile preference marked ★)")
     default_label = "★ profile default" if preferred or cands else "★ fallback (preferred channel unavailable)"
+    if selectable[default_index - 1].is_rc:
+        default_label += " (RC: explicit selection)"
     rows = [[str(i), r.version, r.moniker, r.released, default_label if i == default_index else ""]
             for i, r in enumerate(selectable, 1)]
     unavailable = sorted((r for r in releases if r.moniker in CHANNEL_CHOICES and r.kver.key() < floor.key()),
@@ -2378,7 +2383,9 @@ def choose_release(p: KernelProfile, releases: Sequence[Release], exact_pin: boo
     rows.extend(["–", r.version, r.moniker, r.released, f"below {floor} minimum"] for r in unavailable)
     table(["#", "version", "channel", "released", "status"], rows)
     if not (preferred or cands):
-        warn(f"Profile channel '{channel}' has no selectable release; choose a supported version")
+        warn(f"Profile channel '{channel}' has no release at or above {floor} in this feed; choose another channel's supported release")
+    if not p.g("release", "allow_rc") and any(r.is_rc for r in selectable):
+        note("RCs may be selected explicitly here; unattended RC selection requires --allow-rc")
     return selectable[ask_index("Release", len(selectable), default_index) - 1]
 
 

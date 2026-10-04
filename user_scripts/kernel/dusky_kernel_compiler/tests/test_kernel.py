@@ -144,6 +144,23 @@ class AuditTests(unittest.TestCase):
         k.cross_validate(p)
         self.assertFalse(profile().g('release', 'allow_rc'))
 
+    def test_mainline_rc_is_available_interactively_without_automatic_rc_opt_in(self):
+        p = profile(); p.set('release', 'channel', 'mainline')
+        releases = [k.Release('7.3-rc5', 'mainline', '2026-09-27', 'rc', None),
+                    k.Release('7.2.9', 'stable', '2026-10-03', 'stable', None)]
+        with patch.object(k, 'interactive', return_value=True), patch.object(k, 'warn') as warning, \
+             patch.object(k, 'table') as table, \
+             patch.object(k, 'ask_index', return_value=1) as choose:
+            self.assertEqual(k.choose_release(p, releases).version, '7.3-rc5')
+            warning.assert_not_called()
+            choose.assert_called_once_with('Release', 1, 1)
+            self.assertIn('profile default', table.call_args.args[1][0][4])
+            self.assertIn('RC: explicit selection', table.call_args.args[1][0][4])
+        self.assertFalse(p.g('release', 'allow_rc'))
+        with patch.object(k, 'interactive', return_value=False):
+            with self.assertRaises(k.NetworkError):
+                k.choose_release(p, releases)
+
     def test_release_picker_shows_supported_channels_and_profile_default(self):
         releases = [k.Release('7.4-rc4', 'mainline', '2026-09-20', 'rc', None),
                     k.Release('7.3.7', 'stable', '2026-09-21', 'stable', None),
