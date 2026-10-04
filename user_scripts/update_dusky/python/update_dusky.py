@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # ==============================================================================
-#  DUSKY UPDATER (v9.7.3)
+#  DUSKY UPDATER (v9.7.5)
 # ==============================================================================
 import sys
 
-if sys.version_info < (3, 14):
-    sys.stdout.write("\033[1;31m[FATAL]\033[0m Dusky requires Python 3.14+ bleeding-edge architecture.\n")
+if sys.version_info < (3, 14, 7):
+    sys.stdout.write("\033[1;31m[FATAL]\033[0m Dusky requires Python 3.14.7+ bleeding-edge architecture.\n")
     sys.exit(1)
 
 import argparse
@@ -49,7 +49,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
-VERSION = "9.7.4"
+VERSION = "9.7.5"
 SCRIPT_DIR: Path = Path(__file__).resolve().parent
 SCRIPT_PATH: Path = Path(__file__).resolve()
 PROFILES_DIR: Path = Path(
@@ -454,8 +454,8 @@ def version_tuple(value: str) -> tuple[int, ...]:
 
 
 def check_runtime_versions() -> None:
-    if sys.version_info < (3, 14):
-        sys.stderr.write("\033[1;31m[FATAL]\033[0m Python 3.14+ is required.\n")
+    if sys.version_info < (3, 14, 7):
+        sys.stderr.write("\033[1;31m[FATAL]\033[0m Python 3.14.7+ is required.\n")
         sys.exit(1)
     try:
         textual_version = importlib_metadata.version("textual")
@@ -4416,6 +4416,20 @@ def validate_restart_handoff(path: Path | None, profile: 'ProfileConfig') -> dic
         if age > HANDOFF_TTL_SEC or age < -60:
             return None
 
+        if "run_start_mono" in payload or "phase_durations" in payload:
+            start = payload.get("run_start_mono")
+            durations = payload.get("phase_durations")
+            if (isinstance(start, bool) or not isinstance(start, (int, float))
+                    or not math.isfinite(start) or not 0 <= start <= time.monotonic()):
+                return None
+            if not isinstance(durations, dict):
+                return None
+            for key in ("phase1_git", "phase1_5_resolve", "phase2_exec"):
+                value = durations.get(key)
+                if (isinstance(value, bool) or not isinstance(value, (int, float))
+                        or not math.isfinite(value) or value < 0):
+                    return None
+
         tasks = payload.get("git_tasks")
         if not isinstance(tasks, list) or len(tasks) != 5:
             return None
@@ -7664,6 +7678,7 @@ if _HAS_UI:
             self.exit_code: int = 0
             self.pipeline_finished: bool = False
             self._restart_handoff: Path | None = None
+            self._previous_signal_handlers: dict[int, Any] = {}
             self.run_start_mono: float = time.monotonic()
             self.phase_durations: dict[str, float] = {
                 "phase1_git": 0.0,
@@ -7732,6 +7747,10 @@ if _HAS_UI:
             yield ProgressBar(total=len(self.tasks), id="main_progress", show_eta=False)
 
         async def on_mount(self) -> None:
+            loop = asyncio.get_running_loop()
+            for signum in (signal.SIGTERM, signal.SIGHUP):
+                self._previous_signal_handlers[signum] = signal.getsignal(signum)
+                loop.add_signal_handler(signum, self._terminate, signum)
             self.progress = self.query_one("#main_progress", ProgressBar)
 
             self.sleep_inhibitor = SleepInhibitor(enabled=True)
@@ -7796,7 +7815,25 @@ if _HAS_UI:
                     self.add_warning("logging", f"optional retention pruning failed: {e}")
             self.run_worker(self.execute_pipeline(), exclusive=True, thread=False)
 
-        def on_unmount(self) -> None:
+        def _terminate(self, signum: int) -> None:
+            self.exit_code = 128 + signum
+            self.log_main(f"Termination requested: {signal.Signals(signum).name}")
+            if self._restart_handoff is not None:
+                with suppress(OSError):
+                    self._restart_handoff.unlink(missing_ok=True)
+                self._restart_handoff = None
+            self.action_quit()
+
+        async def on_unmount(self) -> None:
+            # Textual cancels workers before unmount but does not await their
+            # cleanup. Keep databases/logs open until the pipeline has finished.
+            with suppress(Exception):
+                await self.workers.wait_for_complete()
+            loop = asyncio.get_running_loop()
+            for signum, previous in self._previous_signal_handlers.items():
+                loop.remove_signal_handler(signum)
+                signal.signal(signum, previous)
+            self._previous_signal_handlers.clear()
             if self.heartbeat_task and not self.heartbeat_task.done():
                 self.heartbeat_task.cancel()
             if self.sleep_inhibitor:
@@ -7836,6 +7873,18 @@ if _HAS_UI:
             if rec not in self.run_warnings:
                 self.run_warnings.append(rec)
 
+        @staticmethod
+        async def _store_call(func, *args, **kwargs):
+            # Cancelling to_thread() cannot stop its running database operation.
+            # Retain and join it before cancellation can close the connection.
+            operation = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+            try:
+                return await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                with suppress(Exception):
+                    await operation
+                raise
+
         async def _safe_state_mark(
             self, task: DuskyTask, status: str, *, exit_code: int | None = None,
             note: str = "", duration: float = 0.0,
@@ -7843,7 +7892,7 @@ if _HAS_UI:
             if self.state_store is None or OPT_DRY_RUN:
                 return True
             try:
-                await asyncio.to_thread(
+                await self._store_call(
                     self.state_store.mark, task, status, exit_code=exit_code,
                     note=note, duration=duration,
                 )
@@ -7859,7 +7908,7 @@ if _HAS_UI:
             if self.once_store is None:
                 return "error"
             try:
-                return await asyncio.to_thread(self.once_store.check_marker_status, task, self.profile.name)
+                return await self._store_call(self.once_store.check_marker_status, task, self.profile.name)
             except Exception as e:
                 self.add_warning(
                     "persistence", f"once-state read failed; task skipped to avoid an unsafe rerun: {e}",
@@ -7871,7 +7920,7 @@ if _HAS_UI:
             if self.once_store is None or OPT_DRY_RUN:
                 return True
             try:
-                await asyncio.to_thread(self.once_store.mark_sealed_notified, task, self.profile.name)
+                await self._store_call(self.once_store.mark_sealed_notified, task, self.profile.name)
                 return True
             except Exception as e:
                 self.add_warning("persistence", f"once sealed-notification write failed: {e}", task=task.name)
@@ -7881,7 +7930,7 @@ if _HAS_UI:
             if self.once_store is None or OPT_DRY_RUN:
                 return True
             try:
-                await asyncio.to_thread(
+                await self._store_call(
                     self.once_store.mark_success, task, self.profile.name,
                     exit_code=exit_code, run_id=getattr(self, "run_id", ""),
                 )
@@ -7966,6 +8015,9 @@ if _HAS_UI:
                     handoff.unlink(missing_ok=True)
             if payload is None:
                 return False
+            if "run_start_mono" in payload:
+                self.run_start_mono = payload["run_start_mono"]
+                self.phase_durations.update(payload["phase_durations"])
             self.git_summary.update(payload["git_summary"])
             for warning in payload.get("warnings", []):
                 if isinstance(warning, dict):
@@ -8873,24 +8925,10 @@ if _HAS_UI:
                     return 124, "timeout"
 
         def _request_interactive_cancel(self) -> None:
-            """Signal a shared-group interactive child by PID (never killpg).
-
-            Sets the worker's cancel event and best-effort TERMs the direct
-            child; the helper thread performs tree cleanup and reaping.
-            """
-            try:
-                event = getattr(self, "_interactive_cancel", None)
-                if event is not None:
-                    event.set()
-            except Exception:
-                pass
-            try:
-                proc = getattr(self, "_interactive_proc", None)
-                if proc is not None and proc.poll() is None:
-                    with suppress(ProcessLookupError, PermissionError, OSError):
-                        os.kill(proc.pid, signal.SIGTERM)
-            except Exception:
-                pass
+            """Let the wait worker capture descendants before signaling them."""
+            event = self._interactive_cancel
+            if event is not None:
+                event.set()
 
         async def _execute_task_inner(self, index: int) -> str:
             task = self.tasks[index]
@@ -9136,8 +9174,12 @@ if _HAS_UI:
                             self.log_task(f"\n[bold {THEME['error']}]>>> EXECUTION FAILED (Code {rc})[/]", index)
                         return "failed"
 
+            except asyncio.CancelledError:
+                task.duration = time.monotonic() - start_t
+                raise
             except Exception as e:
                 duration = time.monotonic() - start_t
+                task.duration = duration
                 err_msg = f"[bold {THEME['error']}][ERROR][/] Internal Exception: {escape(str(e))}"
                 self.log_main(err_msg)
                 self.log_task(err_msg, index)
@@ -9437,11 +9479,11 @@ if _HAS_UI:
             self.update_task_state(index, task.outcome)
             if index >= 5:
                 await self._safe_state_mark(
-                    task, task.outcome, exit_code=task.exit_code, note=reason, duration=0.0
+                    task, task.outcome, exit_code=task.exit_code, note=reason, duration=task.duration
                 )
             code = task.exit_code if task.exit_code is not None else (0 if task.outcome != "failed" else 1)
             self._safe_close_task_log(
-                task, index, "completed" if task.outcome == "success" else task.outcome, code, 0.0
+                task, index, "completed" if task.outcome == "success" else task.outcome, code, task.duration
             )
 
         def _outcome_counts(self) -> dict[str, int]:
@@ -9512,7 +9554,7 @@ if _HAS_UI:
                 # never execute the generic skip branch (which would overwrite
                 # all five with skipped) nor re-run sync. Preserve exact.
                 self.log_main("[dim]Preserving exact git outcomes from restart handoff; skipping re-sync.[/dim]")
-                self.phase_durations["phase1_git"] = time.monotonic() - p1_start
+                self.phase_durations["phase1_git"] += time.monotonic() - p1_start
             elif not OPT_SKIP_SYNC or (OPT_POST_SELF_UPDATE and not handoff_ok):
                 if OPT_DRY_RUN:
                     self.log_main(f"\n[bold {THEME['accent']}]═══ Phase 1: Git Architecture Reconciliation (DRY-RUN) ═══[/]\n")
@@ -9896,7 +9938,8 @@ if _HAS_UI:
                     if self.tasks[index].status in ("pending", "running"):
                         await self._finalize_task(index, "skipped", "cancelled", 130)
                 self.abort_flag = True
-                self.exit_code = 130
+                if self.exit_code == 0:
+                    self.exit_code = 130
                 await self._stop_periodic()
                 if self.run_logger:
                     counts = self._outcome_counts()
@@ -10401,20 +10444,8 @@ if _HAS_UI:
 
         def action_quit(self) -> None:
             self.abort_flag = True
-            # Best-effort child shutdown so quit does not orphan live
-            # children: TERM the process group, then exit. The pipeline's
-            # cancellation path does bounded TERM→KILL, reaps, and finalizes.
-            # A shared-group interactive child is signaled by PID only.
-            pid = getattr(self, "active_child_pid", None)
-            if pid is not None and not getattr(self, "active_child_group", False) and getattr(self, "_interactive_proc", None) is not None:
-                self._request_interactive_cancel()
-            elif pid is not None:
-                try:
-                    if _pg_has_owned_member(pid):
-                        with suppress(ProcessLookupError, PermissionError, OSError):
-                            os.killpg(pid, signal.SIGTERM)
-                except Exception:
-                    pass
+            # Worker cancellation owns child cleanup and reaping. Signaling
+            # here could race task finalization or orphan interactive children.
             self.exit()
 
         def _show_completion_dialog(self, title: str, message: str, level: str) -> None:
@@ -10535,6 +10566,8 @@ if _HAS_UI:
                 "git_tasks": git_tasks,
                 "git_summary": self.git_summary if isinstance(getattr(self, "git_summary", None), dict) else {},
                 "warnings": list(self.run_warnings),
+                "run_start_mono": self.run_start_mono,
+                "phase_durations": dict(self.phase_durations),
                 "restart_generation": previous_generation + 1,
                 "sudo": {"mode": sudo_mode if sudo_mode in ("password", "nopasswd") else "none",
                          "askpass_path": askpass,
