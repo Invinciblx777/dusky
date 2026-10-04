@@ -22,10 +22,15 @@ SCHEMA_PATH = USER_SCRIPTS / "fonts/tui_fonts.py"
 
 # Official Arch packages required by the default font deployment. Install before
 # schema discovery or D-Bus startup so a fresh system can bootstrap both.
+FONT_PACKAGES = {
+    "Atkinson Hyperlegible": "ttf-atkinson-hyperlegible",
+    "JetBrainsMono Nerd Font Mono": "ttf-jetbrains-mono-nerd",
+    "Noto Color Emoji": "noto-fonts-emoji",
+    "Liberation Serif": "ttf-liberation",
+}
 REQUIRED_PACKAGES = (
     "fontconfig", "glib2", "dconf", "gsettings-desktop-schemas", "dbus",
-    "ttf-atkinson-hyperlegible", "ttf-jetbrains-mono-nerd",
-    "noto-fonts-emoji", "ttf-liberation",
+    *FONT_PACKAGES.values(),
 )
 
 
@@ -53,6 +58,23 @@ def ensure_packages() -> None:
     subprocess.run(command, check=True)
     subprocess.run(["pacman", "--query", "--quiet", "--", *REQUIRED_PACKAGES],
                    check=True, stdout=subprocess.DEVNULL)
+
+
+def ensure_font_cache() -> None:
+    # An installed package can still be invisible through a stale ISO cache.
+    # Repair before schema discovery and the engine's pre-write validation;
+    # the engine's post-write rebuild happens too late for missing families.
+    proc = subprocess.run(
+        ["fc-list", "--format=%{[]family{%{family}\n}}", ":"],
+        check=True, capture_output=True, text=True, timeout=30,
+    )
+    if proc.stderr.strip():
+        raise RuntimeError(proc.stderr.strip())
+    installed = {family.strip().casefold() for family in proc.stdout.splitlines()}
+    missing = [family for family in FONT_PACKAGES if family.casefold() not in installed]
+    if missing:
+        print(f"[CACHE] Rebuilding for missing families: {', '.join(missing)}", flush=True)
+        subprocess.run(["fc-cache", "--force"], check=True, timeout=120)
 
 
 def _load_schema():
@@ -87,6 +109,7 @@ def main() -> int:
                 and os.environ.get("GSETTINGS_BACKEND", "dconf") == "dconf"):
             os.execvp("dbus-run-session", ["dbus-run-session", "--", sys.executable,
                        str(Path(__file__).resolve()), *sys.argv[1:]])
+        ensure_font_cache()
         mod = _load_schema()
         from python.engines.fontconfig import FontconfigEngine
 
