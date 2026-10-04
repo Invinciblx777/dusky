@@ -158,6 +158,319 @@ class GitTests(BareRepoCase):
         self.commit([('[foo]', None, '??')])
         self.assertEqual(self.git('show', 'HEAD:[foo]'), b'yes')
 
+class AuditTests(BareRepoCase):
+    def test_manifest_rename_keeps_both_sides(self):
+        self.git('mv', 'a', 'outside')
+        for scope in ['a', 'outside']:
+            self.write('.manifest', scope + '\n')
+            self.assertEqual(m.scoped_entries(), [('outside', 'a', 'R ')])
+        self.commit(m.scoped_entries())
+        self.assertEqual(self.git('show', 'HEAD:outside'), b'base\n')
+        self.assertEqual(self.git('ls-tree', '--name-only', 'HEAD', 'a'), b'')
+
+    def preview(self, name):
+        with patch.object(m.shutil, 'which', return_value=None), patch('sys.stdout', new_callable=io.StringIO) as out:
+            m.handle_diff_preview('', name, [])
+            return out.getvalue()
+
+    def test_preview_preserves_literal_whitespace_names(self):
+        for name in ['[x]', 'x', ' spaced ']:
+            self.write(name, 'base\n')
+        self.git('add', '.')
+        self.git('commit', '-qm', 'names')
+        self.write('[x]', 'chosen-marker\n')
+        self.write('x', 'wrong-marker\n')
+        self.write(' spaced ', 'space-marker\n')
+        self.assertIn('chosen-marker', self.preview('[x]'))
+        self.assertNotIn('wrong-marker', self.preview('[x]'))
+        self.assertIn('space-marker', self.preview(' spaced '))
+
+    def test_preview_staged_addition_and_non_utf8_content(self):
+        self.write('new', 'staged-marker\n')
+        self.git('add', 'new')
+        self.assertIn('staged-marker', self.preview('new'))
+        (self.w / 'new').unlink()
+        self.assertEqual(self.preview('new'), '')
+        (self.w / 'raw').write_bytes(b'non-utf8-\xff\n')
+        self.assertIn('non-utf8-', self.preview('raw'))
+
+    def test_numstat_rename_and_control_names(self):
+        self.git('mv', 'a', 'renamed')
+        self.write('renamed', 'edited\n')
+        self.write('tab\tline\nbreak', 'different content\n')
+        self.git('add', '.')
+        stats = m.get_numstat_map()
+        self.assertIn('renamed', stats)
+        self.assertIn('tab\tline\nbreak', stats)
+
+    def test_python_picker_roundtrips_control_names(self):
+        names = ['tab\tname', 'line\nbreak', '[literal]', ' spaced ']
+        for name in names:
+            self.write(name, 'new')
+        def select(choices, **kwargs):
+            self.assertIn('--diff-preview-json', kwargs['preview'])
+            return choices
+        with patch.object(m, 'fzf_select', side_effect=select), patch.object(m, 'stage_entries') as stage:
+            m.sync_single()
+        self.assertEqual({entry[0] for entry in stage.call_args.args[0]}, set(names))
+
+    def test_json_preview_cli(self):
+        import json
+        (self.w / 'dusky').symlink_to(self.g, target_is_directory=True)
+        name = 'tab\tline\nbreak'
+        self.write(name, 'preview-cli-marker\n')
+        result = subprocess.run([sys.executable, '-B', str(ROOT / 'git_dusky.py'),
+            '--diff-preview-json', '', json.dumps(name)], env=self.env | {'HOME': str(self.w)},
+            capture_output=True, check=True)
+        self.assertIn(b'preview-cli-marker', result.stdout)
+
+    def test_preview_batches_tracked_files(self):
+        self.write('a', 'edited-a')
+        self.write('b', 'edited-b')
+        with patch.object(m, 'run_git', wraps=m.run_git) as calls, patch.object(m.shutil, 'which', return_value=None), patch('sys.stdout', new_callable=io.StringIO):
+            m.handle_diff_preview('', 'a', ['a', 'b'])
+        self.assertEqual(calls.call_count, 3)
+
+    def test_shell_selection_roundtrip(self):
+        config = ROOT.parents[1] / '.config/zshrc/git'
+        self.git('mv', 'a', ' spaced ')
+        self.git('commit', '-qm', 'rename')
+        result = subprocess.run(['zsh', '-fc',
+            'source "$1"; function fzf() { printf "enter\\0"; /usr/bin/cat; }; function _gitdelta_show() { printf "%s\\0" "$@"; }; _gitdelta_select 1',
+            'audit', str(config)], env=self.env | {'HOME': str(self.w), 'DUSKY_GIT_DIR': str(self.g)}, capture_output=True, check=True)
+        self.assertIn(b' spaced ', result.stdout.split(b'\0'))
+
+    def test_shell_staging_failure_propagates(self):
+        config = ROOT.parents[1] / '.config/zshrc/git'
+        self.write('.manifest', 'a\n')
+        result = subprocess.run(['zsh', '-fc',
+            'source "$1"; DUSKY_GIT_LIST="$HOME/.manifest"; function git_dusky() { return 7; }; git_dusky_add_list',
+            'audit', str(config)], env=self.env | {'HOME': str(self.w)}, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_shell_selector_uses_literal_paths(self):
+        config = ROOT.parents[1] / '.config/zshrc/git'
+        names = ['unicodé', 'with|pipe', 'line\nbreak', 'tab\tfile', '\x1b[31mescape', ' spaced ']
+        for name in names:
+            self.write(name, 'new\n')
+        self.git('add', '.')
+        result = subprocess.run(['zsh', '-fc',
+            'source "$1"; _gitdelta_render_stream "" fzf_items', 'audit', str(config)],
+            env=self.env | {'HOME': str(self.w), 'DUSKY_GIT_DIR': str(self.g)}, capture_output=True, check=True)
+        paths = [record.split(b'\t', 1)[1] for record in result.stdout.split(b'\0') if record]
+        for name in names:
+            self.assertIn(name.encode(), paths)
+
+class SecondPassTests(BareRepoCase):
+    def shell(self, script, *, env=None, input_data=b''):
+        config = ROOT.parents[1] / '.config/zshrc/git'
+        return subprocess.run(['zsh', '-fc', 'source "$1"\n' + script, 'test', str(config)],
+            env=self.env | {'HOME': str(self.w), 'DUSKY_GIT_DIR': str(self.g)} | (env or {}),
+            input=input_data, capture_output=True)
+
+    def test_shell_manifest_home_prefixes(self):
+        self.write('one', 'first')
+        self.write('two', 'second')
+        self.write('.manifest', '$HOME/one\n~/two\n')
+        result = self.shell('DUSKY_GIT_LIST="$HOME/.manifest"; git_dusky_add_list')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.git('ls-files', '-z', 'one', 'two'), b'one\0two\0')
+
+    def test_shell_git_errors_are_not_clean_results(self):
+        for script in ['_gitdelta_render_stream nonexistent fzf_items',
+                       '_gitdelta_render_stream nonexistent', '_gitdelta_show nonexistent',
+                       'git_dusky symbolic-ref HEAD refs/heads/unborn; gitdelta a']:
+            with self.subTest(script=script):
+                result = self.shell(script)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn(b'no changed files', result.stdout + result.stderr)
+
+    def test_shell_diff_failure_stops_before_commit(self):
+        result = self.shell('''function git_dusky() {
+            if [[ $1 == diff ]]; then return 23; fi
+            if [[ $1 == commit ]]; then print UNEXPECTED_COMMIT; fi
+            return 0
+        }
+        git_dusky_push "$HOME/a"''', input_data=b'message\n')
+        self.assertEqual(result.returncode, 23)
+        self.assertNotIn(b'UNEXPECTED_COMMIT', result.stdout)
+        self.assertNotIn(b'Commit message for', result.stderr)
+
+    def test_diff_stream_failure_and_pager_close_status(self):
+        bindir = self.root / 'bin'
+        bindir.mkdir()
+        renderer = bindir / 'delta'
+        renderer.write_text('#!/bin/sh\n/usr/bin/cat >/dev/null\nexit "$TEST_RENDERER"\n')
+        renderer.chmod(0o755)
+        for producer, consumer, expected in [(7, 0, 7), (0, 9, 9), (141, 0, 0), (0, 141, 141)]:
+            with self.subTest(producer=producer, consumer=consumer):
+                result = self.shell('function _gitdelta_render_stream() { return $TEST_PRODUCER; }; _gitdelta_show',
+                    env={'TEST_PRODUCER': str(producer), 'TEST_RENDERER': str(consumer),
+                         'PATH': str(bindir) + os.pathsep + self.env['PATH']})
+                self.assertEqual(result.returncode, expected, result.stderr)
+
+    def test_editor_arguments_and_surviving_selected_file(self):
+        self.write('b', 'one\ntwo\nthree\n')
+        self.git('add', 'b')
+        self.git('commit', '-qm', 'lines')
+        self.write('b', 'one\nchanged\nthree\n')
+        (self.w / 'a').unlink()
+        editor = self.root / 'editor with space'
+        output = self.root / 'editor-args'
+        editor.write_text('#!/bin/sh\nprintf "%s\\0" "$@" > "$EDITOR_OUTPUT"\n')
+        editor.chmod(0o755)
+        result = self.shell('function fzf() { printf "ctrl-e\\0"; /usr/bin/cat; }; _gitdelta_select',
+            env={'EDITOR': f'"{editor}" --flag', 'EDITOR_OUTPUT': str(output)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output.read_bytes().split(b'\0')[:-1],
+                         [b'--flag', b'+2', os.fsencode(self.w / 'b')])
+
+    def test_directory_symlink_preview(self):
+        (self.w / 'directory-link').symlink_to('.')
+        with patch.object(m.shutil, 'which', return_value=None), patch('sys.stdout', new_callable=io.StringIO) as output:
+            m.handle_diff_preview('', 'directory-link', [])
+        self.assertIn("'directory-link' → '.'", output.getvalue())
+
+    def test_file_disappearing_during_preview_reports_error(self):
+        self.write('vanishes', 'contents')
+        original = m.run_git
+        def run(*args, **kwargs):
+            if args[0] == 'diff' and '--no-index' in args:
+                (self.w / 'vanishes').unlink()
+            return original(*args, **kwargs)
+        with patch.object(m, 'run_git', side_effect=run):
+            with self.assertRaisesRegex(RuntimeError, 'File preview failed'):
+                m.handle_diff_preview('', 'vanishes', [])
+
+    def test_preview_cli_uses_configured_repo_and_validates_arguments(self):
+        result = subprocess.run([sys.executable, '-B', str(ROOT / 'git_dusky.py'),
+            '--diff-preview', '', 'a'], env=self.env | {'HOME': str(self.w), 'DUSKY_GIT_DIR': str(self.g)},
+            capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for args in [['--move-preview', 'invalid'], ['--diff-preview'], ['3', 'extra'],
+                     ['--key-escape', 'extra'], ['--diff-preview-json', '', 'bad-json']]:
+            with self.subTest(args=args):
+                result = subprocess.run([sys.executable, '-B', str(ROOT / 'git_dusky.py'), *args],
+                    env=self.env | {'HOME': str(self.w), 'DUSKY_GIT_DIR': str(self.g)}, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn(b'Traceback', result.stdout + result.stderr)
+
+    def test_failed_action_sets_cli_exit_status(self):
+        with patch.object(m, 'check_dependencies'), patch.object(m, 'sync_all', return_value=False), patch('sys.argv', ['dusky', '3']):
+            with self.assertRaises(SystemExit) as exit_status:
+                m.main()
+        self.assertEqual(exit_status.exception.code, 1)
+        with patch.object(m, 'sync_all', side_effect=RuntimeError('failed')):
+            self.assertFalse(m.dispatch('3'))
+
+    def test_failed_commit_hook_sets_failure_result(self):
+        self.write('a', 'edit')
+        hook = self.g / 'hooks/pre-commit'
+        hook.write_text('#!/bin/sh\nexit 1\n')
+        hook.chmod(0o755)
+        before = self.git('rev-parse', 'HEAD')
+        with patch.object(m, 'ask', return_value='message'):
+            self.assertFalse(m.stage_entries([('a', None, ' M')], local_only=True))
+        self.assertEqual(self.git('rev-parse', 'HEAD'), before)
+
+    def test_detached_step_back_leaves_local_state(self):
+        self.write('a', 'second')
+        self.git('add', 'a')
+        self.git('commit', '-qm', 'second')
+        self.git('checkout', '--detach')
+        self.write('a', 'private edits')
+        before = self.git('rev-parse', 'HEAD')
+        with patch.object(m, 'ask_yesno', side_effect=AssertionError('must check branch first')):
+            self.assertFalse(m.quick_step_back())
+        self.assertEqual(self.git('rev-parse', 'HEAD'), before)
+        self.assertEqual((self.w / 'a').read_text(), 'private edits')
+
+    def test_force_push_recovery_sets_new_upstream(self):
+        remote = self.root / 'remote'
+        subprocess.run(['git', 'init', '--bare', '--initial-branch=main', str(remote)],
+            env={k: v for k, v in self.env.items() if k not in ('GIT_DIR', 'GIT_WORK_TREE')},
+            check=True, stdout=subprocess.DEVNULL)
+        self.git('remote', 'add', 'origin', str(remote))
+        self.git('push', 'origin', 'main')
+        old = self.git('rev-parse', 'HEAD').decode().strip()
+        self.write('a', 'remote')
+        self.git('add', 'a')
+        self.git('commit', '-qm', 'remote')
+        self.git('push', 'origin', 'main')
+        self.git('reset', '--hard', old)
+        self.write('b', 'local')
+        self.git('add', 'b')
+        self.git('commit', '-qm', 'local')
+        with patch.object(m, 'ask_yesno', return_value=True), patch.object(m, 'ask', return_value='2'):
+            self.assertTrue(m.safe_push())
+        self.assertEqual(m.upstream_target('main'), ('origin', 'refs/heads/main'))
+
+    def test_sha256_initial_selected_commit_preserves_other_index(self):
+        self.g = self.root / 'sha256'
+        subprocess.run(['git', 'init', '--bare', '--object-format=sha256', '--initial-branch=main', str(self.g)],
+            env={k: v for k, v in self.env.items() if k not in ('GIT_DIR', 'GIT_WORK_TREE')},
+            check=True, stdout=subprocess.DEVNULL)
+        self.env['GIT_DIR'] = str(self.g)
+        m.GIT_DIR = self.g
+        self.git('add', 'a', 'b')
+        before = self.git('ls-files', '-s', 'b')
+        self.commit([('a', None, 'A ')])
+        self.assertEqual(self.git('ls-tree', '--name-only', 'HEAD'), b'a\n')
+        self.assertEqual(self.git('show', 'HEAD:a'), b'base\n')
+        self.assertEqual(self.git('ls-files', '-s', 'b'), before)
+
+
+class SecondPassTerminalTests(BareRepoCase):
+    def terminal(self, executable, args):
+        try:
+            import pexpect
+        except ImportError:
+            self.skipTest('pexpect is required for terminal tests')
+        env = self.env | {'HOME': str(self.w), 'DUSKY_GIT_DIR': str(self.g), 'TERM': 'xterm-256color',
+            'FZF_DEFAULT_OPTS': '--height=10% --bind=enter:abort --preview=echo BAD',
+            'FZF_DEFAULT_OPTS_FILE': '/does/not/exist'}
+        child = pexpect.spawn(executable, args, env=env, encoding='utf-8', timeout=10, dimensions=(40,140))
+        self.addCleanup(child.close, force=True)
+        return child, pexpect
+
+    def test_python_search_escape_then_quit(self):
+        code = f"import runpy; m=runpy.run_path({str(ROOT / 'git_dusky.py')!r}); print('RESULT',repr(m['fzf_select'](['alpha','beta'])))"
+        child, pexpect = self.terminal(sys.executable, ['-B', '-c', code])
+        child.expect_exact('\x1b[?1049h')
+        child.send('\x1b[1;1R')
+        child.expect_exact('q:quit')
+        child.send('/')
+        child.expect_exact('search ❯')
+        child.send('alpha\x1b')
+        child.expect_exact('q:quit')
+        child.send('\x1b')
+        child.expect_exact('RESULT []')
+        child.expect(pexpect.EOF)
+        child.close()
+        self.assertEqual(child.exitstatus, 0)
+
+    def test_shell_real_preview_and_selection_preserve_control_names(self):
+        name = ' spaced\tline\nbreak\x1b[31m '
+        self.write(name, 'old\n')
+        self.git('add', '.')
+        self.git('commit', '-qm', 'name')
+        self.write(name, 'TERMINAL_PREVIEW_MARKER\n')
+        self.write('.git_dusky_list', '')
+        helper = self.w / 'user_scripts/git/git_dusky.py'
+        helper.parent.mkdir(parents=True)
+        helper.symlink_to(ROOT / 'git_dusky.py')
+        config = ROOT.parents[1] / '.config/zshrc/git'
+        child, pexpect = self.terminal('zsh', ['-fc', 'source "$1"; _gitdelta_select; print -r -- "RESULT=$?"', 'test', str(config)])
+        child.expect_exact('\x1b[?1049h')
+        child.send('\x1b[1;1R')
+        child.expect_exact('TERMINAL_PREVIEW_MARKER')
+        child.send('\r')
+        child.expect_exact('RESULT=0')
+        child.expect(pexpect.EOF)
+        child.close()
+        self.assertEqual(child.exitstatus, 0)
+
+
 class TimeMachineTests(BareRepoCase):
 
     def run_tm(self, script):
@@ -270,7 +583,9 @@ class TimeMachineTests(BareRepoCase):
         try:
             child.expect_exact('\x1b[?1049h')
             child.send('\x1b[1;1R')
-            child.expect('Time Machine')
+            # Startup transforms replace the fixed title prompt with the
+            # current phase; either frame proves the picker is ready.
+            child.expect(r'Time Machine| :: present [0-9a-f]+')
             child.send('\x1b')
             child.expect(pexpect.EOF)
             child.close()
@@ -458,7 +773,7 @@ class ShellIntegrationTests(unittest.TestCase):
     def test_shell_commit_prompt_arrow_editing(self):
         # Exercise the real shell helper, with Git stubbed to prevent writes.
         script = self.home / 'check.zsh'
-        script.write_text('source "$1"\nfunction git_dusky() {\n case "$1" in\n diff) return 1 ;;\n commit) print -r -- "MESSAGE=$3" ;;\n branch) print main ;;\n esac\n return 0\n}\ngit_dusky_push "$HOME/fixture"\n')
+        script.write_text('source "$1"\nfunction git_dusky() {\n case "$1" in\n diff) [[ $3 == --quiet ]] && return 1 ;;\n commit) print -r -- "MESSAGE=$3" ;;\n branch) print main ;;\n esac\n return 0\n}\ngit_dusky_push "$HOME/fixture"\n')
         child = self.pexpect.spawn('zsh', ['-f', str(script), str(self.config)], env=self.env, encoding='utf-8', timeout=10)
         try:
             child.expect_exact("Commit message for 'fixture': ")

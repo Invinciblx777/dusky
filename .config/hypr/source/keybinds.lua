@@ -477,7 +477,11 @@ hl.bind(
 
 
 -- --- Clipboard & Screenshot ---
-local clipboard_state_file = os.getenv("HOME") .. "/.config/dusky/settings/clipboard_state"
+local clipboard_config_home = os.getenv("XDG_CONFIG_HOME")
+if not clipboard_config_home or clipboard_config_home == "" then
+    clipboard_config_home = os.getenv("HOME") .. "/.config"
+end
+local clipboard_state_file = clipboard_config_home .. "/dusky/settings/clipboard_state"
 local use_terminal_clipboard = true
 local f_state = io.open(clipboard_state_file, "r")
 if f_state then
@@ -493,7 +497,7 @@ if use_terminal_clipboard then
         os.execute("pkill -15 -f '^foot.*terminal_clipboard'")
         hl.dispatch(hl.dsp.exec_cmd(
             "foot --app-id=terminal_clipboard.sh " ..
-            os.getenv("HOME") .. "/user_scripts/clipboard/terminal_clipboard.sh"
+            "'" .. (os.getenv("HOME") .. "/user_scripts/clipboard/terminal_clipboard.sh"):gsub("'", "'\\''") .. "'"
         ))
     end, { description = "Clipboard History (Terminal)" })
 else

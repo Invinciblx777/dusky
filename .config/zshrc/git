@@ -10,8 +10,7 @@
 #   gitdelta list          fzf commit browser with live delta preview
 #   lazygit_dusky · dusky  lazygit / dashboard entry points
 #
-#   Forks removed: realpath, sed, head, 5 colour command-substitutions, and
-#   two `( ... )` subshells.  `gitdelta list` : 16 -> 3 (git, fzf, delta).
+#   Path resolution and cached colour lookup use zsh builtins.
 #
 #   Spec anchors:
 #     git-add(1)        --pathspec-from-file / --pathspec-file-nul / -u
@@ -102,9 +101,11 @@ function git_dusky_add_list() {
                 clean=${${line##[[:space:]]##}%%[[:space:]]##}
                 [[ -z $clean || $clean == '#'* ]] && continue
 
-                # Try every line as a pattern exactly once; only fall back to an
-                # existence test.  This covers *, ?, [..], {a,b}, <->, (a|b),
-                # **/ , ^x and x~y — the old *[\*\?\[]* probe missed most of them.
+                # Expand supported home prefixes before filesystem matching.
+                [[ $clean == '~/'* ]] && clean=$HOME/${clean#\~/}
+                [[ $clean == '$HOME/'* ]] && clean=$HOME/${clean#\$HOME/}
+                # Match zsh filename patterns, then allow literal paths and
+                # broken symlinks. Brace expansion is not performed here.
                 matches=( ${~clean}(N) )
                 if (( ! $#matches )); then
                     if [[ -e $clean || -L $clean ]]; then
@@ -137,11 +138,13 @@ function git_dusky_add_list() {
                 if ! printf ':(literal,top)%s\0' "${valid[@]}" |
                      git_dusky add --pathspec-from-file=- --pathspec-file-nul; then
                     print -ru2 -- "${CR}✖ git add failed for manifest paths${C0}"
+                    return 1
                 fi
             fi
 
             if ! git_dusky add -u; then
                 print -ru2 -- "${CR}✖ git add -u failed${C0}"
+                return 1
             fi
 
             # `add -u` walks the ENTIRE work tree ($HOME): never hide deletions.
@@ -238,34 +241,75 @@ function _gitdelta_render_stream() {
             local -a filter_arg=()
             (( $#file_filters )) && filter_arg=( -- "${(@)file_filters/#/:(literal,top)}" )
 
+            # Selector identities come from machine-readable output, never
+            # from Git's quoted, abbreviated or rename-formatted stat labels.
+            if [[ $mode == fzf_items ]]; then
+                local -a records
+                local raw_records record add del item_path old display
+                local TAB=$'\t'
+                local -i i
+                if [[ -n $target ]]; then
+                    raw_records=$(git_dusky show --numstat -z --format='' "$target" "${filter_arg[@]}") || return $?
+                else
+                    raw_records=$(git_dusky diff --numstat -z HEAD "${filter_arg[@]}") || return $?
+                fi
+                records=( ${(0)raw_records} )
+                for (( i=1; i <= $#records; ++i )); do
+                    record=$records[i]
+                    add=${record%%$TAB*}
+                    record=${record#*$TAB}
+                    del=${record%%$TAB*}
+                    item_path=${record#*$TAB}
+                    old=''
+                    if [[ -z $item_path ]]; then
+                        (( ++i )); old=$records[i]
+                        (( ++i )); item_path=$records[i]
+                    fi
+                    display=${(V)item_path}
+                    [[ -n $old ]] && display+=" (from ${(V)old})"
+                    if [[ $add == - ]]; then
+                        display+=' (binary)'
+                    else
+                        display+=" (+$add, -$del)"
+                    fi
+                    # The path occupies all remaining fields, so tabs inside
+                    # filenames remain intact in {s2..} and in selected output.
+                    printf '%s\t%s\0' "$display" "$item_path"
+                done
+                return 0
+            fi
+
             local -a stat_lines numstat_lines
+            local raw_stat raw_numstat
             local C_DIM=$'\e[38;5;242m' C_GREEN=$'\e[32m' C_RED=$'\e[31m' C_RESET=$'\e[0m'
             local TAB=$'\t'
 
             if [[ -n $target ]]; then
                 local header
-                if [[ $mode != "fzf_items" ]]; then
-                    header="$(git_dusky show --color=always --decorate=short \
+                header="$(git_dusky show --color=always --decorate=short \
                         --date=format-local:'%Y-%m-%d %H:%M' \
                         --format='%C(bold blue)󰏖 %h%C(reset) %C(bold green)%an%C(reset) %C(dim)%ad%C(reset)%d%n%C(bold yellow)%s%C(reset)' \
-                        --no-patch "$target")"
-                fi
-                stat_lines=( ${(f)"$(git_dusky show --color=always --stat-width=1000 --stat-name-width=1000 --stat-graph-width=20 --format='' "$target" "${filter_arg[@]}")"} )
-                numstat_lines=( ${(f)"$(git_dusky show --numstat --format='' "$target" "${filter_arg[@]}")"} )
+                        --no-patch "$target")" || return $?
+                raw_stat=$(git_dusky show --color=always --stat-width=1000 --stat-name-width=1000 --stat-graph-width=20 --format='' "$target" "${filter_arg[@]}") || return $?
+                raw_numstat=$(git_dusky show --numstat --format='' "$target" "${filter_arg[@]}") || return $?
+                stat_lines=( ${(f)raw_stat} )
+                numstat_lines=( ${(f)raw_numstat} )
                 if [[ $#stat_lines -eq 0 ]]; then
                     [[ -n $header ]] && print -r -- "$header"
                     return 0
                 fi
                 [[ -n $header ]] && print -r -- "$header"$'\n'
             else
-                stat_lines=( ${(f)"$(git_dusky diff --color=always --stat-width=1000 --stat-name-width=1000 --stat-graph-width=20 HEAD "${filter_arg[@]}")"} )
-                numstat_lines=( ${(f)"$(git_dusky diff --numstat HEAD "${filter_arg[@]}")"} )
+                raw_stat=$(git_dusky diff --color=always --stat-width=1000 --stat-name-width=1000 --stat-graph-width=20 HEAD "${filter_arg[@]}") || return $?
+                raw_numstat=$(git_dusky diff --numstat HEAD "${filter_arg[@]}") || return $?
+                stat_lines=( ${(f)raw_stat} )
+                numstat_lines=( ${(f)raw_numstat} )
                 if [[ $#stat_lines -eq 0 ]]; then
                     return 0
                 fi
             fi
 
-            typeset -A num_add num_del det_map det_len dir_color
+            typeset -A det_map det_len dir_color
             local line a d p rest det det_pad formatted
             integer max_det_w=0 w pad_det next_color_idx=0
             local base_dir sub_dir file_p lead trail c_base C_DIM_CODE=$'\e[2m'
@@ -291,8 +335,6 @@ function _gitdelta_render_stream() {
                 rest=${line#*$TAB}
                 d=${rest%%$TAB*}
                 p=${rest#*$TAB}
-                num_add[$p]=$a
-                num_del[$p]=$d
                 if [[ $a == "-" && $d == "-" ]]; then
                     det="${C_DIM}(binary)${C_RESET}"
                     w=8
@@ -305,7 +347,7 @@ function _gitdelta_render_stream() {
                 (( w > max_det_w )) && max_det_w=$w
             done
 
-            local raw_p clean_p after_pipe clean_after clean_after_trim cnt cnt_part gr fzf_p
+            local raw_p clean_p after_pipe clean_after clean_after_trim cnt cnt_part gr
             for line in "${stat_lines[@]}"; do
                 if [[ $line == *"|"* ]]; then
                     raw_p=${line%%|*}
@@ -360,28 +402,12 @@ function _gitdelta_render_stream() {
                             formatted="${raw_p}|${after_pipe}  ${det}"
                         fi
 
-                        if [[ $mode == "fzf_items" ]]; then
-                            fzf_p=$clean_p
-                            if [[ $fzf_p == *"=>"* ]]; then
-                                if [[ $fzf_p == (#b)(*)\{([^\}]#)\=\>([^\}]#)\}(*) ]]; then
-                                    local pre=$match[1] new_p=${${match[3]## #}%% #} post=$match[4]
-                                    fzf_p="${pre}${new_p}${post}"
-                                    fzf_p=${fzf_p//\/\///}
-                                elif [[ $fzf_p == (#b)(*)[[:space:]]##\=\>[[:space:]]##(*) ]]; then
-                                    fzf_p=${match[2]}
-                                fi
-                            fi
-                            print -r -- "${fzf_p}${TAB}${formatted}" 2>/dev/null || break
-                        else
-                            print -r -- "${formatted}" 2>/dev/null || break
-                        fi
+                        print -r -- "${formatted}" 2>/dev/null || break
                         continue
                     fi
                 fi
-                [[ $mode != "fzf_items" ]] && print -r -- "$line" 2>/dev/null || break
+                print -r -- "$line" 2>/dev/null || break
             done
-
-            [[ $mode == "fzf_items" ]] && return 0
 
             print -r -- "" 2>/dev/null || true
 
@@ -400,15 +426,23 @@ function _gitdelta_render_stream() {
 
 function _gitdelta_show() {
     emulate -L zsh
+    setopt localoptions pipefail
     local target=${1-} mode=${2-}
+    local -a stream_status
     shift 2 2>/dev/null || shift $#
     if (( ! $+commands[delta] )); then
         _gitdelta_render_stream "$target" "$mode" "$@"
+        return $?
     elif [[ -t 1 ]]; then
         _gitdelta_render_stream "$target" "$mode" "$@" | delta
+        stream_status=( "${pipestatus[@]}" )
     else
         _gitdelta_render_stream "$target" "$mode" "$@" | delta --paging=never
+        stream_status=( "${pipestatus[@]}" )
     fi
+    (( stream_status[2] == 0 && stream_status[1] == 141 )) && return 0
+    (( stream_status[2] )) && return $stream_status[2]
+    return $stream_status[1]
 }
 
 # -----------------------------------------------------------------------------
@@ -444,7 +478,7 @@ function _gitdelta_browse() {
     preview+=' --stat --patch {5}'
     (( $+commands[delta] )) && preview+=' | delta --paging=never ${FZF_PREVIEW_COLUMNS:+--width=$FZF_PREVIEW_COLUMNS}'
 
-    local helper="${HOME}/user_scripts/git/git_dusky.py"
+    local helper=${(q)HOME}/user_scripts/git/git_dusky.py
     local cur_layout="right,70%,border-left,wrap"
     [[ -f "$HOME/.config/dusky/settings/git_preview_layout" ]] && cur_layout=$(< "$HOME/.config/dusky/settings/git_preview_layout")
     [[ $cur_layout == "hidden" ]] && cur_layout="hidden"
@@ -452,7 +486,7 @@ function _gitdelta_browse() {
     sel=$(git_dusky log --color=always \
             --date=format-local:'%Y-%m-%d %H:%M' \
             --format="%C(yellow)%<(48,trunc)%s%C(reset)${TAB}%C(green)%<(14,trunc)%cr%C(reset)${TAB}%C(dim)%ad%C(reset)${TAB}%C(bold green)%<(8,trunc)%an%C(reset)${TAB}%C(bold cyan)%h%C(reset)${TAB}%C(auto)%d%C(reset)" \
-        | fzf --ansi \
+        | FZF_DEFAULT_OPTS= FZF_DEFAULT_OPTS_FILE= fzf --ansi --with-shell='/bin/sh -c' \
             --delimiter="$TAB" \
             --tabstop=4 \
             --ellipsis='' \
@@ -465,7 +499,7 @@ function _gitdelta_browse() {
             --prompt='󰏖 commits ❯ ' \
             --pointer='▶' \
             --marker='▶' \
-            --height=100% \
+            --no-height \
             --layout=reverse \
             --border=rounded \
             --border-label=' 󰏖 dusky commit browser ' \
@@ -494,7 +528,8 @@ function _gitdelta_browse() {
             --color="hl:$c_acc,hl+:$c_acc,pointer:$c_ok,marker:$c_ok" \
             --color="prompt:$c_acc,info:$c_acc,border:$c_mut,label:$c_acc,scrollbar:$c_acc,separator:$c_mut")
     rc=$?
-    (( rc == 0 )) || return 0            # 1 = no match, 130 = abort
+    (( rc == 1 || rc == 130 )) && return 0
+    (( rc == 0 )) || return $rc
     [[ -n $sel ]] || return 0
 
     fields=("${(@ps:\t:)sel}")
@@ -549,10 +584,12 @@ function _gitdelta_select() {
     _gitdelta_matugen muted   '#55433b'; c_mut=$REPLY
     _gitdelta_matugen success '#f0be79'; c_ok=$REPLY
 
-    local helper="${HOME}/user_scripts/git/git_dusky.py"
-    local preview="${helper} --diff-preview ${(q)target} {1} {+1}"
+    local helper=${(q)HOME}/user_scripts/git/git_dusky.py
+    local preview="DUSKY_GIT_DIR=${(q)DUSKY_GIT_DIR} ${helper} --diff-preview ${(q)target} {s2..} {+s2..}"
 
-    lines=( ${(f)"$(_gitdelta_render_stream "$target" "fzf_items")"} )
+    local raw_items
+    raw_items=$(_gitdelta_render_stream "$target" "fzf_items") || return $?
+    lines=( ${(0)raw_items} )
     if (( $#lines == 0 )); then
         print -ru2 -- 'gitdelta: no changed files to select.'
         return 0
@@ -562,11 +599,11 @@ function _gitdelta_select() {
     [[ -f "$HOME/.config/dusky/settings/git_preview_layout" ]] && cur_layout=$(< "$HOME/.config/dusky/settings/git_preview_layout")
     [[ $cur_layout == "hidden" ]] && cur_layout="hidden"
 
-    sel=$(printf '%s\n' "${lines[@]}" \
-        | fzf --ansi \
+    sel=$(printf '%s\0' "${lines[@]}" \
+        | FZF_DEFAULT_OPTS= FZF_DEFAULT_OPTS_FILE= fzf --read0 --print0 --with-shell='/bin/sh -c' \
             --multi \
             --delimiter="$TAB" \
-            --with-nth=2 \
+            --with-nth=1 \
             --expect='ctrl-e,enter' \
             --ellipsis='' \
             --highlight-line \
@@ -576,7 +613,7 @@ function _gitdelta_select() {
             --prompt='󰏖 files ❯ ' \
             --pointer='▶' \
             --marker='✔ ' \
-            --height=100% \
+            --no-height \
             --layout=reverse \
             --border=rounded \
             --border-label=' 󰏖 dusky file diff browser ' \
@@ -606,10 +643,11 @@ function _gitdelta_select() {
             --color="hl:$c_acc,hl+:$c_acc,pointer:$c_ok,marker:$c_ok" \
             --color="prompt:$c_acc,info:$c_acc,border:$c_mut,label:$c_acc,scrollbar:$c_acc,separator:$c_mut")
     rc=$?
-    (( rc == 0 )) || return 0
+    (( rc == 1 || rc == 130 )) && return 0
+    (( rc == 0 )) || return $rc
     [[ -n $sel ]] || return 0
 
-    sel_lines=( ${(f)sel} )
+    sel_lines=( "${(@0)sel}" )
     (( $#sel_lines )) || return 0
 
     key=${sel_lines[1]}
@@ -617,13 +655,14 @@ function _gitdelta_select() {
     local l item_f
     for l in "${sel_lines[@]:1}"; do
         [[ -z $l ]] && continue
-        item_f=${l%%$TAB*}
+        item_f=${l#*$TAB}
         [[ -n $item_f ]] && files+=( "$item_f" )
     done
     (( $#files )) || return 0
 
     if [[ $key == 'ctrl-e' ]]; then
-        local editor=${EDITOR:-nvim}
+        local -a editor=( ${(z)${EDITOR:-nvim}} )
+        editor=( "${(@Q)editor}" )
         local -a existing_paths
         local f fp
         for f in "${files[@]}"; do
@@ -638,16 +677,19 @@ function _gitdelta_select() {
 
         if (( $#existing_paths == 1 )); then
             line_num=0
-            local h match mbegin mend
+            local h
+            local -a match mbegin mend
+            _git_dusky_relpath "${existing_paths[1]}" || return 1
+            local selected_path=$REPLY
             if [[ -n $target ]]; then
-                for h in ${(f)"$(git_dusky show -U0 --format='' "$target" -- ":(literal,top)${files[1]}" 2>/dev/null)"}; do
+                for h in ${(f)"$(git_dusky show -U0 --format='' "$target" -- ":(literal,top)${selected_path}" 2>/dev/null)"}; do
                     if [[ $h == (#b)@@\ -[0-9]#(,[0-9]#)#\ \+([0-9]##)* ]]; then
                         line_num=$match[2]
                         break
                     fi
                 done
             else
-                for h in ${(f)"$(git_dusky diff -U0 HEAD -- ":(literal,top)${files[1]}" 2>/dev/null)"}; do
+                for h in ${(f)"$(git_dusky diff -U0 HEAD -- ":(literal,top)${selected_path}" 2>/dev/null)"}; do
                     if [[ $h == (#b)@@\ -[0-9]#(,[0-9]#)#\ \+([0-9]##)* ]]; then
                         line_num=$match[2]
                         break
@@ -655,12 +697,12 @@ function _gitdelta_select() {
                 done
             fi
             if (( line_num > 0 )); then
-                "$editor" "+$line_num" "${existing_paths[1]}"
+                "${editor[@]}" "+$line_num" "${existing_paths[1]}"
             else
-                "$editor" "${existing_paths[1]}"
+                "${editor[@]}" "${existing_paths[1]}"
             fi
         else
-            "$editor" "${existing_paths[@]}"
+            "${editor[@]}" "${existing_paths[@]}"
         fi
         return $?
     fi
@@ -673,7 +715,7 @@ function _gitdelta_select() {
 # -----------------------------------------------------------------------------
 function gitdelta() {
     emulate -L zsh
-    setopt localoptions extendedglob
+    setopt localoptions extendedglob pipefail
     local n target
 
     if (( $# == 0 )); then
@@ -682,13 +724,7 @@ function gitdelta() {
             print -ru2 -- 'gitdelta: no commits yet — nothing to diff against HEAD.'
             return 1
         fi
-        if (( ! $+commands[delta] )); then
-            _gitdelta_render_stream
-        elif [[ -t 1 ]]; then
-            _gitdelta_render_stream | delta
-        else
-            _gitdelta_render_stream | delta --paging=never
-        fi
+        _gitdelta_show
         return $?
     fi
 
@@ -729,11 +765,13 @@ function gitdelta() {
 
     # Handle file path or pattern arguments
     local -a changed_files matched_files matches
+    local raw_files
     if [[ -n $target ]]; then
-        changed_files=( ${(f)"$(git_dusky show --name-only --format='' "$target")"} )
+        raw_files=$(git_dusky show --name-only -z --format='' "$target") || return $?
     else
-        changed_files=( ${(f)"$(git_dusky diff --name-only HEAD)"} )
+        raw_files=$(git_dusky diff --name-only -z HEAD) || return $?
     fi
+    changed_files=( ${(0)raw_files} )
     if (( $#changed_files == 0 )); then
         print -ru2 -- 'gitdelta: no changed files.'
         return 0
@@ -742,7 +780,7 @@ function gitdelta() {
     local query abs REPLY
     for query in "$@"; do
         # 1. Exact match
-        if (( ${changed_files[(I)$query]} )); then
+        if (( ${changed_files[(Ie)$query]} )); then
             matched_files+=( "$query" )
             continue
         fi
@@ -750,7 +788,7 @@ function gitdelta() {
         # 2. Path relative to $HOME
         abs=${query:a}
         if _git_dusky_relpath "$abs"; then
-            if (( ${changed_files[(I)$REPLY]} )); then
+            if (( ${changed_files[(Ie)$REPLY]} )); then
                 matched_files+=( "$REPLY" )
                 continue
             fi
@@ -809,12 +847,19 @@ function git_dusky_push() {
                 print -ru2 -- 'Error: git add failed — nothing committed or pushed.'
                 return 1
             fi
-            if git_dusky diff --cached --quiet -- ":(literal,top)$rel"; then
+            git_dusky diff --cached --quiet -- ":(literal,top)$rel"
+            local -i diff_rc=$?
+            if (( diff_rc == 0 )); then
                 print -ru2 -- "Nothing to commit for '$rel' (identical to HEAD)."
                 return 0
+            elif (( diff_rc != 1 )); then
+                print -ru2 -- 'Error: git diff failed — nothing committed or pushed.'
+                return $diff_rc
             fi
 
-            others=( ${(0)"$(git_dusky diff --cached --name-only -z)"} )
+            local raw_others
+            raw_others=$(git_dusky diff --cached --name-only -z) || return $?
+            others=( ${(0)raw_others} )
             others=( ${others:#${(b)rel}} )
             (( $#others )) && print -ru2 -- \
                 "Note: ${#others} other path(s) are staged; this commit is scoped to '$rel' only."
