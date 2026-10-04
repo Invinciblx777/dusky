@@ -66,7 +66,7 @@ class Fixture:
         return run([str(self.script), *args], self.env | (extra or {}), check=check)
 
     def shell(self, code, *args, check=True, extra=None):
-        return run(['bash','-c','source "$1"; shift; init_backend_env; setup_dirs; '+code,
+        return run(['bash','-c','source "$1"; shift; init_backend_env; DB_GENERATION=$(stat -L --printf="%d:%i:%w" -- "$CLIPHIST_DB_PATH" 2>/dev/null) || DB_GENERATION=""; export CLIPFZF_DB_GENERATION="$DB_GENERATION"; setup_dirs; '+code,
                     'audit',str(self.lib), *map(str,args)], self.env | (extra or {}), check=check)
 
     def store(self, data):
@@ -100,6 +100,15 @@ class UI:
         self.reader = threading.Thread(target=self.read_loop, daemon=True)
         self.reader.start()
         self.wait(lambda s: s.get('totalCount',0)>0 and s.get('progress')==100)
+        # Results can arrive before the start transform installs the mode.
+        # Await the configured prompt before sending simulated keystrokes.
+        vim='VIM_MODE="true"' in fixture.state.read_text()
+        deadline=time.monotonic()+5
+        while True:
+            prompt=self.prompt()
+            if (('q:quit' in prompt) if vim else prompt=='  '):break
+            assert time.monotonic()<deadline, f'Bootstrap did not settle: {prompt!r}'
+            time.sleep(.002)
         self.ready_ms = (time.perf_counter()-self.started)*1000
 
     def read_loop(self):
@@ -203,12 +212,13 @@ def suite(script):
         ids=[f.store(v) for v in values]
         rows=f.items()
         assert len(rows)==len(values)
-        assert all(len(r.split(SEP))==3 for r in rows)
+        assert all(len(r.split(SEP))==5 for r in rows)
         for ident,val in zip(ids,values):
             assert run(['cliphist','decode'],f.env,(ident+'\t\n').encode()).stdout==val
         ok('real cliphist byte-for-byte roundtrip: Unicode, NUL, binary, image, escapes, 220KB text')
         rowmap={r.split(SEP)[2].decode():r for r in rows}
         assert rowmap[ids[5]].split(SEP)[1]==b'img'
+        assert rowmap[ids[4]].split(SEP)[1]==b'bin'
         assert b'No visual preview' in f.ui('--preview','bin',ids[4]).stdout
         ok('list classification and field/control-character isolation')
         for ident in ids:
@@ -228,6 +238,9 @@ def suite(script):
             expected=values[ids.index(ident)]
             assert (f.root/'regular.copy').read_bytes()==expected
             assert (f.root/'primary.copy').read_bytes()==expected
+            if ident in (ids[4],ids[5]):
+                mime=run(['file','--mime-type','-b','-'],f.env,expected).stdout.strip()
+                assert mime in (f.root/'regular.args').read_bytes().splitlines()
         ok('single-copy exact bytes and MIME sink for text, binary and image')
         f.shell('cmd_batch_copy "$@"',rowmap[ids[0]].decode(),rowmap[ids[1]].decode())
         assert (f.root/'regular.copy').read_bytes()==values[0]+b'\n'+values[1]
@@ -244,6 +257,13 @@ def suite(script):
         f.ui('--batch-pin',f.selection([pins[0]]))
         assert len([r for r in f.items() if r.split(SEP)[1]==b'pin'])==1
         ok('pin exact payload, order and unpin')
+        unusual=f.root/'hash\\path\n.txt'
+        unusual.write_bytes(values[0])
+        digest=f.shell('generate_hash_file "$1"',unusual).stdout
+        assert digest==hashlib.blake2b(values[0]).hexdigest()[:16].encode()
+        assert f.shell('get_target_preview_width; printf "%s" "$REPLY"',
+                       extra={'FZF_PREVIEW_COLUMNS':'048','FZF_COLUMNS':'0120'}).stdout==b'48'
+        ok('pin hashes ignore filename escaping; preview geometry uses decimal')
         f.setstate()
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(lambda _: f.ui('--toggle-vim'),range(40)))
@@ -295,18 +315,73 @@ def suite(script):
             assert 'q:quit' in u.prompt()
             u.key(b'j')
             assert u.http()['query']==''
+            u.key('z界 !'.encode())
+            u.key(bytes([127,23,25]))
+            u.key(b'\x1b[200~pasted text\x1b[201~')
+            assert u.http()['query']==''
             u.key(b'/alpha')
             u.wait(lambda s:s['query']=='alpha')
         finally: assert u.close()==0
         ok('persisted Vim startup accepts motion and enters search')
+        for vim in (False,True):
+            f.setstate(vim=vim)
+            u=UI(f)
+            try:
+                assert ('q:quit' in u.prompt())==vim
+                expected={kind:sum(r.split(SEP)[1]==kind for r in rows)
+                          for kind in (b'txt',b'img',b'pin',b'bin')}
+                expected[b'pin']=1
+                for key,kind in ((b't',b'txt'),(b'i',b'img'),(b'p',b'pin'),(b'b',b'bin')):
+                    u.key(b'\x1b'+key)
+                    u.wait(lambda s:s['matchCount']==expected[kind])
+                    assert ('q:quit' in u.prompt())==vim
+                    # A reload must retain the active filter in either mode.
+                    u.key(b'\x12')
+                    u.wait(lambda s:s['matchCount']==expected[kind] and s['totalCount']==10)
+                u.key(b'\x1bx')
+                u.wait(lambda s:s['query']=='' and s['matchCount']==10)
+                if vim:
+                    u.key(b'/')
+                u.key(b'alpha')
+                u.wait(lambda s:s['query']=='alpha' and s['matchCount']>=1)
+                u.key(b'\x01Z')
+                u.wait(lambda s:s['query']=='Zalpha')
+                u.key(b'\x04')
+                u.wait(lambda s:s['query']=='Zlpha')
+                u.key(b'\x15')
+                u.wait(lambda s:s['query']=='lpha')
+                if vim:
+                    u.key(b'\x1b')
+                    u.key(b'\x1bi')
+                    u.wait(lambda s:s['matchCount']==1)
+                    u.key(b'\x01')
+                    u.wait(lambda s:len(s['selected'])==1)
+                    u.key(b'j')
+                    assert u.http()['query']=='󰋩 '
+                    u.key(b'/')
+                    u.key(b'\x15')
+                    u.wait(lambda s:s['query']=='' and s['matchCount']==10)
+                    u.key(bytes([27]))
+                    u.key(b'g')
+                    u.wait(lambda s:s['position']==0)
+                    u.key(bytes([4]))
+                    u.wait(lambda s:s['position']>0)
+                    u.key(bytes([21]))
+                    u.wait(lambda s:s['position']==0)
+            finally: assert u.close()==0
+        ok('standard and Vim filters/reset/reload; search Ctrl-A/D/U; normal Ctrl-A selection')
         f.setstate()
+        alpha_count=sum(b'alpha' in row.split(SEP)[0] for row in f.items())
         u=UI(f)
         try:
             u.http('change-query(alpha)+wait')
-            u.wait(lambda s:s['matchCount']>=1 and s['query']=='alpha')
+            # The query updates before matching finishes; wait for the actual
+            # result count before sending Enter to this asynchronous UI.
+            u.wait(lambda s:s['matchCount']==alpha_count and s['query']=='alpha')
             u.key(b'\r')
-            assert u.close(abort=False)==0
+            closing=u
             u=None
+            assert closing.close(abort=False)==0
         finally:
             if u: u.close()
         assert (f.root/'regular.copy').read_bytes()==values[0]
@@ -709,6 +784,160 @@ else:
         f.close()
 
 
+def integration():
+    """Cross-frontend tests with real databases and isolated desktop sinks."""
+    import runpy
+    from unittest.mock import patch
+    f=Fixture(ROOT/'terminal_clipboard.sh')
+    children=[]
+    try:
+        home=Path.home()
+        envfile=f.settings/'cliphist_db_env'
+        zsource=(home/'.zshrc').read_text()
+        start=zsource.index('_dusky_clipboard_env() {')
+        end=zsource.index('add-zsh-hook precmd _dusky_clipboard_env',start)
+        zsource=zsource[start:end+len('add-zsh-hook precmd _dusky_clipboard_env')]
+        daemon_source=(ROOT/'dusky_clipboard_daemon.sh').read_text().split('# A watcher starts')[0]
+        with patch.dict(os.environ,f.env):
+            module=runpy.run_path(str(ROOT.parent/'arch_setup_scripts/scripts/390_clipboard_persistance.py'))
+        fallback=str(f.root/'cache/cliphist/db')
+        literal=str(f.root/'literal $name `data` space/db')
+        cases=[('',fallback),('CLIPHIST_DB_PATH=relative\n',fallback),
+               (f'export CLIPHIST_DB_PATH="{literal}" # data\n',literal),
+               (f"CLIPHIST_DB_PATH='{literal}'\nCLIPHIST_DB_PATH=relative\n",literal),
+               (f'CLIPHIST_DB_PATH={f.db} # comment\nCLIPHIST_DB_PATH="/unclosed\n',str(f.db))]
+        for content,expected in cases:
+            envfile.write_text(content)
+            assert f.ui('--backend').stdout.decode().strip()==expected
+            assert run(['bash','-c',daemon_source+'\nload_env; printf "%s" "$CLIPHIST_DB_PATH"'],f.env).stdout.decode()==expected
+            assert run(['zsh','-f','-c',zsource+'\n_dusky_clipboard_env; printf "%s" "$CLIPHIST_DB_PATH"'],f.env).stdout.decode()==expected
+            lua='hl={env=function(k,v) if k=="CLIPHIST_DB_PATH" then io.write(v) end end}; dofile(arg[1])'
+            assert run(['lua','-e',lua,'--',str(home/'.config/hypr/source/environment_variables.lua')],f.env).stdout.decode()==expected
+            with patch.dict(os.environ,f.env):assert str(module['current_db']())==expected
+        lua='hl={env=function(k,v) if k:match("^XDG_.*_HOME$") then io.write(k,"=",v,"\\n") end end}; dofile(arg[1])'
+        roots=run(['lua','-e',lua,'--',str(home/'.config/hypr/source/environment_variables.lua')],f.env).stdout.decode().splitlines()
+        for key in ('XDG_CONFIG_HOME','XDG_CACHE_HOME','XDG_DATA_HOME'):assert key+'='+f.env[key] in roots
+        lua='hl={on=function(n,f) if n=="hyprland.start" then f() end end,exec_cmd=function(c) io.write(c,"\\n") end}; dofile(arg[1])'
+        startup=run(['lua','-e',lua,'--',str(home/'.config/hypr/source/autostart.lua')],f.env).stdout.decode().splitlines()[0]
+        f.executable('systemctl','#!/bin/bash\n printf "%s\\n" "$*" >> "$AUDIT_ROOT/startup-log"\n')
+        f.executable('dbus-update-activation-environment','#!/bin/sh\nexit 1\n')
+        run(['bash','-c',startup],f.env)
+        log=(f.root/'startup-log').read_text().splitlines()
+        assert len(log)==2 and 'import-environment' in log[0] and log[1]=='--user start hyprland-session.target'
+        for key in ('XDG_CONFIG_HOME','XDG_CACHE_HOME','XDG_DATA_HOME','PATH','CLIPHIST_DB_PATH'):assert key in log[0].split()
+        envfile.write_text(f'CLIPHIST_DB_PATH="{f.db}"\n')
+        hook=zsource+'\nprintf \'CLIPHIST_DB_PATH="%s"\\n\' "$AUDIT_ROOT/new.db" > "$XDG_CONFIG_HOME/dusky/settings/cliphist_db_env"; for hook in $precmd_functions; do "$hook" || exit; done; printf "%s" "$CLIPHIST_DB_PATH"'
+        assert run(['zsh','-f','-c',hook],f.env).stdout.decode()==str(f.root/'new.db')
+        envfile.write_text(f'CLIPHIST_DB_PATH="{f.db}"\n')
+        print('PASS menu, daemon, zsh and Hyprland loaders agree with switcher; prompt refreshes backend')
+
+        f.db=f.root/'runtime/cliphist.db'
+        f.env['CLIPHIST_DB_PATH']=str(f.db)
+        envfile.write_text(f'CLIPHIST_DB_PATH="{f.db}"\n')
+        payload=b'exact text\n\n'
+        ident=f.store(payload)
+        row=next(r for r in f.items() if r.split(SEP)[2].decode()==ident)
+        fields=row.split(SEP); db,generation=map(bytes.decode,fields[3:])
+        other=f.root/'cache/cliphist/db';other.parent.mkdir(parents=True,exist_ok=True)
+        run(['/usr/bin/cliphist','store'],f.env|{'CLIPHIST_DB_PATH':str(other)},b'other backend')
+        f.setstate(vim=True)
+        u=UI(f)
+        try:
+            u.wait_output(b'[RAM]')
+            u.key(b'\x01');u.wait(lambda s:len(s['selected'])==1)
+            offset=len(u.output)
+            envfile.write_text(f'CLIPHIST_DB_PATH="{other}"\n')
+            u.key(b'\x12');u.wait(lambda s:len(s['selected'])==0 and s['matchCount']==1)
+            deadline=time.monotonic()+5
+            while b'[DISK]' not in u.output[offset:] and time.monotonic()<deadline:time.sleep(.005)
+            assert b'[DISK]' in u.output[offset:]
+        finally:u.close()
+        print('PASS live fzf reload follows RAM/disk switches, updates label and drops stale selections')
+        for args in [('--copy','txt',ident,db,generation),('--decode',ident,db,generation),
+                     ('--batch-pin',f.selection([row])),('--batch-delete',f.selection([row])),('--wipe',db,generation)]:
+            assert f.ui(*args,check=False).returncode!=0,args
+        assert run(['/usr/bin/cliphist','list'],f.env|{'CLIPHIST_DB_PATH':str(other)}).stdout
+        assert not (f.root/'regular.copy').exists()
+        envfile.write_text(f'CLIPHIST_DB_PATH="{f.db}"\n')
+        f.ui('--wipe',db,generation)
+        f.db.unlink()  # Same-path database recreation can reuse cliphist IDs.
+        replacement=f.store(b'reused ID')
+        assert replacement==ident, (replacement,ident)
+        assert f.ui('--copy','txt',ident,db,generation,check=False).returncode!=0
+        print('PASS stale backend and reused-ID selections refuse copy, decode, pin, delete and wipe')
+
+        binary=b'x'*700+b'\0tail'
+        bid=f.store(binary)
+        brow=next(r for r in f.items() if r.split(SEP)[2].decode()==bid)
+        bf=list(map(bytes.decode,brow.split(SEP)))
+        f.ui('--copy',bf[1],bid,*bf[3:])
+        assert (f.root/'regular.copy').read_bytes()==binary
+        assert b'text/plain' not in (f.root/'regular.args').read_bytes()
+        f.ui('--batch-pin',f.selection([brow]),check=False)
+        assert not list((f.root/'data/rofi-cliphist/pins').glob('*.pin'))
+        text_id=f.store(payload)
+        text_row=next(r for r in f.items() if r.split(SEP)[2].decode()==text_id)
+        f.shell('cmd_batch_copy "$@"',brow.decode(),text_row.decode())
+        assert (f.root/'regular.copy').read_bytes()==payload
+        assert b'text/plain' in (f.root/'regular.args').read_bytes()
+        print('PASS truncated binary preserves bytes/MIME, cannot become a text pin or contaminate merged text')
+
+        rofi=ROOT.parent/'rofi/rofi_clipboard.sh'
+        tid=f.store(payload)
+        f.store(png())
+        def menu(extra=None,action=False):return run([str(rofi)]+(['selected'] if action else []),f.env|(extra or {}),check=False)
+        output=menu().stdout
+        context=next(line.split(SEP,1)[1].decode() for line in output.splitlines() if line.startswith(b'\0data'+SEP))
+        assert b'\0no-custom\x1ftrue' in output
+        assert b'\0info\x1ftxt:'+tid.encode() in output
+        thumbs=list((f.root/'cache/rofi-cliphist/thumbs').glob('*.png'))
+        assert thumbs and all(t.read_bytes().startswith(b'\x89PNG\r\n\x1a\n') for t in thumbs)
+        f.store(b'new unrelated text')
+        menu()
+        assert list((f.root/'cache/rofi-cliphist/thumbs').glob('*.png'))==thumbs
+        stale=f.root/'cache/rofi-cliphist/thumbs/stale.png'
+        stale.write_bytes(b'stale');os.utime(stale,(time.time()-90000,)*2)
+        menu();assert not stale.exists()
+        state={'ROFI_RETV':'1','ROFI_INFO':'txt:'+tid,'ROFI_DATA':context}
+        assert menu(state,True).returncode==0
+        assert (f.root/'regular.copy').read_bytes()==payload
+        menu(state|{'ROFI_RETV':'10'},True)
+        pins=list((f.root/'data/rofi-cliphist/pins').glob('*.pin'))
+        assert len(pins)==1 and pins[0].read_bytes()==payload
+        assert pins[0].stem==hashlib.blake2b(payload).hexdigest()[:16], pins[0].stem
+        pinstate=state|{'ROFI_INFO':'pin:'+pins[0].stem}
+        assert menu(pinstate,True).returncode==0
+        assert (f.root/'regular.copy').read_bytes()==payload
+        menu(pinstate|{'ROFI_RETV':'11'},True);assert not pins[0].exists()
+        menu(state|{'ROFI_RETV':'11'},True)
+        assert all(r.split(SEP)[2].decode()!=tid for r in f.items())
+        envfile.write_text(f'CLIPHIST_DB_PATH="{other}"\n')
+        before=(f.root/'regular.copy').read_bytes()
+        assert menu(state,True).returncode!=0
+        assert (f.root/'regular.copy').read_bytes()==before
+        assert not list((f.root/'cache/rofi-cliphist/thumbs').glob('.menu.*'))
+        print('PASS Rofi protocol, PNG thumbnails, exact newline copying, shared pins and stale-token rejection')
+
+        envfile.write_text(f'CLIPHIST_DB_PATH="{f.db}"\n')
+        f.executable('wl-copy','#!/bin/bash\ncat >/dev/null\n(exec >/dev/null 2>&1; sleep 30) &\nprintf "%s\\n" "$!" >> "$AUDIT_ROOT/owners"\n')
+        fresh=next(r.split(SEP) for r in f.items() if r.split(SEP)[1]==b'txt')
+        f.ui('--copy',*map(bytes.decode,[fresh[1],fresh[2],fresh[3],fresh[4]]))
+        children=list(map(int,(f.root/'owners').read_text().splitlines()))
+        assert len(children)==2
+        with open(f.settings/'.clipboard_backend.lock','r+b') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            for pid in children:
+                for fd in Path(f'/proc/{pid}/fd').iterdir():
+                    try:assert '.clipboard_backend.lock' not in os.readlink(fd)
+                    except FileNotFoundError:pass
+        print('PASS long-lived clipboard owners do not retain backend locks')
+    finally:
+        for pid in children:
+            try:os.kill(pid,signal.SIGTERM)
+            except ProcessLookupError:pass
+        f.close()
+
+
 def stat_mode(path):
     return path.stat().st_mode & 0o777
 
@@ -719,7 +948,11 @@ if __name__=='__main__':
     parser.add_argument('--benchmark',type=Path,nargs='+')
     parser.add_argument('--runs',type=int,default=30)
     parser.add_argument('--persistence-only',action='store_true')
+    parser.add_argument('--integration-only',action='store_true')
     args=parser.parse_args()
+    if args.integration_only:
+        integration()
+        sys.exit(0)
     if args.persistence_only:
         persistence()
         sys.exit(0)
@@ -730,4 +963,5 @@ if __name__=='__main__':
         stress()
         daemon()
         persistence()
+        integration()
 CLIP_VERIFY_PYTHON

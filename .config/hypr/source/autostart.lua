@@ -3,7 +3,7 @@ hl.on("hyprland.start", function()
     -- --- Sync variables with D-Bus and Systemd ---
     -- exec_cmd is asynchronous: use one shell so imports finish before services start.
     -- A D-Bus update failure must not prevent startup after systemd's import succeeds.
-    hl.exec_cmd("systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XDG_SESSION_DESKTOP CLIPHIST_DB_PATH && { dbus-update-activation-environment --systemd --all; systemctl --user start hyprland-session.target; }")
+    hl.exec_cmd("systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XDG_SESSION_DESKTOP XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME PATH CLIPHIST_DB_PATH && { dbus-update-activation-environment --systemd --all; systemctl --user start hyprland-session.target; }")
     -- --- SYSTEM ESSENTIALS ---
 
     -- Gnome Keyring: Stores passwords for apps (VSCode, Chrome, etc.). (recommanded to enable systemd service instead of auto starting with exec-once)

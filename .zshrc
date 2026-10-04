@@ -60,9 +60,9 @@ export VISUAL='nvim'
 
 # Compilation Optimization: Moved to ~/.config/pacman/makepkg.conf
 
-# Clipboard DB path: refresh new shells, including those in an existing terminal.
+# Clipboard DB path: refresh at startup and at each interactive prompt.
 # Read the toggler's file as literal data, using the daemon's path/fallback rules.
-() {
+_dusky_clipboard_env() {
   emulate -L zsh
   local env_file="${XDG_CONFIG_HOME:-$HOME/.config}/dusky/settings/cliphist_db_env"
   local line val MATCH MBEGIN MEND
@@ -82,7 +82,11 @@ export VISUAL='nvim'
       [[ $val == /?* ]] && CLIPHIST_DB_PATH=$val
     done < "$env_file"
   fi
+  return 0
 }
+_dusky_clipboard_env
+autoload -Uz add-zsh-hook
+add-zsh-hook precmd _dusky_clipboard_env
 
 # Configure PATH - enabled for npm global bins (fixes gemini-cli)
 # Deduped PATH - ensures npm global bins without duplication (Hyprland also sets PATH via systemd)

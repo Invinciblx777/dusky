@@ -43,7 +43,7 @@ def warn(message):
 
 def checked_path(value):
     path = Path(value)
-    # These paths also appear in systemd EnvironmentFile and the menu's parser.
+    # These paths also appear in the literal environment file used by all loaders.
     if not path.is_absolute() or any(c in str(path) for c in '\\"\r\n\x00'):
         raise SwitchError(f"Unsupported clipboard path: {str(path)!r}")
     return path
@@ -137,20 +137,21 @@ def current_db():
         return disk_db()
     value = None
     for line in DB_ENV_FILE.read_text().splitlines():
-        match = re.fullmatch(r'\s*(?:export\s+)?CLIPHIST_DB_PATH\s*=\s*(.*?)\s*', line)
+        match = re.match(r'\s*(?:export\s+)?CLIPHIST_DB_PATH\s*=\s*(.*)', line)
         if match:
             text = match[1]
             if text.startswith(('"', "'")):
                 quote = text[0]
                 end = text.find(quote, 1)
-                if end < 0:
-                    raise SwitchError("Malformed clipboard database configuration")
-                value = text[1:end]
+                candidate = text[1:end] if end >= 0 else ""
             else:
-                value = text.split()[0] if text else None
-    if not value:
-        raise SwitchError("No valid CLIPHIST_DB_PATH in clipboard configuration")
-    return checked_path(value)
+                fields = text.split(maxsplit=1)
+                candidate = fields[0] if fields else ""
+            # Match the daemon, menu, Lua and zsh loaders: the last valid
+            # absolute assignment wins; malformed/relative values are ignored.
+            if candidate.startswith("/") and len(candidate) > 1:
+                value = candidate
+    return checked_path(value) if value else disk_db()
 
 
 def validate_db(db):

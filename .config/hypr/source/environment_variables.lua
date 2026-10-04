@@ -1,5 +1,5 @@
 -- ~/.config/hypr/source/environment_variables.lua
--- Native Hyprland 0.55.4+ / systemd 261+ / Arch bleeding-edge
+-- Native Hyprland 0.56.2+ / systemd 262+ / Arch rolling
 -- No UWSM, no GPU vars. Performance: locals cached, single io.popen, deduped PATH
 -- @diagnostic disable: undefined-global
 
@@ -98,6 +98,12 @@ do
   if not config_home or config_home == "" then config_home = home .. "/.config" end
   local cache_home = getenv("XDG_CACHE_HOME")
   if not cache_home or cache_home == "" then cache_home = home .. "/.cache" end
+  local data_home = getenv("XDG_DATA_HOME")
+  if not data_home or data_home == "" then data_home = home .. "/.local/share" end
+  -- Export the same directories to apps and the user service manager.
+  hl_env("XDG_CONFIG_HOME", config_home)
+  hl_env("XDG_CACHE_HOME", cache_home)
+  hl_env("XDG_DATA_HOME", data_home)
   local path = cache_home .. "/cliphist/db"
   local f = io.open(config_home .. "/dusky/settings/cliphist_db_env", "r")
   if f then

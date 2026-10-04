@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 #==============================================================================
-# FZF CLIPBOARD MANAGER — v4.1            (Wayland / Hyprland)
+# FZF CLIPBOARD MANAGER — v4.2            (Wayland / Hyprland)
 #==============================================================================
 # HARD target stack. No legacy fallbacks, no shims, no X11, no version probes
 # for anything older than the following:
 #
-#   Arch Linux rolling · kernel 7.1+ · systemd 257+
+#   Arch Linux rolling · kernel 7.3+ · systemd 262+
 #   bash      5.3+     (SRANDOM, ${var@Q}, printf -v, {fd} auto-alloc, nameref,
 #                       globskipdots, assoc arrays, ${var@U}, wait -p)
 #   fzf       0.74.4+  (transform / bg-transform, reload-sync, change-query,
 #                       change-preview[-label], change-header, --id-nth,
 #                       --track, --scheme=history, wrap-word, disable-search,
 #                       FZF_PROMPT / FZF_PREVIEW_LABEL / FZF_INPUT_STATE)
-#   cliphist  0.6+     (-preview-width / CLIPHIST_PREVIEW_WIDTH, multi-line
+#   cliphist  0.7+     (-preview-width / CLIPHIST_PREVIEW_WIDTH, multi-line
 #                       stdin for `delete`)
 #   wl-clipboard latest · Hyprland latest · coreutils 9.x · util-linux (flock)
 #   file · gawk 5.4+ · bat · chafa 1.18+ · kitten (kitty 0.49+) · b2sum
@@ -21,6 +21,9 @@
 #   <no args>           interactive menu
 #   --list              emit the fzf item stream
 #   --preview T ID      render the preview pane
+#   --backend           emit the current database path
+#   --copy T ID [DB GEN] copy one entry (shared Rofi frontend)
+#   --decode ID [DB GEN] emit original bytes (shared Rofi thumbnails)
 #   --help-pane         render the help overlay          (change-preview target)
 #   --toggle-help       emit fzf actions toggling help              (transform)
 #   --toggle-vim        flip VIM_MODE + emit fzf actions            (transform)
@@ -44,8 +47,7 @@ set -o nounset -o pipefail
 shopt -s nullglob extglob globskipdots
 umask 077
 
-# Deterministic byte semantics everywhere; individual call sites narrow this
-# further only where UTF-8 character (not byte) semantics are required.
+# UTF-8 character semantics for display; byte-oriented reads select LC_ALL=C.
 export LC_ALL=C.UTF-8
 
 : "${HOME:?HOME is not set}"
@@ -53,7 +55,7 @@ export LC_ALL=C.UTF-8
 #==============================================================================
 # CONSTANTS / PATHS
 #==============================================================================
-readonly VERSION='4.1'
+readonly VERSION='4.2'
 
 readonly XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 readonly XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
@@ -62,6 +64,7 @@ readonly XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 readonly SETTINGS_DIR="$XDG_CONFIG_HOME/dusky/settings"
 readonly USER_STATE_FILE="$SETTINGS_DIR/clipboard_state"
 readonly STATE_LOCK_FILE="$SETTINGS_DIR/.clipboard_state.lock"
+readonly BACKEND_LOCK_FILE="$SETTINGS_DIR/.clipboard_backend.lock"
 readonly PERSIST_STATE_FILE="$SETTINGS_DIR/clipboard_persistance"
 readonly DB_ENV_FILE="$SETTINGS_DIR/cliphist_db_env"
 readonly PINS_DIR="$XDG_DATA_HOME/rofi-cliphist/pins"
@@ -108,7 +111,7 @@ readonly HEADER_WIPE=' 󰀦  Alt-W again within 5s to WIPE THE ENTIRE HISTORY '
 
 # Keys owned by vim normal mode. Declared in exactly ONE place so the
 # bind / unbind / rebind sets can never drift out of sync.
-readonly VIM_KEYS='j,k,g,G,J,K,v,V,q,ctrl-a,ctrl-d,ctrl-u,/'
+readonly VIM_KEYS='j,k,g,G,J,K,v,V,q,/'
 
 SELF=$(realpath -e -- "${BASH_SOURCE[0]}") || { printf 'cannot resolve self\n' >&2; exit 1; }
 readonly SELF
@@ -136,6 +139,9 @@ SESSION_OWNED=0
 # reference hazard of `local -n x=$1` and a subshell per item.
 P_TYPE=''
 P_ID=''
+P_DB=''
+P_GENERATION=''
+DB_GENERATION=''
 
 #==============================================================================
 # DEFAULTS + VALIDATION TABLE
@@ -462,6 +468,36 @@ init_backend_env() {
     export CLIPHIST_PREVIEW_WIDTH="$CLIP_PREVIEW_WIDTH"
 }
 
+# Resolve the backend while holding the switcher's shared lock, and retain it
+# until the complete operation finishes. The interactive picker holds no lock
+# while waiting for input, so storage can still be switched while it is open.
+cmd_backend_path() { printf '%s\n' "$CLIPHIST_DB_PATH"; }
+
+backend_command() {
+    local backend_fd rc=0 lock_mode=--shared
+    ensure_private_dir "$SETTINGS_DIR" || return 1
+    exec {backend_fd}<>"$BACKEND_LOCK_FILE" || return 1
+    # A wipe can replace the database. It must not interleave with
+    # readers between validating a selected row and decoding that row.
+    [[ $1 != cmd_wipe ]] || lock_mode=--exclusive
+    if ! flock "$lock_mode" --timeout 15 "$backend_fd"; then
+        exec {backend_fd}>&-
+        log_err 'Timed out waiting for clipboard storage switch'
+        return 1
+    fi
+    init_backend_env
+    if [[ $1 == cmd_list && ! -e $CLIPHIST_DB_PATH ]]; then
+        # cliphist creates a missing database on its first read. Initialize it
+        # before assigning a generation to rows that concurrent stores may add.
+        cliphist list &>/dev/null || :
+    fi
+    DB_GENERATION=$(stat -L --printf='%d:%i:%w' -- "$CLIPHIST_DB_PATH" 2>/dev/null) || DB_GENERATION=''
+    export CLIPFZF_DB_GENERATION="$DB_GENERATION"
+    "$@" || rc=$?
+    exec {backend_fd}>&-
+    return "$rc"
+}
+
 # cliphist's stdin protocol is "<id>\t<anything>". A here-string costs zero
 # forks, unlike `printf ... | cliphist` (fork + pipe on every preview render).
 cliphist_decode() { cliphist decode <<< "$1$TAB"; }
@@ -494,23 +530,34 @@ mime_is_image()  { [[ ${1:-} == image/* ]]; }
 
 generate_hash_file() {
     local line
-    line=$(b2sum -- "$1" 2>/dev/null) || return 1        # BLAKE2b, no md5
+    # Hash stdin so b2sum's filename escaping cannot prefix the digest with
+    # a backslash when an XDG path contains a backslash or newline.
+    line=$(b2sum <"$1" 2>/dev/null) || return 1
     line="${line%% *}"
     printf '%s' "${line:0:16}"
 }
 
-# Split an fzf line into P_TYPE / P_ID without a subshell.
-# Contract: BOTH globals are reset on entry, so a failed parse can never leave
+# Split an fzf line into type, ID and optional backend identity without a subshell.
+# History rows include database path and generation; pins are backend independent.
+# Contract: outputs are reset on entry, so a failed parse can never leave
 # a previous item's values visible to the caller (the re-entrancy hazard of the
 # global-output design). Every call site tests the return value.
 parse_item() {
     local rest
     P_TYPE=''
     P_ID=''
+    P_DB=''
+    P_GENERATION=''
     rest="${1#*"$SEP"}"
     [[ $rest == "$1" ]] && return 1            # no separator => not our item
     P_TYPE="${rest%%"$SEP"*}"
     P_ID="${rest#*"$SEP"}"
+    P_DB="${P_ID#*"$SEP"}"
+    [[ $P_DB != "$P_ID" ]] || P_DB=''
+    if [[ $P_DB == *"$SEP"* ]]; then
+        P_GENERATION="${P_DB#*"$SEP"}"
+        P_DB="${P_DB%%"$SEP"*}"
+    fi
     P_ID="${P_ID%%"$SEP"*}"
     case $P_TYPE in
         empty|error) return 0 ;;
@@ -519,6 +566,34 @@ parse_item() {
         *) P_TYPE=''; P_ID=''; return 1 ;;
     esac
     return 0
+}
+
+validate_item_backend() {
+    case $P_TYPE in
+        txt|img|bin)
+            if [[ ( -n $P_DB && $P_DB != "$CLIPHIST_DB_PATH" ) ||
+                  ( -n $P_GENERATION && $P_GENERATION != "$DB_GENERATION" ) ]]; then
+                notify 'Clipboard history changed' 'Reload with Ctrl-R before using this selection.' critical
+                return 1
+            fi
+            ;;
+    esac
+    return 0
+}
+
+cmd_decode() {
+    parse_item "$SEP""bin$SEP$1$SEP${2:-}$SEP${3:-}" || return 1
+    validate_item_backend || return 1
+    cliphist_decode "$P_ID"
+}
+
+# Validate the whole batch before any copy, pin, or deletion can take place.
+validate_file_backend() {
+    local line
+    while IFS= read -r line || [[ -n $line ]]; do
+        parse_item "$line" || continue
+        validate_item_backend || return 1
+    done <"$1"
 }
 
 #==============================================================================
@@ -673,6 +748,8 @@ get_target_preview_width() {
     local fzf_width="${FZF_PREVIEW_COLUMNS:-0}" total_cols="${FZF_COLUMNS:-0}"
     is_uint "$fzf_width" || fzf_width=0
     is_uint "$total_cols" || total_cols=0
+    fzf_width=$((10#$fzf_width))
+    total_cols=$((10#$total_cols))
 
     if (( fzf_width > 4 )); then
         REPLY="$fzf_width"
@@ -758,7 +835,7 @@ render_text_preview() {
 # IMAGE HANDLING
 #==============================================================================
 # Include the database path and observable file generation in the cache key.
-# A bare cliphist ID is not globally unique: IDs can be reused after a wipe,
+# A bare cliphist ID is not globally unique: IDs can be reused after database recreation,
 # and different databases can contain different payloads under the same ID.
 image_cache_key() {
     local metadata line
@@ -1024,12 +1101,23 @@ display_image() {
 wl_put() {
     local mime="$1" path="$2"
 
-    wl-copy --type "$mime" <"$path" || return 1
+    wl_copy_without_lock --type "$mime" <"$path" || return 1
 
-    if ! wl-copy --primary --type "$mime" <"$path" 2>/dev/null; then
+    if ! wl_copy_without_lock --primary --type "$mime" <"$path" 2>/dev/null; then
         notify 'Copied to clipboard' 'PRIMARY selection could not be updated.'
     fi
     return 0
+}
+
+wl_copy_without_lock() {
+    # wl-copy forks a long-lived selection owner. It must not inherit the
+    # switch lock; the parent still holds it until copying has completed.
+    local copy_lock_fd="${backend_fd:-}"
+    if [[ -n $copy_lock_fd ]]; then
+        wl-copy "$@" {copy_lock_fd}>&-
+    else
+        wl-copy "$@"
+    fi
 }
 
 copy_text_entry() {
@@ -1038,10 +1126,22 @@ copy_text_entry() {
     decode_entry_to_tmp "$1" "$CACHE_DIR" cp || return 1
     tmp="$REPLY"
 
-    wl_put 'text/plain;charset=utf-8' "$tmp"
+    wl_put_text_file "$tmp"
     rc=$?
     remove_tmpfile "$tmp"
     return "$rc"
+}
+
+wl_put_text_file() {
+    local mime
+    # The list is truncated: a binary marker may lie beyond its preview width.
+    # Verify the actual payload before advertising it as UTF-8 text.
+    mime=$(file --mime -b -- "$1" 2>/dev/null) || return 1
+    if [[ $mime == *'charset=binary'* ]]; then
+        wl_put "${mime%%;*}" "$1"
+    else
+        wl_put 'text/plain;charset=utf-8' "$1"
+    fi
 }
 
 copy_binary_entry() {
@@ -1069,7 +1169,7 @@ cmd_copy_single() {
             is_pin_hash "$2" || return 1
             path="$PINS_DIR/$2.pin"
             [[ -f $path && ! -L $path && -r $path ]] || return 1
-            wl_put 'text/plain;charset=utf-8' "$path"
+            wl_put_text_file "$path"
             ;;
         img|bin)
             # The list's image classification is heuristic. Determine the MIME
@@ -1086,13 +1186,18 @@ cmd_copy_single() {
 }
 
 cmd_batch_copy() {
-    local item tmp='' part='' last_byte rc=0
+    local item tmp='' part='' last_byte encoding rc=0
     local n_text=0 n_other=0 last_t='' last_i=''
+
+    for item in "$@"; do
+        parse_item "$item" || continue
+        validate_item_backend || return 1
+    done
 
     # The usual Enter action selects one item. Copy its original bytes directly
     # rather than decoding, concatenating and deleting multiple temporary files.
     if (( $# == 1 )); then
-        parse_item "$1" || return 0
+        parse_item "$1" || return 1
         case $P_TYPE in empty|error) return 0 ;; esac
         cmd_copy_single "$P_TYPE" "$P_ID" && return 0
         notify 'Copy failed' 'The clipboard could not be updated.' critical
@@ -1133,6 +1238,17 @@ cmd_batch_copy() {
                         rc=1
                         break
                     fi
+                fi
+
+                encoding=$(file --mime-encoding -b -- "$part" 2>/dev/null) || { rc=1; break; }
+                if [[ $encoding == binary && -s $part ]]; then
+                    last_t="$P_TYPE"
+                    [[ $last_t != txt ]] || last_t=bin
+                    last_i="$P_ID"
+                    (( ++n_other ))
+                    remove_tmpfile "$part"
+                    part=''
+                    continue
                 fi
 
                 if [[ -s $part ]]; then
@@ -1211,6 +1327,17 @@ cmd_list() {
     local -a st=()
     local -a pin_paths=("$PINS_DIR"/*.pin)
 
+    # The reload event uses this snapshot for the label and wipe validation.
+    if [[ -n $SESSION_DIR ]]; then
+        local snapshot mode=DISK
+        [[ $CLIPHIST_DB_PATH == "${XDG_RUNTIME_DIR:-/run/user/$UID}/cliphist.db" ]] && mode=RAM
+        new_tmp "$SESSION_DIR" backend || return 1
+        snapshot="$REPLY"
+        printf '%s\n%s\n%s\n' "$CLIPHIST_DB_PATH" "$mode" "$DB_GENERATION" >"$snapshot" &&
+            mv -f -- "$snapshot" "$SESSION_DIR/list_backend" || return 1
+        untrack_tmpfile "$snapshot"
+    fi
+
     # Empty pins directory: no interpreter, sorting, or temporary-file work.
     if (( ${#pin_paths[@]} )); then
         new_tmp "$CACHE_DIR" pinlist || {
@@ -1280,7 +1407,7 @@ cmd_list() {
     cliphist list 2>/dev/null | LC_ALL=C.UTF-8 gawk \
         -v pin_count="$n" -v icon_img="$ICON_IMG" -v icon_bin="$ICON_BIN" \
         -v sep="$SEP" -v max_len="$LIST_TRUNC" '
-        BEGIN { FS = "\t"; n = 0 }
+        BEGIN { FS = "\t"; n = 0; db = ENVIRON["CLIPHIST_DB_PATH"]; generation = ENVIRON["CLIPFZF_DB_GENERATION"] }
         NF < 2 { next }
         $1 !~ /^[0-9]+$/ { next }
         {
@@ -1288,6 +1415,15 @@ cmd_list() {
             content = $0
             sub(/^[^\t]*\t/, "", content)
             idx = ++n + pin_count
+
+            # cliphist can emit unrecognized binary payloads verbatim rather
+            # than using its image-description marker. A NUL cannot occur in
+            # ordinary text; retain the binary copy/preview path for it.
+            if (index(content, "\000")) {
+                printf "%d %s Binary%s%s%s%s%s%s%s%s\n", \
+                    idx, icon_bin, sep, "bin", sep, id, sep, db, sep, generation
+                next
+            }
 
             if (content ~ /^\[\[[[:space:]]*binary data/) {
                 lc = tolower(content); dims = ""; fmt = ""
@@ -1309,8 +1445,8 @@ cmd_list() {
                 if (dims != "" || fmt != "") {
                     info = (dims != "" && fmt != "") \
                         ? dims " " fmt : (dims != "" ? dims : fmt)
-                    printf "%d \033[36m%s %s\033[0m%s%s%s%s\n", \
-                        idx, icon_img, info, sep, "img", sep, id
+                    printf "%d \033[36m%s %s\033[0m%s%s%s%s%s%s%s%s\n", \
+                        idx, icon_img, info, sep, "img", sep, id, sep, db, sep, generation
                     next
                 }
                 info = content
@@ -1321,8 +1457,8 @@ cmd_list() {
                 gsub(/^ +| +$/, "", info)
                 if (info == "") info = "Binary"
                 if (length(info) > max_len) info = substr(info, 1, max_len)
-                printf "%d %s %s%s%s%s%s\n", \
-                    idx, icon_bin, info, sep, "bin", sep, id
+                printf "%d %s %s%s%s%s%s%s%s%s%s\n", \
+                    idx, icon_bin, info, sep, "bin", sep, id, sep, db, sep, generation
                 next
             }
 
@@ -1331,7 +1467,7 @@ cmd_list() {
             gsub(/^ +| +$/, "", content)
             if (content == "") content = "[Whitespace]"
             if (length(content) > max_len) content = substr(content, 1, max_len)
-            printf "%d %s%s%s%s%s\n", idx, content, sep, "txt", sep, id
+            printf "%d %s%s%s%s%s%s%s%s%s\n", idx, content, sep, "txt", sep, id, sep, db, sep, generation
         }
         END { exit (n > 0 ? 0 : 20) }'
     st=("${PIPESTATUS[@]}")
@@ -1478,9 +1614,9 @@ cmd_resize_preview() {
 # round-trip through a temp file, no lost multi-selection, no flicker.
 emit_vim_actions() {
     if [[ $1 == true ]]; then
-        printf 'rebind(%s)+disable-search+change-prompt(%s)+refresh-preview' "$VIM_KEYS" "$PROMPT_VIM"
+        printf 'rebind(%s)+hide-input+change-prompt(%s)+change-header(%s)+refresh-preview' "$VIM_KEYS" "$PROMPT_VIM" "$PROMPT_VIM"
     else
-        printf 'unbind(%s)+enable-search+change-prompt(%s)+refresh-preview' "$VIM_KEYS" "$PROMPT_NORMAL"
+        printf 'unbind(%s)+show-input+enable-search+change-header()+change-prompt(%s)+refresh-preview' "$VIM_KEYS" "$PROMPT_NORMAL"
     fi
 }
 
@@ -1518,7 +1654,7 @@ cmd_toggle_vim() {
 cmd_key_escape() {
     if [[ ${FZF_PROMPT-} == *"$MARK_SEARCH"* ]]; then
         emit_vim_actions true                       # search -> vim normal
-    elif [[ ${FZF_INPUT_STATE-} == disabled || ${FZF_PROMPT-} == *"$MARK_VIM"* ]]; then
+    elif [[ ${FZF_INPUT_STATE-} == hidden || ${FZF_PROMPT-} == *"$MARK_VIM"* ]]; then
         printf 'ignore'                             # vim normal: Esc is a no-op
     else
         printf 'abort'
@@ -1529,7 +1665,7 @@ cmd_key_escape() {
 # sentinel file, so a crashed session cannot leave the next run stuck in help.
 cmd_toggle_help() {
     if [[ ${FZF_PREVIEW_LABEL-} == *Help* ]]; then
-        printf 'change-preview(%s --preview {2} {3})+change-preview-label(%s)' "$SELF_REF" "$LABEL_PREVIEW"
+        printf 'change-preview(%s --preview {2} {3} {4} {5})+change-preview-label(%s)' "$SELF_REF" "$LABEL_PREVIEW"
     else
         printf 'change-preview(%s --help-pane)+change-preview-label(%s)' "$SELF_REF" "$LABEL_HELP"
     fi
@@ -1608,11 +1744,17 @@ cmd_help_pane() {
 # PREVIEW RENDERER
 #==============================================================================
 cmd_preview() {
-    local type="${1:-}" id="${2:-}" pin_file img info tmp
+    local type="${1:-}" id="${2:-}" expected_db="${3:-}" expected_generation="${4:-}" pin_file img info tmp
     write_preview_size
     is_kitty && kitty_purge
 
     [[ -n $type ]] || { printf '\e[2mNo selection.\e[0m\n'; return 0; }
+
+    if [[ $type != pin && ( ( -n $expected_db && $expected_db != "$CLIPHIST_DB_PATH" ) ||
+                           ( -n $expected_generation && $expected_generation != "$DB_GENERATION" ) ) ]]; then
+        printf '\e[33mClipboard history changed. Reload with Ctrl-R.\e[0m\n'
+        return 0
+    fi
 
     case $type in
         empty)
@@ -1668,10 +1810,11 @@ cmd_preview() {
 # BATCH ACTIONS
 #==============================================================================
 cmd_batch_pin() {
-    local file="${1:-}" line tmp hash target
+    local file="${1:-}" line tmp hash target encoding
     local pinned=0 unpinned=0 failed=0
 
     [[ -f $file && -r $file ]] || return 1
+    validate_file_backend "$file" || return 1
 
     while IFS= read -r line || [[ -n $line ]]; do
         parse_item "$line" || continue
@@ -1692,6 +1835,12 @@ cmd_batch_pin() {
                     continue
                 fi
                 tmp="$REPLY"
+
+                if ! encoding=$(file --mime-encoding -b -- "$tmp" 2>/dev/null) || [[ $encoding == binary ]]; then
+                    remove_tmpfile "$tmp"
+                    (( ++failed ))
+                    continue
+                fi
 
                 if ! hash=$(generate_hash_file "$tmp"); then
                     remove_tmpfile "$tmp"
@@ -1729,6 +1878,7 @@ cmd_batch_delete() {
     local -a delete_ids=() cached=()
 
     [[ -f $file && -r $file ]] || return 1
+    validate_file_backend "$file" || return 1
 
     while IFS= read -r line || [[ -n $line ]]; do
         parse_item "$line" || continue
@@ -1785,6 +1935,22 @@ cmd_batch_delete() {
 
 cmd_wipe() {
     local status
+    if [[ -n ${1:-} && $1 != "$CLIPHIST_DB_PATH" ]]; then
+        notify 'Clipboard storage changed' 'Reload before wiping history.' critical
+        return 1
+    fi
+    if [[ -n ${2:-} && $2 != "$DB_GENERATION" ]]; then
+        notify 'Clipboard history changed' 'Reload before wiping history.' critical
+        return 1
+    fi
+    if [[ -n $SESSION_DIR && -f $SESSION_DIR/list_backend ]]; then
+        local listed_db _mode listed_generation
+        { IFS= read -r listed_db; IFS= read -r _mode; IFS= read -r listed_generation; } <"$SESSION_DIR/list_backend" || return 1
+        if [[ $listed_db != "$CLIPHIST_DB_PATH" || $listed_generation != "$DB_GENERATION" ]]; then
+            notify 'Clipboard history changed' 'Reload with Ctrl-R before wiping history.' critical
+            return 1
+        fi
+    fi
 
     cliphist wipe 2>/dev/null
     status=$?
@@ -1935,11 +2101,11 @@ persist_drag_resize() {
 #==============================================================================
 spawn_terminal() {
     local -a cmd
-    if   have kitty;     then cmd=(kitty --class=cliphist-fzf --title=Clipboard -o confirm_os_window_close=0 -e)
-    elif have foot;      then cmd=(foot --app-id=cliphist-fzf --title=Clipboard --window-size-chars=110x28)
-    elif have ghostty;   then cmd=(ghostty --class=cliphist-fzf --title=Clipboard -e)
-    elif have wezterm;   then cmd=(wezterm start --class=cliphist-fzf --)
-    elif have alacritty; then cmd=(alacritty --class=cliphist-fzf --title=Clipboard \
+    if   have kitty;     then cmd=(kitty --class=terminal_clipboard.sh --title=Clipboard -o confirm_os_window_close=0 -e)
+    elif have foot;      then cmd=(foot --app-id=terminal_clipboard.sh --title=Clipboard --window-size-chars=110x28)
+    elif have ghostty;   then cmd=(ghostty --class=terminal_clipboard.sh --title=Clipboard -e)
+    elif have wezterm;   then cmd=(wezterm start --class=terminal_clipboard.sh --)
+    elif have alacritty; then cmd=(alacritty --class=terminal_clipboard.sh --title=Clipboard \
                                    -o 'window.dimensions.columns=110' -o 'window.dimensions.lines=28' -e)
     else die 'No terminal emulator found' 'Install kitty, foot, ghostty, wezterm or alacritty.'
     fi
@@ -2033,6 +2199,20 @@ show_menu() {
     local border_main=" ${c_mode}[$mode_label]${c_rst} ${c_key}F1${c_rst} ${c_desc}help${c_rst} ${c_sep}·${c_rst} ${c_key}Alt-M${c_rst} ${c_desc}vim${c_rst} ${c_sep}·${c_rst} ${c_key}Alt-V${c_rst} ${c_desc}view${c_rst} ${c_sep}·${c_rst} ${c_key}Alt-A${c_rst} ${c_desc}pin${c_rst} ${c_sep}·${c_rst} ${c_key}Alt-D${c_rst} ${c_desc}del${c_rst} ${c_sep}·${c_rst} ${c_key}Alt-W${c_rst} ${c_desc}wipe${c_rst} "
     export CLIPFZF_BORDER_MAIN="$border_main"
 
+    # This callback only reads the list snapshot: keep it in fzf's existing
+    # shell instead of reparsing the full script on every load.
+    # shellcheck disable=SC2016
+    local label_action='transform:if { IFS= read -r _db; IFS= read -r mode; } < "$CLIPFZF_SESSION/list_backend"; then
+        label=$CLIPFZF_BORDER_MAIN
+        label=${label/\[RAM\]/[$mode]}
+        label=${label/\[DISK\]/[$mode]}
+        printf "change-border-label(%s)" "$label"
+    fi'
+    # Temporarily expose the query for a preset, then restore normal mode.
+    # fzf executes the complete chain before drawing, so this does not flicker.
+    # shellcheck disable=SC2016
+    local filter_mode_action='transform:if [[ $FZF_PROMPT == *q:quit* ]]; then printf hide-input; else printf ignore; fi'
+
     # Every command string below is pure ASCII and free of fzf's action-argument
     # metacharacters; the script path travels in $CLIPFZF_SELF instead.
     local -a args=(
@@ -2044,8 +2224,8 @@ show_menu() {
         --info=hidden
         --pointer='▌' --marker='┃'
         --delimiter="$SEP" --with-nth=1 --nth=1
-        --track '--id-nth=2,3'
-        --preview="$SELF_REF --preview {2} {3}"
+        --track '--id-nth=2,3,4,5'
+        --preview="$SELF_REF --preview {2} {3} {4} {5}"
         --preview-window="${STATE[PREVIEW_LAYOUT]}"
         --preview-label="$LABEL_PREVIEW" --preview-label-pos=3
         --color="label:bold,preview-scrollbar:${MATUGEN_ACCENT}"
@@ -2054,6 +2234,7 @@ show_menu() {
         --bind="f1:transform:$SELF_REF --toggle-help"
         --bind="esc:transform:$SELF_REF --key-escape"
         --bind="alt-w:transform:$SELF_REF --confirm-wipe"
+        --bind="load:$label_action"
 
         # The preview process records the geometry itself, so `resize` no longer
         # needs its own execute-silent fork.
@@ -2069,11 +2250,11 @@ show_menu() {
         --bind="alt-up:transform:$SELF_REF --resize-preview up"
         --bind="alt-down:transform:$SELF_REF --resize-preview down"
 
-        --bind="alt-t:change-query:!$ICON_IMG !$ICON_PIN !$ICON_BIN "
-        --bind="alt-i:change-query:$ICON_IMG "
-        --bind="alt-p:change-query:$ICON_PIN "
-        --bind="alt-b:change-query:$ICON_BIN "
-        --bind='alt-x:clear-query'
+        --bind="alt-t:show-input+change-query(!$ICON_IMG !$ICON_PIN !$ICON_BIN )+search(!$ICON_IMG !$ICON_PIN !$ICON_BIN )+$filter_mode_action"
+        --bind="alt-i:show-input+change-query($ICON_IMG )+search($ICON_IMG )+$filter_mode_action"
+        --bind="alt-p:show-input+change-query($ICON_PIN )+search($ICON_PIN )+$filter_mode_action"
+        --bind="alt-b:show-input+change-query($ICON_BIN )+search($ICON_BIN )+$filter_mode_action"
+        --bind="alt-x:show-input+clear-query+search()+$filter_mode_action"
 
         # clear-multi, NOT clear-selection: the latter is not an fzf action and
         # made fzf abort at startup with "unknown action".
@@ -2082,15 +2263,19 @@ show_menu() {
         --bind="ctrl-r:reload-sync($SELF_REF --list)"
 
         # Vim keys are declared once; standard mode unbinds them at start.
-        # `rebind` restores these definitions when Vim mode is enabled. With
-        # search disabled fzf ignores every unbound printable key, so nothing
-        # can leak into the query buffer and no ignore-list is needed.
+        # `rebind` restores these definitions when Vim mode is enabled.
+        # hide-input also prevents unbound characters, editing keys and paste
+        # from altering the query; disable-search alone cannot do this.
         --bind='j:down' --bind='k:up' --bind='g:first' --bind='G:last'
         --bind='J:toggle+down' --bind='K:toggle+up'
-        --bind='v:toggle' --bind='V:toggle' --bind='ctrl-a:select-all'
-        --bind='ctrl-d:half-page-down' --bind='ctrl-u:half-page-up'
+        --bind='v:toggle' --bind='V:toggle'
+        # Unbinding a custom control key removes fzf's default too. Keep these
+        # bindings active and choose their normal/search meaning inside fzf.
+        --bind="ctrl-a:transform:if [[ \$FZF_INPUT_STATE == hidden ]]; then printf select-all; else printf beginning-of-line; fi"
+        --bind="ctrl-d:transform:if [[ \$FZF_INPUT_STATE == hidden ]]; then printf half-page-down; else printf delete-char/eof; fi"
+        --bind="ctrl-u:transform:if [[ \$FZF_INPUT_STATE == hidden ]]; then printf half-page-up; else printf unix-line-discard; fi"
         --bind='q:abort'
-        --bind="/:change-prompt($PROMPT_SEARCH)+enable-search+unbind($VIM_KEYS)"
+        --bind="/:show-input+change-header()+change-prompt($PROMPT_SEARCH)+enable-search+unbind($VIM_KEYS)"
     )
 
     # Keep the original mode bootstrap: direct initialization and --sync
@@ -2118,7 +2303,7 @@ show_menu() {
             trap 'exit 130' INT
             trap 'exit 143' TERM
 
-            cmd_list
+            backend_command cmd_list
         ) | fzf "${args[@]}"
 
         exit "${PIPESTATUS[1]}"
@@ -2143,7 +2328,7 @@ show_menu() {
     readarray -t lines <<<"$output"
     (( ${#lines[@]} )) || return 0
 
-    cmd_batch_copy "${lines[@]}"
+    backend_command cmd_batch_copy "${lines[@]}"
 }
 
 #==============================================================================
@@ -2195,8 +2380,11 @@ main() {
     init_backend_env
 
     case "${1:-}" in
-        --list)            setup_dirs && cmd_list ;;
-        --preview)         (( $# >= 2 )) || exit 1; cmd_preview "${2:-}" "${3:-}" ;;
+        --list)            setup_dirs && backend_command cmd_list ;;
+        --backend)         backend_command cmd_backend_path ;;
+        --preview)         (( $# >= 2 )) || exit 1; backend_command cmd_preview "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+        --copy)            (( $# >= 3 )) || exit 1; setup_dirs && backend_command cmd_batch_copy "$SEP$2$SEP$3$SEP${4:-}$SEP${5:-}" ;;
+        --decode)          (( $# >= 2 )) || exit 1; backend_command cmd_decode "$2" "${3:-}" "${4:-}" ;;
         --help-pane)       cmd_help_pane ;;
         --toggle-help)     cmd_toggle_help ;;
         --toggle-vim)      cmd_toggle_vim ;;
@@ -2206,10 +2394,10 @@ main() {
         --capture-size)    write_preview_size ;;
         --move-preview)    (( $# >= 2 )) || exit 1; cmd_move_preview "$2" ;;
         --resize-preview)  (( $# >= 2 )) || exit 1; cmd_resize_preview "$2" ;;
-        --batch-pin)       setup_dirs && cmd_batch_pin "${2:-}" ;;
-        --batch-delete)    setup_dirs && cmd_batch_delete "${2:-}" ;;
-        --wipe)            setup_dirs && cmd_wipe ;;
-        --prune-cache)     setup_dirs && cmd_prune_cache ;;
+        --batch-pin)       setup_dirs && backend_command cmd_batch_pin "${2:-}" ;;
+        --batch-delete)    setup_dirs && backend_command cmd_batch_delete "${2:-}" ;;
+        --wipe)            setup_dirs && backend_command cmd_wipe "${2:-}" "${3:-}" ;;
+        --prune-cache)     setup_dirs && backend_command cmd_prune_cache ;;
         --doctor)          cmd_doctor ;;
         --version)         printf '%s %s\n' "$SCRIPT_NAME" "$VERSION" ;;
         --help|-h)
