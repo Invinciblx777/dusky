@@ -6,7 +6,7 @@
 # ==============================================================================
 # Architecture: Asynchronous Non-Blocking PTY Stream Engine | Textual Split TUI
 # Features: Progress Bar/Speed Extraction | Auto-Prompt Responder | State Persistence
-# Compatibility: Python 3.14+ | Textual 8.2+ | Arch Linux ISO (2026+)
+# Compatibility: Python 3.14.7+ | Textual 8.2.8+ | Arch Linux ISO (2026+)
 # ==============================================================================
 
 import os
@@ -121,7 +121,7 @@ except (importlib_metadata.PackageNotFoundError, RuntimeError) as exc:
 # ==============================================================================
 # CONSTANTS & CONFIGURATION LOAD
 # ==============================================================================
-VERSION = "19.0.1"
+VERSION = "19.0.2"
 SCRIPT_DIR: Path = Path(__file__).resolve().parent
 PROFILES_DIR: Path = Path(
     os.environ.get("DUSKY_PROFILES_DIR", SCRIPT_DIR / "profiles")
@@ -2026,6 +2026,7 @@ class DuskyOrchestratorApp(App):
         self.start_time = inherited_start
         self.finished_time: float | None = None
         self.current_pty_master: int | None = None
+        self._previous_signal_handlers: dict[int, Any] = {}
         self._status_text = "Ready"
         self._speed_text = ""
 
@@ -2103,6 +2104,10 @@ class DuskyOrchestratorApp(App):
             yield Footer()
 
     def on_mount(self) -> None:
+        loop = asyncio.get_running_loop()
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            self._previous_signal_handlers[signum] = signal.getsignal(signum)
+            loop.add_signal_handler(signum, self._terminate, signum)
         with suppress(Exception):
             self.query_one("#log_switcher", ContentSwitcher).current = "pty_log"
 
@@ -2120,6 +2125,17 @@ class DuskyOrchestratorApp(App):
         self.log_system(f"Loaded Cached State: {len(self.completed_keys)} tasks completed")
 
         self.run_execution_loop()
+
+    def _terminate(self, signum: int) -> None:
+        self.log_system(f"Termination requested: {signal.Signals(signum).name}")
+        self.exit(return_code=128 + signum)
+
+    def on_unmount(self) -> None:
+        loop = asyncio.get_running_loop()
+        for signum, previous in self._previous_signal_handlers.items():
+            loop.remove_signal_handler(signum)
+            signal.signal(signum, previous)
+        self._previous_signal_handlers.clear()
 
     def _render_final_overview_block(self) -> None:
         failed = self.counters["failed"] or self.persistence_failed or self.logger.failed_write
@@ -2481,13 +2497,23 @@ class DuskyOrchestratorApp(App):
 
     @staticmethod
     async def _stop_pty_child(proc: asyncio.subprocess.Process) -> None:
-        # A PTY child has its own session; its descendants may outlive the leader.
+        # Give the whole group time to flush and exit, including descendants
+        # whose leader has already stopped.
+        deadline = time.monotonic() + 2
         with suppress(ProcessLookupError, PermissionError):
             os.killpg(proc.pid, signal.SIGTERM)
         try:
             await asyncio.wait_for(proc.wait(), 2)
         except TimeoutError:
             pass
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(proc.pid, 0)
+            except ProcessLookupError:
+                return
+            except PermissionError:
+                break
+            await asyncio.sleep(0.05)
         with suppress(ProcessLookupError, PermissionError):
             os.killpg(proc.pid, signal.SIGKILL)
         if proc.returncode is None:
@@ -2872,6 +2898,8 @@ class DuskyOrchestratorApp(App):
 
     def action_toggle_manual(self):
         self.manual = not self.manual
+        if self.manual:
+            self.auto_mode = False
         mode = "ENABLED" if self.manual else "DISABLED"
         self.log_system(f"Manual step confirmation mode {mode}")
 
@@ -2943,24 +2971,20 @@ def main():
         phase2 = is_in_chroot()
         phase1 = not phase2
 
-    profiles = discover_profiles()
     selected_profile: ProfileConfig | None = None
-
-    if args.profile:
-        for p in profiles:
-            if p.filepath and (p.filepath.name.lower() == args.profile.lower()
-                               or p.filepath.stem.lower() == args.profile.lower()
-                               or p.name.lower() == args.profile.lower()):
-                selected_profile = p
-                break
-        if not selected_profile:
-            p_path = Path(args.profile)
-            if p_path.exists():
-                try:
-                    selected_profile = load_profile(p_path)
-                except Exception as e:
-                    sys.stderr.write(f"Error loading profile '{args.profile}': {e}\n")
-                    sys.exit(1)
+    explicit_path = Path(args.profile).expanduser() if args.profile else None
+    if explicit_path is not None and explicit_path.is_file():
+        selected_profile = load_profile(explicit_path)
+        profiles = [selected_profile]
+    else:
+        profiles = discover_profiles()
+        if args.profile:
+            for p in profiles:
+                if p.filepath and (p.filepath.name.lower() == args.profile.lower()
+                                   or p.filepath.stem.lower() == args.profile.lower()
+                                   or p.name.lower() == args.profile.lower()):
+                    selected_profile = p
+                    break
 
     if args.profile and selected_profile is None:
         raise ValueError(f"Unknown installer profile: {args.profile}")
@@ -3000,8 +3024,8 @@ def main():
                         break
             else:
                 raise RuntimeError(f"Offline repository unavailable: {repo_reason}. Select --online explicitly for online installation.")
-            if not selected_profile and profiles:
-                selected_profile = profiles[0]
+            if not selected_profile:
+                raise RuntimeError("No offline installer profile available; select --profile explicitly")
         else:
             from rich.panel import Panel
             from rich.console import Console
@@ -3214,7 +3238,7 @@ def main():
             if not t.resolved_path:
                 reasons.append("MISSING SCRIPT -> ABORT")
             else:
-                if t.once and once_store.marker_valid(t, profile_name):
+                if t.once and not t.always and once_store.marker_valid(t, profile_name):
                     reasons.append("SKIP (once-marker valid)")
                 if t.condition:
                     reasons.append(f"condition: {t.condition}")
@@ -3245,7 +3269,7 @@ def main():
             status = "PENDING"
             if not t.resolved_path:
                 status = "MISSING"
-            elif t.once and once_store.marker_valid(t, profile_name):
+            elif t.once and not t.always and once_store.marker_valid(t, profile_name):
                 status = "SKIP (once-marker valid)"
             print(
                 f"  {i+1:2d}. {t.script_name} {' '.join(t.args)} [{'IGNORE_FAIL' if t.ignore_fail else 'STRICT'}] [{'INTERACTIVE' if t.interactive else 'NON-INT'}] -> {status} (using {t.interpreter})"

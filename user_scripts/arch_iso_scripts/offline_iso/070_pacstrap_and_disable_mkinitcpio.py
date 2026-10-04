@@ -37,7 +37,7 @@ MOUNT_POINT = Path("/mnt")
 
 # Base packages every system needs
 FINAL_PACKAGES = [
-    "base", "base-devel", "linux", "linux-headers", "mkinitcpio",
+    "base", "base-devel", "linux", "linux-headers", "mkinitcpio", "terminus-font",
     "neovim", "btrfs-progs", "dosfstools", "efibootmgr", "openssh", "git", "zsh",
     "networkmanager", "yazi", "linux-firmware-other", "otf-atkinsonhyperlegiblemono-nerd",
     "python", "python-textual", "python-rich"

@@ -98,7 +98,6 @@ if [[ -t 0 && -t 1 ]]; then
 fi
 readonly HAS_TTY
 
-readonly PACMAN_DB_LOCK='/var/lib/pacman/db.lck'
 readonly PACMAN_LOCK_TIMEOUT=300
 readonly SCRIPT_LOCK_FILE='/run/lock/elite-system-installer.lock'
 readonly COMPILED_MANIFEST="$(dirname -- "${BASH_SOURCE[0]}")/compiled_packages.txt"
@@ -176,7 +175,6 @@ acquire_script_lock() {
 
 run_pacman() {
   local start_time=$SECONDS
-  local warned=0
   local rc=0
   local tee_pid=0
   local temp_dir=''
@@ -221,10 +219,12 @@ run_pacman() {
     if grep -Fqs 'unable to lock database' -- "$stderr_file"; then
       rm -rf -- "$temp_dir"
 
-      print_warn "Pacman database is locked: purging ${PACMAN_DB_LOCK}..."
-      killall -9 pacman 2>/dev/null || true
-      rm -f -- "${PACMAN_DB_LOCK}"
-      sleep 1
+      if (( SECONDS - start_time >= PACMAN_LOCK_TIMEOUT )); then
+        print_error "Timed out waiting for the pacman database lock."
+        exit "$rc"
+      fi
+      print_warn "Pacman database is locked; waiting for the active transaction..."
+      sleep 2
       continue
     fi
 
