@@ -2026,6 +2026,14 @@ def stage_payloads(cfg: IsoConfig) -> None:
 
 def configure_live_hooks(cfg: IsoConfig) -> None:
     info("Live hooks")
+    # archiso mounts its own ISO and SquashFS. systemd's optical GPT autodiscovery
+    # otherwise tries to attach the UEFI boot medium as a root disk and fails.
+    rules = cfg.profile_dir / "airootfs" / "etc" / "udev" / "rules.d"
+    rules.mkdir(parents=True, exist_ok=True)
+    (rules / "98-dusky-live-optical.rules").write_text(
+        'SUBSYSTEM=="block", ENV{ID_CDROM}=="1", ENV{ID_FS_TYPE}=="iso9660", '
+        'ENV{ID_PART_GPT_AUTO_ROOT_DISK_NEEDS_LOOP}="0"\n', encoding="utf-8",
+    )
     script = cfg.profile_dir / "airootfs" / "root" / ".automated_script.sh"
     script.write_text(
         "#!/usr/bin/env bash\n"
