@@ -128,7 +128,7 @@ CORE_USER_DEFS = {
     ),
     "dusky_ram_monitor.service": (
         "Dusky RAM Monitor",
-        "Background monitor that alerts you if physical RAM usage exceeds 95% or ZRAM swap occupancy exceeds 90%. Clicking the alert opens an interactive Rofi menu to select and terminate memory-heavy processes before a system crash.",
+        "Background monitor that alerts you if RAM usage reaches 95%, or both RAM usage and active ZRAM swap occupancy reach 90%. Clicking the alert opens an interactive Rofi menu to select and terminate memory-heavy processes before a system crash.",
     ),
     "dusky_visualizer.service": (
         "Audio Visualizer Daemon",
