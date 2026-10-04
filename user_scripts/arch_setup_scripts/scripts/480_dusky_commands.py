@@ -122,14 +122,14 @@ BEFORE_COMMANDS: list[FleetCommand] = [
     FleetCommand(Mode.USER, 'mkdir -p ~/.config/opencode/themes || true', "Create Opencode Themes Directory"),
     FleetCommand(Mode.USER, 'mkdir -p ~/.config/Kvantum/matugen || true', "Create Kvantum Matugen Directory"),
     FleetCommand(Mode.USER, 'systemctl --user disable --now dusky_sliders.service || true', "Disable Legacy Sliders Service"),
-    # --- Remove old dusky_snaapshot timer (typo) before re-deploying dusky_snapshot ---
+    # --- Remove old dusky_snapshot units before re-deployment ---
     FleetCommand(
         Mode.SUDO,
-        'systemctl stop dusky_snaapshot.timer dusky_snaapshot.service 2>/dev/null || true; '
-        'systemctl disable dusky_snaapshot.timer 2>/dev/null || true',
-        "Stop & Disable Legacy Typo Snapshot Service"
+        'systemctl stop dusky_snapshot.timer dusky_snapshot.service 2>/dev/null || true; '
+        'systemctl disable dusky_snapshot.timer 2>/dev/null || true',
+        "Stop & Disable Snapshot Service"
     ),
-    FleetCommand(Mode.SUDO, 'rm -f /etc/systemd/system/dusky_snaapshot.service /etc/systemd/system/dusky_snaapshot.timer', "Remove Legacy Typo Snapshot Unit Files"),
+    FleetCommand(Mode.SUDO, 'rm -f /etc/systemd/system/dusky_snapshot.service /etc/systemd/system/dusky_snapshot.timer', "Remove Snapshot Unit Files"),
     FleetCommand(Mode.SUDO, 'systemctl daemon-reload', "Systemd System Daemon Reload"),
     # --- System Services ---
     # FleetCommand(Mode.USER, 'systemctl --user disable dusky.service || true', "Disable Legacy Dusky Service"),
