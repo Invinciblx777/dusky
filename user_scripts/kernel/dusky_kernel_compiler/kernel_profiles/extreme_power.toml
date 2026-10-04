@@ -11,7 +11,6 @@ tags = ["laptop", "power-saving"]
 governor = "powersave"
 epp = "power"
 mitigations = "off"
-compat32 = false
 
 [timing]
 hz = 100
@@ -48,7 +47,6 @@ ubsan_bounds = false
 acknowledge_risk = true
 
 [gaming]
-ntsync = false
 uclamp = false
 max_map_count = 1048576
 

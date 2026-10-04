@@ -9,7 +9,6 @@ tags = ["low-memory", "desktop"]
 
 [cpu]
 mitigations = "off"
-compat32 = false
 
 [timing]
 hz = 250
@@ -49,7 +48,6 @@ ubsan_bounds = false
 acknowledge_risk = true
 
 [gaming]
-ntsync = false
 uclamp = false
 max_map_count = 1048576
 

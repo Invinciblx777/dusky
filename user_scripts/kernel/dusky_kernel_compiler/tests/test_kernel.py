@@ -43,6 +43,8 @@ class AuditTests(unittest.TestCase):
             with self.subTest(profile=name):
                 p = k.load_profile(k.SCRIPT_DIR / 'kernel_profiles' / f'{name}.toml')
                 self.assertEqual(p.g('cpu', 'arch'), 'native')
+                self.assertTrue(p.g('cpu', 'compat32'))
+                self.assertTrue(p.g('gaming', 'ntsync'))
                 self.assertEqual(p.g('compiler', 'lto'), 'thin')
                 self.assertEqual(p.g('compiler', 'optimize'), 'size' if name == 'low_memory' else 'o2')
                 self.assertEqual(p.g('compiler', 'module_compress'), 'zstd')

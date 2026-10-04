@@ -16,10 +16,12 @@ Choose **Build** in the menu, review the profile and release, then proceed. Choo
 |---|---|---|
 | battery | Laptop battery use | 300 Hz, lazy preemption/RCU, power EPP, automatic THP disabled |
 | performance | Responsive desktop | 1000 Hz, full preemption, performance EPP, THP on request |
-| extreme_power | Aggressive power saving | 100 Hz, lazy RCU, aggressive ASPM, no IA32/NTSync |
-| low_memory | Memory-constrained desktop | Size optimization, 250 Hz, ZSTD swap, automatic THP disabled; no IA32/NTSync/hibernation |
+| extreme_power | Aggressive power saving | 100 Hz, lazy RCU, aggressive ASPM |
+| low_memory | Memory-constrained desktop | Size optimization, 250 Hz, ZSTD swap, automatic THP disabled; no hibernation |
 
 All use strict census pruning and native local CPU targeting. None has a vendor-specific keep list or blanket VM driver overrides. The battery profile no longer enables sched_ext/BTF solely for an unused daemon or forces PCIe ASPM against firmware restrictions. CPU mitigations and other existing security preferences remain profile settings.
+
+All four profiles retain 32-bit x86 application support and NTSync as a module for compatible Wine/Proton applications. An unloaded NTSync module occupies disk space, not resident driver memory, and creates no background polling. IA32 compatibility adds built-in code; disabling it can reduce the kernel footprint, but the supplied profiles preserve application compatibility instead.
 
 ```sh
 python dusky_kernal_compile.py -p battery --no-install
