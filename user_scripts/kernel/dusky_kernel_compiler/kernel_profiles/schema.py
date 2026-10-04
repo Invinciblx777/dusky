@@ -3,10 +3,11 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Final, Literal
 
-HZ_CHOICES: Final = (100, 250, 300, 1000)
+HZ_CHOICES: Final = (100, 250, 300, 500, 600, 750, 1000)
+HZ_UPSTREAM: Final = (100, 250, 300, 1000)
 TICKLESS_CHOICES: Final = ("periodic", "idle", "full")
 PREEMPT_CHOICES: Final = ("lazy", "full", "rt")
-SCHED_CHOICES: Final = ("eevdf",)
+SCHED_CHOICES: Final = ("eevdf", "bore", "bmq")
 SCX_CHOICES: Final = ("none", "scx_lavd", "scx_bpfland", "scx_layered", "scx_rusty", "scx_flash", "scx_p2dq", "scx_cosmos")
 CHANNEL_CHOICES: Final = ("mainline", "stable", "longterm")
 LTO_CHOICES: Final = ("none", "thin", "thin_dist", "full")
@@ -44,7 +45,7 @@ CHOICE_HELP: Final[dict[tuple[str, str], dict[str, str]]] = {
     ("release", "channel"): {
         "mainline": "Linus' tree: newest features and release candidates when allow_rc=true",
         "stable": "latest stable point release -- recommended for daily drivers",
-        "longterm": "LTS branch (still subject to the >= 7.3 floor)",
+        "longterm": "LTS branch (still subject to the >= 7.2 floor)",
     },
     ("cpu", "arch"): {
         "native": "-march=native via CONFIG_X86_NATIVE_CPU: fastest, host-only, never portable",
@@ -81,6 +82,8 @@ CHOICE_HELP: Final[dict[tuple[str, str], dict[str, str]]] = {
     },
     ("scheduler", "type"): {
         "eevdf": "upstream EEVDF (7.x default) -- required for sched_ext BPF classes",
+        "bore": "BORE: burst-oriented EEVDF variant (out-of-tree patch, sched_ext compatible)",
+        "bmq": "Project C BMQ (out-of-tree patch replacing EEVDF; incompatible with sched_ext)",
     },
     ("scheduler", "scx"): {
         "none": "no BPF scheduler daemon (sched_ext class may still be compiled)",
@@ -151,8 +154,8 @@ CHOICE_HELP: Final[dict[tuple[str, str], dict[str, str]]] = {
     },
     ("compiler", "debug_info"): {
         "none": "DEBUG_INFO_NONE (forced to DWARF5 when BTF is required by sched_ext/BPF)",
-        "reduced": "reduced DWARF5; promoted to full debug types when BTF is required",
-        "full": "full DWARF5 (largest build tree)",
+        "reduced": "DWARF5 debug info (needed for BTF); no runtime memory cost",
+        "full": "full DWARF5, uncompressed (largest build tree)",
     },
     ("security", "profile"): {
         "balanced": "Arch-like hardening: usercopy checks, init_on_alloc, freelist hardening, UBSAN bounds",
@@ -181,12 +184,12 @@ CHOICE_HELP: Final[dict[tuple[str, str], dict[str, str]]] = {
         "expanded": "modprobed.db + LMC_KEEP safety net (USB/GPU/net/HID/fs stay available)",
     },
     ("compiler", "headers"): {
-        "auto": "build -headers when target DKMS modules are installed (nvidia, zfs, v4l2loopback...)",
+        "auto": "build -headers only when DKMS modules are installed (nvidia, zfs, v4l2loopback...)",
         "always": "always build the -headers package",
         "never": "never build headers (enables TRIM_UNUSED_KSYMS eligibility)",
     },
     ("dusky", "seed"): {
-        "auto": "Arch complete config -> running -> headers -> snapshot -> defconfig",
+        "auto": "snapshot -> Arch upstream config -> /proc/config.gz -> headers -> defconfig",
         "snapshot": "only the saved snapshot for this profile",
         "arch": "Arch Linux packaging config (gitlab.archlinux.org)",
         "running": "/proc/config.gz of the running kernel",
@@ -240,17 +243,20 @@ PROFILE_SPEC: Final[dict[str, tuple[FieldSpec, ...]]] = {
         F("channel", "str", "stable", "Preferred upstream release channel for the interactive picker", CHANNEL_CHOICES),
         F("pin", "str", "", "Exact unattended version; preselected in the interactive picker (e.g. 7.2.3 or 7.3-rc2)"),
         F("allow_rc", "bool", False, "Allow -rc as the automatic mainline choice; interactive selection can override"),
-        F("min_version", "str", "7.3-rc1", "Hard floor; anything older is rejected", wizard=False),
+        F("min_version", "str", "7.2", "Hard floor; anything older is rejected", wizard=False),
         F("require_signature", "bool", True, "Require PGP or SHA256 verification of release tarballs"),
     ),
     "scheduler": (
-        F("type", "str", "eevdf", "Stock upstream EEVDF scheduler", SCHED_CHOICES, wizard=False),
+        F("type", "str", "eevdf", "Base scheduler", SCHED_CHOICES),
         F("scx", "str", "none", "sched_ext BPF scheduler executable (or none)"),
         F("scx_flags", "str", "", "Flags passed to the scx daemon (e.g. --autopilot)"),
-        F("scx_enable_class", "bool", False, "Compile CONFIG_SCHED_CLASS_EXT (+BTF/BPF JIT)"),
+        F("scx_enable_class", "bool", True, "Compile CONFIG_SCHED_CLASS_EXT (+BTF/BPF JIT)"),
+        F("require_patch", "bool", False, "Fail the build if the scheduler patch cannot be applied"),
+        F("allow_vanilla_fallback", "bool", True, "Fall back to EEVDF when the patch fails"),
         F("autogroup", "bool", True, "SCHED_AUTOGROUP (per-session fairness)"),
         F("rt_group", "bool", False, "RT_GROUP_SCHED bandwidth control"),
         F("sched_core", "bool", False, "SCHED_CORE core scheduling (SMT side-channel isolation; overhead)"),
+        F("patch_sources", "list", ["cachyos", "upstream_author", "tkg"], "Ordered patch resolvers", wizard=False),
     ),
     "cache": (
         F("sched_cache", "bool", True, "CONFIG_SCHED_CACHE Cache-Aware Scheduling (LLC affinity)"),
@@ -263,6 +269,9 @@ PROFILE_SPEC: Final[dict[str, tuple[FieldSpec, ...]]] = {
     ),
     "dusky": (
         F("enhanced", "bool", False, "Desktop heuristics (nowatchdog, faster fbcon takeover)"),
+        F("patch_sched_inline", "bool", False, "Optional context-switch inlining patch; benchmark on the target"),
+        F("patch_evdev_rcu", "bool", False, "Asynchronous evdev detach (eliminates 27s input close stalls)"),
+        F("patch_pci_pme", "bool", False, "Clear Linux 4000ms PCI PME polling timeout (reduces wakeups/saves power)"),
         F("hostname", "str", "", "KBUILD_BUILD_HOST (empty = system hostname)", wizard=False),
         F("user", "str", "", "KBUILD_BUILD_USER (empty = dynamic active user)", wizard=False),
         F("reproducible", "bool", True, "Fixed KBUILD_BUILD_TIMESTAMP / SOURCE_DATE_EPOCH", wizard=False),
@@ -289,7 +298,7 @@ PROFILE_SPEC: Final[dict[str, tuple[FieldSpec, ...]]] = {
         F("preempt_dynamic", "bool", True, "PREEMPT_DYNAMIC (preempt= boot switch)"),
     ),
     "memory": (
-        F("footprint", "str", "lean", "Memory footprint tier (bundles many small Kconfig cuts)", FOOTPRINT_CHOICES),
+        F("footprint", "str", "standard", "Memory footprint tier (bundles many small Kconfig cuts)", FOOTPRINT_CHOICES),
         F("thp", "str", "madvise", "Transparent Hugepages mode", THP_CHOICES),
         F("thp_defrag", "str", "defer+madvise", "THP defrag strategy", THP_DEFRAG_CHOICES),
         F("thp_shmem", "str", "never", "THP for shmem/tmpfs", THP_SHMEM_CHOICES),
@@ -333,6 +342,7 @@ PROFILE_SPEC: Final[dict[str, tuple[FieldSpec, ...]]] = {
     "compiler": (
         F("toolchain", "str", "llvm", "Toolchain", TOOLCHAIN_CHOICES),
         F("optimize", "str", "o2", "Optimization level", OPT_CHOICES),
+        F("polly", "bool", False, "Clang Polly loop optimizer (CONFIG_POLLY_CLANG)"),
         F("lto", "str", "thin", "Link-time optimization", LTO_CHOICES),
         F("thinlto_cache", "bool", True, "Persist the ThinLTO cache across builds"),
         F("thinlto_cache_size_gb", "int", 20, "Prune the ThinLTO cache above this size", minimum=1, maximum=500),
@@ -367,7 +377,7 @@ PROFILE_SPEC: Final[dict[str, tuple[FieldSpec, ...]]] = {
         F("uclamp", "bool", True, "UCLAMP_TASK utilization clamping"),
         F("max_map_count", "int", 2147483642, "vm.max_map_count", minimum=65530, maximum=2147483642),
         F("split_lock_mitigate", "bool", False, "Split-lock detection penalty (off = better emulator/game frametimes)"),
-        F("controllers", "bool", False, "Keep controller/HID drivers (xpad, playstation, nintendo, steam, uinput)"),
+        F("controllers", "bool", True, "Keep controller/HID drivers (xpad, playstation, nintendo, steam, uinput)"),
     ),
     "storage": (
         F("nvme_poll_queues", "int", 0, "nvme.poll_queues (IOPOLL) count", minimum=0, maximum=128),
@@ -411,6 +421,7 @@ PROFILE_SPEC: Final[dict[str, tuple[FieldSpec, ...]]] = {
         F("write_entries", "bool", True, "Write/refresh systemd-boot entries for this flavor"),
         F("set_default", "bool", False, "Make this flavor the systemd-boot default"),
         F("nowatchdog", "bool", True, "Disable NMI/soft watchdog (nowatchdog nmi_watchdog=0)"),
+        F("acs_override", "bool", False, "PCIe ACS override for broken IOMMU groups (VFIO GPU passthrough; dangerous)"),
     ),
     "runtime": (
         F("enabled", "bool", True, "Package a kernel-specific one-shot boot tuning service"),
@@ -435,7 +446,7 @@ class WizardStep:
 WIZARD_STEPS: Final[tuple[WizardStep, ...]] = (
     WizardStep("Release", (("release", ("channel", "pin", "allow_rc", "require_signature")),)),
     WizardStep("CPU", (("cpu", ("arch", "governor", "amd_pstate", "epp", "mitigations", "nr_cpus", "smt", "prefcore", "compat32", "mce")),)),
-    WizardStep("Scheduler", (("scheduler", ("type", "scx", "scx_flags", "scx_enable_class", "autogroup", "rt_group", "sched_core")),
+    WizardStep("Scheduler", (("scheduler", ("type", "scx", "scx_flags", "scx_enable_class", "require_patch", "allow_vanilla_fallback", "autogroup", "rt_group", "sched_core")),
                              ("cache", ("sched_cache", "llc_aggr_tolerance", "llc_overaggr_pct")),
                              ("rseq", ("slice_extension", "slice_ext_nsec")))),
     WizardStep("Timing", (("timing", ("hz", "tickless", "preempt", "preempt_dynamic")),)),
@@ -445,9 +456,9 @@ WIZARD_STEPS: Final[tuple[WizardStep, ...]] = (
                                                 "dirty_bytes_mb", "slub_tiny", "slab_buckets", "per_vma_lock", "numa", "numa_balancing", "nodes_shift", "ksm", "ksm_run",
                                                 "damon", "page_reporting", "hugetlbfs", "kallsyms_all", "memcg", "base_small", "log_buf_shift", "tracing", "kexec",
                                                 "ikconfig", "trim_unused_ksyms", "dead_code_elimination")),)),
-    WizardStep("Compiler & Toolchain", (("compiler", ("toolchain", "optimize", "lto", "thinlto_cache", "thinlto_cache_size_gb", "kcfi", "fdo", "fdo_profile_dir",
+    WizardStep("Compiler & Toolchain", (("compiler", ("toolchain", "optimize", "polly", "lto", "thinlto_cache", "thinlto_cache_size_gb", "kcfi", "fdo", "fdo_profile_dir",
                                                        "debug_info", "module_compress", "rust", "jobs", "modversions")),
-                                        ("dusky", ("seed", "enhanced", "extra_config")))),
+                                        ("dusky", ("seed", "enhanced", "patch_sched_inline", "patch_evdev_rcu", "patch_pci_pme", "extra_config")))),
     WizardStep("Security", (("security", ("profile", "init_on_alloc", "init_on_free", "hardened_usercopy", "stackprotector", "slab_freelist_hardened",
                                           "slab_freelist_random", "randomize_kstack", "ubsan_bounds", "apparmor", "selinux", "lockdown_early", "acknowledge_risk")),)),
     WizardStep("Gaming / Low-Latency", (("gaming", ("ntsync", "uclamp", "max_map_count", "split_lock_mitigate", "controllers")),)),
@@ -458,7 +469,7 @@ WIZARD_STEPS: Final[tuple[WizardStep, ...]] = (
     WizardStep("Modules, Headers & Boot", (("modules", ("mode", "modprobed_db", "modprobed_db_path", "allow_lsmod_fallback", "lmc_keep_extra", "keep_symbols",
                                                         "localyesconfig", "sig_force")),
                                            ("compiler", ("headers",)),
-                                           ("boot", ("cmdline", "cmdline_extra", "write_entries", "nowatchdog", "set_default")),
+                                           ("boot", ("cmdline", "cmdline_extra", "write_entries", "nowatchdog", "acs_override", "set_default")),
                                            ("meta", ("bare_metal_only", "portable_package")),
                                            ("verify", ("strict", "require_ntsync", "require_btf", "require_sched_ext")))),
 )
