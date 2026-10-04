@@ -54,7 +54,6 @@ ANSI_RE: re.Pattern[str] = re.compile(r"\x1b\[[0-9;]*m")
 
 SETTINGS_DIR: Path = HOME / ".config" / "dusky" / "settings"
 LAYOUT_FILE: Path = SETTINGS_DIR / "git_preview_layout"
-LAST_LAYOUT_FILE: Path = SETTINGS_DIR / "git_preview_last"
 VIM_MODE_FILE: Path = SETTINGS_DIR / "git_vim_mode"
 
 VIM_KEYS: str = "j,k,g,G,J,K,v,V,q,ctrl-a,ctrl-d,ctrl-u,/"
@@ -85,90 +84,10 @@ def get_preview_layout() -> tuple[str, int, str]:
     return edge, pct, rest
 
 
-def handle_fzf_resize(direction: str) -> None:
-    """Synchronous transform callback for Alt-Left/Right/Up/Down preview resizing."""
-    if direction not in {"left", "right", "up", "down"}:
-        raise ValueError(f"Invalid preview direction: {direction}")
-    edge, pct, _ = get_preview_layout()
-    if edge == "hidden":
-        return
-
-    try:
-        if edge in ("right", "left"):
-            pc = int(os.environ.get("FZF_PREVIEW_COLUMNS", 0))
-            tc = int(os.environ.get("FZF_COLUMNS", 0))
-            if tc > 0 and 0 < pc < tc:
-                pct = (pc * 100 + tc // 2) // tc
-        else:
-            pl = int(os.environ.get("FZF_PREVIEW_LINES", 0))
-            tl = int(os.environ.get("FZF_LINES", 0))
-            if tl > 0 and 0 < pl < tl:
-                pct = (pl * 100 + tl // 2) // tl
-    except (ValueError, TypeError):
-        pass
-
-    new_pct = pct
-    match (edge, direction):
-        case ("right", "left") | ("left", "right") | ("up", "down") | ("down", "up"):
-            new_pct += 5
-        case ("right", "right") | ("left", "left") | ("up", "up") | ("down", "down"):
-            new_pct -= 5
-
-    new_pct = max(10, min(90, new_pct))
-    border = {"left": "border-right", "right": "border-left", "up": "border-bottom", "down": "border-top"}.get(edge, "border-left")
-    next_layout = f"{edge},{new_pct}%,{border},wrap"
-    try:
-        SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
-        LAYOUT_FILE.write_text(next_layout, encoding="utf-8")
-        LAST_LAYOUT_FILE.write_text(next_layout, encoding="utf-8")
-    except OSError:
-        pass
-    print(f"change-preview-window({next_layout})+refresh-preview")
-
-
-def handle_fzf_move(direction: str) -> None:
-    """Synchronous transform callback for Alt-H/J/K/L/V preview relocation & toggle."""
-    if direction not in {"left", "right", "up", "down", "hidden"}:
-        raise ValueError(f"Invalid preview direction: {direction}")
-    edge, pct, _ = get_preview_layout()
-    try:
-        SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
-
-    if direction == "hidden":
-        if edge == "hidden":
-            last = "right,70%,border-left,wrap"
-            if LAST_LAYOUT_FILE.is_file():
-                try:
-                    val = LAST_LAYOUT_FILE.read_text(encoding="utf-8").strip()
-                    if val and val != "hidden":
-                        last = val
-                except OSError:
-                    pass
-            next_layout = last
-        else:
-            if edge != "hidden":
-                border = {"left": "border-right", "right": "border-left", "up": "border-bottom", "down": "border-top"}.get(edge, "border-left")
-                try:
-                    LAST_LAYOUT_FILE.write_text(f"{edge},{pct}%,{border},wrap", encoding="utf-8")
-                except OSError:
-                    pass
-            next_layout = "hidden"
-    else:
-        border = {"left": "border-right", "right": "border-left", "up": "border-bottom", "down": "border-top"}.get(direction, "border-left")
-        default_pct = 50 if direction in ("up", "down") else 70
-        next_layout = f"{direction},{default_pct}%,{border},wrap"
-        try:
-            LAST_LAYOUT_FILE.write_text(next_layout, encoding="utf-8")
-        except OSError:
-            pass
-
-    try:
-        LAYOUT_FILE.write_text(next_layout, encoding="utf-8")
-    except OSError:
-        pass
-    print(f"change-preview-window({next_layout})+refresh-preview")
+def handle_fzf_layout(action: str, direction: str) -> None:
+    """Compatibility entry point; fzf calls the lightweight Bash helper directly."""
+    subprocess.run(["bash", str(Path(__file__).resolve().with_name("git_fzf_layout.sh")),
+                    action, direction, str(SETTINGS_DIR)], check=True)
 
 
 def handle_fzf_toggle_vim(default_prompt: str = "Select") -> None:
@@ -616,34 +535,26 @@ def sync_all(local_only: bool = False) -> bool | None:
 
 
 DIR_PALETTE: list[str] = [
-    "\033[38;5;75m",   # Light Blue (.config)
-    "\033[38;5;141m",  # Purple (user_scripts)
-    "\033[38;5;79m",   # Aqua Green (.local)
-    "\033[38;5;214m",  # Orange (.zshrc / .bashrc)
-    "\033[38;5;213m",  # Pink (.themes / .icons)
-    "\033[38;5;178m",  # Gold
-    "\033[38;5;110m",  # Steel Blue
-    "\033[38;5;174m",  # Rose
+    "\033[38;5;111m",  # Sky blue
+    "\033[38;5;176m",  # Lavender
+    "\033[38;5;215m",  # Peach
+    "\033[38;5;114m",  # Sage green
+    "\033[38;5;221m",  # Warm yellow
+    "\033[38;5;116m",  # Mint teal
+    "\033[38;5;211m",  # Soft rose
+    "\033[38;5;147m",  # Periwinkle
+    "\033[38;5;180m",  # Sand
+    "\033[38;5;152m",  # Ice blue
+    "\033[38;5;182m",  # Mauve
+    "\033[38;5;186m",  # Light olive
 ]
-
-KNOWN_DIR_COLORS: dict[str, str] = {
-    ".config": "\033[38;5;75m",
-    "user_scripts": "\033[38;5;141m",
-    ".local": "\033[38;5;79m",
-    ".zshrc": "\033[38;5;214m",
-    ".bashrc": "\033[38;5;214m",
-    ".themes": "\033[38;5;213m",
-    ".icons": "\033[38;5;213m",
-}
 
 
 def format_path_colored(path: str, dir_color_cache: dict[str, str]) -> str:
-    """Formats file path with directory hierarchy color coordination."""
+    """Match gitdelta's palette: one color per first two directory components."""
     parts = path.split("/")
     if len(parts) == 1:
-        top = parts[0]
-        color = KNOWN_DIR_COLORS.get(top, "")
-        return f"{color}{top}\033[0m" if color else top
+        return path
 
     if len(parts) <= 2:
         base_dir = parts[0] + "/"
@@ -655,19 +566,11 @@ def format_path_colored(path: str, dir_color_cache: dict[str, str]) -> str:
         file_name = parts[-1]
 
     if base_dir not in dir_color_cache:
-        matched_color = None
-        for prefix, col in KNOWN_DIR_COLORS.items():
-            if parts[0] == prefix or parts[0].startswith(prefix):
-                matched_color = col
-                break
-        if not matched_color:
-            idx = len(dir_color_cache) % len(DIR_PALETTE)
-            matched_color = DIR_PALETTE[idx]
-        dir_color_cache[base_dir] = matched_color
+        dir_color_cache[base_dir] = DIR_PALETTE[len(dir_color_cache) % len(DIR_PALETTE)]
 
     c_base = dir_color_cache[base_dir]
     if sub_dir:
-        return f"{c_base}{base_dir}\033[0m\033[2m{sub_dir}\033[0m{file_name}"
+        return f"{c_base}{base_dir}\033[2m{sub_dir}\033[0m{file_name}"
     return f"{c_base}{base_dir}\033[0m{file_name}"
 
 
@@ -714,12 +617,21 @@ def get_numstat_map() -> dict[str, str]:
 
 
 def sync_single() -> bool | None:
-    """Select literal filenames with live Delta preview and colorized hierarchy."""
+    """Stage and commit selected changes."""
     entries = scoped_entries()
     if not entries:
         console.print("[green]No matching changes to commit.[/green]")
         return
 
+    selected = select_changed_entries(entries, prompt="Stage Files")
+    if selected:
+        return stage_entries(selected)
+
+
+def select_changed_entries(
+    entries: list[tuple[str, str | None, str]], *, prompt: str, notice: str = "",
+) -> list[tuple[str, str | None, str]]:
+    """Select literal filenames with live Delta preview and colorized hierarchy."""
     numstat_map = get_numstat_map()
     dir_colors: dict[str, str] = {}
     choices: dict[str, tuple[str, str | None, str]] = {}
@@ -747,10 +659,12 @@ def sync_single() -> bool | None:
         "\033[33m[ M]\033[0m Mod  \033[32m[M ]\033[0m Staged  \033[35m[MM]\033[0m Both  "
         "\033[31m[ D]\033[0m Del  \033[36m[A ]\033[0m Add  \033[90m[??]\033[0m New"
     )
+    if notice:
+        header = f"{notice}\n{header}"
 
     selected = fzf_select(
         displays,
-        prompt="Stage Files",
+        prompt=prompt,
         multi=True,
         preview=preview_cmd,
         delimiter="\t",
@@ -759,14 +673,8 @@ def sync_single() -> bool | None:
         preview_label=" file diff ",
     )
 
-    if selected:
-        selected_entries = []
-        for line in selected:
-            raw_path = line.split("\t", 1)[0]
-            if raw_path in choices:
-                selected_entries.append(choices[raw_path])
-        if selected_entries:
-            return stage_entries(selected_entries)
+    return [choices[identity] for line in selected or []
+            if (identity := line.split("\t", 1)[0]) in choices]
 
 
 def format_status_badge(code: str) -> str:
@@ -878,16 +786,17 @@ def fzf_select(
         fzf_cmd.append(f"--preview-window={win}")
         if preview_label:
             fzf_cmd.extend([f"--preview-label={preview_label}", "--preview-label-pos=center"])
+        layout_bin = shlex.quote(str(Path(__file__).resolve().with_name("git_fzf_layout.sh")))
         bind_actions.extend([
-            f"alt-left:transform:{self_bin} --resize-preview left",
-            f"alt-right:transform:{self_bin} --resize-preview right",
-            f"alt-up:transform:{self_bin} --resize-preview up",
-            f"alt-down:transform:{self_bin} --resize-preview down",
-            f"alt-h:transform:{self_bin} --move-preview left",
-            f"alt-j:transform:{self_bin} --move-preview down",
-            f"alt-k:transform:{self_bin} --move-preview up",
-            f"alt-l:transform:{self_bin} --move-preview right",
-            f"alt-v:transform:{self_bin} --move-preview hidden",
+            f"alt-left:transform:bash {layout_bin} --resize-preview left",
+            f"alt-right:transform:bash {layout_bin} --resize-preview right",
+            f"alt-up:transform:bash {layout_bin} --resize-preview up",
+            f"alt-down:transform:bash {layout_bin} --resize-preview down",
+            f"alt-h:transform:bash {layout_bin} --move-preview left",
+            f"alt-j:transform:bash {layout_bin} --move-preview down",
+            f"alt-k:transform:bash {layout_bin} --move-preview up",
+            f"alt-l:transform:bash {layout_bin} --move-preview right",
+            f"alt-v:transform:bash {layout_bin} --move-preview hidden",
             "shift-up:preview-up", "shift-down:preview-down",
             "shift-scroll-up:preview-up", "shift-scroll-down:preview-down",
             "scroll-up:up", "scroll-down:down",
@@ -1056,6 +965,31 @@ def safe_push(branch: str | None = None) -> bool:
         return False
     console.print("[green]✔ Push successful.[/green]")
     return True
+
+
+def restore_selected_files() -> bool | None:
+    """Restore selected paths in the index and work tree to the last commit."""
+    if run_git("rev-parse", "--verify", "HEAD")[0] != 0:
+        console.print("[red]No HEAD exists to restore. No files changed.[/red]")
+        return False
+    entries = scoped_entries(tracked_only=True)
+    if not entries:
+        console.print("[green]No matching tracked changes to restore.[/green]")
+        return
+    selected = select_changed_entries(
+        entries, prompt="Restore Files to HEAD",
+        notice="Enter: discard selected staged + unstaged edits; staged new files are removed. Esc: cancel.",
+    )
+    if not selected:
+        return
+    paths = dict.fromkeys(name for path, old, status in selected
+                          for name in (path, old if "R" in status else None)
+                          if name is not None)
+    payload = os.fsencode("\0".join(paths) + "\0")
+    run_git("restore", "--source=HEAD", "--staged", "--worktree", "--quiet",
+            "--pathspec-from-file=-", "--pathspec-file-nul",
+            input_data=payload, check=True, literal_pathspecs=True)
+    console.print(f"[green]✔ Restored {len(selected)} selected change(s) to HEAD.[/green]")
 
 
 def discard_local_changes() -> bool | None:
@@ -1820,13 +1754,14 @@ ACTIONS: tuple[Action, ...] = (
     Action("7",  "Branch Management Submenu (Create / Switch / Merge / Push / Delete)",      1, False, manage_branches),
     Action("8",  "Stash Management Submenu (Create / Pop / Apply / Drop / Clear)",           2, False, manage_stashes),
     Action("9",  "Discard All Uncommitted Local Edits",                                      2, True,  discard_local_changes),
-    Action("10", "Undo Last Commit Safely (Creates Revert Commit on Local & Remote)",        3, False, safe_revert_last_commit),
-    Action("11", "Undo Local Commits to a Specific Commit (Safe - keeps edits on disk)",     3, False, undo_local_commits_to_commit),
-    Action("12", "Reset Local Branch State to Match GitHub",                                 3, True,  reset_local_to_remote),
-    Action("13", "Delete Local Commits since a Specific Commit",                             4, True,  delete_local_commits_to_commit),
-    Action("14", "Delete Last Commit from Remote (Force Push HEAD~1)",                       4, True,  quick_step_back),
-    Action("15", "Delete Commits since a Specific Commit from Remote (Nuclear Force Push)",  4, True,  nuclear_revert),
-    Action("16", "Engage Ephemeral Time Machine (TUI)",                                      4, False, run_time_machine),
+    Action("10", "Restore Selected File(s) to HEAD (Staged & Unstaged)",                     2, True,  restore_selected_files),
+    Action("11", "Undo Last Commit Safely (Creates Revert Commit on Local & Remote)",        3, False, safe_revert_last_commit),
+    Action("12", "Undo Local Commits to a Specific Commit (Safe - keeps edits on disk)",     3, False, undo_local_commits_to_commit),
+    Action("13", "Reset Local Branch State to Match GitHub",                                 3, True,  reset_local_to_remote),
+    Action("14", "Delete Local Commits since a Specific Commit",                             4, True,  delete_local_commits_to_commit),
+    Action("15", "Delete Last Commit from Remote (Force Push HEAD~1)",                       4, True,  quick_step_back),
+    Action("16", "Delete Commits since a Specific Commit from Remote (Nuclear Force Push)",  4, True,  nuclear_revert),
+    Action("17", "Engage Ephemeral Time Machine (TUI)",                                      4, False, run_time_machine),
 )
 
 ACTION_MAP: dict[str, Action] = {a.key: a for a in ACTIONS}
@@ -1881,14 +1816,14 @@ def render_dashboard() -> None:
     for idx, (title, colorkey) in enumerate(CATEGORIES):
         c = COLORS.get(colorkey, "white")
         rows = [
-            f"[bold {c}]{a.key}[/bold {c}] │ "
+            f"[bold {c}]{a.key:>2}[/bold {c}] │ "
             + (f"[bold {COLORS['error']}]{escape(a.label)}[/bold {COLORS['error']}]" if a.destructive else escape(a.label))
             for a in ACTIONS
             if a.category == idx
         ]
         if idx == len(CATEGORIES) - 1:
             c_err = COLORS["error"]
-            rows.append(f"[bold {c_err}]q[/bold {c_err}] │ Quit Dashboard")
+            rows.append(f"[bold {c_err}] q[/bold {c_err}] │ Quit Dashboard")
         console.print(Panel.fit(
             "\n".join(rows),
             title=f"[bold {c}]  {title}[/bold {c}]",
@@ -1902,7 +1837,7 @@ def render_dashboard() -> None:
 def dispatch(choice: str) -> bool:
     """Executes a registry action by key."""
     try:
-        if choice == "16":
+        if ACTION_MAP[choice].handler is run_time_machine:
             return ACTION_MAP[choice].handler() is not False
         # Share the same advisory lock as Time Machine so our own tools cannot
         # stage/reset the work tree while the other tool is switching snapshots.
@@ -1972,11 +1907,9 @@ if __name__ == "__main__":
             }
             if _act in helper_limits and len(sys.argv) > helper_limits[_act]:
                 raise ValueError(f"Too many arguments for {_act}")
-            if _act == "--resize-preview":
-                handle_fzf_resize(sys.argv[2] if len(sys.argv) > 2 else "left")
-                sys.exit(0)
-            elif _act == "--move-preview":
-                handle_fzf_move(sys.argv[2] if len(sys.argv) > 2 else "right")
+            if _act in {"--resize-preview", "--move-preview"}:
+                default = "left" if _act == "--resize-preview" else "right"
+                handle_fzf_layout(_act, sys.argv[2] if len(sys.argv) > 2 else default)
                 sys.exit(0)
             elif _act == "--toggle-vim":
                 handle_fzf_toggle_vim(sys.argv[2] if len(sys.argv) > 2 else "Select")

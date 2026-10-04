@@ -479,6 +479,7 @@ function _gitdelta_browse() {
     (( $+commands[delta] )) && preview+=' | delta --paging=never ${FZF_PREVIEW_COLUMNS:+--width=$FZF_PREVIEW_COLUMNS}'
 
     local helper=${(q)HOME}/user_scripts/git/git_dusky.py
+    local layout_helper=${(q)HOME}/user_scripts/git/git_fzf_layout.sh
     local cur_layout="right,70%,border-left,wrap"
     [[ -f "$HOME/.config/dusky/settings/git_preview_layout" ]] && cur_layout=$(< "$HOME/.config/dusky/settings/git_preview_layout")
     [[ $cur_layout == "hidden" ]] && cur_layout="hidden"
@@ -509,15 +510,15 @@ function _gitdelta_browse() {
             --preview-label-pos=center \
             --preview="$preview" \
             --header='[ENTER] diff   [Alt-M] vim   [Alt-←/→] resize   [Alt-H/J/K/L] move   [Alt-V] view   [Shift-↑/↓] scroll   [q/ESC] quit' \
-            --bind="alt-left:transform:${helper} --resize-preview left" \
-            --bind="alt-right:transform:${helper} --resize-preview right" \
-            --bind="alt-up:transform:${helper} --resize-preview up" \
-            --bind="alt-down:transform:${helper} --resize-preview down" \
-            --bind="alt-h:transform:${helper} --move-preview left" \
-            --bind="alt-j:transform:${helper} --move-preview down" \
-            --bind="alt-k:transform:${helper} --move-preview up" \
-            --bind="alt-l:transform:${helper} --move-preview right" \
-            --bind="alt-v:transform:${helper} --move-preview hidden" \
+            --bind="alt-left:transform:bash ${layout_helper} --resize-preview left" \
+            --bind="alt-right:transform:bash ${layout_helper} --resize-preview right" \
+            --bind="alt-up:transform:bash ${layout_helper} --resize-preview up" \
+            --bind="alt-down:transform:bash ${layout_helper} --resize-preview down" \
+            --bind="alt-h:transform:bash ${layout_helper} --move-preview left" \
+            --bind="alt-j:transform:bash ${layout_helper} --move-preview down" \
+            --bind="alt-k:transform:bash ${layout_helper} --move-preview up" \
+            --bind="alt-l:transform:bash ${layout_helper} --move-preview right" \
+            --bind="alt-v:transform:bash ${layout_helper} --move-preview hidden" \
             --bind="alt-m:transform:${helper} --toggle-vim '󰏖 commits ❯ '" \
             --bind="esc:transform:${helper} --key-escape" \
             --bind="start:transform:${helper} --vim-init '󰏖 commits ❯ '" \
@@ -585,6 +586,7 @@ function _gitdelta_select() {
     _gitdelta_matugen success '#f0be79'; c_ok=$REPLY
 
     local helper=${(q)HOME}/user_scripts/git/git_dusky.py
+    local layout_helper=${(q)HOME}/user_scripts/git/git_fzf_layout.sh
     local preview="DUSKY_GIT_DIR=${(q)DUSKY_GIT_DIR} ${helper} --diff-preview ${(q)target} {s2..} {+s2..}"
 
     local raw_items
@@ -623,15 +625,15 @@ function _gitdelta_select() {
             --preview-label-pos=center \
             --preview="$preview" \
             --header='[TAB] mark   [Alt-M] vim   [Alt-←/→] resize   [Alt-H/J/K/L] move   [Alt-V] view   [Shift-↑/↓] scroll   [ctrl-e] edit   [ENTER] diff   [q] quit' \
-            --bind="alt-left:transform:${helper} --resize-preview left" \
-            --bind="alt-right:transform:${helper} --resize-preview right" \
-            --bind="alt-up:transform:${helper} --resize-preview up" \
-            --bind="alt-down:transform:${helper} --resize-preview down" \
-            --bind="alt-h:transform:${helper} --move-preview left" \
-            --bind="alt-j:transform:${helper} --move-preview down" \
-            --bind="alt-k:transform:${helper} --move-preview up" \
-            --bind="alt-l:transform:${helper} --move-preview right" \
-            --bind="alt-v:transform:${helper} --move-preview hidden" \
+            --bind="alt-left:transform:bash ${layout_helper} --resize-preview left" \
+            --bind="alt-right:transform:bash ${layout_helper} --resize-preview right" \
+            --bind="alt-up:transform:bash ${layout_helper} --resize-preview up" \
+            --bind="alt-down:transform:bash ${layout_helper} --resize-preview down" \
+            --bind="alt-h:transform:bash ${layout_helper} --move-preview left" \
+            --bind="alt-j:transform:bash ${layout_helper} --move-preview down" \
+            --bind="alt-k:transform:bash ${layout_helper} --move-preview up" \
+            --bind="alt-l:transform:bash ${layout_helper} --move-preview right" \
+            --bind="alt-v:transform:bash ${layout_helper} --move-preview hidden" \
             --bind="alt-m:transform:${helper} --toggle-vim '󰏖 files ❯ '" \
             --bind="esc:transform:${helper} --key-escape" \
             --bind="start:transform:${helper} --vim-init '󰏖 files ❯ '" \

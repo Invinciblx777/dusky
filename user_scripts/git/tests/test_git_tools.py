@@ -61,6 +61,135 @@ class BareRepoCase(unittest.TestCase):
         with patch.object(m, 'ask', return_value='test'), patch.object(m, 'ask_yesno', return_value=False):
             m.stage_entries(entries, local_only=True)
 
+class SelectedRestoreTests(BareRepoCase):
+
+    def test_action_numbers_follow_display_order(self):
+        self.assertEqual([a.key for a in m.ACTIONS], [str(n) for n in range(1, 18)])
+        self.assertEqual([a.category for a in m.ACTIONS], sorted(a.category for a in m.ACTIONS))
+        self.assertIs(m.ACTION_MAP['17'].handler, m.run_time_machine)
+
+    def test_time_machine_bypasses_parent_repository_lock(self):
+        from dataclasses import replace
+        with patch.object(m, 'run_time_machine') as handler:
+            action = replace(m.ACTION_MAP['17'], handler=handler)
+            with patch.dict(m.ACTION_MAP, {'17': action}), patch.object(m.fcntl, 'flock', side_effect=AssertionError('parent must not lock Time Machine')):
+                self.assertTrue(m.dispatch('17'))
+                handler.assert_called_once()
+
+    def test_picker_directory_colors_match_gitdelta(self):
+        cache = {}
+        names = ['.config/hypr/source/keybinds.lua', '.config/zshrc/git',
+                 'user_scripts/arch_setup_scripts/scripts/setup.sh',
+                 'user_scripts/git/git_dusky.py', 'user_scripts/rofi/calculator.sh']
+        for name, color in zip(names, [111, 176, 215, 114, 221], strict=True):
+            display = m.format_path_colored(name, cache)
+            self.assertTrue(display.startswith(f'\x1b[38;5;{color}m'))
+            self.assertEqual(m.strip_ansi(display), name)
+        display = m.format_path_colored('user_scripts/git/tests/test_git_tools.py', cache)
+        self.assertEqual(display, '\x1b[38;5;114muser_scripts/git/\x1b[2mtests/\x1b[0mtest_git_tools.py')
+        self.assertEqual(len(cache), 5)
+        self.assertEqual(m.format_path_colored('.zshrc', cache), '.zshrc')
+
+    def restore(self, *names):
+        def select(rows, **kwargs):
+            import json
+            self.assertTrue(kwargs['multi'])
+            self.assertIn('discard selected staged + unstaged', kwargs['header'])
+            return [row for row in rows if json.loads(row.split('\t', 1)[0]) in names]
+        with patch.object(m, 'fzf_select', side_effect=select):
+            return m.restore_selected_files()
+
+    def test_selected_staged_and_unstaged_preserves_other_files(self):
+        self.write('a', 'staged\n')
+        self.write('b', 'other staged\n')
+        self.git('add', 'a', 'b')
+        self.write('a', 'unstaged\n')
+        self.write('b', 'other unstaged\n')
+        self.write('untracked', 'keep\n')
+        index_b = self.git('ls-files', '-s', 'b')
+        head = self.git('rev-parse', 'HEAD')
+        self.restore('a')
+        self.assertEqual((self.w / 'a').read_text(), 'base\n')
+        self.assertEqual(self.git('diff', 'HEAD', '--', 'a'), b'')
+        self.assertEqual(self.git('ls-files', '-s', 'b'), index_b)
+        self.assertEqual((self.w / 'b').read_text(), 'other unstaged\n')
+        self.assertEqual((self.w / 'untracked').read_text(), 'keep\n')
+        self.assertEqual(self.git('rev-parse', 'HEAD'), head)
+
+    def test_multiselect_deletions_and_staged_addition(self):
+        (self.w / 'a').unlink()
+        (self.w / 'b').unlink()
+        self.git('add', '-u', 'b')
+        self.write('new', 'added\n')
+        self.git('add', 'new')
+        self.restore('a', 'b', 'new')
+        self.assertEqual((self.w / 'a').read_text(), 'base\n')
+        self.assertEqual((self.w / 'b').read_text(), 'base\n')
+        self.assertFalse((self.w / 'new').exists())
+        self.assertEqual(self.git('status', '--porcelain'), b'')
+
+    def test_rename_restores_both_paths(self):
+        self.git('mv', 'a', 'renamed')
+        self.write('renamed', 'edits after rename\n')
+        self.write('b', 'keep\n')
+        self.restore('renamed')
+        self.assertEqual((self.w / 'a').read_text(), 'base\n')
+        self.assertFalse((self.w / 'renamed').exists())
+        self.assertEqual((self.w / 'b').read_text(), 'keep\n')
+        self.assertEqual(self.git('status', '--porcelain'), b' M b\n')
+
+    def test_literal_filenames(self):
+        names = ['[x]', 'x', 'line\nbreak', 'tab\tfile', '-option', ':(glob)*']
+        for name in names:
+            self.write(name, 'base\n')
+        self.git('add', '.')
+        self.git('commit', '-qm', 'names')
+        for name in names:
+            self.write(name, 'changed\n')
+        self.restore(*[name for name in names if name != 'x'])
+        for name in names:
+            self.assertEqual((self.w / name).read_text(), 'changed\n' if name == 'x' else 'base\n')
+
+    def test_cancel_and_untracked_only_do_nothing(self):
+        self.write('a', 'keep\n')
+        before = self.git('status', '--porcelain=v1', '-z')
+        self.restore()
+        self.assertEqual(self.git('status', '--porcelain=v1', '-z'), before)
+        self.assertEqual((self.w / 'a').read_text(), 'keep\n')
+        self.restore('a')
+        self.write('new', 'keep\n')
+        with patch.object(m, 'fzf_select') as picker:
+            m.restore_selected_files()
+        picker.assert_not_called()
+        self.assertEqual((self.w / 'new').read_text(), 'keep\n')
+
+    def test_manifest_limits_choices(self):
+        m.DOTFILES_LIST.write_text('a\n')
+        self.write('a', 'changed\n')
+        self.write('b', 'keep\n')
+        self.restore('a', 'b')
+        self.assertEqual((self.w / 'a').read_text(), 'base\n')
+        self.assertEqual((self.w / 'b').read_text(), 'keep\n')
+
+    def test_unborn_head_does_not_open_picker(self):
+        self.git('symbolic-ref', 'HEAD', 'refs/heads/unborn')
+        before = self.git('ls-files', '-s')
+        with patch.object(m, 'fzf_select') as picker:
+            self.assertFalse(m.restore_selected_files())
+        picker.assert_not_called()
+        self.assertEqual(self.git('ls-files', '-s'), before)
+        self.assertEqual((self.w / 'a').read_text(), 'base\n')
+
+    def test_action_registered_and_restore_failure_reported(self):
+        self.assertIs(m.ACTION_MAP['10'].handler, m.restore_selected_files)
+        self.assertTrue(m.ACTION_MAP['10'].destructive)
+        self.write('a', 'keep\n')
+        (self.g / 'index.lock').touch()
+        with patch.object(m, 'select_changed_entries', return_value=[('a', None, ' M')]):
+            self.assertFalse(m.dispatch('10'))
+        self.assertEqual((self.w / 'a').read_text(), 'keep\n')
+
+
 class GitTests(BareRepoCase):
 
     def test_selected_preserves_other_index(self):
@@ -420,7 +549,51 @@ class SecondPassTests(BareRepoCase):
         self.assertEqual(self.git('ls-files', '-s', 'b'), before)
 
 
+class LayoutTests(unittest.TestCase):
+
+    def test_direction_steps_bounds_and_hidden(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Path(directory)
+            layout = settings / 'git_preview_layout'
+            def call(action, direction):
+                return subprocess.run(['bash', str(ROOT / 'git_fzf_layout.sh'), action, direction, directory],
+                    env=os.environ | {'FZF_PREVIEW_COLUMNS': '1', 'FZF_COLUMNS': '140'},
+                    check=True, capture_output=True, text=True).stdout
+            for edge, grow, shrink in [('right', 'left', 'right'), ('left', 'right', 'left'),
+                                       ('up', 'down', 'up'), ('down', 'up', 'down')]:
+                layout.write_text(f'{edge},70%,wrap-word')
+                for expected in (75, 80, 85, 90):
+                    self.assertIn(f'{edge},{expected}%,wrap-word', call('--resize-preview', grow))
+                self.assertEqual(call('--resize-preview', grow), '')
+                for _ in range(16):
+                    call('--resize-preview', shrink)
+                self.assertEqual(layout.read_text().strip(), f'{edge},10%,wrap-word')
+                self.assertEqual(call('--resize-preview', shrink), '')
+                call('--move-preview', 'hidden')
+                self.assertEqual(layout.read_text().strip(), 'hidden')
+                self.assertEqual(call('--resize-preview', grow), '')
+                call('--move-preview', 'hidden')
+                self.assertEqual(layout.read_text().strip(), f'{edge},10%,wrap-word')
+            call('--move-preview', 'up')
+            self.assertEqual(layout.read_text().strip(), 'up,50%,border-bottom,wrap')
+
+
 class SecondPassTerminalTests(BareRepoCase):
+
+    def wait_layout(self, expected, child):
+        import pexpect
+        import time
+        layout = self.w / '.config/dusky/settings/git_preview_layout'
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if layout.is_file() and layout.read_text().strip() == expected:
+                return
+            # Drain redraws while waiting; a full PTY output buffer blocks fzf.
+            try:
+                child.read_nonblocking(size=65536, timeout=0.01)
+            except pexpect.TIMEOUT:
+                pass
+        self.fail(f'Layout did not become {expected}: {layout.read_text() if layout.exists() else "missing"}')
     def terminal(self, executable, args):
         try:
             import pexpect
@@ -449,6 +622,43 @@ class SecondPassTerminalTests(BareRepoCase):
         child.close()
         self.assertEqual(child.exitstatus, 0)
 
+    def test_real_fzf_repeated_resize_keys(self):
+        code = f"import runpy; m=runpy.run_path({str(ROOT / 'git_dusky.py')!r}); print('RESULT',repr(m['fzf_select'](['alpha'],preview='printf RESIZE_READY')))"
+        child, pexpect = self.terminal(sys.executable, ['-B', '-c', code])
+        child.expect_exact('\x1b[?1049h')
+        child.send('\x1b[1;1R')
+        child.expect_exact('q:quit')
+        child.expect_exact('RESIZE_READY')
+        for size in (75, 80, 85):
+            child.send('\x1b[1;3D')
+            self.wait_layout(f'right,{size}%,border-left,wrap', child)
+        for size in (80, 75):
+            child.send('\x1b[1;3C')
+            self.wait_layout(f'right,{size}%,border-left,wrap', child)
+        child.send('q')
+        child.expect_exact('RESULT []')
+        child.expect(pexpect.EOF)
+        child.close()
+        self.assertEqual(child.exitstatus, 0)
+
+    def test_selected_restore_through_real_fzf(self):
+        self.write('a', 'RESTORE_PREVIEW_MARKER\n')
+        self.write('b', 'keep other edits\n')
+        head = self.git('rev-parse', 'HEAD')
+        child, pexpect = self.terminal(sys.executable, ['-B', str(ROOT / 'git_dusky.py'), '10'])
+        child.expect_exact('\x1b[?1049h')
+        child.send('\x1b[1;1R')
+        child.expect_exact('q:quit')
+        child.expect_exact('RESTORE_PREVIEW_MARKER')
+        child.send('\r')
+        child.expect(pexpect.EOF)
+        self.assertIn('Restored 1 selected change(s) to HEAD.', m.strip_ansi(child.before))
+        child.close()
+        self.assertEqual(child.exitstatus, 0)
+        self.assertEqual((self.w / 'a').read_text(), 'base\n')
+        self.assertEqual((self.w / 'b').read_text(), 'keep other edits\n')
+        self.assertEqual(self.git('rev-parse', 'HEAD'), head)
+
     def test_shell_real_preview_and_selection_preserve_control_names(self):
         name = ' spaced\tline\nbreak\x1b[31m '
         self.write(name, 'old\n')
@@ -459,11 +669,15 @@ class SecondPassTerminalTests(BareRepoCase):
         helper = self.w / 'user_scripts/git/git_dusky.py'
         helper.parent.mkdir(parents=True)
         helper.symlink_to(ROOT / 'git_dusky.py')
+        helper.with_name('git_fzf_layout.sh').symlink_to(ROOT / 'git_fzf_layout.sh')
         config = ROOT.parents[1] / '.config/zshrc/git'
         child, pexpect = self.terminal('zsh', ['-fc', 'source "$1"; _gitdelta_select; print -r -- "RESULT=$?"', 'test', str(config)])
         child.expect_exact('\x1b[?1049h')
         child.send('\x1b[1;1R')
         child.expect_exact('TERMINAL_PREVIEW_MARKER')
+        for size in (75, 80):
+            child.send('\x1b[1;3D')
+            self.wait_layout(f'right,{size}%,border-left,wrap', child)
         child.send('\r')
         child.expect_exact('RESULT=0')
         child.expect(pexpect.EOF)
