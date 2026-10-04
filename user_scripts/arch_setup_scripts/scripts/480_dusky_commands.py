@@ -125,7 +125,8 @@ BEFORE_COMMANDS: list[FleetCommand] = [
     # --- Remove old dusky_snaapshot timer (typo) before re-deploying dusky_snapshot ---
     FleetCommand(
         Mode.SUDO,
-        'systemctl stop dusky_snaapshot.timer dusky_snaapshot.service 2>/dev/null; systemctl disable dusky_snaapshot.timer 2>/dev/null; true',
+        'systemctl stop dusky_snaapshot.timer dusky_snaapshot.service 2>/dev/null || true; '
+        'systemctl disable dusky_snaapshot.timer 2>/dev/null || true',
         "Stop & Disable Legacy Typo Snapshot Service"
     ),
     FleetCommand(Mode.SUDO, 'rm -f /etc/systemd/system/dusky_snaapshot.service /etc/systemd/system/dusky_snaapshot.timer', "Remove Legacy Typo Snapshot Unit Files"),
