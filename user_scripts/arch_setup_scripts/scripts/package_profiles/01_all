@@ -69,6 +69,7 @@ papirus-icon-theme
 python-pyquery
 python-textual
 python-rich
+python-regex
 python-pillow
 # Group 4: Desktop Experience
 waybar

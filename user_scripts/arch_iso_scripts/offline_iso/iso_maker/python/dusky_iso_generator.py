@@ -213,7 +213,7 @@ ALL_GROUPS: dict[str, list[str]] = {
         "ttf-atkinson-hyperlegible", "otf-atkinson-hyperlegible",
         "noto-fonts-emoji", "ttf-liberation", "sassc", "python-packaging", "python", "python-gobject",
         "python-cairo", "python-opengl", "gtk-layer-shell", "python-evdev", "python-pyudev",
-        "fontconfig", "python-pyquery", "python-textual", "python-rich", "python-pillow", "papirus-icon-theme",
+        "fontconfig", "python-pyquery", "python-textual", "python-rich", "python-regex", "python-pillow", "papirus-icon-theme",
     ],
     "desktop": [
         "awww", "hyprlock", "hypridle", "hyprsunset", "hyprpicker", "rofi", "hyprshutdown",
