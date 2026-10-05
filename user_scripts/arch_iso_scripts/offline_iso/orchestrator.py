@@ -1575,7 +1575,9 @@ def is_in_chroot() -> bool:
         return False
 
 
-AUTO_POWEROFF_MARKER = Path("/tmp/dusky_auto_poweroff")
+# arch-chroot mounts a temporary /tmp; use the payload directory so the
+# outer wrapper can read the request after arch-chroot tears down its mounts.
+AUTO_POWEROFF_MARKER = Path(__file__).resolve().with_name("dusky_auto_poweroff")
 
 
 def set_auto_poweroff_marker() -> None:
