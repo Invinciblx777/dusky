@@ -4503,6 +4503,54 @@ def ensure_install_dependencies(p: KernelProfile) -> None:
         PRIV.run(["pacman", "-S", "--needed", "--noconfirm", *missing], capture=False)
 
 
+def prune_stale_modules(kernelrelease: str) -> None:
+    """Remove orphaned module files that conflict with built-in modules.
+
+    When kernel-modules-hook is installed or when rebuilding a kernel release
+    after Kconfig symbols transition from =m to =y (built-in), pacman or ALPM
+    hooks (such as 10-linux-modules-post.hook) restore older module files from
+    /usr/lib/modules/backup/<krel> into /usr/lib/modules/<krel>. These stale
+    module files conflict with built-in drivers, corrupt depmod's dependency
+    graph, and cause 'Exec format error' at runtime when modprobe attempts
+    to insert them for dependent drivers (e.g. asus-wmi).
+    """
+    mod_dir = Path(f"/usr/lib/modules/{kernelrelease}")
+    builtin_file = mod_dir / "modules.builtin"
+    if not builtin_file.is_file():
+        return
+    try:
+        builtins = {
+            line.strip().removeprefix("kernel/").removesuffix(".ko")
+            for line in builtin_file.read_text(encoding="utf-8", errors="replace").splitlines()
+            if line.strip()
+        }
+    except OSError:
+        return
+
+    to_remove: list[str] = []
+    kernel_dir = mod_dir / "kernel"
+    if kernel_dir.is_dir():
+        for path in kernel_dir.glob("**/*"):
+            if not path.is_file():
+                continue
+            name = path.name
+            if not any(name.endswith(ext) for ext in (".ko", ".ko.zst", ".ko.xz", ".ko.gz")):
+                continue
+            rel = path.relative_to(kernel_dir).as_posix()
+            for ext in (".ko.zst", ".ko.xz", ".ko.gz", ".ko"):
+                if rel.endswith(ext):
+                    rel = rel[:-len(ext)]
+                    break
+            if rel in builtins:
+                to_remove.append(str(path))
+
+    if to_remove:
+        info(f"Removing {len(to_remove)} stale module files conflicting with built-in drivers...")
+        PRIV.run(["rm", "-f", *to_remove], capture=False)
+        PRIV.run(["depmod", "-a", kernelrelease], capture=False)
+        ok(f"Pruned {len(to_remove)} conflicting module files and updated module dependencies")
+
+
 def install_packages(pkgs: Sequence[Path], profile: KernelProfile, kernelrelease: str) -> None:
     rule("Install packages (pacman -U)")
     ensure_install_dependencies(profile)
@@ -4525,6 +4573,7 @@ def install_packages(pkgs: Sequence[Path], profile: KernelProfile, kernelrelease
     install_started = time.time()
     PRIV.run(["pacman", "-U", "--noconfirm", *[str(x) for x in pkgs]], capture=False)
     ok("Kernel packages installed (mkinitcpio and DKMS pacman hooks have run)")
+    prune_stale_modules(kernelrelease)
     # Fresh-install path: (re)assert the modprobed-db writer so future
     # strict localmodconfig builds keep accumulating modules. User unit -> no sudo.
     if profile.g("modules", "modprobed_db") and have("modprobed-db"):
