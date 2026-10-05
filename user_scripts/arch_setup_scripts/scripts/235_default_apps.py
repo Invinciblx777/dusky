@@ -479,6 +479,16 @@ def menu(switcher: Switcher, category: str | None) -> tuple[int, str]:
         curses.set_escdelay(80)
         curses.mousemask(curses.ALL_MOUSE_EVENTS)
         screen.keypad(True)
+        normal = accent = success = error_style = muted = 0
+        if curses.has_colors():
+            # ANSI black can be grey in the user's palette. Pair zero and all
+            # menu colours must use the terminal's real default background.
+            curses.assume_default_colors(-1, -1)
+            for pair, foreground in enumerate((-1, curses.COLOR_BLUE, curses.COLOR_GREEN, curses.COLOR_RED), 1):
+                curses.init_pair(pair, foreground, -1)
+            normal, accent, success, error_style = (curses.color_pair(i) for i in range(1, 5))
+        muted = normal | curses.A_DIM
+        screen.bkgd(" ", normal)
         selected = 0
         offset = 0
         kind = category
@@ -491,31 +501,57 @@ def menu(switcher: Switcher, category: str | None) -> tuple[int, str]:
         while True:
             screen.erase()
             height, width = screen.getmaxyx()
-            small = height < 8 or width < 35
-            def put(row, text, attr=0):
-                if 0 <= row < height - 1:
-                    screen.addnstr(row, 0, text, max(0, width - 1), attr)
+            small = height < 14 or width < 40
+            left, right = 2, width - 3
+            content_width = max(0, right - left + 1)
+            def put(row, text, attr=normal, column=left):
+                if 0 <= row < height - 1 and 0 <= column < width - 1:
+                    screen.addnstr(row, column, text, max(0, width - column - 1), attr)
             choices = list(CATEGORIES) if kind is None else list(CATEGORIES[kind].apps)
-            visible = max(1, min(10, height - 7))
+            visible = max(1, min(10, height - 11))
             offset = max(0, min(offset, selected))
             if selected >= offset + visible:
                 offset = selected - visible + 1
             if small:
-                put(0, "Resize to at least 35 columns x 8 rows.")
+                put(0, "Resize to at least 40 columns x 14 rows.", column=0)
                 put(1, "q: quit")
             else:
-                title = "Default Applications" if kind is None else CATEGORIES[kind].description
-                put(0, f"Dusky | {title}", curses.A_BOLD)
+                title = "Default Applications" if kind is None else CATEGORIES[kind].description.removeprefix("Launch ").removeprefix("Open ")
+                put(1, "DUSKY", accent | curses.A_BOLD)
+                eyebrow = "DEFAULT APPLICATIONS"
+                put(1, eyebrow, muted, right - len(eyebrow) + 1)
+                counter = f"{selected + 1} / {len(choices)}"
+                put(3, title, normal | curses.A_BOLD)
+                put(3, counter, muted, right - len(counter) + 1)
                 if kind:
-                    put(1, f"Current: {current[kind]} | Terminal: {current['terminal']}")
-                for row, i in enumerate(range(offset, min(offset + visible, len(choices))), 3):
+                    put(4, f"Active: {current[kind]}   |   Terminal: {current['terminal']}", muted)
+                else:
+                    put(4, "Choose a category to change its default.", muted)
+                put(5, "─" * content_width, muted)
+                for row, i in enumerate(range(offset, min(offset + visible, len(choices))), 6):
                     choice = choices[i]
-                    label = CATEGORIES[choice].description if kind is None else choice.label
-                    active = " * ACTIVE" if kind and choice.key == current[kind] else ""
-                    put(row, f"  {label}{active}", curses.A_REVERSE if i == selected else 0)
-                put(height - 4, f"[{selected + 1}/{len(choices)}] {status}")
-                put(height - 3, "Up/Down j/k: select | Enter: apply")
-                put(height - 2, "q: quit | Esc: back | click right: apply")
+                    active = bool(kind and choice.key == current[kind])
+                    if kind is None:
+                        label = CATEGORIES[choice].description.removeprefix("Launch ").removeprefix("Open ")
+                        detail = current[choice]
+                    else:
+                        label = choice.label.partition(" (")[0]
+                        app_type = "" if kind == "terminal" else "TUI" if choice.terminal else "GUI"
+                        detail = " · ".join(part for part in (app_type, "ACTIVE" if active else "") if part)
+                    detail = detail[:max(0, content_width // 2 - 2)]
+                    highlighted = i == selected
+                    style = accent | curses.A_REVERSE | curses.A_BOLD if highlighted else normal
+                    put(row, " " * content_width, style)
+                    label_width = max(1, content_width - len(detail) - 6)
+                    label = label if len(label) <= label_width else label[:label_width - 1] + "…"
+                    put(row, ("› " if highlighted else "  ") + label, style, left + 1)
+                    if detail:
+                        put(row, detail, style if highlighted else success if active else muted, right - len(detail))
+                put(height - 5, "─" * content_width, muted)
+                message = status or ("Choose an application to make it your default." if kind else "Selections are saved and restored after updates.")
+                put(height - 4, message, (error_style if outcome[0] else success) if status else muted)
+                put(height - 3, "↑↓ / j k  Move    Enter  " + ("Open" if kind is None else "Apply"), muted)
+                put(height - 2, "Esc  Back    q  Quit    Click right to apply", muted)
             screen.refresh()
             key = screen.getch()  # Block until input/resize; no idle redraw loop.
             if key == -1:
@@ -540,8 +576,8 @@ def menu(switcher: Switcher, category: str | None) -> tuple[int, str]:
                 elif button & getattr(curses, "BUTTON5_PRESSED", 0):
                     selected = (selected + 1) % len(choices)
                 elif button & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED | curses.BUTTON1_DOUBLE_CLICKED):
-                    clicked = offset + y - 3
-                    if 3 <= y < 3 + visible and clicked < len(choices):
+                    clicked = offset + y - 6
+                    if 6 <= y < 6 + visible and clicked < len(choices):
                         selected = clicked
                         apply = x >= min(38, width - 10) or bool(button & curses.BUTTON1_DOUBLE_CLICKED)
             elif key in (curses.KEY_UP, ord("k"), ord("K")):
