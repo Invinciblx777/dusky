@@ -272,6 +272,7 @@ stylua
 prettier
 tree-sitter-cli
 nano
+lua51
 luarocks
 # Group 10: Multimedia
 ffmpeg

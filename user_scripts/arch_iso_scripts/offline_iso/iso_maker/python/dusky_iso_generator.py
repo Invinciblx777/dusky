@@ -252,7 +252,7 @@ ALL_GROUPS: dict[str, list[str]] = {
     "dev": [
         "neovim", "git", "git-delta", "lazygit", "meson", "cmake", "clang", "uv", "rq", "jq",
         "pv", "bc", "viu", "chafa", "ueberzugpp", "ccache", "mold", "shellcheck", "shfmt",
-        "stylua", "prettier", "tree-sitter-cli", "nano", "luarocks",
+        "stylua", "prettier", "tree-sitter-cli", "nano", "lua51", "luarocks",
     ],
     "multimedia": [
         "ffmpeg", "mpv", "mpv-mpris", "satty", "swayimg", "resvg", "imagemagick", "libheif",
@@ -2117,6 +2117,16 @@ def inject_dotfiles(cfg: IsoConfig) -> None:
                                 ignore_dangling_symlinks=True)
             else:
                 shutil.copy2(item, skel / item.name)
+
+        # Keep Git metadata alongside the flattened work tree. useradd copies
+        # this into ~/dusky, so offline installations have a usable bare repo.
+        bare = skel / "dusky"
+        run(["git", "clone", "--quiet", "--bare", "--no-hardlinks", repo, bare],
+            env=git_env, capture=True, check=True)
+        run(["git", "--git-dir", bare, "remote", "set-url", "origin", "https://github.com/dusklinux/dusky"],
+            env=git_env, capture=True, check=True)
+        run(["git", "--git-dir", bare, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"],
+            env=git_env, capture=True, check=True)
     finally:
         remove_tree(tmp)
 

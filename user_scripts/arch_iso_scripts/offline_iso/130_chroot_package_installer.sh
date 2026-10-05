@@ -60,7 +60,7 @@ declare -ar pkgs_terminal=(
 
 # Group 9: Development
 declare -ar pkgs_dev=(
-  "neovim" "git" "git-delta" "lazygit" "meson" "cmake" "clang" "uv" "rq" "jq" "pv" "bc" "viu" "chafa" "ueberzugpp" "ccache" "mold" "shellcheck" "fd" "ripgrep" "fzf" "shfmt" "stylua" "prettier" "tree-sitter-cli" "nano" "luarocks"
+  "neovim" "git" "git-delta" "lazygit" "meson" "cmake" "clang" "uv" "rq" "jq" "pv" "bc" "viu" "chafa" "ueberzugpp" "ccache" "mold" "shellcheck" "fd" "ripgrep" "fzf" "shfmt" "stylua" "prettier" "tree-sitter-cli" "nano" "lua51" "luarocks"
 )
 
 # Group 10: Multimedia
@@ -529,6 +529,7 @@ main() {
   fi
 
   print_summary
+  (( ${#FAILED_PACKAGES[@]} == 0 )) || exit 1
   exit 0
 }
 
