@@ -220,6 +220,7 @@ class RowProperties(TypedDict, total=False):
     style_map: dict[str, str]
     interval: int
     key: str
+    watch_key: str
     state_command: str
     value_command: str
     min: float
@@ -2248,6 +2249,7 @@ class SelectionRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ComboRow):
         self._programmatic_update = False
         self._operation_busy = False
         self._confirmed_item: str | None = None
+        self._selection_unknown = False
         self._selection_fetch_running = False
         self._selection_fetch_pending = False
         self._selection_fetch_generation = 0
@@ -2295,7 +2297,9 @@ class SelectionRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ComboRow):
                     self.set_selected(self.options_list.index(mapped_val))
                 self._confirmed_item = mapped_val
 
-        if self._confirmed_item is None and self.options_list:
+        if self._confirmed_item is None and (properties.get("key") or properties.get("value_command")):
+            self._set_selection_unknown()
+        elif self._confirmed_item is None and self.options_list:
             self._confirmed_item = self.options_list[0]
 
         if properties.get("value_command") or properties.get("key"):
@@ -2326,11 +2330,12 @@ class SelectionRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ComboRow):
 
     @contextmanager
     def _suppress_change_signal(self):
+        previous = self._programmatic_update
         self._programmatic_update = True
         try:
             yield
         finally:
-            self._programmatic_update = False
+            self._programmatic_update = previous
 
     def _queue_options_fetch(self) -> None:
         if not self.get_mapped():
@@ -2372,7 +2377,7 @@ class SelectionRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ComboRow):
             return
 
         with self._state.lock:
-            if self._state.is_destroyed:
+            if self._state.is_destroyed or self._operation_busy:
                 return
             if self._selection_fetch_running:
                 self._selection_fetch_pending = True
@@ -2429,6 +2434,9 @@ class SelectionRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ComboRow):
                 self.set_model(Gtk.StringList.new(self.options_list))
                 if selected_text in new_options:
                     self.set_selected(new_options.index(selected_text))
+                    self._selection_unknown = False
+                elif self.properties.get("key") or self.properties.get("value_command"):
+                    self._set_selection_unknown()
             self._queue_selection_fetch()
 
         return GLib.SOURCE_REMOVE
@@ -2436,6 +2444,21 @@ class SelectionRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ComboRow):
     def _start_selection_monitor(self) -> None:
         if not self.get_mapped():
             return
+        if self._state.value.source_id or self._state.value.cancellable is not None:
+            return
+        key = self.properties.get("watch_key") or self.properties.get("key")
+        if key:
+            target = utility._validate_settings_path(str(key).strip())
+            if target is None:
+                return
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                monitor = Gio.File.new_for_path(str(target.parent)).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
+                monitor.connect("changed", self._on_selection_file_changed, target.name)
+                self._state.value.cancellable = monitor
+                return
+            except (OSError, GLib.Error) as error:
+                log.warning("Selection file monitor failed for %s: %s", key, error)
         interval = max(
             1,
             _safe_int(self.properties.get("interval"), DEFAULT_INTERVAL_SECONDS),
@@ -2449,14 +2472,25 @@ class SelectionRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ComboRow):
                 self._check_selection_tick,
             )
 
+    def _on_selection_file_changed(self, _monitor, file, other_file, event, target_name) -> None:
+        if target_name not in (file.get_basename(), other_file.get_basename() if other_file else None):
+            return
+        if event in {
+            Gio.FileMonitorEvent.CHANGED, Gio.FileMonitorEvent.CHANGES_DONE_HINT,
+            Gio.FileMonitorEvent.CREATED, Gio.FileMonitorEvent.DELETED,
+            Gio.FileMonitorEvent.RENAMED, Gio.FileMonitorEvent.MOVED_IN,
+            Gio.FileMonitorEvent.MOVED_OUT,
+        }:
+            self._queue_selection_fetch()
+
     def _on_map(self, _widget: Gtk.Widget) -> None:
         self._start_hyprland_ipc()
         self._resume_all_polls()
-        self._queue_selection_fetch()
         if self.properties.get("options_command"):
             self._queue_options_fetch()
         if (self.properties.get("value_command") or self.properties.get("key")) and self._state.value.source_id == 0:
             self._start_selection_monitor()
+        self._queue_selection_fetch()
 
     def _on_unmap(self, _widget: Gtk.Widget) -> None:
         self._stop_hyprland_ipc()
@@ -2495,8 +2529,7 @@ class SelectionRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ComboRow):
         if key := self.properties.get("key"):
             value = str(utility.load_setting(str(key).strip(), default=""))
             mapped = self.options_map.get(value.lower(), value)
-            if mapped:
-                self._update_selection_ui(mapped, generation)
+            self._update_selection_ui(mapped, generation)
             self._complete_selection_fetch(generation)
             return
 
@@ -2506,11 +2539,9 @@ class SelectionRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ComboRow):
             return
 
         def on_result(output: str | None) -> None:
-            if output is not None:
-                value = output.strip()
-                mapped = self.options_map.get(value.lower(), value)
-                if mapped:
-                    self._update_selection_ui(mapped, generation)
+            value = output.strip() if output is not None else ""
+            mapped = self.options_map.get(value.lower(), value)
+            self._update_selection_ui(mapped, generation)
             self._complete_selection_fetch(generation)
 
         self._selection_fetch_handle = _run_shell_async(cmd, SUBPROCESS_TIMEOUT_SHORT, on_result)
@@ -2521,11 +2552,16 @@ class SelectionRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ComboRow):
                 return GLib.SOURCE_REMOVE
 
         if value not in self.options_list:
+            self._set_selection_unknown()
             if self.properties.get("options_command"):
                 self._queue_options_fetch()
             return GLib.SOURCE_REMOVE
 
         idx = self.options_list.index(value)
+        if self._selection_unknown:
+            with self._suppress_change_signal():
+                self.set_model(Gtk.StringList.new(self.options_list))
+            self._selection_unknown = False
         if self.get_selected() != idx:
             with self._suppress_change_signal():
                 self.set_selected(idx)
@@ -2533,11 +2569,16 @@ class SelectionRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ComboRow):
 
         return GLib.SOURCE_REMOVE
 
+    def _set_selection_unknown(self) -> None:
+        self._confirmed_item = None
+        self._selection_unknown = True
+        with self._suppress_change_signal():
+            self.set_model(Gtk.StringList.new(["Unknown", *self.options_list]))
+            self.set_selected(0)
+
     def _on_selected(self, _row: Adw.ComboRow, _param: GObject.ParamSpec) -> None:
         if self._programmatic_update or self._operation_busy:
             return
-        with self._state.lock:
-            self._selection_fetch_generation += 1
         model = self.get_model()
         if not model:
             return
@@ -2545,11 +2586,25 @@ class SelectionRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ComboRow):
         if idx >= model.get_n_items():
             return
         item = model.get_string(idx)
+        if self._selection_unknown:
+            if idx == 0:
+                return
+            with self._suppress_change_signal():
+                self.set_model(Gtk.StringList.new(self.options_list))
+                self.set_selected(self.options_list.index(item))
+            self._selection_unknown = False
+        with self._state.lock:
+            self._selection_fetch_generation += 1
+            self._selection_fetch_running = False
+            self._selection_fetch_pending = False
+        if self._selection_fetch_handle is not None:
+            self._selection_fetch_handle.cancel()
+            self._selection_fetch_handle = None
 
         action = None
         if isinstance(self.on_action, dict):
             action = self.on_action.get(item)
-            if not isinstance(action, dict) and "command" in self.on_action:
+            if not isinstance(action, dict) and ("command" in self.on_action or "argv" in self.on_action):
                 action = self.on_action
 
         if isinstance(action, dict):
@@ -2573,17 +2628,19 @@ class SelectionRow(DynamicIconMixin, HyprlandIPCMixin, Adw.ComboRow):
                 _submit_setting_save_safe(str(key).strip(), self.reverse_map.get(item, item))
             if result.message != "Launched":
                 self._confirmed_item = item
-                if self.get_mapped():
-                    self._queue_selection_fetch()
             elif self._confirmed_item in self.options_list:
                 with self._suppress_change_signal():
                     self.set_selected(self.options_list.index(self._confirmed_item))
             utility.toast(self.toast_overlay, result.message)
+            self._queue_selection_fetch()
             return
         if self._confirmed_item in self.options_list:
             with self._suppress_change_signal():
                 self.set_selected(self.options_list.index(self._confirmed_item))
+        elif self.properties.get("key") or self.properties.get("value_command"):
+            self._set_selection_unknown()
         utility.toast(self.toast_overlay, f"Failed: {result.message}", 4)
+        self._queue_selection_fetch()
 
     def do_unroot(self) -> None:
         if self._selection_fetch_handle is not None:

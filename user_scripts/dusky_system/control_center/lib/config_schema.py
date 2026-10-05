@@ -89,7 +89,7 @@ def _node(value: Any, where: str, context: str, page_ids: set[str]) -> None:
         _error(f"{where}.properties", "must be a table")
     for key, val in props.items():
         path = f"{where}.properties.{key}"
-        if key in COMMAND_PROPS | {"key", "path", "service", "scope", "title", "message", "options_command"}:
+        if key in COMMAND_PROPS | {"key", "watch_key", "path", "service", "scope", "title", "message", "options_command"}:
             if not isinstance(val, str):
                 _error(path, "must be a string")
         elif key in NUMBER_PROPS:
@@ -109,6 +109,11 @@ def _node(value: Any, where: str, context: str, page_ids: set[str]) -> None:
         _error(f"{where}.properties.persistence", "required when key is configured")
     if "options" in props and (not isinstance(props["options"], list) or any(not isinstance(x, str) for x in props["options"])):
         _error(f"{where}.properties.options", "must be a list of strings")
+    if "watch_key" in props:
+        if kind != "selection" or not props["watch_key"].strip() or not props.get("value_command", "").strip():
+            _error(f"{where}.properties.watch_key", "requires a selection with a value_command and nonempty watch key")
+    if kind == "selection" and props.get("key") and props.get("value_command"):
+        _error(f"{where}.properties", "use key for a scalar setting, or value_command with watch_key for a parsed setting")
     if "value" in value:
         source = value["value"]
         if isinstance(source, dict):

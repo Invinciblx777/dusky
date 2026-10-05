@@ -2961,20 +2961,17 @@ type = "selection"
 title = "Clipboard Interface"
 description = "Toggle between Rofi and Terminal clipboards"
 icon = "edit-paste-symbolic"
-key = "clipboard_state"
+value_command = "$HOME/user_scripts/arch_setup_scripts/scripts/460_switch_clipboard.sh --status"
+watch_key = "clipboard_state"
 persistence = "action"
 options = ["Rofi", "Terminal"]
-options_map = { "false" = "Rofi", "true" = "Terminal" }
+options_map = { "rofi" = "Rofi", "terminal" = "Terminal" }
 [pages.layout.items.on_change.Rofi]
 type = "exec"
-command = "kitty --class 460_switch_clipboard.sh --hold sh -c \"$HOME/user_scripts/arch_setup_scripts/scripts/460_switch_clipboard.sh --rofi\""
-mode = "launch"
-terminal = false
+argv = ["$HOME/user_scripts/arch_setup_scripts/scripts/460_switch_clipboard.sh", "--rofi"]
 [pages.layout.items.on_change.Terminal]
 type = "exec"
-command = "kitty --class 460_switch_clipboard.sh --hold sh -c \"$HOME/user_scripts/arch_setup_scripts/scripts/460_switch_clipboard.sh --terminal\""
-mode = "launch"
-terminal = false
+argv = ["$HOME/user_scripts/arch_setup_scripts/scripts/460_switch_clipboard.sh", "--terminal"]
 
 [[pages.layout]]
 type = "section"
