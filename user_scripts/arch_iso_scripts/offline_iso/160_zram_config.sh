@@ -17,7 +17,7 @@ set -euo pipefail
 # ------------------------------------------------------------------------------
 readonly CONFIG_DIR="/etc/systemd/zram-generator.conf.d"
 readonly CONFIG_FILE="${CONFIG_DIR}/99-zram0.conf"
-readonly COMPRESSION_ALGORITHM="zstd(level=2)"
+readonly COMPRESSION_ALGORITHM="zstd(level=1)"
 readonly SWAP_PRIORITY=32767
 
 # ------------------------------------------------------------------------------

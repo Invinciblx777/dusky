@@ -505,7 +505,7 @@ def set_zram0_size(size_raw: str) -> None:
 [zram0]
 zram-size = {size_expr}
 zram-resident-limit = {res_limit}
-compression-algorithm = zstd(level=2)
+compression-algorithm = zstd(level=1)
 swap-priority = 32767
 options = discard
 """
@@ -803,7 +803,7 @@ zram-size = {size_expr}
 zram-resident-limit = ram * 4 / 5
 fs-type = ext4
 mount-point = /mnt/zram1
-compression-algorithm = zstd(level=2)
+compression-algorithm = zstd(level=1)
 options = rw,nosuid,nodev,discard,noatime,lazytime,X-mount.mode=1777
 """
     write_file_atomic(ZRAM1_CONF, content)

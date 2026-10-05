@@ -49,7 +49,7 @@ Options:
                                 - >= 32GB class: 50% RAM (0.5x)
   --resident-limit, -r <expr> Resident memory limit expression (default: 0 / unlimited)
   --priority, -p <prio>       Swap priority (default: 32767 - Maximum priority over disk)
-  --algorithm, -a <algo>      Compression algorithm (default: "zstd(level=2)")
+  --algorithm, -a <algo>      Compression algorithm (default: "zstd(level=1)")
   --help, -h                  Show this help menu
 EOF
 }
@@ -78,7 +78,7 @@ TIER_DESC="Continuous Formula: min(ram, 16384) + max(ram - 32768, 0) / 2 (${RAM_
 ZRAM_SIZE_EXPR=""
 ZRAM_RESIDENT_LIMIT_EXPR=""
 SWAP_PRIORITY="32767"
-COMPRESSION_ALGORITHM="zstd(level=2)"
+COMPRESSION_ALGORITHM="zstd(level=1)"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in

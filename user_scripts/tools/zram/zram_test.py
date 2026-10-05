@@ -1236,7 +1236,7 @@ class BalloonEngine:
         name_vma(self.tmpl_addr, TEMPLATE, b"dusky:template")
         try:
             from compression import zstd                 # PEP 784 (3.14): per-page estimate, zram-style
-            comp = sum(len(zstd.compress(self.tmpl_view[o:o + PAGE], level=3)) for o in range(0, TEMPLATE, PAGE))
+            comp = sum(len(zstd.compress(self.tmpl_view[o:o + PAGE], level=1)) for o in range(0, TEMPLATE, PAGE))
             self.tmpl_ratio = TEMPLATE / comp
         except ImportError:
             self.tmpl_ratio = 0.0
@@ -1473,7 +1473,7 @@ def rows_balloon(stats: BalloonStats | None, pending: dict[str, int], sel: str,
     rows.append((L("Engine"), R(t(f"running: {busy}", A) if busy else t("idle", D))))
     rows.append((L("Page-cache backing"), R(t(backing, D))))
     if stats and stats.tmpl_ratio:
-        rows.append((L("Template", "per-page 1/3 entropy"), R(t(f"zstd-3 est. {stats.tmpl_ratio:.2f}× per page", D))))
+        rows.append((L("Template", "per-page 1/3 entropy"), R(t(f"zstd-1 est. {stats.tmpl_ratio:.2f}× per page", D))))
     if stats and stats.touch_errors:
         rows.append((L("Pressure-loop populate errors"), R(t(str(stats.touch_errors), EB))))
     rows.append((L("Quick actions", style=D), R(t("p=PageOut s=Sync d=Drop k=Compact c=Clear", D))))
