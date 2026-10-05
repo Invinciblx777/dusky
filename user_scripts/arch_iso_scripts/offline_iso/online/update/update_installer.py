@@ -74,7 +74,7 @@ def main() -> int:
         parser.error("Run as root on the live ISO.")
     if not shutil.which("git"):
         parser.error("Git is required; it is included in the Dusky ISO.")
-    destination = Path(__file__).resolve().parent
+    destination = Path(__file__).resolve().parents[2]
     try:
         with (destination / ".installer-update.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
