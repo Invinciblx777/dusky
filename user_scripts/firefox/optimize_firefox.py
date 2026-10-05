@@ -155,6 +155,7 @@ SYSTEMD_SLEEP_SERVICE_NAME: Final = "dusky_firefox_cache_sleep.service"
 MANAGED_KEYS: Final = frozenset({
     "browser.cache.disk.enable",
     "browser.cache.memory.enable",
+    "storage.sqlite.exclusiveLock.enabled",
 })
 
 # Preferences that must never be recorded into rollback state or logged raw
@@ -162,12 +163,13 @@ SECRET_KEYS: Final = frozenset({
     "browser.cache.disk.encryption.key",
 })
 
-# Frozen, version-independent block body so SHA-256 remains stable forever
+# Rollback state stores the digest of the exact policy version applied.
 MANAGED_BLOCK_BODY: Final = (
     "// === BEGIN FIREFOX OPTIMIZATION SUITE ===",
     "// Managed by optimize_firefox.py - Firefox 156+ HTTP cache policy",
     'user_pref("browser.cache.disk.enable", false);',
     'user_pref("browser.cache.memory.enable", true);',
+    'user_pref("storage.sqlite.exclusiveLock.enabled", false);',
     "// === END FIREFOX OPTIMIZATION SUITE ===",
     "",
 )
@@ -913,6 +915,7 @@ def generated_user_js(original: str | None, capacity_override: int | None = None
             "// Managed by optimize_firefox.py - Firefox 156+ HTTP cache policy",
             'user_pref("browser.cache.disk.enable", false);',
             'user_pref("browser.cache.memory.enable", true);',
+            'user_pref("storage.sqlite.exclusiveLock.enabled", false);',
             f'user_pref("browser.cache.memory.capacity", {capacity_override});',
             "// === END FIREFOX OPTIMIZATION SUITE ===",
             "",
@@ -1367,10 +1370,22 @@ def prepare_profile(
             user_js if capacity_override is None and sha256_text(user_js) == state.applied_sha256
             else generated_user_js(state.original_user_js, capacity_override)
         )
+        baseline_prefs = state.baseline_prefs
+        old_block, _, _ = extract_legacy_block(user_js)
+        if "storage.sqlite.exclusiveLock.enabled" not in {record.key for record in scan_prefs_js(old_block or "")}:
+            # Upgrade an existing policy without changing a saved capacity override.
+            expected_block, _, _ = extract_legacy_block(expected_applied)
+            if "storage.sqlite.exclusiveLock.enabled" not in {record.key for record in scan_prefs_js(expected_block or "")}:
+                expected_applied = expected_applied.replace(
+                    BLOCK_END,
+                    'user_pref("storage.sqlite.exclusiveLock.enabled", false);\n' + BLOCK_END,
+                    1,
+                )
+            baseline_prefs += tuple(record.line for record in scan_prefs_js(prefs_js) if record.key == "storage.sqlite.exclusiveLock.enabled")
         new_state = state_text
         if sha256_text(expected_applied) != state.applied_sha256:
             new_state = encode_state(RollbackState(
-                state.original_user_js, state.baseline_prefs,
+                state.original_user_js, baseline_prefs,
                 sha256_text(expected_applied), state.migrated_from_legacy,
             ), profile)
         return ProfilePlan(
@@ -1997,6 +2012,17 @@ def _sync_profile_to_ram(profile: Profile, mode: str = "auto", table: Sequence[M
     if shutil.which("rsync") is None:
         raise RamSyncUnavailable("rsync is required for profile RAM synchronization.")
 
+    # Normal SQLite locking permits consistent live backups. Apply the policy
+    # before Firefox starts, while sync_profile_to_ram holds its profile lock.
+    dir_fd = open_directory(profile.path.resolve())
+    try:
+        plan = prepare_profile(profile, dir_fd, True)
+        if plan.changed:
+            apply_plan(plan, dir_fd)
+            verify_applied(plan, dir_fd)
+    finally:
+        os.close(dir_fd)
+
     LOGGER.info("Syncing %s to RAM (engine: %s)...", profile.path.name, mode)
 
     if paths.backup_path.exists():
@@ -2097,9 +2123,15 @@ def sqlite_paths(source: Path) -> Iterator[Path]:
 
 def snapshot_sqlite(source: Path, staging: Path, *, candidates: Sequence[Path] | None = None) -> list[str]:
     """Stage self-contained database snapshots in RAM, including committed WAL pages."""
-    excluded: list[str] = []
+    # Firefox holds its root quota cache exclusively while running. It rebuilds
+    # storage.sqlite from the preserved origin directories when absent; copying
+    # or opening the live cache is unnecessary and can block the whole checkpoint.
+    # Per-origin databases remain essential and are always snapshotted below.
+    excluded = ["storage.sqlite" + suffix for suffix in ("", "-wal", "-shm", "-journal")]
     for path in sqlite_paths(source) if candidates is None else candidates:
         relative = path.relative_to(source)
+        if relative == Path("storage.sqlite"):
+            continue
         target = staging / relative
         target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         deadline = time.monotonic() + 30
