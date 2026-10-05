@@ -2827,58 +2827,8 @@ def setup_runtime_dir():
 _LOCK_FD: int | None = None
 
 
-def get_lock_holders() -> str:
-    lp = lock_path()
-    if not lp.exists():
-        return ""
-
-    try:
-        real_lock = lp.resolve()
-    except Exception:
-        return ""
-
-    holders: list[str] = []
-    proc_dir = Path("/proc")
-    if not proc_dir.exists():
-        return ""
-
-    try:
-        pids = [d for d in proc_dir.iterdir() if d.name.isdigit()]
-    except PermissionError:
-        return ""
-
-    my_pid = str(os.getpid())
-
-    for pid_dir in pids:
-        if pid_dir.name == my_pid:
-            continue
-
-        fd_dir = pid_dir / "fd"
-        try:
-            if not fd_dir.exists():
-                continue
-            for fd_link in fd_dir.iterdir():
-                try:
-                    if os.readlink(fd_link) == str(real_lock):
-                        cmdline_path = pid_dir / "cmdline"
-                        cmd = ""
-                        with suppress(PermissionError, OSError):
-                            if cmdline_path.exists():
-                                cmd = cmdline_path.read_text(errors="replace").replace("\x00", " ").strip()
-                        if not cmd:
-                            cmd = f"[pid {pid_dir.name}]"
-                        holders.append(f"  - PID {pid_dir.name}: {cmd}")
-                        break
-                except (PermissionError, FileNotFoundError, OSError):
-                    continue
-        except (PermissionError, OSError):
-            continue
-
-    return "\n".join(holders)
-
-
 def _cleanup_lock() -> None:
-    global _LOCK_FD, _LOCK_INO
+    global _LOCK_FD
     try:
         if _LOCK_FD is not None:
             with suppress(OSError):
@@ -2886,38 +2836,40 @@ def _cleanup_lock() -> None:
             with suppress(OSError):
                 os.close(_LOCK_FD)
             _LOCK_FD = None
-            _LOCK_INO = None
     except OSError:
         pass
 
 
-_LOCK_INO: tuple[int, int] | None = None
-
-
 def acquire_lock() -> bool:
     global _LOCK_FD
+    if _LOCK_FD is not None:
+        return True
     if OPT_DRY_RUN:
         return True
     lp = lock_path()
     try:
         ensure_secure_dir(lp.parent)
-        cloexec = getattr(os, "O_CLOEXEC", 0)
-        _LOCK_FD = os.open(str(lp), os.O_RDWR | os.O_CREAT | cloexec, 0o600)
+        _LOCK_FD = os.open(str(lp), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
         try:
             fcntl.flock(_LOCK_FD, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            os.ftruncate(_LOCK_FD, 0)
-            os.write(_LOCK_FD, f"{os.getpid()}\n".encode("ascii"))
-            atexit.register(_cleanup_lock)
-            return True
-        except (BlockingIOError, OSError):
-            holders = get_lock_holders()
-            msg = f"Another instance of Dusky Updater is currently active on {lp}."
-            if holders:
-                msg += f"\nActive lock holder(s):\n{holders}"
-            sys.stderr.write(f"\033[1;31m[FATAL]\033[0m {msg}\n")
-            os.close(_LOCK_FD)
-            _LOCK_FD = None
-            return False
+        except BlockingIOError:
+            # Import only on contention: ordinary launches pay no recovery
+            # startup cost. The supervisor also supports direct worker recovery.
+            try:
+                from update_dusky_supervisor import recover_lock_conflict
+            except ImportError:
+                sys.stderr.write("[INFO] Dusky Updater is already updating. Close the existing update window.\n")
+                recovered = False
+            else:
+                recovered = recover_lock_conflict(_LOCK_FD)
+            if not recovered:
+                os.close(_LOCK_FD)
+                _LOCK_FD = None
+                raise SystemExit(0)
+        os.ftruncate(_LOCK_FD, 0)
+        os.write(_LOCK_FD, f"{os.getpid()}\n".encode("ascii"))
+        atexit.register(_cleanup_lock)
+        return True
     except OSError as e:
         sys.stderr.write(f"\033[1;31m[FATAL]\033[0m Could not establish process lock ({lp}): {e}\n")
         if _LOCK_FD is not None:
@@ -2925,6 +2877,7 @@ def acquire_lock() -> bool:
                 os.close(_LOCK_FD)
         _LOCK_FD = None
         return False
+
 
 def release_lock() -> None:
     _cleanup_lock()
@@ -4475,15 +4428,16 @@ def validate_restart_handoff(path: Path | None, profile: 'ProfileConfig') -> dic
                     return None
 
         lock = payload.get("lock")
-        if not isinstance(lock, dict):
-            return None
-        for key in ("fd", "ino", "dev"):
-            value = lock.get(key)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        if lock is not None:
+            if not isinstance(lock, dict):
                 return None
-        lock_path_value = lock.get("path")
-        if not isinstance(lock_path_value, str) or "\x00" in lock_path_value:
-            return None
+            for key in ("fd", "ino", "dev"):
+                value = lock.get(key)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    return None
+            lock_path_value = lock.get("path")
+            if not isinstance(lock_path_value, str) or "\x00" in lock_path_value:
+                return None
 
         sudo = payload.get("sudo")
         if not isinstance(sudo, dict) or sudo.get("mode") not in {"none", "password", "nopasswd"}:
@@ -10112,7 +10066,31 @@ if _HAS_UI:
                     pass
                 return
             finally:
+                if self._restart_handoff is None:
+                    await self._finish_update_session()
                 self.pipeline_finished = True
+                completion = getattr(self, "_completion_dialog", None)
+                if completion is not None and self.is_running:
+                    title, message, level = completion
+                    self.push_screen(
+                        CompletionDialog(title=title, message=message, level=level),
+                        self._on_completion_reply,
+                    )
+
+        async def _finish_update_session(self) -> None:
+            """End mutation ownership while keeping the completed report visible."""
+            await self._stop_periodic()
+            # Join cleanup before a new updater can create/use shared state.
+            await asyncio.to_thread(SudoEngine.cleanup)
+            for store in (self.state_store, self.once_store):
+                if store is not None:
+                    store.close()
+            self.state_store = None
+            self.once_store = None
+            # The supervisor may still need rollback/publication ownership.
+            # Its acknowledgement proves that work is complete before unlock.
+            await asyncio.to_thread(_supervisor_finish_checkpoint)
+            release_lock()
 
         def action_open_search(self) -> None:
             if isinstance(self.screen, ModalScreen):
@@ -10449,11 +10427,9 @@ if _HAS_UI:
             self.exit()
 
         def _show_completion_dialog(self, title: str, message: str, level: str) -> None:
-            self.pipeline_finished = True
-            self.push_screen(
-                CompletionDialog(title=title, message=message, level=level),
-                self._on_completion_reply,
-            )
+            # Present it only after the worker/supervisor have finished cleanup
+            # and released mutation ownership in execute_pipeline's finally.
+            self._completion_dialog = (title, message, level)
 
         def _maybe_reexec_after_sync(self) -> str:
             # Explicit outcomes: "unchanged" (no restart needed, proceed),
@@ -10748,9 +10724,32 @@ def _supervisor_health_checkpoint(profile: ProfileConfig) -> None:
         if ack.is_file():
             with suppress(OSError):
                 ack.unlink(missing_ok=True)
+            os.environ["DUSKY_SUPERVISOR_LAUNCH_ID"] = launch_id
             return
         time.sleep(0.05)
     raise RuntimeError("supervisor did not acknowledge durable known-good snapshot")
+
+
+def _supervisor_finish_checkpoint() -> None:
+    control_raw = os.environ.get("DUSKY_SUPERVISOR_CONTROL_DIR")
+    launch_id = os.environ.get("DUSKY_SUPERVISOR_LAUNCH_ID")
+    if (OPT_DRY_RUN or not control_raw or not launch_id
+            or os.environ.get("DUSKY_SUPERVISOR_FINISH_PROTOCOL") != "1"):
+        # A worker can update itself under the already-running previous
+        # supervisor. Only request completion acknowledgement when supported.
+        return
+    control = Path(control_raw)
+    _atomic_json_write(control / "finished.json", {
+        "schema": 1, "launch_id": launch_id, "pid": os.getpid(),
+    })
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        if (control / f"finished_ack_{launch_id}").is_file():
+            return
+        time.sleep(0.05)
+    # Keep ownership on failure; normal process exit still closes the fd.
+    raise RuntimeError("supervisor did not acknowledge update completion")
+
 
 def _close_inherited_lock_fd(raw_fd: str | None) -> None:
     """Close an exec-inherited lock descriptor when its handoff is rejected."""

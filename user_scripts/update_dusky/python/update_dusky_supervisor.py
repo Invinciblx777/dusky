@@ -8,6 +8,7 @@ from contextlib import suppress
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import signal
 import stat
@@ -29,6 +30,186 @@ MANIFEST = KNOWN / "manifest.json"
 ROLLBACK_JOURNAL = STATE / "rollback_pending.json"
 REJECTED = STATE / "rejected_candidate.json"
 REJECTED_TTL_SEC = 7 * 24 * 3600
+_SUPERVISOR_LOCK_FD: int | None = None
+_SUPERVISION_FINISHED = False
+
+
+def recover_lock_conflict(fd: int, *, grace: float = 15.0) -> bool:
+    """Offer interactive recovery; retain the inode and acquire its actual flock.
+
+    Identify ownership from the kernel, never from the stale PID in a file.
+    pidfds pin process identities throughout confirmation and termination.
+    """
+    def acquire() -> bool:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+
+    def owner() -> int | None:
+        st = os.fstat(fd)
+        key = (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
+        for line in Path('/proc/locks').read_text().splitlines():
+            fields = line.split()
+            if len(fields) < 8 or fields[1:4] != ['FLOCK', 'ADVISORY', 'WRITE']:
+                continue
+            major, minor, inode = fields[5].split(':')
+            if (int(major, 16), int(minor, 16), int(inode)) == key:
+                pid = int(fields[4])
+                return pid if pid > 0 else None
+        return None
+
+    def is_updater(pid: int) -> bool:
+        proc = Path('/proc') / str(pid)
+        try:
+            if proc.stat().st_uid != os.getuid():
+                return False
+            args = proc.joinpath('cmdline').read_bytes().split(b'\0')
+        except (FileNotFoundError, ProcessLookupError):
+            return False
+        scripts = {str(SCRIPT), str(Path(__file__).resolve())}
+        return len(args) > 1 and os.fsdecode(args[1]) in scripts
+
+    def confirm(message: str) -> bool:
+        try:
+            return input(message).strip().lower() in {'y', 'yes'}
+        except (EOFError, KeyboardInterrupt):
+            return False
+
+    handles: dict[int, int] = {}
+    stopped: set[int] = set()
+
+    def freeze_process(pid: int, handle: int) -> None:
+        signal.pidfd_send_signal(handle, signal.SIGSTOP)
+        stopped.add(pid)
+        deadline = time.monotonic() + 2.0
+        while alive(handle):
+            try:
+                status = (Path('/proc') / str(pid) / 'status').read_text()
+            except (FileNotFoundError, ProcessLookupError):
+                return
+            state = next(line.split()[1] for line in status.splitlines() if line.startswith('State:'))
+            if state in {'T', 't'}:
+                return
+            if time.monotonic() >= deadline:
+                raise OSError(f'PID {pid} cannot be stopped; refusing concurrent recovery')
+            time.sleep(0.01)
+
+    def capture(pid: int, expected_parent: int | None = None, freeze: bool = False) -> None:
+        if pid in handles:
+            return
+        try:
+            handle = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return
+        if expected_parent is not None:
+            try:
+                status = (Path('/proc') / str(pid) / 'status').read_text()
+                actual_parent = int(next(line.split()[1] for line in status.splitlines() if line.startswith('PPid:')))
+                if actual_parent != expected_parent or not alive(handle):
+                    os.close(handle)
+                    return
+            except (FileNotFoundError, ProcessLookupError):
+                os.close(handle)
+                return
+        handles[pid] = handle
+        if freeze and alive(handle):
+            freeze_process(pid, handle)
+        # Tasks can launch from any thread, not just the process leader.
+        for path in (Path('/proc') / str(pid) / 'task').glob('*/children'):
+            try:
+                children = path.read_text().split()
+            except FileNotFoundError:
+                continue
+            for child in children:
+                capture(int(child), pid, freeze)
+
+    def alive(handle: int) -> bool:
+        return not select.select([handle], [], [], 0)[0]
+
+    def wait_all(seconds: float) -> bool:
+        deadline = time.monotonic() + seconds
+        while any(alive(handle) for handle in handles.values()):
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+        return True
+
+    try:
+        if acquire():
+            return True
+        print('[INFO] Dusky Updater is already updating.', file=sys.stderr)
+        if not sys.stdin.isatty():
+            return False
+        pid = owner()
+        if pid is None:
+            print('[WARN] Cannot identify the live lock owner; retry after it exits.', file=sys.stderr)
+            return acquire()
+        capture(pid)
+        if pid not in handles or not alive(handles[pid]) or owner() != pid:
+            return acquire()
+        if not is_updater(pid):
+            print('[WARN] Lock owner is not a verified updater; it will not be stopped.', file=sys.stderr)
+            return False
+        # When a direct launch encounters a supervised worker, wait for its
+        # parent too: rollback must finish before a replacement update starts.
+        status = (Path('/proc') / str(pid) / 'status').read_text()
+        parent = int(next(line.split()[1] for line in status.splitlines() if line.startswith('PPid:')))
+        if parent > 1 and is_updater(parent):
+            capture(parent)
+        if not confirm(f'Stop existing updater PID {pid} and retry? [y/N] '):
+            return False
+        if not alive(handles[pid]) or owner() != pid:
+            return wait_all(grace) and acquire()
+        # Signal workers first, allowing Textual to cancel/reap task groups
+        # and the supervisor to finish its rollback normally.
+        workers = [p for p in handles if alive(handles[p]) and is_updater(p)
+                   and str(SCRIPT).encode() in (Path('/proc') / str(p) / 'cmdline').read_bytes().split(b'\0')]
+        for worker in workers or [pid]:
+            signal.pidfd_send_signal(handles[worker], signal.SIGTERM)
+        if not wait_all(grace):
+            if not confirm('Updater or its tasks are still running. Force kill them? An interrupted update may need repair. [y/N] '):
+                return False
+            # Stop the tree before refreshing it: a hung task must not fork
+            # another mutating child between discovery and force termination.
+            for p, handle in handles.items():
+                if alive(handle):
+                    freeze_process(p, handle)
+            for p, handle in list(handles.items()):
+                if alive(handle):
+                    for path in (Path('/proc') / str(p) / 'task').glob('*/children'):
+                        with suppress(FileNotFoundError):
+                            for child in path.read_text().split():
+                                capture(int(child), p, freeze=True)
+            # Task processes first, then workers; give the supervisor a chance
+            # to reap the killed worker and complete candidate rollback.
+            order = [p for p in handles if p not in workers and p != pid and p != parent]
+            order += workers
+            order += [p for p in (pid, parent) if p in handles and p not in order]
+            for p in order:
+                handle = handles[p]
+                if alive(handle):
+                    if p not in workers and is_updater(p):
+                        signal.pidfd_send_signal(handle, signal.SIGCONT)
+                        stopped.discard(p)
+                        if wait_all(5.0):
+                            break
+                    with suppress(ProcessLookupError):
+                        signal.pidfd_send_signal(handle, signal.SIGKILL)
+            if not wait_all(5.0):
+                print('[WARN] Some tasks remain alive; recovery cannot proceed.', file=sys.stderr)
+                return False
+        return acquire()
+    except (OSError, ValueError, StopIteration) as e:
+        print(f'[WARN] Recovery could not complete: {e}. Existing lock retained.', file=sys.stderr)
+        return False
+    finally:
+        for p in stopped:
+            with suppress(OSError):
+                signal.pidfd_send_signal(handles[p], signal.SIGCONT)
+        for handle in handles.values():
+            os.close(handle)
 
 
 def digest(path: Path | None) -> str | None:
@@ -513,30 +694,27 @@ def installed_matches_known() -> bool:
     return True
 
 
-def _clear_control() -> None:
-    ensure_private_dir(CONTROL)
-    for p in CONTROL.glob("ack_*"):
-        try:
-            p.unlink()
-        except OSError:
-            pass
-    try:
-        (CONTROL / "health.json").unlink()
-    except OSError:
-        pass
-    fsync_dir(CONTROL)
-
-
 def run_once(argv: list[str]) -> tuple[int, int]:
-    _clear_control()
+    global CONTROL, _SUPERVISOR_LOCK_FD, _SUPERVISION_FINISHED
+    # Completed report windows can coexist with the next update. Give each
+    # worker private health/completion files so old windows cannot consume or
+    # delete another run's acknowledgements.
+    control_root = STATE / "control"
+    ensure_private_dir(control_root)
+    CONTROL = Path(tempfile.mkdtemp(prefix="run-", dir=control_root))
+    _SUPERVISION_FINISHED = False
     env = os.environ.copy()
     env["DUSKY_SUPERVISOR_CONTROL_DIR"] = str(CONTROL)
     env["DUSKY_SUPERVISOR_STATE_DIR"] = str(STATE)
+    env["DUSKY_SUPERVISOR_FINISH_PROTOCOL"] = "1"
     proc = subprocess.Popen([sys.executable, str(SCRIPT), *argv], env=env)
     last_launch = ""
     healthy_count = 0
+    finish_rc = 0
     try:
         while proc.poll() is None:
+            if _SUPERVISION_FINISHED:
+                return proc.wait() or finish_rc, healthy_count
             health = read_json(CONTROL / "health.json")
             if isinstance(health, dict):
                 launch_id = health.get("launch_id")
@@ -563,8 +741,22 @@ def run_once(argv: list[str]) -> tuple[int, int]:
                         return 70, healthy_count
                     last_launch = launch_id
                     healthy_count += 1
+            finished = read_json(CONTROL / "finished.json")
+            if (last_launch and isinstance(finished, dict)
+                    and finished.get("schema") == 1
+                    and finished.get("launch_id") == last_launch
+                    and finished.get("pid") == proc.pid):
+                # Finish rollback while still serialized. Once ownership is
+                # released this supervisor only waits for its report window;
+                # it must never inspect/restore a later updater's candidate.
+                finish_rc = _finish_candidate(0)
+                _SUPERVISION_FINISHED = True
+                if _SUPERVISOR_LOCK_FD is not None:
+                    os.close(_SUPERVISOR_LOCK_FD)
+                    _SUPERVISOR_LOCK_FD = None
+                (CONTROL / f"finished_ack_{last_launch}").touch(mode=0o600)
             time.sleep(0.05)
-        return proc.wait(), healthy_count
+        return proc.wait() or finish_rc, healthy_count
     except KeyboardInterrupt:
         try:
             proc.send_signal(signal.SIGINT)
@@ -573,6 +765,40 @@ def run_once(argv: list[str]) -> tuple[int, int]:
             proc.kill()
             proc.wait()
             return 130, healthy_count
+    finally:
+        shutil.rmtree(CONTROL, ignore_errors=True)
+
+
+def _finish_candidate(rc: int) -> int:
+    # Roll back only when the installed bundle differs from the last durable
+    # startup-health acknowledgement. Ordinary child-task failure after a health
+    # checkpoint does not trigger updater rollback.
+    if bundle_valid(KNOWN) and not installed_matches_known():
+        print(
+            "[WARN] candidate did not reach a durable startup-health checkpoint; "
+            "restoring the previous known-good bundle",
+            file=sys.stderr,
+        )
+        try:
+            remember_rejected_candidate()
+        except Exception as e:
+            print(f"[WARN] could not record rejected candidate identity: {e}", file=sys.stderr)
+        if not restore_known_good():
+            print(
+                f"[FATAL] automatic rollback failed; recovery bundle retained at {KNOWN}",
+                file=sys.stderr,
+            )
+            return rc if rc != 0 else 70
+        # Do not immediately relaunch: doing so can fetch/select the exact same
+        # rejected candidate and create a rollback loop. A later normal launch
+        # can accept a different candidate; the worker blocks the recorded bad
+        # bundle for a bounded seven-day rejection window.
+        print(
+            "[WARN] known-good bundle restored; rejected candidate will not be relaunched automatically",
+            file=sys.stderr,
+        )
+        return rc if rc != 0 else 75
+    return rc
 
 
 def _run_supervised() -> int:
@@ -624,38 +850,13 @@ def _run_supervised() -> int:
 
     rc, _healthy = run_once(sys.argv[1:])
 
-    # Roll back only when the installed bundle differs from the last durable
-    # startup-health acknowledgement. Ordinary child-task failure after a health
-    # checkpoint does not trigger updater rollback.
-    if bundle_valid(KNOWN) and not installed_matches_known():
-        print(
-            "[WARN] candidate did not reach a durable startup-health checkpoint; "
-            "restoring the previous known-good bundle",
-            file=sys.stderr,
-        )
-        try:
-            remember_rejected_candidate()
-        except Exception as e:
-            print(f"[WARN] could not record rejected candidate identity: {e}", file=sys.stderr)
-        if not restore_known_good():
-            print(
-                f"[FATAL] automatic rollback failed; recovery bundle retained at {KNOWN}",
-                file=sys.stderr,
-            )
-            return rc if rc != 0 else 70
-        # Do not immediately relaunch: doing so can fetch/select the exact same
-        # rejected candidate and create a rollback loop. A later normal launch
-        # can accept a different candidate; the worker blocks the recorded bad
-        # bundle for a bounded seven-day rejection window.
-        print(
-            "[WARN] known-good bundle restored; rejected candidate will not be relaunched automatically",
-            file=sys.stderr,
-        )
-        return rc if rc != 0 else 75
-    return rc
+    if _SUPERVISION_FINISHED or (rc == 0 and _healthy == 0):
+        return rc
+    return _finish_candidate(rc)
 
 
 def main() -> int:
+    global _SUPERVISOR_LOCK_FD
     # Informational commands must not publish or restore an unrelated bundle.
     # The worker remains responsible for full argument validation.
     passthrough = {"--dry-run", "--help", "-h", "--version", "--doctor", "--list", "--list-once", "--forget-once"}
@@ -670,15 +871,18 @@ def main() -> int:
     # lifecycle, including the interval after the worker exits.
     ensure_private_dir(STATE)
     fd = os.open(str(STATE / "supervisor.lock"), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    _SUPERVISOR_LOCK_FD = fd
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            print("[WARN] another Dusky supervisor is already running", file=sys.stderr)
-            return 1
+            if not recover_lock_conflict(fd):
+                return 0
         return _run_supervised()
     finally:
-        os.close(fd)
+        if _SUPERVISOR_LOCK_FD is not None:
+            os.close(_SUPERVISOR_LOCK_FD)
+            _SUPERVISOR_LOCK_FD = None
 
 
 if __name__ == "__main__":
