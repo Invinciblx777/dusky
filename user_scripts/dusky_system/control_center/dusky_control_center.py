@@ -13,8 +13,9 @@ import sys
 import threading
 import traceback
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
+from functools import lru_cache
 from pathlib import Path
 from typing import (
     Any,
@@ -265,6 +266,14 @@ class SearchHit:
     nav_path: tuple[str, ...]
     unique_id: str
     score: int = 0
+    key: str = ""
+    breadcrumb: str = ""
+
+
+@lru_cache(maxsize=2048)
+def _normalize_search_text(text: str) -> tuple[str, str, tuple[str, ...]]:
+    folded = text.casefold()
+    return folded, "".join(char for char in folded if char.isalnum()), tuple(folded.split())
 
 
 def _fuzzy_subsequence(needle: str, haystack: str) -> bool:
@@ -310,6 +319,8 @@ class DuskyControlCenter(Adw.Application):
         self._reload_queued = False
         self._directory_generator_cache: dict[int, tuple[ConfigItem, ...]] = {}
         self._file_generator_cache: dict[int, tuple[ConfigItem, ...]] = {}
+        self._search_index: tuple[SearchHit, ...] | None = None
+        self._first_search_result: Adw.ActionRow | None = None
 
     def _init_widget_refs(self) -> None:
         """Initialize or reset all widget references to None."""
@@ -372,6 +383,9 @@ class DuskyControlCenter(Adw.Application):
         self._remove_css_provider()
         self._directory_generator_cache.clear()
         self._file_generator_cache.clear()
+        self._search_index = None
+        self._first_search_result = None
+        _normalize_search_text.cache_clear()
         Adw.Application.do_shutdown(self)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -735,6 +749,9 @@ class DuskyControlCenter(Adw.Application):
         self._deactivate_search()
         self._directory_generator_cache.clear()
         self._file_generator_cache.clear()
+        self._search_index = None
+        self._first_search_result = None
+        _normalize_search_text.cache_clear()
         self._state.last_visible_page = None
 
         self._search_page = None
@@ -775,6 +792,9 @@ class DuskyControlCenter(Adw.Application):
 
     def _highlight_widget_by_id(self, parent: Gtk.Widget, unique_id: str) -> Literal[False]:
         """Find the widget by its ID, auto-scroll to it, and trigger a visual pulse."""
+        visible = self._stack.get_visible_child() if self._stack is not None else None
+        if not parent.get_mapped() or not isinstance(visible, Adw.NavigationView) or visible.get_visible_page() is not parent:
+            return GLib.SOURCE_REMOVE
         widget = self._find_widget_by_name(parent, unique_id)
         if widget:
             ancestor = widget.get_parent()
@@ -874,6 +894,12 @@ class DuskyControlCenter(Adw.Application):
         if src_id > 0:
             self._state.debounce_source_id = src_id
 
+    def _on_search_activate(self, entry: Gtk.SearchEntry) -> None:
+        self._cancel_debounce()
+        self._execute_search(entry.get_text())
+        if self._first_search_result is not None:
+            self._first_search_result.grab_focus()
+
     def _execute_search(self, query: str) -> Literal[False]:
         """
         Execute the search and populate results.
@@ -906,6 +932,7 @@ class DuskyControlCenter(Adw.Application):
 
     def _reset_search_results(self, title: str) -> None:
         """Reset the search results group with a new title."""
+        self._first_search_result = None
         if self._search_page is None:
             return
 
@@ -937,7 +964,10 @@ class DuskyControlCenter(Adw.Application):
 
         kept = hits[:SEARCH_MAX_RESULTS]
         for hit in kept:
-            self._search_results_group.add(self._build_search_result_row(hit))
+            row = self._build_search_result_row(hit)
+            self._search_results_group.add(row)
+            if self._first_search_result is None:
+                self._first_search_result = row
 
         if len(hits) > SEARCH_MAX_RESULTS:
             overflow_row = Adw.ActionRow(
@@ -958,9 +988,10 @@ class DuskyControlCenter(Adw.Application):
 
     def _build_search_result_row(self, hit: SearchHit) -> Adw.ActionRow:
         """Build a clickable row that navigates to the matched item's location."""
+        subtitle = f"{hit.breadcrumb} • {hit.description}" if hit.description else hit.breadcrumb
         row = Adw.ActionRow(
-            title=GLib.markup_escape_text(hit.title),
-            subtitle=GLib.markup_escape_text(hit.description)
+            title=GLib.markup_escape_text(hit.title or "Unnamed"),
+            subtitle=GLib.markup_escape_text(subtitle),
         )
         row.add_css_class("action-row")
         row.set_activatable(True)
@@ -1069,6 +1100,17 @@ class DuskyControlCenter(Adw.Application):
         if not query:
             return
 
+        if self._search_index is None:
+            self._search_index = tuple(self._build_search_index())
+
+        for hit in self._search_index:
+            score = self._score_search_match(query, hit.title, hit.description, hit.key)
+            if score > 0:
+                yield replace(hit, score=score)
+
+    def _build_search_index(self) -> Iterator[SearchHit]:
+        """Keep generated item identities aligned with the current UI generation."""
+
         for page_idx, page in enumerate(self._state.config.get("pages", [])):
             if not isinstance(page, dict):
                 continue
@@ -1077,18 +1119,16 @@ class DuskyControlCenter(Adw.Application):
             layout = page.get("layout", [])
 
             if isinstance(layout, list):
-                yield from self._iter_layout_hits(
+                yield from self._iter_layout_search_entries(
                     layout,
-                    query,
                     page_title,
                     page_idx,
                     (page_title,),
                 )
 
-    def _iter_layout_hits(
+    def _iter_layout_search_entries(
         self,
         layout: list[ConfigSection],
-        query: str,
         breadcrumb: str,
         page_idx: int,
         nav_path: tuple[str, ...],
@@ -1100,14 +1140,13 @@ class DuskyControlCenter(Adw.Application):
             items = section.get("items")
             if isinstance(items, list):
                 for item in items:
-                    yield from self._iter_item_hits(item, query, breadcrumb, page_idx, nav_path)
+                    yield from self._iter_item_search_entries(item, breadcrumb, page_idx, nav_path)
             else:
-                yield from self._iter_item_hits(section, query, breadcrumb, page_idx, nav_path)
+                yield from self._iter_item_search_entries(section, breadcrumb, page_idx, nav_path)
 
-    def _iter_item_hits(
+    def _iter_item_search_entries(
         self,
         item: Any,
-        query: str,
         breadcrumb: str,
         page_idx: int,
         nav_path: tuple[str, ...],
@@ -1122,12 +1161,12 @@ class DuskyControlCenter(Adw.Application):
 
         if item_type == ItemType.DIRECTORY_GENERATOR:
             for gen_item in self._process_directory_generator(item):
-                yield from self._iter_item_hits(gen_item, query, breadcrumb, page_idx, nav_path)
+                yield from self._iter_item_search_entries(gen_item, breadcrumb, page_idx, nav_path)
             return
 
         if item_type == ItemType.FILE_GENERATOR:
             for gen_item in self._process_file_generator(item):
-                yield from self._iter_item_hits(gen_item, query, breadcrumb, page_idx, nav_path)
+                yield from self._iter_item_search_entries(gen_item, breadcrumb, page_idx, nav_path)
             return
 
         title = str(props.get("title", "")).strip()
@@ -1135,26 +1174,24 @@ class DuskyControlCenter(Adw.Application):
 
         unique_id = self._generate_widget_id(item)
 
-        score = self._score_search_match(query, title, desc)
-        if score > 0:
-            yield SearchHit(
-                title=title or "Unnamed",
-                description=f"{breadcrumb} • {desc}" if desc else breadcrumb,
-                icon_name=self._extract_icon_name(props),
-                page_idx=page_idx,
-                nav_path=nav_path,
-                unique_id=unique_id,
-                score=score,
-            )
+        yield SearchHit(
+            title=title,
+            description=desc,
+            icon_name=self._extract_icon_name(props),
+            page_idx=page_idx,
+            nav_path=nav_path,
+            unique_id=unique_id,
+            key=str(props.get("key", "")),
+            breadcrumb=breadcrumb,
+        )
 
         if item_type == ItemType.NAVIGATION:
             sub_title = title or "Submenu"
             sub_layout = item.get("layout")
             if isinstance(sub_layout, list):
                 next_path = (*nav_path, sub_title)
-                yield from self._iter_layout_hits(
+                yield from self._iter_layout_search_entries(
                     sub_layout,
-                    query,
                     f"{breadcrumb} › {sub_title}",
                     page_idx,
                     next_path,
@@ -1166,31 +1203,31 @@ class DuskyControlCenter(Adw.Application):
             if isinstance(sub_items, list):
                 next_breadcrumb = f"{breadcrumb} › {sub_title}"
                 for child in sub_items:
-                    yield from self._iter_item_hits(
+                    yield from self._iter_item_search_entries(
                         child,
-                        query,
                         next_breadcrumb,
                         page_idx,
                         nav_path,
                     )
 
     @staticmethod
-    def _score_search_match(query: str, title: str, desc: str) -> int:
+    def _score_search_match(query: str, title: str, desc: str, key: str = "") -> int:
         """
         Rank a config item against a search query.
 
         Returns a non-negative relevance score (0 == no match). Substring and
         word-prefix matches outrank fuzzy subsequences, and title matches
-        always outrank description matches. Typo-tolerant fuzzy matching lets
-        users find settings without needing the exact spelling.
+        outrank key and description matches. Multiple words can match across
+        fields in any order; fuzzy subsequences support abbreviated queries.
         """
-        q = query.casefold()
+        q = " ".join(query.casefold().split())
         if not q:
             return 0
-        t = title.casefold()
-        d = desc.casefold()
+        t, t_clean, title_words = _normalize_search_text(title)
+        d, d_clean, desc_words = _normalize_search_text(desc)
+        _, q_clean, terms = _normalize_search_text(q)
 
-        # Fuzzy subsequence is typo-tolerant but noisy for very short queries;
+        # Fuzzy subsequences are noisy for very short queries;
         # only apply it once the user has typed enough to disambiguate.
         allow_fuzzy = len(q) >= 3
 
@@ -1202,11 +1239,11 @@ class DuskyControlCenter(Adw.Application):
         if q in t:
             return 800
 
-        # Alphanumeric normalized matching (e.g., "wifi" <-> "Wi-Fi", "lockscreen" <-> "Lock Screen")
-        q_clean = "".join(c for c in q if c.isalnum())
-        t_clean = "".join(c for c in t if c.isalnum())
-        d_clean = "".join(c for c in d if c.isalnum())
+        if len(terms) > 1:
+            scores = [DuskyControlCenter._score_search_match(term, title, desc, key) for term in terms]
+            return sum(scores) // len(scores) - 25 if all(scores) else 0
 
+        # Alphanumeric normalized matching (e.g., "wifi" <-> "Wi-Fi", "lockscreen" <-> "Lock Screen")
         if q_clean and t_clean == q_clean:
             return 950
         if q_clean and t_clean.startswith(q_clean):
@@ -1214,17 +1251,20 @@ class DuskyControlCenter(Adw.Application):
         if q_clean and q_clean in t_clean:
             return 750
 
-        if any(word.startswith(q) for word in t.split()):
+        if any(word.startswith(q) for word in title_words):
             return 500
         if allow_fuzzy and _fuzzy_subsequence(q, t):
             return 300
+
+        if q in key.casefold():
+            return 250
 
         # Description matches are weaker but still useful.
         if q in d:
             return 200
         if q_clean and q_clean in d_clean:
             return 175
-        if any(word.startswith(q) for word in d.split()):
+        if any(word.startswith(q) for word in desc_words):
             return 150
         if allow_fuzzy and _fuzzy_subsequence(q, d):
             return 100
@@ -1254,7 +1294,10 @@ class DuskyControlCenter(Adw.Application):
 
         self._search_bar = Gtk.SearchBar()
         self._search_entry = Gtk.SearchEntry(placeholder_text="Find setting...")
-        self._search_entry.connect("search-changed", self._on_search_changed)
+        # Gtk's search-changed signal already delays input; use our one debounce.
+        self._search_entry.connect("changed", self._on_search_changed)
+        self._search_entry.connect("activate", self._on_search_activate)
+        self._search_entry.connect("stop-search", lambda _entry: self._deactivate_search())
         self._search_bar.set_child(self._search_entry)
         self._search_bar.connect_entry(self._search_entry)
         view.add_top_bar(self._search_bar)
