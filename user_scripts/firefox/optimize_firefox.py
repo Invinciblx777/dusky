@@ -117,7 +117,7 @@ from compression import zstd
 
 TOOL_NAME: Final = "optimize_firefox.py"
 TOOL_ID: Final = "firefox-cache-policy"
-TOOL_VERSION: Final = "4.1.0-ff156"
+TOOL_VERSION: Final = "4.1.1-ff156"
 MIN_FIREFOX_MAJOR: Final = 156
 
 STATE_SCHEMA: Final = 2
@@ -155,7 +155,6 @@ SYSTEMD_SLEEP_SERVICE_NAME: Final = "dusky_firefox_cache_sleep.service"
 MANAGED_KEYS: Final = frozenset({
     "browser.cache.disk.enable",
     "browser.cache.memory.enable",
-    "storage.sqlite.exclusiveLock.enabled",
 })
 
 # Preferences that must never be recorded into rollback state or logged raw
@@ -163,13 +162,12 @@ SECRET_KEYS: Final = frozenset({
     "browser.cache.disk.encryption.key",
 })
 
-# Rollback state stores the digest of the exact policy version applied.
+# Frozen, version-independent block body so SHA-256 remains stable forever
 MANAGED_BLOCK_BODY: Final = (
     "// === BEGIN FIREFOX OPTIMIZATION SUITE ===",
     "// Managed by optimize_firefox.py - Firefox 156+ HTTP cache policy",
     'user_pref("browser.cache.disk.enable", false);',
     'user_pref("browser.cache.memory.enable", true);',
-    'user_pref("storage.sqlite.exclusiveLock.enabled", false);',
     "// === END FIREFOX OPTIMIZATION SUITE ===",
     "",
 )
@@ -915,7 +913,6 @@ def generated_user_js(original: str | None, capacity_override: int | None = None
             "// Managed by optimize_firefox.py - Firefox 156+ HTTP cache policy",
             'user_pref("browser.cache.disk.enable", false);',
             'user_pref("browser.cache.memory.enable", true);',
-            'user_pref("storage.sqlite.exclusiveLock.enabled", false);',
             f'user_pref("browser.cache.memory.capacity", {capacity_override});',
             "// === END FIREFOX OPTIMIZATION SUITE ===",
             "",
@@ -1370,22 +1367,10 @@ def prepare_profile(
             user_js if capacity_override is None and sha256_text(user_js) == state.applied_sha256
             else generated_user_js(state.original_user_js, capacity_override)
         )
-        baseline_prefs = state.baseline_prefs
-        old_block, _, _ = extract_legacy_block(user_js)
-        if "storage.sqlite.exclusiveLock.enabled" not in {record.key for record in scan_prefs_js(old_block or "")}:
-            # Upgrade an existing policy without changing a saved capacity override.
-            expected_block, _, _ = extract_legacy_block(expected_applied)
-            if "storage.sqlite.exclusiveLock.enabled" not in {record.key for record in scan_prefs_js(expected_block or "")}:
-                expected_applied = expected_applied.replace(
-                    BLOCK_END,
-                    'user_pref("storage.sqlite.exclusiveLock.enabled", false);\n' + BLOCK_END,
-                    1,
-                )
-            baseline_prefs += tuple(record.line for record in scan_prefs_js(prefs_js) if record.key == "storage.sqlite.exclusiveLock.enabled")
         new_state = state_text
         if sha256_text(expected_applied) != state.applied_sha256:
             new_state = encode_state(RollbackState(
-                state.original_user_js, baseline_prefs,
+                state.original_user_js, state.baseline_prefs,
                 sha256_text(expected_applied), state.migrated_from_legacy,
             ), profile)
         return ProfilePlan(
@@ -2012,17 +1997,6 @@ def _sync_profile_to_ram(profile: Profile, mode: str = "auto", table: Sequence[M
     if shutil.which("rsync") is None:
         raise RamSyncUnavailable("rsync is required for profile RAM synchronization.")
 
-    # Normal SQLite locking permits consistent live backups. Apply the policy
-    # before Firefox starts, while sync_profile_to_ram holds its profile lock.
-    dir_fd = open_directory(profile.path.resolve())
-    try:
-        plan = prepare_profile(profile, dir_fd, True)
-        if plan.changed:
-            apply_plan(plan, dir_fd)
-            verify_applied(plan, dir_fd)
-    finally:
-        os.close(dir_fd)
-
     LOGGER.info("Syncing %s to RAM (engine: %s)...", profile.path.name, mode)
 
     if paths.backup_path.exists():
@@ -2121,30 +2095,77 @@ def sqlite_paths(source: Path) -> Iterator[Path]:
                 yield path
 
 
+def copy_stable_sqlite(path: Path, destination: Path, deadline: float) -> None:
+    """Capture a crash-recoverable DB/journal set without bypassing SQLite locks.
+
+    Firefox's exclusive VFS prevents outside readers. SQLite writes databases
+    and journals through file I/O, so unchanged identities, sizes and nanosecond
+    modification/change times across the entire copy establish a stable set.
+    Never copy shared memory: SQLite rebuilds its WAL index in the private copy.
+    """
+    members = [path.with_name(path.name + suffix) for suffix in ("", "-wal", "-journal")]
+
+    def signatures() -> list[tuple[int, int, int, int, int, int] | None]:
+        result = []
+        for member in members:
+            try:
+                result.append(stat_signature(member.stat()))
+            except FileNotFoundError:
+                result.append(None)
+        return result
+
+    while time.monotonic() < deadline:
+        before = signatures()
+        if before[0] is None:
+            fail(f"SQLite database vanished: {path}; previous checkpoint preserved.")
+        try:
+            for member, signature in zip(members, before):
+                target = destination / member.name
+                target.unlink(missing_ok=True)
+                if signature is not None:
+                    shutil.copy2(member, target)
+            if signatures() == before:
+                return
+        except FileNotFoundError:
+            pass  # Journal rotation raced the copy; retry the complete set.
+        time.sleep(0.01)
+    fail(f"SQLite files kept changing during RAM snapshot: {path}; previous checkpoint preserved.")
+
+
 def snapshot_sqlite(source: Path, staging: Path, *, candidates: Sequence[Path] | None = None) -> list[str]:
     """Stage self-contained database snapshots in RAM, including committed WAL pages."""
-    # Firefox holds its root quota cache exclusively while running. It rebuilds
-    # storage.sqlite from the preserved origin directories when absent; copying
-    # or opening the live cache is unnecessary and can block the whole checkpoint.
-    # Per-origin databases remain essential and are always snapshotted below.
-    excluded = ["storage.sqlite" + suffix for suffix in ("", "-wal", "-shm", "-journal")]
+    excluded: list[str] = []
     for path in sqlite_paths(source) if candidates is None else candidates:
         relative = path.relative_to(source)
-        if relative == Path("storage.sqlite"):
-            continue
         target = staging / relative
         target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         deadline = time.monotonic() + 30
-        def progress(_status: int, _remaining: int, _total: int) -> None:
+        locked = False
+        def progress(status: int, _remaining: int, _total: int) -> None:
+            nonlocal locked
+            if status in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                locked = True
+                raise sqlite3.OperationalError("Live SQLite database is exclusively locked")
             if time.monotonic() >= deadline:
                 fail(f"SQLite snapshot timed out: {path}; previous checkpoint preserved.")
         try:
-            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=1)) as db:
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0)) as db:
                 with closing(sqlite3.connect(target)) as backup:
                     db.backup(backup, pages=256, progress=progress, sleep=0.01)
                     backup.execute("PRAGMA journal_mode=DELETE")
         except sqlite3.Error as error:
-            raise SafetyError(f"Cannot snapshot {path}; previous checkpoint preserved: {error}") from error
+            if not locked:
+                raise SafetyError(f"Cannot snapshot {path}; previous checkpoint preserved: {error}") from error
+            target.unlink(missing_ok=True)
+            with tempfile.TemporaryDirectory(prefix="locked-sqlite-", dir=target.parent) as tmp:
+                private = Path(tmp)
+                copy_stable_sqlite(path, private, deadline)
+                # A writable private connection recovers a hot rollback journal or
+                # committed WAL before producing a self-contained backup.
+                with closing(sqlite3.connect(private / path.name)) as db:
+                    with closing(sqlite3.connect(target)) as backup:
+                        db.backup(backup, pages=256, progress=progress)
+                        backup.execute("PRAGMA journal_mode=DELETE")
         shutil.copystat(path, target)
         excluded.extend(str(relative) + suffix for suffix in ("", "-wal", "-shm", "-journal"))
     return excluded
@@ -2955,8 +2976,28 @@ def run_verification_suite(verbose: bool) -> int:
             vfail("Write leaked directly to disk backing before resync")
 
         # 11. Incremental Resync Test
-        vlog("11. Incremental Resync to Disk Backing (--resync)")
-        run_sub("--resync", "--profile", str(profile_dir))
+        vlog("11. Incremental Resync While Firefox Is Running (--resync)")
+        live_firefox = subprocess.Popen(
+            ["firefox", "--no-remote", "--profile", str(profile_dir), "--headless", "about:blank"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while probe_profile_lock(profile_dir) is None and time.monotonic() < deadline:
+                if live_firefox.poll() is not None:
+                    raise AssertionError("Firefox exited before its live checkpoint test")
+                time.sleep(0.05)
+            if probe_profile_lock(profile_dir) is None:
+                raise AssertionError("Firefox did not acquire its RAM profile lock")
+            run_sub("--resync", "--profile", str(profile_dir), timeout=60)
+            checkpoint = psd_paths.back_ovfs_path if mode_used == "overlay" else psd_paths.backup_path
+            with closing(sqlite3.connect((checkpoint / "cookies.sqlite").as_uri() + "?mode=ro&immutable=1", uri=True)) as cookies:
+                if cookies.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise AssertionError("Live Firefox cookie snapshot failed integrity check")
+            vok("Running Firefox's cookie database was backed up consistently without closing the browser")
+        finally:
+            live_firefox.terminate()
+            live_firefox.wait(timeout=10)
         if mode_used == "overlay":
             synced_ok = (psd_paths.back_ovfs_path / "ram_test_marker.txt").exists()
         else:
@@ -2998,7 +3039,6 @@ def run_verification_suite(verbose: bool) -> int:
         # 14. High-Frequency SQLite Stress Test in RAM
         vlog("14. High-Frequency SQLite Stress Test in RAM Profile")
         run_sub("--sync", "--profile", str(profile_dir))
-        import sqlite3
         db_path = profile_dir / "stress_test.sqlite"
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
@@ -3041,6 +3081,33 @@ def run_verification_suite(verbose: bool) -> int:
                 vok(f"Fresh install {arguments or 'default'} reports no changes without creating a profile")
             else:
                 vfail(f"Fresh install {arguments}: exit={result.returncode}, stdout={result.stdout}, stderr={result.stderr}")
+
+        vlog("16. Exclusively Locked SQLite WAL and Hot Journal Recovery")
+        with tempfile.TemporaryDirectory(prefix="exclusive-verify-", dir=get_volatile_root()) as tmp:
+            for journal_mode in ("WAL", "DELETE"):
+                source = Path(tmp) / journal_mode
+                snapshots = Path(tmp) / f"{journal_mode}-snapshot"
+                source.mkdir()
+                snapshots.mkdir()
+                database = source / "exclusive.sqlite"
+                with closing(sqlite3.connect(database)) as db:
+                    db.execute(f"PRAGMA journal_mode={journal_mode}")
+                    db.execute("PRAGMA locking_mode=EXCLUSIVE")
+                    db.execute("PRAGMA cache_size=2")
+                    db.execute("CREATE TABLE tokens (id INTEGER PRIMARY KEY, value TEXT)")
+                    db.execute("INSERT INTO tokens VALUES (1, 'committed')")
+                    db.commit()
+                    db.execute("BEGIN IMMEDIATE")
+                    db.executemany("INSERT INTO tokens VALUES (?, ?)", ((i, "X" * 1000) for i in range(2, 102)))
+                    snapshot_sqlite(source, snapshots)
+                    with closing(sqlite3.connect(snapshots / database.name)) as saved:
+                        integrity = saved.execute("PRAGMA integrity_check").fetchone()[0]
+                        rows = saved.execute("SELECT COUNT(*) FROM tokens").fetchone()[0]
+                    db.rollback()
+                if integrity == "ok" and rows == 1:
+                    vok(f"Exclusive {journal_mode} snapshot retained committed data and recovered away the unfinished transaction")
+                else:
+                    vfail(f"Exclusive {journal_mode}: integrity={integrity}, rows={rows}")
 
     finally:
         # Cleanup
