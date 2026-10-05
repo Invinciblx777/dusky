@@ -184,24 +184,37 @@ def ensure_root(argv: list[str]) -> None:
 def parse_set_args(args_list: list[str]) -> list[tuple[str, str]]:
     """
     Parses key=value or key value pairs from CLI.
-    Supports: ['pl1=65', 'pl2=90'], ['pl1', '65', 'pl2', '90'], ['pl1_time=28.0']
+    Supports:
+      - ['35'] or ['35w'] -> sets both pl1=35, pl2=35
+      - ['pl1=65', 'pl2=90']
+      - ['pl1', '65', 'pl2', '90']
+      - ['pl1_time=28.0']
     """
+    if len(args_list) == 1 and not args_list[0].startswith("-") and "=" not in args_list[0]:
+        val = args_list[0].strip().rstrip("wW")
+        try:
+            float(val)
+            return [("pl1", val), ("pl2", val)]
+        except ValueError:
+            pass
+
     pairs: list[tuple[str, str]] = []
     i = 0
     while i < len(args_list):
         item = args_list[i]
         if "=" in item:
             k, v = item.split("=", 1)
-            pairs.append((k.strip().lower(), v.strip()))
+            pairs.append((k.strip().lower(), v.strip().rstrip("wW")))
             i += 1
         elif i + 1 < len(args_list) and not args_list[i + 1].startswith("-"):
-            pairs.append((item.strip().lower(), args_list[i + 1].strip()))
+            pairs.append((item.strip().lower(), args_list[i + 1].strip().rstrip("wW")))
             i += 2
         else:
             raise ValueError(f"Missing value for {item}")
         if not pairs[-1][0] or not pairs[-1][1]:
             raise ValueError("Expected a nonempty key and value")
     return pairs
+
 
 def display_status_table() -> None:
     """Renders a rich, comprehensive status table of CPU power limits and telemetry."""
@@ -244,6 +257,11 @@ def display_status_table() -> None:
                 st = "CUSTOM" if abs(v["current"] - v["boot"]) > 0.0000005 else "STOCK"
                 print(f"{k:<12} | {str(v['current']) + ' ' + v['unit']:<12} | {str(v['boot']) + ' ' + v['unit']:<14} | {st:<10}")
         print("-" * 65)
+        plat_info = info.get("platform_extension") or info.get("asus_wmi", {})
+        if plat_info.get("supported"):
+            vendor = plat_info.get("vendor", "Platform Hardware Limit")
+            print(f"{vendor}: Sustained (PL1) = {plat_info.get('pl1')} W | Burst (PL2) = {plat_info.get('pl2')} W")
+            print("-" * 65)
         print(telemetry)
         return
 
@@ -299,13 +317,18 @@ def display_status_table() -> None:
 
         console.print(t_table)
 
-    # Telemetry and Persistence Banner
+    # Telemetry, Hardware Platform, and Persistence Banner
+    plat_info = info.get("platform_extension") or info.get("asus_wmi", {})
+    summary_lines = []
+    if plat_info.get("supported"):
+        vendor = plat_info.get("vendor", "Platform Hardware Limit")
+        p1 = plat_info.get("pl1", "N/A")
+        p2 = plat_info.get("pl2", "N/A")
+        summary_lines.append(f"[bold cyan]{vendor}:[/bold cyan] Sustained (PL1) = [bold green]{p1} W[/bold green]  •  Burst (PL2) = [bold green]{p2} W[/bold green]")
+    summary_lines.append(f"[dim]Telemetry:[/dim] {telemetry}")
     persisted_str = ", ".join(f"{k}: {v}" for k, v in persisted_data.items()) if persisted_data else "None"
-    status_summary = (
-        f"[dim]Telemetry:[/dim] {telemetry}\n"
-        f"[dim]Persistence ({persisted_file}):[/dim] [cyan]{persisted_str}[/cyan]"
-    )
-    console.print(Panel(status_summary, border_style="dim cyan", expand=True))
+    summary_lines.append(f"[dim]Persistence ({persisted_file}):[/dim] [cyan]{persisted_str}[/cyan]")
+    console.print(Panel("\n".join(summary_lines), border_style="dim cyan", expand=True))
 
 def monitor_telemetry() -> None:
     """Continuously prints live power consumption until interrupted."""

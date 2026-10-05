@@ -12,6 +12,106 @@ from python.frontend.core_types import BaseEngine
 RAPL_BASE = Path("/sys/class/powercap")
 STATE_FILE = Path("/dev/shm/dusky_rapl_state.json")
 
+
+class PlatformHardwareExtension:
+    """
+    Lightweight, vendor-neutral hardware extension manager.
+    Coordinates laptop EC / firmware-level power limits that exist outside standard RAPL.
+    Designed for zero-overhead fallback: on standard/unsupported platforms (Dell, Lenovo,
+    Framework, desktops), all operations gracefully no-op.
+    """
+    def __init__(self) -> None:
+        self.pl1_node, self.pl2_node, self.vendor_name = self._discover_ppt_nodes()
+
+    @staticmethod
+    def _discover_ppt_nodes() -> tuple[Path | None, Path | None, str]:
+        # Probe known Linux kernel vendor WMI/armoury drivers (e.g. ASUS TUF/ROG)
+        for base, vendor in (
+            (Path("/sys/devices/platform/asus-nb-wmi"), "ASUS WMI PPT"),
+            (Path("/sys/devices/platform/asus-armoury"), "ASUS Armoury PPT"),
+        ):
+            if not base.is_dir():
+                continue
+            pl1 = base / "ppt_pl1_spl"
+            pl2 = base / "ppt_pl2_sppt"
+            if pl1.is_file() or pl2.is_file():
+                return (pl1 if pl1.is_file() else None, pl2 if pl2.is_file() else None, vendor)
+        return (None, None, "None")
+
+    @property
+    def supported(self) -> bool:
+        return self.pl1_node is not None or self.pl2_node is not None
+
+    def apply(self, pl1_watts: int | None = None, pl2_watts: int | None = None) -> None:
+        if self.pl1_node and pl1_watts is not None:
+            self._write_limit(self.pl1_node, pl1_watts)
+        if self.pl2_node and pl2_watts is not None:
+            self._write_limit(self.pl2_node, pl2_watts)
+
+    def restore(self, baseline: dict[str, Any], fallback_values: dict[str, int]) -> None:
+        if self.pl1_node:
+            val = baseline.get("_platform_pl1") or baseline.get("_asus_pl1")
+            if val is None and "pl1" in fallback_values:
+                val = round(fallback_values["pl1"] / 1_000_000)
+            if val is not None:
+                self._write_limit(self.pl1_node, val)
+        if self.pl2_node:
+            val = baseline.get("_platform_pl2") or baseline.get("_asus_pl2")
+            if val is None and "pl2" in fallback_values:
+                val = round(fallback_values["pl2"] / 1_000_000)
+            if val is not None:
+                self._write_limit(self.pl2_node, val)
+
+    def get_status(self) -> dict[str, Any]:
+        if not self.supported:
+            return {"supported": False}
+        return {
+            "supported": True,
+            "vendor": self.vendor_name,
+            "pl1": safe_read_int(self.pl1_node) if self.pl1_node else None,
+            "pl2": safe_read_int(self.pl2_node) if self.pl2_node else None,
+        }
+
+    def capture_baseline(self) -> dict[str, int]:
+        res: dict[str, int] = {}
+        if self.pl1_node:
+            v1 = safe_read_int(self.pl1_node)
+            if v1 is not None:
+                res["_platform_pl1"] = v1
+                res["_asus_pl1"] = v1
+        if self.pl2_node:
+            v2 = safe_read_int(self.pl2_node)
+            if v2 is not None:
+                res["_platform_pl2"] = v2
+                res["_asus_pl2"] = v2
+        return res
+
+    @staticmethod
+    def _write_limit(path: Path, watts: int) -> bool:
+        try:
+            clamped = max(5, int(watts))
+            path.write_text(f"{clamped}\n", encoding="ascii")
+            return True
+        except OSError:
+            return False
+
+
+def restore_cpufreq_max() -> int:
+    """Restores any cpufreq scaling_max_freq that was throttled back to cpuinfo_max_freq."""
+    restored = 0
+    cpufreq_dir = Path("/sys/devices/system/cpu/cpufreq")
+    if not cpufreq_dir.is_dir():
+        return 0
+    for p in cpufreq_dir.glob("policy*"):
+        info_max = safe_read_int(p / "cpuinfo_max_freq")
+        if info_max is not None and info_max > 0:
+            scale_max = safe_read_int(p / "scaling_max_freq")
+            if scale_max is not None and scale_max < info_max:
+                if safe_write(p / "scaling_max_freq", info_max):
+                    restored += 1
+    return restored
+
+
 def get_real_user() -> tuple[str, int, int, Path]:
     """Dynamically resolves real (non-root) user, UID, GID, and home directory."""
     pkexec_uid = os.environ.get("PKEXEC_UID")
@@ -145,6 +245,7 @@ class FastEnergyReader:
 
 class PkgThrottleEngine(BaseEngine):
     def __init__(self, config_path: str = ""):
+        self.platform = PlatformHardwareExtension()
         self._constraint_cache: dict[Path, dict[str, str]] = {}
         self.domain = self.find_package_domain()
         self.all_package_domains = self.find_all_package_domains()
@@ -292,6 +393,8 @@ class PkgThrottleEngine(BaseEngine):
                 payload = {k: int(v) for k, v in limits.items() if not k.startswith("_")}
                 payload["_cpu_model"] = get_cpu_model()
                 payload["_packages"] = self._capture_packages(raw=True)
+                if self.platform.supported:
+                    payload.update(self.platform.capture_baseline())
                 atomic_write(b_file, json.dumps(payload, indent=2) + "\n", user_owned=True)
                 ensure_real_user_ownership(b_file)
         except Exception:
@@ -488,6 +591,11 @@ class PkgThrottleEngine(BaseEngine):
                     failures.append(f"{domain.name}/{key}: requested {requested}, read back {actual}")
                 elif actual != requested:
                     quantized.append(f"{domain.name}/{key}: quantized to {actual / 1_000_000:g}")
+        # Synchronize platform hardware extensions (e.g. ASUS WMI PPT) when present
+        if not failures and self.platform.supported:
+            pl1_val = round(values["pl1"] / 1_000_000) if "pl1" in values else None
+            pl2_val = round(values["pl2"] / 1_000_000) if "pl2" in values else None
+            self.platform.apply(pl1_watts=pl1_val, pl2_watts=pl2_val)
         return not failures, "; ".join(failures if failures else quantized + skipped)
 
     def _parse_values(self, changes: list[tuple[str, str, str, str]]) -> dict[str, int]:
@@ -536,6 +644,8 @@ class PkgThrottleEngine(BaseEngine):
             if value is not None:
                 limits[key] = value / 1_000_000
         limits["_packages"] = self._capture_packages()
+        if self.platform.supported:
+            limits.update(self.platform.capture_baseline())
         path = get_user_home() / ".config" / "dusky" / "settings" / "dusky_pkg_power"
         atomic_write(path, json.dumps(limits, indent=2) + "\n", user_owned=True)
 
@@ -563,6 +673,9 @@ class PkgThrottleEngine(BaseEngine):
                     return False
             ok, _ = self._apply_values(values, packages)
             if ok:
+                if self.platform.supported:
+                    self.platform.restore(limits, values)
+                restore_cpufreq_max()
                 def modified(data):
                     data["modified"] = True
                     return data
@@ -601,6 +714,9 @@ class PkgThrottleEngine(BaseEngine):
             if len(names) > 1:
                 return False, "Legacy baseline lacks per-package defaults; cannot reliably reset multiple sockets"
         ok, msg = self._apply_values(values, packages)
+        if self.platform.supported:
+            self.platform.restore(baseline if isinstance(baseline, dict) else {}, values)
+        restore_cpufreq_max()
         def modified(data):
             data["modified"] = not ok
             return data
@@ -722,5 +838,8 @@ class PkgThrottleEngine(BaseEngine):
                     "boot": boot.get(self.constraint_file("pl2_time"), 0) / 1_000_000,
                     "unit": "s"
                 }
-            }
+            },
+            "platform_extension": self.platform.get_status(),
+            "asus_wmi": self.platform.get_status(),
         }
+
