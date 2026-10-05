@@ -599,7 +599,8 @@ class ServerDVR(unittest.TestCase):
                     contextlib.redirect_stderr(io.StringIO()) as diagnostics:
                 self.assertEqual(player.main(), 0)
                 adapt.assert_called_once_with(source, {'Referer': 'test'})
-                metadata = dump.call_args.args[0]
+                metadata = next(call.args[0] for call in dump.call_args_list
+                                if call.args[0].get('url') == 'http://127.0.0.1:1234/dvr.m3u8')
                 self.assertEqual(metadata['url'], 'http://127.0.0.1:1234/dvr.m3u8')
                 self.assertEqual(metadata['manifest_url'], metadata['url'])
                 self.assertIn('ytdl_hook-use_manifests=yes', diagnostics.getvalue())
