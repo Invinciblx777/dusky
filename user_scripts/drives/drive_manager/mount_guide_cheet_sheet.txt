@@ -132,8 +132,7 @@ f2fs    | flash only    | atgc,gc_merge,lazytime,compress_algorithm=zstd:6 | nee
   preallocated_size= (not 'prealloc').
 * Lifecycle Hooks: drives.toml supports 'post_unlock', 'pre_lock', and 'post_lock' commands
   (strings or lists of strings, executed unprivileged with $DRIVE_NAME and $DRIVE_MOUNTPOINT).
-  Any hook failure returns failure; failed pre_lock aborts before unmount. Browser unlock
-  uses systemctl start (idempotent); pre_lock stops the unit and verifies RAM unsync.
+  Any hook failure returns failure; failed pre_lock aborts before unmount.
   Close Firefox before locking browser; --force no longer bypasses its profile lock.
   The Firefox service uses --disk-fallback: insufficient RAM/disk headroom or an active
   disk profile keeps Firefox on disk without failing unlock. The resync timer skips
