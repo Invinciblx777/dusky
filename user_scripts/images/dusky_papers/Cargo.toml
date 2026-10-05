@@ -9,9 +9,10 @@ description = "Dusky Papers: fast, lightweight wallpapers for Arch Linux / Hyprl
 iced_core = "0.14.0"
 iced_futures = { version = "0.14.0", features = ["thread-pool"] }
 iced_runtime = "0.14.0"
-iced_renderer = { version = "0.14.0", features = ["wgpu-bare"] }
+iced_renderer = { version = "0.14.0", features = ["wgpu-bare", "fira-sans"] }
 iced_widget = { version = "0.14.2", features = ["advanced", "image", "wgpu"] }
-# Enable Linux graphics backends explicitly; retain Vulkan and the Wayland GL override.
+iced_wgpu = { version = "0.14.0", default-features = false }
+# Enable Vulkan and Wayland EGL explicitly for adapter selection.
 wgpu = { version = "27.0.1", default-features = false, features = ["std", "wgsl", "vulkan", "gles", "parking_lot"] }
 iced_exwlshell = { version = "0.20.1", default-features = false }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif"] }

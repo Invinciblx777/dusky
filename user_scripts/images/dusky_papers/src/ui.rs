@@ -11,7 +11,7 @@ use iced_widget::{
 };
 
 type Element<'a, Message> =
-    iced_core::Element<'a, Message, iced_core::Theme, iced_renderer::Renderer>;
+    iced_core::Element<'a, Message, iced_core::Theme, crate::renderer::Renderer>;
 
 use std::collections::HashSet;
 use std::path::PathBuf;

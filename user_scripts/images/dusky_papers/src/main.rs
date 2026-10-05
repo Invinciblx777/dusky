@@ -3,6 +3,7 @@ mod cache;
 mod color;
 mod config;
 mod favorites;
+mod renderer;
 mod scanner;
 mod theme;
 mod ui;
@@ -211,7 +212,7 @@ impl SingleInstanceGuard {
     }
 }
 
-fn read_card_vendor_driver(card_name: &str) -> Option<(String, String)> {
+fn read_card_vendor_driver(card_name: &str) -> Option<(String, String, String)> {
     let sys_base = format!("/sys/class/drm/{card_name}/device");
     let vendor_path = format!("{sys_base}/vendor");
     let vendor = std::fs::read_to_string(&vendor_path)
@@ -225,10 +226,16 @@ fn read_card_vendor_driver(card_name: &str) -> Option<(String, String)> {
         .unwrap_or_default()
         .to_ascii_lowercase();
 
-    Some((vendor, driver))
+    let pci_device = std::fs::canonicalize(&sys_base)
+        .ok()?
+        .file_name()?
+        .to_string_lossy()
+        .into_owned();
+
+    Some((vendor, driver, pci_device))
 }
 
-fn detect_primary_gpu_vendor() -> Option<(String, String)> {
+fn detect_primary_gpu_vendor() -> Option<(String, String, String)> {
     // 1. Check AQ_DRM_DEVICES (set by Hyprland via gpu.lua, ordered with primary card first)
     if let Ok(aq_devices) = env::var("AQ_DRM_DEVICES") {
         if let Some(first) = aq_devices.split(':').next() {
@@ -245,110 +252,144 @@ fn detect_primary_gpu_vendor() -> Option<(String, String)> {
         }
     }
 
-    // 2. Scan /sys/class/drm/card* directly for the boot_vga device (KMS primary display)
-    let mut first_card: Option<String> = None;
+    // boot_vga is a firmware hint, not necessarily Hyprland's render device.
+    // Without AQ_DRM_DEVICES, prefer it, then the first identifiable DRM card.
+    let mut first_gpu = None;
     if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
         let mut card_names: Vec<String> = entries
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|name| name.starts_with("card") && !name.contains('-'))
+            .filter(|name| {
+                name.strip_prefix("card").is_some_and(|index| {
+                    !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit())
+                })
+            })
             .collect();
-        card_names.sort();
+        card_names.sort_by_key(|name| name[4..].parse::<u32>().unwrap_or(u32::MAX));
 
         for name in &card_names {
-            if first_card.is_none() {
-                first_card = Some(name.clone());
-            }
+            let Some(gpu) = read_card_vendor_driver(name) else {
+                continue;
+            };
             let boot_vga_path = format!("/sys/class/drm/{name}/device/boot_vga");
             if let Ok(content) = std::fs::read_to_string(&boot_vga_path) {
                 if content.trim() == "1" {
-                    if let Some(pair) = read_card_vendor_driver(name) {
-                        return Some(pair);
-                    }
+                    return Some(gpu);
                 }
+            }
+            if first_gpu.is_none() {
+                first_gpu = Some(gpu);
             }
         }
     }
 
-    if let Some(name) = first_card {
-        return read_card_vendor_driver(&name);
-    }
-
-    None
+    first_gpu
 }
 
 fn optimize_gpu_environment() {
-    // Avoid initializing unused graphics backends on this Vulkan/Wayland target.
-    // An explicit user override still takes precedence.
-    if env::var_os("WGPU_BACKEND").is_none() {
-        unsafe { env::set_var("WGPU_BACKEND", "vulkan") };
+    // With no backend override, our compositor tries Vulkan, then EGL only
+    // if Vulkan initialization fails. Pin drivers before starting any threads.
+    let backend_overridden = env::var_os("WGPU_BACKEND").is_some();
+    if env::var_os("WGPU_POWER_PREF").is_none() {
+        unsafe { env::set_var("WGPU_POWER_PREF", "low") };
     }
-    // 1. If user explicitly provided driver files, don't override
-    if env::var_os("VK_DRIVER_FILES").is_some() {
+    // Respect explicit GPU/offload selection, including the legacy Vulkan API.
+    if [
+        "VK_DRIVER_FILES",
+        "VK_ICD_FILENAMES",
+        "VK_ADD_DRIVER_FILES",
+        "VK_LOADER_DRIVERS_SELECT",
+        "VK_LOADER_DRIVERS_DISABLE",
+        "VK_LOADER_DEVICE_SELECT",
+        "DRI_PRIME",
+        "MESA_VK_DEVICE_SELECT",
+        "MESA_LOADER_DRIVER_OVERRIDE",
+        "__NV_PRIME_RENDER_OFFLOAD",
+        "__NV_PRIME_RENDER_OFFLOAD_PROVIDER",
+        "__EGL_VENDOR_LIBRARY_FILENAMES",
+        "__EGL_VENDOR_LIBRARY_DIRS",
+    ]
+    .iter()
+    .any(|name| env::var_os(name).is_some())
+    {
         return;
     }
 
-    let Some((vendor, driver)) = detect_primary_gpu_vendor() else {
+    let Some((vendor, driver, pci_device)) = detect_primary_gpu_vendor() else {
         return;
     };
 
     // 2. Determine matching Vulkan ICD candidates based on the actual primary GPU
-    let (candidates, power_pref): (&[&str], &str) = match vendor.as_str() {
+    let candidates: &[&str] = match vendor.as_str() {
         // Intel (Iris Xe, UHD, Arc)
-        "0x8086" => (
-            &[
-                "/usr/share/vulkan/icd.d/intel_icd.x86_64.json",
-                "/usr/share/vulkan/icd.d/intel_icd.json",
-                "/usr/share/vulkan/icd.d/intel_hasvk_icd.x86_64.json",
-                "/usr/share/vulkan/icd.d/intel_hasvk_icd.json",
-            ],
-            "low",
-        ),
+        "0x8086" => &[
+            "/usr/share/vulkan/icd.d/intel_icd.x86_64.json",
+            "/usr/share/vulkan/icd.d/intel_icd.json",
+            "/usr/share/vulkan/icd.d/intel_hasvk_icd.x86_64.json",
+            "/usr/share/vulkan/icd.d/intel_hasvk_icd.json",
+        ],
         // AMD (Radeon, Ryzen iGPU, Radeon dGPU)
-        "0x1002" => (
-            &[
-                "/usr/share/vulkan/icd.d/radeon_icd.x86_64.json",
-                "/usr/share/vulkan/icd.d/radeon_icd.json",
-            ],
-            "low",
-        ),
+        "0x1002" => &[
+            "/usr/share/vulkan/icd.d/radeon_icd.x86_64.json",
+            "/usr/share/vulkan/icd.d/radeon_icd.json",
+        ],
         // NVIDIA (Desktop discrete GPU or single-GPU system)
         "0x10de" => {
             if driver == "nouveau" {
-                (
-                    &[
-                        "/usr/share/vulkan/icd.d/nouveau_icd.x86_64.json",
-                        "/usr/share/vulkan/icd.d/nouveau_icd.json",
-                    ],
-                    "high",
-                )
+                &[
+                    "/usr/share/vulkan/icd.d/nouveau_icd.x86_64.json",
+                    "/usr/share/vulkan/icd.d/nouveau_icd.json",
+                ]
             } else {
-                (
-                    &[
-                        "/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json",
-                        "/usr/share/vulkan/icd.d/nvidia_icd.json",
-                    ],
-                    "high",
-                )
+                &[
+                    "/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json",
+                    "/usr/share/vulkan/icd.d/nvidia_icd.json",
+                ]
             }
         }
-        // Generic / Virtual Machines (QEMU, VirtIO, VMware, etc.)
+        // VirtIO's Venus Vulkan driver is optional; VirGL-only guests use EGL.
+        "0x1af4" => &[
+            "/usr/share/vulkan/icd.d/virtio_icd.x86_64.json",
+            "/usr/share/vulkan/icd.d/virtio_icd.json",
+        ],
+        // Other unknown/virtual drivers use Vulkan-first compositor fallback.
         _ => return,
     };
 
-    // 3. Set power preference so wgpu aligns with primary GPU
-    if env::var_os("WGPU_POWER_PREF").is_none() {
-        unsafe { env::set_var("WGPU_POWER_PREF", power_pref) };
+    // Mesa selects this PCI GPU for EGL and puts it first for Vulkan.
+    // This does not prevent enumeration/initialization of same-driver GPUs.
+    // Leave unknown/non-PCI devices to their driver defaults.
+    if matches!(vendor.as_str(), "0x8086" | "0x1002" | "0x1af4") {
+        if matches!(vendor.as_str(), "0x8086" | "0x1002")
+            && pci_device.split([':', '.']).count() == 4
+            && pci_device
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+        {
+            let prime = format!("pci-{}", pci_device.replace([':', '.'], "_"));
+            unsafe { env::set_var("DRI_PRIME", prime) };
+        }
+        let mesa_egl = "/usr/share/glvnd/egl_vendor.d/50_mesa.json";
+        if env::var_os("__EGL_VENDOR_LIBRARY_FILENAMES").is_none()
+            && std::path::Path::new(mesa_egl).is_file()
+        {
+            unsafe { env::set_var("__EGL_VENDOR_LIBRARY_FILENAMES", mesa_egl) };
+        }
     }
 
-    // 4. Pin Vulkan to the primary GPU's driver to prevent waking up secondary sleeping GPUs
-    for candidate in candidates {
-        if std::path::Path::new(candidate).exists() {
-            unsafe {
-                env::set_var("VK_DRIVER_FILES", candidate);
-            }
-            break;
-        }
+    // Include all installed matching ICDs: ANV and HASVK cover different Intel
+    // generations. Driver filtering is not physical-device filtering.
+    // If the matching driver is missing,
+    // use EGL rather than letting the loader probe unrelated discrete drivers.
+    let drivers: Vec<_> = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| std::path::Path::new(candidate).is_file())
+        .collect();
+    if !drivers.is_empty() {
+        unsafe { env::set_var("VK_DRIVER_FILES", drivers.join(":")) };
+    } else if !backend_overridden {
+        unsafe { env::set_var("WGPU_BACKEND", "gl") };
     }
 }
 
@@ -421,6 +462,9 @@ fn main() -> iced_exwlshell::Result {
     optimize_gpu_environment();
     // Cover the active output without entering native fullscreen or hiding its windows.
     let settings = iced_exwlshell::Settings {
+        // Cosmic Text's generic sans-serif/fallback families may be absent on
+        // the ISO. iced_renderer embeds this font via its fira-sans feature.
+        default_font: iced_core::Font::with_name("Fira Sans"),
         layer_settings: iced_exwlshell::settings::LayerShellSettings {
             layer: iced_exwlshell::reexport::Layer::Overlay,
             blur_option: iced_exwlshell::reexport::BlurOption::FullRegion,
