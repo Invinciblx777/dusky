@@ -4188,6 +4188,12 @@ def check_disk_space(lto: str, *, installing: bool = False, building: bool = Tru
             raise BuildError(f"Only {fmt_bytes(free)} free in {BUILD_DIR}; a kernel build needs >= {fmt_bytes(need)}")
         if free < need:
             warn(f"{fmt_bytes(free)} free in {BUILD_DIR}; builds with debug info can exceed {fmt_bytes(need)}")
+        # Check persistent storage disk if building in a separate RAM workspace
+        p_dir = STORAGE.get("persistent_dir")
+        if p_dir and Path(p_dir).exists() and Path(p_dir).resolve() != BUILD_DIR.resolve():
+            p_free = shutil.disk_usage(p_dir).free
+            if p_free < (10 << 30):
+                warn(f"Persistent disk {p_dir} has only {fmt_bytes(p_free)} free; post-build cache sync needs ~10 GiB")
     if not installing:
         return
     boot = Path("/boot")
@@ -4204,6 +4210,44 @@ def check_disk_space(lto: str, *, installing: bool = False, building: bool = Tru
             mod_free = shutil.disk_usage(mod_dir).free
             if mod_free < 500 * 1024 * 1024:
                 warn(f"Low disk space on {mod_dir}: {fmt_bytes(mod_free)} free")
+        except OSError:
+            pass
+
+
+def prune_obsolete_build_trees(profile_name: str, current_tree: str, keep_limit: int = 1) -> None:
+    """Automatically remove obsolete build trees and packages to prevent persistent disk exhaustion.
+
+    Retains the active tree plus up to keep_limit previous builds for fast rebuilds.
+    Incomplete trees (failed or aborted before vmlinux) are pruned immediately.
+    """
+    src_parent = STORAGE.get("persistent_dir", BUILD_DIR) / "src"
+    if not src_parent.is_dir():
+        return
+    pattern = f"+{profile_name}-"
+    try:
+        matching = [d for d in src_parent.iterdir() if d.is_dir() and pattern in d.name]
+    except OSError:
+        return
+
+    to_check: list[Path] = []
+    for d in matching:
+        if d.name == current_tree:
+            continue
+        if not (d / "vmlinux").is_file():
+            try:
+                shutil.rmtree(d)
+                ok(f"Pruned incomplete build workspace: {d.name}")
+            except OSError:
+                pass
+        else:
+            to_check.append(d)
+
+    to_check.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for old_tree in to_check[keep_limit:]:
+        try:
+            size = sum(f.stat().st_size for f in old_tree.rglob("*") if f.is_file())
+            shutil.rmtree(old_tree)
+            ok(f"Pruned obsolete build tree: {old_tree.name} (freed {fmt_bytes(size)})")
         except OSError:
             pass
 
@@ -4421,6 +4465,16 @@ def compile_kernel(tree: Path, p: KernelProfile, d: Derived, env: Mapping[str, s
     ok(f"Built in {fmt_duration(duration)} ({steps:,} kbuild steps):")
     for f in pkgs:
         say(f"    {C.GREEN}•{C.RESET} {f.name} ({fmt_bytes(f.stat().st_size)})")
+    # Prune older packages for this profile to prevent package directory bloat
+    all_pkgs = sorted(pkgdest.glob(f"{p.pkgbase}*.pkg.tar*"), key=lambda f: f.stat().st_mtime, reverse=True)
+    h_pkgs = [f for f in all_pkgs if "-headers-" in f.name and not f.name.endswith(".sig")]
+    k_pkgs = [f for f in all_pkgs if "-headers-" not in f.name and not f.name.endswith(".sig")]
+    for old_pkg in h_pkgs[2:] + k_pkgs[2:]:
+        try:
+            old_pkg.unlink(missing_ok=True)
+            old_pkg.with_suffix(old_pkg.suffix + ".sig").unlink(missing_ok=True)
+        except OSError:
+            pass
     return pkgs
 
 
@@ -5030,6 +5084,7 @@ def do_build(args: argparse.Namespace) -> int:
         identity = json.dumps({"profile": profile.sections, "target": target_facts.as_json()}, sort_keys=True)
         build_id = profile.name + "-" + hashlib.sha256(identity.encode()).hexdigest()[:16]
         tree_name = tree_dir_for(release, build_id).name
+        prune_obsolete_build_trees(profile.name, tree_name)
         use_ram = choose_ram_build(args, profile.g("compiler", "lto"), tree_name)
         workspace.enter_context(storage_session(use_ram, tree_name))
         check_disk_space(profile.g("compiler", "lto"), installing=not args.no_install and not args.configure_only)
