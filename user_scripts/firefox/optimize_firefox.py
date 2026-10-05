@@ -30,12 +30,17 @@ Capabilities:
 
     --resync
         Perform an incremental one-shot sync from active RAM profile to disk backing.
-        May run while Firefox is active; live copies are best-effort checkpoints,
-        not transactionally consistent SQLite snapshots.
+        May run while Firefox is active. SQLite's online backup API captures each
+        database consistently; other files and cross-database state are best-effort.
+        A completed checkpoint atomically replaces the previous disk checkpoint.
 
     --daemon [--interval SECONDS]
         Run persistent background daemon: syncs on start, resyncs periodically (default 3600s),
         and safely unsyncs on system shutdown/logout (SIGTERM/SIGINT).
+
+    --watch-sleep
+        Checkpoint before sleep/shutdown using logind delay inhibitors. Requires
+        python-gobject. The system's InhibitDelayMaxSec bounds the available time.
 
     --install-service
         Autonomously deploy and enable systemd user units (service + hourly timer)
@@ -83,7 +88,7 @@ if not sys.platform.startswith("linux"):
 
 import argparse
 import configparser
-from contextlib import ExitStack, contextmanager, nullcontext, suppress
+from contextlib import ExitStack, closing, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 import fcntl
 import hashlib
@@ -95,6 +100,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import sqlite3
 import stat
 import struct
 import subprocess
@@ -111,7 +117,7 @@ from compression import zstd
 
 TOOL_NAME: Final = "optimize_firefox.py"
 TOOL_ID: Final = "firefox-cache-policy"
-TOOL_VERSION: Final = "4.0.0-ff156"
+TOOL_VERSION: Final = "4.1.0-ff156"
 MIN_FIREFOX_MAJOR: Final = 156
 
 STATE_SCHEMA: Final = 2
@@ -144,6 +150,7 @@ CRASH_RECOVERY_PREFIX: Final = "-psd-crashrecovery-"
 SYSTEMD_SERVICE_NAME: Final = "dusky_firefox_cache.service"
 SYSTEMD_RESYNC_SERVICE_NAME: Final = "dusky_firefox_cache_resync.service"
 SYSTEMD_RESYNC_TIMER_NAME: Final = "dusky_firefox_cache_resync.timer"
+SYSTEMD_SLEEP_SERVICE_NAME: Final = "dusky_firefox_cache_sleep.service"
 
 MANAGED_KEYS: Final = frozenset({
     "browser.cache.disk.enable",
@@ -1846,16 +1853,16 @@ def psd_operation_lock() -> Iterator[None]:
     root = get_volatile_root(create=True)
     fd = os.open(root / ".operation.lock", os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise SafetyError("Another Firefox optimizer operation is running; retry after it finishes.") from error
+        fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
         os.close(fd)
 
 
-def sync_directories(src: Path, dst: Path, exclude: Sequence[str] = (), delete: bool = True) -> None:
+def sync_directories(
+    src: Path, dst: Path, exclude: Sequence[str] = (), delete: bool = True,
+    *, link_dest: Path | None = None, checksum: bool = False,
+) -> None:
     """Replace completed files atomically and propagate every transfer failure.
 
     Changed files need temporary disk space; a live tree is not an atomic snapshot.
@@ -1868,8 +1875,13 @@ def sync_directories(src: Path, dst: Path, exclude: Sequence[str] = (), delete: 
     cmd = [rsync, "-aX", "--fsync"]
     if delete:
         cmd.append("--delete-after")
+    if link_dest is not None:
+        cmd.append(f"--link-dest={link_dest.resolve()}")
+    if checksum:
+        cmd.append("--checksum")
     for ex in sorted(set(exclude) | {PARENTLOCK, SYMLINK_LOCK, PSD_FLAG_FILE, PSD_STATE_FILE}):
-        cmd.extend(["--exclude", f"/{ex}"])
+        pattern = re.sub(r"([\\*?\[])", r"\\\1", ex)
+        cmd.extend(["--exclude", f"/{pattern}"])
     cmd.extend(["--", f"{src}/", f"{dst}/"])
     res = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if res.returncode != 0:
@@ -1880,6 +1892,12 @@ def sync_directories(src: Path, dst: Path, exclude: Sequence[str] = (), delete: 
 def check_and_recover_ungraceful_state(profile_path: Path, table: Sequence[MountEntry]) -> bool:
     """Restore a missing RAM profile by renaming its backing, without duplicating it."""
     paths = get_psd_paths(profile_path)
+    # Interrupted checkpoint trees can retain hard links to the published files.
+    # Remove them before validation requires single-link configuration files.
+    for destination in (paths.backup_path, paths.back_ovfs_path):
+        staging = destination.with_name(destination.name + ".checkpoint-tmp")
+        if staging.is_dir():
+            shutil.rmtree(staging)
     if profile_path.is_symlink():
         synced, target, _ = is_profile_synced(profile_path)
         if not synced:
@@ -1889,6 +1907,15 @@ def check_and_recover_ungraceful_state(profile_path: Path, table: Sequence[Mount
                 fail(f"Unflagged RAM profile at {target}; preserve it and inspect before recovery.")
             return False
     elif profile_path.exists():
+        # A power cut after unsync's atomic exchange can leave the obsolete link.
+        for obsolete in (paths.backup_path, paths.back_ovfs_path):
+            if obsolete.is_symlink():
+                old_target = obsolete.readlink()
+                if old_target.is_relative_to(get_volatile_root()) and (profile_path / PSD_STATE_FILE).is_file():
+                    if obsolete == paths.back_ovfs_path and paths.backup_path.is_dir():
+                        shutil.rmtree(paths.backup_path)
+                    obsolete.unlink()
+                    fsync_directory_path(profile_path.parent)
         if paths.backup_path.exists():
             fail(f"Both profile and backing exist: {profile_path}, {paths.backup_path}; reconcile them first.")
         return False
@@ -1948,10 +1975,25 @@ def _sync_profile_to_ram(profile: Profile, mode: str = "auto", table: Sequence[M
         raise RamSyncUnavailable("fusermount3 is required for overlay teardown.")
     if mode == "copy" and ram_free < prof_size + BACKUP_HEADROOM_BYTES:
         raise RamSyncUnavailable(f"Insufficient RAM filesystem space: {human_bytes(ram_free)} available for {human_bytes(prof_size)} profile.")
-    if shutil.disk_usage(profile.path.parent).free < BACKUP_HEADROOM_BYTES:
-        raise RamSyncUnavailable(f"Insufficient disk headroom at {profile.path.parent}; free at least {human_bytes(BACKUP_HEADROOM_BYTES)} before RAM sync.")
-    if mode == "overlay" and shutil.disk_usage(profile.path.parent).free < prof_size + BACKUP_HEADROOM_BYTES:
-        raise RamSyncUnavailable("Overlay mode requires disk space for a full merged checkpoint in addition to its lower profile.")
+    # Estimate initial SQLite normalization plus atomic replacement of a large file.
+    # Check the profile's actual backing mount, which can differ from $HOME.
+    sqlite_bytes = 0
+    largest_file = 0
+    for root, _, files in os.walk(profile.path):
+        for name in files:
+            path = Path(root) / name
+            info = path.lstat()
+            if stat.S_ISREG(info.st_mode):
+                largest_file = max(largest_file, info.st_size)
+                if path.suffix in {".sqlite", ".db"}:
+                    sqlite_bytes += info.st_size
+    disk_needed = max(sqlite_bytes, largest_file) + BACKUP_HEADROOM_BYTES
+    disk_free = shutil.disk_usage(profile.path.parent).free
+    if disk_free < disk_needed:
+        raise RamSyncUnavailable(
+            f"Insufficient checkpoint headroom at {profile.path.parent}: "
+            f"{human_bytes(disk_free)} free, approximately {human_bytes(disk_needed)} required."
+        )
     if shutil.which("rsync") is None:
         raise RamSyncUnavailable("rsync is required for profile RAM synchronization.")
 
@@ -2023,17 +2065,101 @@ def _sync_profile_to_ram(profile: Profile, mode: str = "auto", table: Sequence[M
         raise
 
 
-def checkpoint_overlay(source: Path, destination: Path) -> None:
-    destination.mkdir(mode=0o700, parents=True, exist_ok=True)
-    marker = destination / PSD_STATE_FILE
-    marker.unlink(missing_ok=True)
-    fsync_directory_path(destination)
-    sync_directories(source, destination)
-    dir_fd = open_directory(destination)
+def exchange_paths(first: Path, second: Path) -> None:
+    """Linux renameat2(RENAME_EXCHANGE): no missing/partially replaced checkpoint."""
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = libc.renameat2
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    if renameat2(-100, os.fsencode(first), -100, os.fsencode(second), 2) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(second))
+
+
+def sqlite_paths(source: Path) -> Iterator[Path]:
+    """Identify regular SQLite files by their documented header, regardless of name."""
+    def walk_error(error: OSError) -> None:
+        raise error
+    for root, _, files in os.walk(source, onerror=walk_error):
+        for name in files:
+            path = Path(root) / name
+            try:
+                if not stat.S_ISREG(path.lstat().st_mode) or name.endswith(("-wal", "-shm", "-journal")):
+                    continue
+                with path.open("rb") as stream:
+                    header = stream.read(16)
+            except FileNotFoundError:
+                continue  # Firefox may remove transient files while we scan.
+            if header == b"SQLite format 3\x00":
+                yield path
+
+
+def snapshot_sqlite(source: Path, staging: Path, *, candidates: Sequence[Path] | None = None) -> list[str]:
+    """Stage self-contained database snapshots in RAM, including committed WAL pages."""
+    excluded: list[str] = []
+    for path in sqlite_paths(source) if candidates is None else candidates:
+        relative = path.relative_to(source)
+        target = staging / relative
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        deadline = time.monotonic() + 30
+        def progress(_status: int, _remaining: int, _total: int) -> None:
+            if time.monotonic() >= deadline:
+                fail(f"SQLite snapshot timed out: {path}; previous checkpoint preserved.")
+        try:
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=1)) as db:
+                with closing(sqlite3.connect(target)) as backup:
+                    db.backup(backup, pages=256, progress=progress, sleep=0.01)
+                    backup.execute("PRAGMA journal_mode=DELETE")
+        except sqlite3.Error as error:
+            raise SafetyError(f"Cannot snapshot {path}; previous checkpoint preserved: {error}") from error
+        shutil.copystat(path, target)
+        excluded.extend(str(relative) + suffix for suffix in ("", "-wal", "-shm", "-journal"))
+    return excluded
+
+
+def checkpoint_profile(source: Path, destination: Path, *, live: bool = True, baseline: Path | None = None) -> None:
+    """Publish only completed trees; hard-link unchanged files to avoid data writes.
+
+    The fixed staging name is never used for recovery. If interrupted, the last
+    published destination remains valid and staging is removed on the next run.
+    """
+    staging = destination.with_name(destination.name + ".checkpoint-tmp")
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(mode=0o700)
+    previous = destination if destination.is_dir() else None
+    link_dest = previous if previous is not None and (previous / PSD_STATE_FILE).is_file() else baseline or previous
     try:
-        write_config(dir_fd, PSD_STATE_FILE, json.dumps({"completed_at": time.time()}))
+        with tempfile.TemporaryDirectory(prefix="sqlite-snapshot-", dir=get_volatile_root(create=True)) as tmp:
+            snapshots = Path(tmp)
+            excluded = snapshot_sqlite(source, snapshots) if live else []
+            sync_directories(source, staging, exclude=excluded, link_dest=link_dest)
+            if live:
+                # Firefox can create a database after the initial scan. Replace any
+                # newly copied raw database/WAL pair with an online snapshot too.
+                new_databases = [source / path.relative_to(staging) for path in sqlite_paths(staging)]
+                for name in snapshot_sqlite(source, snapshots, candidates=new_databases):
+                    (staging / name).unlink(missing_ok=True)
+                    excluded.append(name)
+            if excluded:
+                sync_directories(snapshots, staging, delete=False, link_dest=link_dest, checksum=True)
+        # Persist nested directory entries too, before publishing the tree.
+        for root, _, _ in os.walk(staging, topdown=False):
+            fsync_directory_path(Path(root))
+        dfd = open_directory(staging)
+        try:
+            write_config(dfd, PSD_STATE_FILE, json.dumps({"completed_at": time.time()}))
+        finally:
+            os.close(dfd)
+        if previous is None:
+            staging.rename(destination)
+        else:
+            exchange_paths(staging, destination)
+        fsync_directory_path(destination.parent)
     finally:
-        os.close(dir_fd)
+        if staging.exists():
+            shutil.rmtree(staging)
 
 
 def resync_profile(profile_path: Path, table: Sequence[MountEntry] | None = None) -> dict:
@@ -2047,9 +2173,9 @@ def resync_profile(profile_path: Path, table: Sequence[MountEntry] | None = None
     LOGGER.info("Resyncing %s from RAM to disk backing...", profile_path.name)
 
     if mode == "overlay":
-        checkpoint_overlay(vtarget, paths.back_ovfs_path)
+        checkpoint_profile(vtarget, paths.back_ovfs_path, baseline=paths.backup_path)
     else:
-        sync_directories(vtarget, paths.backup_path, exclude=[PSD_FLAG_FILE])
+        checkpoint_profile(vtarget, paths.backup_path)
 
     if paths.state_file.exists():
         try:
@@ -2076,30 +2202,28 @@ def unsync_profile_from_ram(profile_path: Path, force: bool = False, table: Sequ
     info = vtarget.stat()
     profile = Profile(profile_path, info.st_dev, info.st_ino, "tmpfs")
     dir_fd = open_directory(vtarget)
+    restored = paths.back_ovfs_path if mode == "overlay" else paths.backup_path
     try:
         with locked_profile(profile, dir_fd):
             LOGGER.info("Unsyncing %s from RAM back to disk...", profile_path.name)
             if mode == "overlay":
-                checkpoint_overlay(vtarget, paths.back_ovfs_path)
+                checkpoint_profile(vtarget, paths.back_ovfs_path, live=False, baseline=paths.backup_path)
             else:
-                sync_directories(vtarget, paths.backup_path)
+                checkpoint_profile(vtarget, paths.backup_path, live=False)
+                # Keep Firefox excluded until the disk directory replaces the RAM link.
+                exchange_paths(profile_path, restored)
+                fsync_directory_path(profile_path.parent)
     finally:
         os.close(dir_fd)
     # Our directory and lock descriptors must be closed before a normal FUSE unmount.
-    restored = paths.backup_path
     if mode == "overlay":
         result = subprocess.run(["fusermount3", "-u", str(vtarget)], capture_output=True, text=True, check=False)
         if result.returncode != 0:
             fail(f"Cannot unmount RAM profile; all data preserved: {result.stderr.strip()}")
-        restored = paths.back_ovfs_path
-    profile_path.unlink()
-    try:
-        restored.rename(profile_path)
+        exchange_paths(profile_path, restored)
         fsync_directory_path(profile_path.parent)
-    except BaseException:
-        if not profile_path.exists() and mode == "copy":
-            profile_path.symlink_to(vtarget)
-        raise
+    # The former backing path now holds the old RAM symlink.
+    restored.unlink()
     shutil.rmtree(paths.volatile_mount, ignore_errors=True)
     shutil.rmtree(paths.volatile_upper, ignore_errors=True)
     shutil.rmtree(paths.volatile_work, ignore_errors=True)
@@ -2127,7 +2251,8 @@ def psd_daemon_loop(profiles: Sequence[Profile], interval_sec: int) -> int:
     # Initial sync for any unsynced profiles
     for prof in profiles:
         try:
-            sync_profile_to_ram(prof)
+            with psd_operation_lock():
+                sync_profile_to_ram(prof)
         except Exception as e:
             failed = True
             LOGGER.error("Initial sync failed for %s: %s", prof.path.name, e)
@@ -2142,7 +2267,8 @@ def psd_daemon_loop(profiles: Sequence[Profile], interval_sec: int) -> int:
         if time.monotonic() - last_resync >= interval_sec:
             for prof in profiles:
                 try:
-                    resync_profile(prof.path)
+                    with psd_operation_lock():
+                        resync_profile(prof.path)
                 except Exception as e:
                     LOGGER.warning("Scheduled resync error for %s: %s", prof.path.name, e)
             last_resync = time.monotonic()
@@ -2150,12 +2276,94 @@ def psd_daemon_loop(profiles: Sequence[Profile], interval_sec: int) -> int:
     LOGGER.info("Shutting down daemon: performing final unsync back to disk...")
     for prof in profiles:
         try:
-            unsync_profile_from_ram(prof.path, force=True)
+            with psd_operation_lock():
+                try:
+                    unsync_profile_from_ram(prof.path)
+                except ProfileLockedError:
+                    resync_profile(prof.path)
         except Exception as e:
             failed = True
             LOGGER.error("Final unsync failed for %s: %s", prof.path.name, e)
 
     LOGGER.info("Daemon finished%s.", " with failures" if failed else " cleanly")
+    return 1 if failed else 0
+
+
+def watch_sleep(script_path: Path) -> int:
+    """Hold real logind inhibitor FDs until a pre-sleep/shutdown checkpoint finishes."""
+    from gi.repository import Gio, GLib
+
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    interface = "org.freedesktop.login1.Manager"
+    object_path = "/org/freedesktop/login1"
+    inhibitor: int | None = None
+    loop = GLib.MainLoop()
+    failed = False
+
+    def acquire() -> None:
+        nonlocal inhibitor
+        if inhibitor is not None:
+            return
+        result, descriptors = bus.call_with_unix_fd_list_sync(
+            "org.freedesktop.login1", object_path, interface, "Inhibit",
+            GLib.Variant("(ssss)", (
+                "sleep:shutdown", TOOL_NAME, "Checkpoint Firefox RAM profiles", "delay",
+            )), GLib.VariantType.new("(h)"), Gio.DBusCallFlags.NONE, 10000, None, None,
+        )
+        inhibitor = descriptors.get(result.unpack()[0])
+        os.set_inheritable(inhibitor, False)
+
+    def release() -> None:
+        nonlocal inhibitor
+        if inhibitor is not None:
+            os.close(inhibitor)
+            inhibitor = None
+
+    def prepare(_bus, _sender, _path, _interface, member, parameters, _data) -> None:
+        nonlocal failed
+        if parameters.unpack()[0]:
+            LOGGER.info("%s: checkpointing Firefox before releasing delay inhibitor.", member)
+            started = time.monotonic()
+            try:
+                result = subprocess.run(
+                    [sys.executable, str(script_path), "--resync", "--disk-fallback"], check=False,
+                )
+                if result.returncode:
+                    LOGGER.error("Pre-sleep/shutdown checkpoint failed (exit %d).", result.returncode)
+                elapsed = time.monotonic() - started
+                LOGGER.info("Pre-sleep/shutdown checkpoint took %.2fs.", elapsed)
+                if elapsed >= limit:
+                    LOGGER.warning("Checkpoint exceeded logind's %.1fs delay; sleep/shutdown may have begun before it completed.", limit)
+            finally:
+                release()
+        else:
+            try:
+                acquire()
+                LOGGER.info("Delay inhibitor rearmed.")
+            except GLib.Error:
+                failed = True
+                LOGGER.exception("Cannot rearm delay inhibitor.")
+                loop.quit()
+
+    subscriptions = [
+        bus.signal_subscribe(
+            "org.freedesktop.login1", interface, member, object_path, None,
+            Gio.DBusSignalFlags.NONE, prepare, None,
+        ) for member in ("PrepareForSleep", "PrepareForShutdown")
+    ]
+    try:
+        acquire()
+        limit = bus.call_sync(
+            "org.freedesktop.login1", object_path, "org.freedesktop.DBus.Properties", "Get",
+            GLib.Variant("(ss)", (interface, "InhibitDelayMaxUSec")),
+            GLib.VariantType.new("(v)"), Gio.DBusCallFlags.NONE, 10000, None,
+        ).unpack()[0] / 1_000_000
+        LOGGER.info("Watching sleep/shutdown; logind allows %.1fs for checkpoints.", limit)
+        loop.run()
+    finally:
+        release()
+        for subscription in subscriptions:
+            bus.signal_unsubscribe(subscription)
     return 1 if failed else 0
 
 
@@ -2182,17 +2390,19 @@ def install_systemd_service(script_path: Path) -> int:
     service_file = s_dir / SYSTEMD_SERVICE_NAME
     resync_service_file = s_dir / SYSTEMD_RESYNC_SERVICE_NAME
     timer_file = s_dir / SYSTEMD_RESYNC_TIMER_NAME
+    sleep_file = s_dir / SYSTEMD_SLEEP_SERVICE_NAME
 
     service_content = f"""[Unit]
 Description=Firefox Profile RAM Sync (optimize_firefox.py)
 Documentation=file://{script_path}
-Wants={SYSTEMD_RESYNC_TIMER_NAME}
+Wants={SYSTEMD_RESYNC_TIMER_NAME} {SYSTEMD_SLEEP_SERVICE_NAME}
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart={py_bin} {script_arg} --sync --disk-fallback
-ExecStop={py_bin} {script_arg} --unsync
+ExecStop={py_bin} {script_arg} --unsync --disk-fallback
+TimeoutStopSec=120
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
@@ -2222,9 +2432,24 @@ Persistent=true
 WantedBy=timers.target
 """
 
+    sleep_content = f"""[Unit]
+Description=Checkpoint Firefox RAM profiles before sleep and shutdown
+After={SYSTEMD_SERVICE_NAME}
+BindsTo={SYSTEMD_SERVICE_NAME}
+
+[Service]
+Type=simple
+ExecStart={py_bin} {script_arg} --watch-sleep
+SuccessExitStatus=130 143
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+"""
+
     service_file.write_text(service_content, encoding="utf-8")
     resync_service_file.write_text(resync_service_content, encoding="utf-8")
     timer_file.write_text(timer_content, encoding="utf-8")
+    sleep_file.write_text(sleep_content, encoding="utf-8")
 
     LOGGER.info("Wrote systemd user units to %s", s_dir)
 
@@ -2248,8 +2473,13 @@ def remove_systemd_service() -> int:
     service_file = s_dir / SYSTEMD_SERVICE_NAME
     resync_service_file = s_dir / SYSTEMD_RESYNC_SERVICE_NAME
     timer_file = s_dir / SYSTEMD_RESYNC_TIMER_NAME
+    sleep_file = s_dir / SYSTEMD_SLEEP_SERVICE_NAME
 
     if shutil.which("systemctl"):
+        subprocess.run(
+            ["systemctl", "--user", "stop", SYSTEMD_SLEEP_SERVICE_NAME, SYSTEMD_RESYNC_TIMER_NAME,
+             SYSTEMD_RESYNC_SERVICE_NAME], check=True,
+        )
         subprocess.run(
             ["systemctl", "--user", "disable", "--now", SYSTEMD_SERVICE_NAME, SYSTEMD_RESYNC_TIMER_NAME],
             check=True
@@ -2258,6 +2488,7 @@ def remove_systemd_service() -> int:
     service_file.unlink(missing_ok=True)
     resync_service_file.unlink(missing_ok=True)
     timer_file.unlink(missing_ok=True)
+    sleep_file.unlink(missing_ok=True)
 
     if shutil.which("systemctl"):
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
@@ -2838,6 +3069,7 @@ def build_parser() -> argparse.ArgumentParser:
     action.add_argument("--unsync", action="store_true", help="Synchronize profile(s) from RAM back to persistent disk.")
     action.add_argument("--resync", action="store_true", help="Perform incremental resync of RAM profile to disk.")
     action.add_argument("--daemon", action="store_true", help="Run background sync daemon with periodic resync.")
+    action.add_argument("--watch-sleep", action="store_true", help="Checkpoint before sleep/shutdown using logind delay inhibitors (python-gobject).")
     action.add_argument("--install-service", action="store_true", help="Install and enable systemd user units for autonomous sync.")
     action.add_argument("--remove-service", action="store_true", help="Stop, disable, and remove systemd user units.")
     action.add_argument("--verify", action="store_true", help="Run full self-contained empirical verification suite.")
@@ -2848,7 +3080,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--disk-fallback", action="store_true",
-        help="For --sync, keep disk profiles when RAM relocation is unavailable; for --resync, skip disk profiles.",
+        help="Keep disk profiles for --sync; skip disk profiles for --resync; checkpoint open Firefox profiles for --unsync.",
     )
     parser.add_argument(
         "--sync-mode", choices=("auto", "overlay", "copy"), default="auto",
@@ -2891,17 +3123,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.cache_mode is None and not any((
         args.disable, args.status, args.sync, args.unsync, args.resync, args.daemon,
-        args.install_service, args.remove_service, args.verify,
+        args.install_service, args.remove_service, args.verify, args.watch_sleep,
     )):
         args.cache_mode = "memory"
 
-    if args.disk_fallback and not (args.sync or args.resync):
-        parser.error("--disk-fallback requires --sync or --resync")
+    if args.disk_fallback and not (args.sync or args.resync or args.unsync):
+        parser.error("--disk-fallback requires --sync, --resync or --unsync")
     if args.interval <= 0:
         parser.error("--interval must be positive")
     if args.memory_capacity is not None and not -1 <= args.memory_capacity < 2 ** 31:
         parser.error("--memory-capacity must be -1 or a nonnegative 32-bit integer")
-    if args.dry_run and (args.sync or args.unsync or args.resync or args.daemon or args.install_service or args.remove_service or args.verify):
+    if args.dry_run and (args.sync or args.unsync or args.resync or args.daemon or args.install_service or args.remove_service or args.verify or args.watch_sleep):
         parser.error("--dry-run is supported only for cache policy changes and status")
 
     configure_logging(args.verbose)
@@ -2928,6 +3160,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if os.geteuid() == 0:
         fail("Running as root or via sudo is refused. Run as the Firefox profile owner.")
 
+    if args.watch_sleep:
+        return watch_sleep(script_path)
+
+    if args.daemon:
+        with psd_operation_lock():
+            profiles = select_profiles(args.profile or [], read_mount_table(), recover=True)
+        return psd_daemon_loop(profiles, args.interval)
+
     with nullcontext() if args.status or args.dry_run else psd_operation_lock():
         table = read_mount_table()
 
@@ -2935,7 +3175,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         profiles = select_profiles(
             explicit_profiles, table, recover=not (args.status or args.dry_run),
             allow_empty=not explicit_profiles and (
-                args.cache_mode == "memory" or (args.sync or args.resync) and args.disk_fallback
+                args.cache_mode == "memory" or (args.sync or args.resync or args.unsync) and args.disk_fallback
             ),
         )
         if not profiles:
@@ -2964,8 +3204,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if args.unsync:
             for prof in profiles:
-                unsync_profile_from_ram(prof.path, force=args.force, table=table)
-            LOGGER.info("All profiles unsynchronized and restored to disk successfully.")
+                try:
+                    unsync_profile_from_ram(prof.path, force=args.force, table=table)
+                except ProfileLockedError:
+                    if not args.disk_fallback:
+                        raise
+                    LOGGER.warning("Firefox is still open; checkpointing %s and retaining RAM link for recovery.", prof.path.name)
+                    resync_profile(prof.path, table=table)
+            LOGGER.info("All profiles saved to persistent disk.")
             return 0
 
         if args.resync:
@@ -2976,9 +3222,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 resync_profile(prof.path, table=table)
             LOGGER.info("All profiles resynchronized successfully.")
             return 0
-
-        if args.daemon:
-            return psd_daemon_loop(profiles, args.interval)
 
         # ------------------------------------------------ Cache Preferences Policy
         if not args.skip_maintenance_check:
