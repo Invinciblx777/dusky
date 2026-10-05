@@ -49,15 +49,48 @@ def recover_lock_conflict(fd: int, *, grace: float = 15.0) -> bool:
 
     def owner() -> int | None:
         st = os.fstat(fd)
-        key = (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
+        candidates: set[int] = set()
         for line in Path('/proc/locks').read_text().splitlines():
             fields = line.split()
             if len(fields) < 8 or fields[1:4] != ['FLOCK', 'ADVISORY', 'WRITE']:
                 continue
-            major, minor, inode = fields[5].split(':')
-            if (int(major, 16), int(minor, 16), int(inode)) == key:
+            inode = int(fields[5].rsplit(':', 1)[1])
+            if inode == st.st_ino:
                 pid = int(fields[4])
-                return pid if pid > 0 else None
+                if pid > 0:
+                    candidates.add(pid)
+
+        def holds_lock(pid: int) -> bool:
+            # Btrfs reports the superblock device in /proc/locks, whereas
+            # stat() reports the subvolume device. Compare stat identities on
+            # both descriptors, then require a lock on that exact descriptor.
+            proc = Path('/proc') / str(pid)
+            for link in proc.joinpath('fd').glob('*'):
+                try:
+                    actual = link.stat()
+                    if (actual.st_dev, actual.st_ino) != (st.st_dev, st.st_ino):
+                        continue
+                    info = proc.joinpath('fdinfo', link.name).read_text()
+                    for line in info.splitlines():
+                        fields = line.split()
+                        if (len(fields) >= 9 and fields[0] == 'lock:'
+                                and fields[2:5] == ['FLOCK', 'ADVISORY', 'WRITE']
+                                and int(fields[6].rsplit(':', 1)[1]) == st.st_ino):
+                            return True
+                except (FileNotFoundError, ProcessLookupError, PermissionError):
+                    continue
+            return False
+
+        for pid in sorted(candidates):
+            if holds_lock(pid):
+                return pid
+        # A flock can survive its acquiring process through an inherited fd.
+        # If its recorded PID vanished, inspect only live updater processes.
+        for proc in Path('/proc').iterdir():
+            if proc.name.isdecimal():
+                pid = int(proc.name)
+                if pid not in candidates and is_updater(pid) and holds_lock(pid):
+                    return pid
         return None
 
     def is_updater(pid: int) -> bool:
