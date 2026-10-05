@@ -2465,7 +2465,7 @@ def download(url: str, dest: Path, fallback_urls: Sequence[str] = ()) -> None:
             tmp.with_name(tmp.name + ".aria2").unlink(missing_ok=True)
         reason = f"exit {cp.returncode}" if cp.returncode else "missing or invalid archive"
         failures.append(f"{source} ({reason})")
-        if auto_attempts < 3:
+        if auto_attempts < 2:
             auto_attempts += 1
             warn(f"Download attempt {auto_attempts}/3 failed ({reason}); retrying automatically...")
             time.sleep(2)

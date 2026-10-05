@@ -114,16 +114,12 @@ def ram_workspace(settings: dict, run, note, save_run=None, *, tree_name: str):
         raise StorageError('Package destination must be persistent disk storage')
     ram.mkdir(parents=True, exist_ok=True)
     marker = ram / '.unsaved'
-    # If a previous checkpoint was interrupted by disk fullness, try finalizing it now.
     if marker.exists():
-        note(f"Found pending unsaved RAM workspace at {ram}; attempting to complete checkpoint to {persistent}...")
-        try:
-            for disk, volatile in pairs:
-                sync_tree(volatile, disk, save_run or run)
-            marker.unlink(missing_ok=True)
-            note(f"Successfully checkpointed previous workspace to {persistent}")
-        except Exception as exc:
-            raise StorageError(f"Unsaved RAM workspace at {ram}; persistent disk lacks space ({exc}). Free up space on {persistent}, then run:\n  rsync -a --delete --exclude=pacman/ --exclude='*.pkg.tar.*' {ram}/ {persistent}/ && rm {marker}")
+        raise StorageError(
+            f"Unsaved RAM workspace at {ram}; persistent disk lacked space during checkpoint.\n"
+            f"Free up disk space on {persistent}, then finalize saving by running:\n"
+            f"  rsync -a --delete --exclude=pacman/ --exclude='*.pkg.tar.*' {ram}/ {persistent}/ && rm {marker}"
+        )
     # Previous sessions have checkpointed these trees. Discard only their RAM
     # copies; never sync/delete the persistent src parent containing other builds.
     source_root = ram / 'src'
@@ -142,20 +138,16 @@ def ram_workspace(settings: dict, run, note, save_run=None, *, tree_name: str):
         yield ram
     finally:
         note(f'Saving changed build objects and caches to {persistent}; do not reboot until finished')
-        save_failed = False
-        for disk, volatile in pairs:
-            try:
+        try:
+            for disk, volatile in pairs:
                 sync_tree(volatile, disk, save_run or run)
-            except Exception as exc:
-                save_failed = True
-                note(f"Warning: could not save {volatile.name} to {disk}: {exc}")
-        if not save_failed:
             marker.unlink(missing_ok=True)
-        else:
+        except Exception as exc:
             note(
-                f"\n[ALERT] Persistent storage has insufficient space to save all caches from RAM.\n"
+                f"\n[ALERT] Persistent storage has insufficient space to save all caches from RAM: {exc}\n"
                 f"Your built kernel packages and RAM workspace are safely intact at:\n"
                 f"  {ram}\n"
                 f"Free up disk space on {persistent}, then finalize saving by running:\n"
                 f"  rsync -a --delete --exclude=pacman/ --exclude='*.pkg.tar.*' {ram}/ {persistent}/ && rm {marker}\n"
             )
+            raise
