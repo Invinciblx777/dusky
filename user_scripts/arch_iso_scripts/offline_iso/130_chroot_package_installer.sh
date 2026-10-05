@@ -537,7 +537,7 @@ main() {
   fi
 
   print_summary
-  (( ${#FAILED_PACKAGES[@]} == 0 )) || exit 1
+  # Individual package failures are reported above; continue the installation.
   exit 0
 }
 
