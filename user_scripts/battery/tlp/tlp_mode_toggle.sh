@@ -39,6 +39,8 @@ USAGE
     tlp-toggle -h | --help         Show help
 
 Profile selection follows TLP_AUTO_SWITCH on subsequent power-source changes.
+Explicit Performance selection attempts to clear userspace frequency caps.
+Configured boost/performance settings and hardware limits still apply.
 Switching requires root or existing non-interactive sudo authorization.
 EOF
 }
@@ -151,19 +153,64 @@ if (( EUID == 0 )); then
 else
     command=(sudo -n tlp "$target")
 fi
+profile_command=("${command[@]}")
+unclamp_requested=0
+frequency_warning=''
+if [[ $target == performance ]]; then
+    # Linux frequency QoS uses S32_MAX as its unconstrained maximum request.
+    # TLP writes the request with its existing privileges; each driver clamps
+    # the effective limit to its own policy's capabilities. The request survives
+    # Intel's turbo-off clamp until TLP enables turbo later in the same switch.
+    # Deliberately override any configured PRF frequency ceiling for this click.
+    for policy in /sys/devices/system/cpu/cpufreq/policy*; do
+        [[ -f $policy/scaling_max_freq ]] || continue
+        command+=(-- CPU_SCALING_MAX_FREQ_ON_PRF=2147483647)
+        unclamp_requested=1
+        break
+    done
+fi
 if ! output=$("${command[@]}" 2>&1); then
-    printf '%s\n' "$output" >&2
-    if command -v notify-send >/dev/null; then
-        (exec {lock_fd}>&-; notify-send --app-name=dusky-tlp --urgency=critical \
-            --icon=dialog-error 'Power Profile Error' 'TLP failed. See command output for details.') >/dev/null 2>&1 &
+    switch_failed=1
+    if (( unclamp_requested )); then
+        [[ -z $output ]] || printf '%s\n' "$output" >&2
+        printf '[WARN] Frequency cap reset failed; retrying the normal Performance profile.\n' >&2
+        frequency_warning='Frequency cap reset was skipped.'
+        if output=$("${profile_command[@]}" 2>&1); then
+            switch_failed=0
+        fi
     fi
-    err "Failed to execute TLP command: $target"
+    if (( switch_failed )); then
+        printf '%s\n' "$output" >&2
+        if command -v notify-send >/dev/null; then
+            (exec {lock_fd}>&-; notify-send --app-name=dusky-tlp --urgency=critical \
+                --icon=dialog-error 'Power Profile Error' 'TLP failed. See command output for details.') >/dev/null 2>&1 &
+        fi
+        err "Failed to execute TLP command: $target"
+    fi
 fi
 # Preserve TLP warnings rather than silently claiming every setting was applied.
 [[ -z $output ]] || printf '%s\n' "$output" >&2
 read_profile
 if [[ $current == unknown || ( $target != start && $current != "$target" ) ]]; then
     err "TLP did not report the requested profile (reported: $current)."
+fi
+
+if [[ $target == performance ]]; then
+    # TLP can return success despite a rejected sysfs write. Check effective
+    # limits without failing a valid profile switch on unsupported/hotplug CPUs.
+    for policy in /sys/devices/system/cpu/cpufreq/policy*; do
+        [[ -r $policy/scaling_max_freq && -r $policy/cpuinfo_max_freq ]] || continue
+        if ! { read -r actual < "$policy/scaling_max_freq" &&
+               read -r maximum < "$policy/cpuinfo_max_freq"; } 2>/dev/null ||
+           [[ ! $actual =~ ^[0-9]+$ || ! $maximum =~ ^[0-9]+$ ]]; then
+            printf '[WARN] Unable to verify frequency limits for %s.\n' "${policy##*/}" >&2
+            frequency_warning='Frequency limits could not be fully verified.'
+        elif (( 10#$actual < 10#$maximum )); then
+            printf '[WARN] %s remains limited to %s kHz (available maximum: %s kHz).\n' \
+                "${policy##*/}" "$actual" "$maximum" >&2
+            frequency_warning='A CPU frequency limit remains; see command output.'
+        fi
+    done
 fi
 
 # Keep the legacy cache for existing consumers, but never use it as runtime truth.
@@ -175,5 +222,5 @@ if command -v notify-send >/dev/null; then
     (exec {lock_fd}>&-; notify-send --app-name=dusky-tlp --urgency=low \
         --icon="${NOTIFY_ICON[$current]}" \
         --hint=string:x-canonical-private-synchronous:power-profile \
-        "TLP ${LABEL[$current]}" "${ICON[$current]}  ${LABEL[$current]}") >/dev/null 2>&1 &
+        "TLP ${LABEL[$current]}" "${ICON[$current]}  ${LABEL[$current]}${frequency_warning:+ — $frequency_warning}") >/dev/null 2>&1 &
 fi
