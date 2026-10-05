@@ -127,6 +127,26 @@ declare -ar GROUP_ARRAYS=(
   pkgs_btrfs_snapshot
 )
 
+# The generator reads the same package list used by installation, without
+# requiring root or performing any installation work.
+list_package_targets() {
+  local grp_array pkg
+  local -A seen=()
+  for grp_array in "${GROUP_ARRAYS[@]}"; do
+    local -n packages="$grp_array"
+    for pkg in "${packages[@]}"; do
+      [[ -n $pkg && -z ${seen[$pkg]+present} ]] || continue
+      seen[$pkg]=1
+      printf '%s\n' "$pkg"
+    done
+  done
+}
+
+if [[ $# == 1 && $1 == --list-packages ]]; then
+  list_package_targets
+  exit 0
+fi
+
 # --- 2. EARLY ROOT CHECK ---
 
 if (( EUID != 0 )); then
@@ -503,20 +523,8 @@ main() {
   
   ensure_keyring
 
-  # Build unified deduplicated package list across all configured groups
   local -a all_pkgs=()
-  local -A seen_pkgs=()
-  local grp_array pkg
-  for grp_array in "${GROUP_ARRAYS[@]}"; do
-    local -n arr_ref="$grp_array"
-    for pkg in "${arr_ref[@]}"; do
-      [[ -n $pkg ]] || continue
-      if [[ -z ${seen_pkgs[$pkg]+_} ]]; then
-        seen_pkgs[$pkg]=1
-        all_pkgs+=("$pkg")
-      fi
-    done
-  done
+  mapfile -t all_pkgs < <(list_package_targets)
 
   print_info "Attempting consolidated single-pass batch installation (${#all_pkgs[@]} packages)..."
   if run_pacman --sync --needed --noconfirm -- "${all_pkgs[@]}"; then

@@ -1403,6 +1403,16 @@ class IsolatedDB:
 
 
 # ═══════════════════════════════ master list & official phase ═══════════════════════════════
+def installer_package_targets(source_dir: Path) -> list[str]:
+    """Read installation targets from the installer rather than duplicating its list."""
+    installer = source_dir / "130_chroot_package_installer.sh"
+    result = run(["bash", installer, "--list-packages"], capture=True, check=True)
+    targets = result.stdout.splitlines()
+    if not targets or any(not PKGNAME_RE.fullmatch(name) for name in targets):
+        die(f"{installer}: invalid or empty --list-packages output")
+    return list(dict.fromkeys(targets))
+
+
 def build_master_list(external: Path | None) -> list[str]:
     seen: set[str] = set()
     master: list[str] = []
@@ -2479,7 +2489,7 @@ def stage_iso_repo(cfg: IsoConfig) -> dict[str, DbEntry]:
     step(f"copied+verified {len(items)} packages, {human_bytes(total)} in {dt:.1f}s "
          f"({human_bytes(int(total / max(dt, 1e-6)))}/s)")
     write_repo_db(cfg.staging, (e for e, _ in items), durable=False)  # consumed in-run: no fsync
-    verify_repo_closure(cfg.staging, list(merged))
+    verify_repo_closure(cfg.staging, list(dict.fromkeys([*merged, *installer_package_targets(cfg.source_dir)])))
     ok(f"ISO repository staged: {len(items)} packages + DB")
     return {n: e for n, (e, _) in merged.items()}
 
@@ -2497,9 +2507,9 @@ def verify_repo_closure(repo: Path, names: Sequence[str]) -> None:
         r = run(["pacman", "--config", conf, "--noconfirm", "--color", "never", "-Swp", "--print-format", "%n",
                  "--cachedir", tmp, "--", *sorted(names)], capture=True)
         if r.returncode == 0:
-            ok("ISO repository is dependency-closed")
+            ok("ISO repository contains installer targets and is dependency-closed")
         else:
-            die(f"ISO repository is NOT dependency-closed; refusing to build an incomplete offline ISO:\n"
+            die(f"ISO repository has missing installer targets or dependencies; rebuild the official/AUR repositories before generating the ISO:\n"
                 f"{pacman_errors(r)}")
     finally:
         remove_tree(tmp)
@@ -2721,7 +2731,7 @@ def main(args: argparse.Namespace) -> None:
     try:
         if do_official or do_aur:
             external = source_dir / "assets" / "iso_temp_packages" / "packages.x86_64"
-            master = build_master_list(external)
+            master = list(dict.fromkeys([*build_master_list(external), *installer_package_targets(source_dir)]))
             db = IsolatedDB()
             db.setup()
             if do_official:
