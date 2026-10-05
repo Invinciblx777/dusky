@@ -750,16 +750,16 @@ show_configs_menu() {
                 edit_file "$HYPR_EDIT_DIR/source/autostart.lua"
                 ;;
             '  File Manager Default')
-                run_term_hold "file_manager_default" "$SCRIPTS_DIR/arch_setup_scripts/scripts/235_file_manager_switch.sh"
+                run_term_hold "235_default_apps.py" "$SCRIPTS_DIR/arch_setup_scripts/scripts/235_default_apps.py" --file-manager
                 ;;
             '  Browser Default')
-                run_term_hold "browser_default" "$SCRIPTS_DIR/arch_setup_scripts/scripts/236_browser_switcher.sh"
+                run_term_hold "235_default_apps.py" "$SCRIPTS_DIR/arch_setup_scripts/scripts/235_default_apps.py" --browser
                 ;;
             '  Editor Default')
-                run_term_hold "editor_default" "$SCRIPTS_DIR/arch_setup_scripts/scripts/237_text_editer_switcher.sh"
+                run_term_hold "235_default_apps.py" "$SCRIPTS_DIR/arch_setup_scripts/scripts/235_default_apps.py" --text-editor
                 ;;
             '  Terminal Default')
-                run_term_hold "terminal_default" "$SCRIPTS_DIR/arch_setup_scripts/scripts/238_terminal_switcher.sh"
+                run_term_hold "235_default_apps.py" "$SCRIPTS_DIR/arch_setup_scripts/scripts/235_default_apps.py" --terminal
                 ;;
             '  Window Rules Generator')
                 run_term_hold "dusky_window_rules" "$SCRIPTS_DIR/hypr/rules/window_rules_generator.py"

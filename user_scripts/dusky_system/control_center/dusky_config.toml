@@ -1165,10 +1165,10 @@ options = ["Yazi", "thunar"]
 options_map = { "false" = "thunar", "true" = "Yazi" }
 [pages.layout.items.on_change.Yazi]
 type = "exec"
-command = "$HOME/user_scripts/arch_setup_scripts/scripts/235_file_manager_switch.sh --yazi"
+command = "$HOME/user_scripts/arch_setup_scripts/scripts/235_default_apps.py --file-manager --set yazi"
 [pages.layout.items.on_change.thunar]
 type = "exec"
-command = "$HOME/user_scripts/arch_setup_scripts/scripts/235_file_manager_switch.sh --thunar"
+command = "$HOME/user_scripts/arch_setup_scripts/scripts/235_default_apps.py --file-manager --set thunar"
 
 [[pages.layout.items]]
 type = "button"
@@ -3405,7 +3405,7 @@ description = "Switch system-wide file manager"
 icon = "system-file-manager-symbolic"
 [pages.layout.items.layout.items.on_press]
 type = "exec"
-command = "kitty --class 235_file_manager_switch.sh --hold sh -c \"$HOME/user_scripts/arch_setup_scripts/scripts/235_file_manager_switch.sh\""
+command = "kitty --app-id 235_default_apps.py --hold \"$HOME/user_scripts/arch_setup_scripts/scripts/235_default_apps.py\" --file-manager"
 terminal = false
 
 [[pages.layout.items.layout.items]]
@@ -3416,7 +3416,7 @@ description = "Set default internet browser"
 icon = "web-browser-symbolic"
 [pages.layout.items.layout.items.on_press]
 type = "exec"
-command = "kitty --class 236_browser_switcher.sh --hold sh -c \"$HOME/user_scripts/arch_setup_scripts/scripts/236_browser_switcher.sh\""
+command = "kitty --app-id 235_default_apps.py --hold \"$HOME/user_scripts/arch_setup_scripts/scripts/235_default_apps.py\" --browser"
 terminal = false
 
 [[pages.layout.items.layout.items]]
@@ -3427,7 +3427,7 @@ description = "Set default code/text editor"
 icon = "text-editor-symbolic"
 [pages.layout.items.layout.items.on_press]
 type = "exec"
-command = "kitty --class 237_text_editer_switcher.sh --hold sh -c \"$HOME/user_scripts/arch_setup_scripts/scripts/237_text_editer_switcher.sh\""
+command = "kitty --app-id 235_default_apps.py --hold \"$HOME/user_scripts/arch_setup_scripts/scripts/235_default_apps.py\" --text-editor"
 terminal = false
 
 [[pages.layout.items.layout.items]]
@@ -3438,7 +3438,7 @@ description = "Set default system terminal"
 icon = "utilities-terminal-symbolic"
 [pages.layout.items.layout.items.on_press]
 type = "exec"
-command = "kitty --class 238_terminal_switcher.sh --hold sh -c \"$HOME/user_scripts/arch_setup_scripts/scripts/238_terminal_switcher.sh\""
+command = "kitty --app-id 235_default_apps.py --hold \"$HOME/user_scripts/arch_setup_scripts/scripts/235_default_apps.py\" --terminal"
 terminal = false
 
 [[pages.layout.items]]

@@ -444,37 +444,10 @@ hl.window_rule({
     center = true
 })
 
---- file_manager_switcher ---
+--- Default Applications ---
 hl.window_rule({
-    name = "file_manager_switcher",
-    match = { class = "^(235_file_manager_switch.sh)$" },
-    float = true,
-    size = {634, 445},
-    center = true
-})
-
---- 236_browser_switcher.sh ---
-hl.window_rule({
-    name = "236_browser_switcher.sh",
-    match = { class = "^(236_browser_switcher.sh)$" },
-    float = true,
-    size = {634, 445},
-    center = true
-})
-
---- 237_text_editer_switcher.sh ---
-hl.window_rule({
-    name = "237_text_editer_switcher.sh",
-    match = { class = "^(237_text_editer_switcher.sh)$" },
-    float = true,
-    size = {634, 445},
-    center = true
-})
-
---- 238_terminal_switcher.sh ---
-hl.window_rule({
-    name = "238_terminal_switcher.sh",
-    match = { class = "^(238_terminal_switcher.sh)$" },
+    name = "default_apps_switcher",
+    match = { class = "^235_default_apps[.]py$" },
     float = true,
     size = {634, 445},
     center = true
