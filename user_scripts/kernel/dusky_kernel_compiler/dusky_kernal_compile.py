@@ -2434,6 +2434,7 @@ def download(url: str, dest: Path, fallback_urls: Sequence[str] = ()) -> None:
     sources = (url, *fallback_urls)
     failures = []
     index = 0
+    auto_attempts = 0
     while True:
         source = sources[index]
         # Different hosts can serve different gzip streams for the same source tree.
@@ -2448,10 +2449,10 @@ def download(url: str, dest: Path, fallback_urls: Sequence[str] = ()) -> None:
         if have("aria2c") and (index == 0 or not have("curl")):
             cmd = ["aria2c", "--console-log-level=warn", "--summary-interval=0", "-x1" if codeload else "-x8",
                    "-s1" if codeload else "-s8", "-k1M", *([] if codeload else ["-c"]),
-                   "--connect-timeout=10", "--timeout=30", "--max-tries=2", "--auto-file-renaming=false",
+                   "--connect-timeout=20", "--timeout=45", "--max-tries=3", "--retry-wait=2", "--auto-file-renaming=false",
                    "-d", str(dest.parent), "-o", tmp.name, source]
         else:
-            cmd = ["curl", "-fL", "--connect-timeout", "10", "--retry", "3", "--retry-all-errors",
+            cmd = ["curl", "-fL", "--connect-timeout", "20", "--retry", "3", "--retry-all-errors",
                    *([] if codeload else ["-C", "-"]),
                    "--progress-bar", "-A", USER_AGENT, "-o", str(tmp), source]
         cp = run(cmd, check=False, capture=False)
@@ -2464,15 +2465,22 @@ def download(url: str, dest: Path, fallback_urls: Sequence[str] = ()) -> None:
             tmp.with_name(tmp.name + ".aria2").unlink(missing_ok=True)
         reason = f"exit {cp.returncode}" if cp.returncode else "missing or invalid archive"
         failures.append(f"{source} ({reason})")
+        if auto_attempts < 3:
+            auto_attempts += 1
+            warn(f"Download attempt {auto_attempts}/3 failed ({reason}); retrying automatically...")
+            time.sleep(2)
+            continue
         if interactive() and not ASSUME_YES:
             choices = "[r]etry / [a]lternate / [c]ancel" if len(sources) > 1 else "[r]etry / [c]ancel"
             default = "a" if len(sources) > 1 else "c"
             while True:
-                action = ask(f"Download failed ({reason}). {choices}", default).lower()
+                action = ask(f"Download failed after 3 attempts ({reason}). {choices}", default).lower()
                 if action in ("r", "retry"):
+                    auto_attempts = 0
                     break
                 if action in ("a", "alternate") and len(sources) > 1:
                     index = (index + 1) % len(sources)
+                    auto_attempts = 0
                     break
                 if action in ("c", "cancel"):
                     raise AbortError("Download cancelled; partial archives remain available for resume")
@@ -2482,6 +2490,7 @@ def download(url: str, dest: Path, fallback_urls: Sequence[str] = ()) -> None:
             raise NetworkError(f"Download failed: {'; '.join(failures)}")
         warn("Source unavailable; trying alternate archive host")
         index += 1
+        auto_attempts = 0
 
 
 def ensure_kernel_keys() -> bool:
@@ -4382,6 +4391,14 @@ def compile_kernel(tree: Path, p: KernelProfile, d: Derived, env: Mapping[str, s
         warn("Full LTO: the final vmlinux link is single-threaded and memory hungry; expect a long silent phase")
     start_wall = time.time()
     is_clean = not (tree / "vmlinux").exists()
+    if is_clean:
+        info("Build type: fresh compile (new kernel release or clean tree; no prior objects)")
+    else:
+        info("Build type: incremental rebuild (reusing existing object files for faster compilation)")
+    if have("ccache"):
+        note(f"ccache active ({CCACHE_DIR})")
+    if d.lto == "thin":
+        note(f"ThinLTO cache active ({THINLTO_CACHE_DIR})")
     expected_steps, expected_seconds = history_estimate(p.name, d.lto, current_jobs=jobs, is_clean=is_clean)
     with Live(p.pkgbase, expected_steps, expected_seconds, lto=d.lto) as live:
         ret = run_stream(["make", f"-j{jobs}", "pacman-pkg"], cwd=tree, env=b_env, on_line=live.feed)
