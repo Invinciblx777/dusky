@@ -57,13 +57,10 @@ declare -a COPY_TASKS=(
     # 2. Zsh Config (Config -> Not Executable)
     "dusky/.zshrc :: /etc/skel/.zshrc"
 
-    # 3. Network Manager Script
-    "dusky/user_scripts/network_manager/tui_dusky_network.py :: /etc/skel/wifi_connect.sh"
-
-    # 4. foot color file
+    # 3. foot color file
     "/etc/skel/.config/matugen/generated_fresh/foot-colors.ini :: /etc/skel/.config/foot/foot-colors.ini"
 
-    # 5. Mako color file
+    # 4. Mako color file
     "/etc/skel/.config/matugen/generated_fresh/mako-colors.ini :: /etc/skel/.config/matugen/generated/mako-colors.ini"
 )
 
