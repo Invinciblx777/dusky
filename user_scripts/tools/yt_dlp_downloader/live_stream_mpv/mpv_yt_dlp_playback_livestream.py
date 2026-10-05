@@ -28,6 +28,11 @@ or last to replay the most recently played item.
 Each playback has its own temporary session, removed even on failure. --keep
 moves archives into the recording pool; reopened live jumps create separate segments.
 Tmpfs prevents direct video writes to persistent filesystems; it may be swapped.
+Plain playback retries failures twice with fresh extraction, preserving position.
+YouTube VOD HLS failures may fall back to HTTPS at the same codec/resolution/FPS;
+this can lose Premium bitrate. Missing requested tracks count as failures.
+Plain HTTP playback uses a 15-second network timeout; override it with
+--player-args="--network-timeout=60" for connections requiring a longer wait.
 
 Env overrides: MPV_DVR_FORMAT, MPV_DVR_SPEED, MPV_DVR_TMPDIR, MPV_DVR_BUFFER,
 MPV_DVR_CODEC, MPV_DVR_COOKIES, MPV_DVR_COOKIES_FROM_BROWSER, MPV_DVR_TIMEOUT,
@@ -871,6 +876,100 @@ def join_threshold(fmts: list[dict], choice: str) -> int:
     return max(START_BYTES, min(int(tbr * 125 * 1.5), 2 * 1024 * 1024))
 
 
+def https_fallback(info: dict, tracks: list[dict]) -> str:
+    """Keep YouTube VOD video characteristics; never substitute a live/archive URL."""
+    if info.get("extractor_key") != "Youtube" or info.get("is_live"):
+        return ""
+    video = next((t for t in tracks if t.get("vcodec") not in (None, "", "?", "none")), None)
+    if not video or video.get("protocol") not in ("m3u8", "m3u8_native"):
+        return ""
+    family = codec_fam(video["vcodec"])
+    candidates = [f for f in info.get("formats", []) if f.get("protocol") == "https"
+                  and codec_fam(f.get("vcodec")) == family
+                  and all(f.get(key) == video.get(key) for key in
+                          ("width", "height", "fps", "language", "dynamic_range"))]
+    if not candidates:
+        return ""
+    # Extractor FPS often differs only by JSON numeric representation, which
+    # Python equality handles. Leave genuinely different frame rates alone.
+    chosen = candidates[-1]
+    fid = str(chosen["format_id"])
+    needs_audio = any(t.get("acodec") != "none" for t in tracks)
+    return f"{fid}+bestaudio[protocol=https]" if chosen.get("acodec") == "none" and needs_audio else fid
+
+
+# Use mpv events rather than parsing human logs. Split EDL can lose a requested
+# track yet return success, so check track presence as well as end-file errors.
+# Only plain playback installs this: reopening a stream-record file would
+# overwrite its archive. Each recovery re-runs the normal yt-dlp hook.
+RECOVERY_LUA = r"""
+local utils = require 'mp.utils'
+local msg = require 'mp.msg'
+local file = assert(io.open(utils.join_path(mp.get_script_directory(), 'config.json'), 'r'))
+local config = assert(utils.parse_json(file:read('*a')))
+file:close()
+local retries = 0
+local position = nil
+local reopening = false
+local loaded = false
+local idle = mp.get_property_native('idle')
+mp.observe_property('time-pos', 'number', function(_, value)
+    if value then position = value end
+end)
+local function recover(reason)
+    if reopening then return end
+    if retries >= 2 then
+        msg.error('Playback failed after 3 attempts: ' .. reason)
+        mp.commandv('quit', 2)
+        return
+    end
+    retries = retries + 1
+    reopening = true
+    -- Keep the process alive between end-file and the replacement load.
+    mp.set_property_native('idle', true)
+    if config.refresh then
+        local raw = mp.get_property_native('ytdl-raw-options', {})
+        raw['load-info-json'] = nil
+        mp.set_property_native('ytdl-raw-options', raw)
+    end
+    if retries == 2 and config.fallback ~= '' then
+        msg.warn('Retry 2/2: using HTTPS at the same codec/resolution/FPS; Premium bitrate may be lost.')
+        mp.set_property('ytdl-format', config.fallback)
+    else
+        msg.warn('Retry ' .. retries .. '/2 with fresh stream URLs: ' .. reason)
+    end
+    local options = {start=mp.get_property('options/start', 'none')}
+    if position and not config.live then options.start = tostring(position) end
+    mp.command_native({name='loadfile', url=config.url, flags='replace', options=options})
+end
+mp.register_event('start-file', function() reopening = false; loaded = false end)
+mp.register_event('file-loaded', function()
+    local present = {}
+    for _, track in ipairs(mp.get_property_native('track-list', {})) do
+        if not track.external then present[track.type] = true end
+    end
+    for _, kind in ipairs({'video', 'audio'}) do
+        local option = kind == 'video' and 'vid' or 'aid'
+        if config[kind] and not present[kind] and mp.get_property('options/' .. option) ~= 'no' then
+            recover('requested ' .. kind .. ' track did not load')
+            return
+        end
+    end
+    loaded = true
+    mp.set_property_native('idle', idle)
+end)
+mp.register_event('end-file', function(event)
+    if event.reason == 'error' then
+        recover(event.file_error or 'media load/read error')
+    elseif event.reason == 'eof' and loaded and retries > 0 then
+        -- mpv retains earlier load failures in its default process exit code.
+        -- Successful recovery followed by normal EOF is a successful playback.
+        mp.commandv('quit', 0)
+    end
+end)
+"""
+
+
 @contextmanager
 def rumble_dvr_playlist(url: str, headers: dict):
     """Expose Rumble's append-only DVR as EVENT HLS; media stays on the CDN.
@@ -1104,7 +1203,8 @@ def doctor(mpv: str, ytdlp: str) -> int:
                 "--scripts-append", "--ytdl-raw-options-append", "--keep-open",
                 "--script-opts-append", "--cache-on-disk", "--demuxer-readahead-secs",
                 "--save-position-on-quit", "--resume-playback", "--speed",
-                "--fullscreen", "--mute", "--input-terminal", "--vo", "--ao", "--start"}
+                "--fullscreen", "--mute", "--input-terminal", "--vo", "--ao", "--start",
+                "--network-timeout"}
     missing = sorted(o for o in required if o not in options)
     if missing:
         print("ERROR  : mpv lacks required options: " + ", ".join(missing))
@@ -1200,6 +1300,9 @@ def build_parser() -> argparse.ArgumentParser:
                "Settings: CLI > replay entry > environment > config.toml > defaults.\n"
                "Player keys: } = 2x, ]/[ = adjust speed, Backspace = reset, Left/Right = seek.\n"
                "Format prompt: enter a row number or ID; IDs win ties, #N forces row N.\n"
+               "Plain playback: two recovery attempts; YouTube VOD HLS may fall back to HTTPS\n"
+               "at the same codec/resolution/FPS (Premium bitrate may be lost). Network timeout: 15s;\n"
+               "override with --player-args='--network-timeout=60'.\n"
                "Codec budgets apply after yt-dlp metadata extraction; unresolved codecs show ?.",
     )
     ap.add_argument("url", nargs="?",
@@ -1498,6 +1601,12 @@ def main() -> int:
             raise SystemExit(f"ERROR: --ytdlp-option {key!r} collides with a built-in flag")
         seen_keys.add(key)
         yt_extra.append(f"--{key}" if value is None else f"--{key}={value}")
+    # The hook runs extraction outside run_yt_dlp_json's process deadline.
+    # Bound stalled requests there too; retain an explicit user timeout.
+    hook_extra = list(args.ytdlp_option)
+    if "socket-timeout" not in seen_keys:
+        yt_extra.append("--socket-timeout=15")
+        hook_extra.append("socket-timeout=15")
     try:
         extra_player = shlex.split(args.player_args)
         extra_rec = shlex.split(args.recorder_args)
@@ -1510,7 +1619,7 @@ def main() -> int:
         session = stack.enter_context(tempfile.TemporaryDirectory(prefix="run-", dir=pool))
         env = dict(os.environ, TMPDIR=session, XDG_CACHE_HOME=os.path.join(session, "cache"))
         yt_cookie_flags, mpv_cookie_opt, _ = stage_cookies(cookie_src, browser, session)
-        raw_opts = build_raw_opts(mpv_cookie_opt, ignore_cfg, args.ytdlp_option)
+        raw_opts = build_raw_opts(mpv_cookie_opt, ignore_cfg, hook_extra)
         info = run_yt_dlp_json(url, yt_extra + yt_cookie_flags + ["--format", DEFAULT_FORMAT],
                               executable=ytdlp, env=env)
         codec_choice = str(args.format or "").strip().lower() in CODEC_ALIASES
@@ -1530,13 +1639,12 @@ def main() -> int:
         bufmode = resolve_buffer(args.buffer, need_player=not args.record_only)
         print(f"Mode: {mode} | format: {choice} | buffer: {bufmode}", file=sys.stderr)
 
-        # stream-record only writes the main demuxer. Check the exact selection
-        # offline so raw selectors are handled by yt-dlp itself without a second
-        # website extraction, URL reimplementation, or missing separate audio.
+        # Select offline with yt-dlp itself: validate recording constraints and
+        # determine which tracks plain playback must actually load.
         record = mode != "plain"
         rumble_dvr = bool(info.get("is_live") and info.get("extractor_key") == "RumbleEmbed"
                           and mode in ("live", "plain"))
-        if record or rumble_dvr:
+        if record or rumble_dvr or (mode == "plain" and fmts):
             metadata = os.path.join(session, "metadata.json")
             with open(metadata, "w", encoding="utf-8") as f:
                 json.dump(info, f)
@@ -1587,6 +1695,10 @@ def main() -> int:
                     server_rewind = True
                     print("Rewind: the stream's earlier footage is available on the seek bar.", file=sys.stderr)
 
+        if mode == "plain" and fmts and not server_rewind:
+            # Reuse fresh extraction for the first load. Recovery removes this
+            # option so expired or failed URLs are re-extracted from the site.
+            raw_opts.append(f"load-info-json={metadata}")
         pin_opt = f"--script-opts-append=ytdl_hook-ytdl_path={ytdlp}"
         url_flags = [pin_opt, f"--ytdl-format={choice}", "--ytdl-raw-options-clr"]
         url_flags += [f"--ytdl-raw-options-append={o}" for o in raw_opts]
@@ -1624,7 +1736,20 @@ def main() -> int:
             return proc
 
         if mode == "plain":
-            cmd = player + url_flags + start_opt + extra_player + ["--", url]
+            recovery = os.path.join(session, "recovery")
+            os.mkdir(recovery)
+            with open(os.path.join(recovery, "main.lua"), "w", encoding="utf-8") as f:
+                f.write(RECOVERY_LUA)
+            expected = tracks if fmts else []
+            with open(os.path.join(recovery, "config.json"), "w", encoding="utf-8") as f:
+                json.dump({"url": url, "live": bool(info.get("is_live")),
+                           "refresh": not server_rewind,
+                           "video": any(t.get("vcodec") != "none" for t in expected),
+                           "audio": any(t.get("acodec") != "none" for t in expected),
+                           "fallback": "" if server_rewind else https_fallback(info, expected)}, f)
+            cmd = (player + url_flags + start_opt
+                   + ["--network-timeout=15", f"--scripts-append={recovery}"]
+                   + extra_player + ["--", url])
             show(cmd)
             return 0 if args.print_cmds else launch(cmd).wait()
 
