@@ -207,7 +207,7 @@ CORE_SYSTEM_DEFS = {
         "Applies the configured G-Helper GPU mode during system startup.",
     ),
     "glance_cpu_pkg_watt.service": (
-        "CPU Package Power Access",
+        "Dusky Glance",
         "Allows Dusky Glance to read CPU package energy counters.",
     ),
     "numlock_disable.service": (

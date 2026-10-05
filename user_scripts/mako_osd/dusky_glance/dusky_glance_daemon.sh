@@ -111,11 +111,12 @@ check_private_dir() {
     [[ -d "$1" && -O "$1" && -w "$1" && ! -L "$1" ]] ||
         die "Directory must be private and owned by this user: $1"
     perms=$(stat -c %a -- "$1") || die "Cannot stat: $1"
-    [[ "$perms" =~ ^[0-7]{3,4}$ ]] && (( 8#$perms == 0700 )) ||
+    if [[ ! "$perms" =~ ^[0-7]{3,4}$ ]] || (( 8#$perms != 0700 )); then
         die "Expected mode 0700 on $1 (found $perms)"
+    fi
 }
 check_private_dir "$RUNTIME_DIR"
-mkdir -p -m 700 -- "$GLANCE_STATE_DIR"
+mkdir -p -- "$GLANCE_STATE_DIR"
 [[ -d "$GLANCE_STATE_DIR" && -O "$GLANCE_STATE_DIR" &&
    ! -L "$GLANCE_STATE_DIR" ]] || die 'Unsafe state directory'
 state_mode=$(stat -c %a -- "$GLANCE_STATE_DIR") || die 'Cannot stat state directory'
@@ -144,18 +145,14 @@ same_process() {
     [[ "$actual" == "$2" ]]
 }
 request_stop() {
-    local record="$1" fifo="${1%.pid}.fifo" pid="" started=""
+    local record="$1" pid="" started=""
     if [[ -L "$record" ]] || ! read -r pid started < "$record" 2>/dev/null ||
        ! same_process "$pid" "$started"; then
         rm -f -- "${record%.pid}.fifo" "$record"
         return 0
     fi
-    if [[ -p "$fifo" ]] && { exec 8<> "$fifo"; } 2>/dev/null; then
-        printf 'stop\n' >&8 || true
-        exec 8>&- || true
-    else
-        kill -TERM "$pid" 2>/dev/null || true
-    fi
+    # TERM interrupts the read wait and runs cleanup without a FIFO read.
+    kill -TERM "$pid" 2>/dev/null || true
 }
 wait_records() {
     local record pid="" started="" attempt pending result=0
@@ -573,19 +570,29 @@ find_cpu_temp_sensor() {
     return 1
 }
 find_rapl_domain() {
-    local f name
-    for f in /sys/class/powercap/intel-rapl/intel-rapl:*/name \
-             /sys/class/powercap/intel-rapl/intel-rapl:*/intel-rapl:*:*/name \
-             /sys/class/powercap/intel-rapl:*/name; do
+    local f name energy inaccessible=""
+    # Powercap exposes packages and subzones as class entries. Prefer MSR
+    # over MMIO: both interfaces may report the same package's energy.
+    for f in /sys/class/powercap/intel-rapl:*/name \
+             /sys/class/powercap/intel-rapl-mmio:*/name; do
         { read -r name < "$f"; } 2>/dev/null || continue
         case "$1:$name" in
             package:package-*|uncore:uncore)
-                if [[ -r "${f%/*}/energy_uj" ]]; then
-                    printf '%s\n' "${f%/*}/energy_uj"
+                energy="${f%/*}/energy_uj"
+                if [[ -r "$energy" ]]; then
+                    printf '%s\n' "$energy"
                     return 0
+                elif [[ -e "$energy" && -z "$inaccessible" ]]; then
+                    inaccessible=$energy
                 fi ;;
         esac
     done
+    # Retain an existing, inaccessible sensor so callers can distinguish a
+    # permission problem from hardware without an energy counter.
+    if [[ -n "$inaccessible" ]]; then
+        printf '%s\n' "$inaccessible"
+        return 0
+    fi
     return 1
 }
 find_intel_gpu_energy() {
@@ -686,6 +693,7 @@ sample_energy_watts() {
 
 CPU_PREV_IDLE=-1 CPU_PREV_TOTAL=-1
 CPU_POWER_PATH="" CPU_POWER_LAST=-5
+CPU_POWER_WARNED=0
 CPU_TEMP_PATH="" CPU_TEMP_LAST=-5
 cpu_usage_once() {
     local -n _dest=$1
@@ -701,10 +709,12 @@ cpu_usage_once() {
         _total=$((_user + _nice + _system + _idle + _iowait + _irq + _softirq + _steal))
         _diff_total=$((_total - CPU_PREV_TOTAL))
         _diff_idle=$((_idle_all - CPU_PREV_IDLE))
-        if (( CPU_PREV_TOTAL >= 0 && _diff_total > 0 && _diff_idle >= 0 )); then
-            _usage=$((100 * (_diff_total - _diff_idle) / _diff_total))
-            (( _usage < 0 )) && _usage=0
-            (( _usage > 100 )) && _usage=100
+        if (( CPU_PREV_TOTAL >= 0 && _diff_total > 0 )); then
+            # Linux permits iowait to decrease. Like btop, clamp the idle
+            # delta and round the percentage instead of dropping the sample.
+            (( _diff_idle < 0 )) && _diff_idle=0
+            (( _diff_idle > _diff_total )) && _diff_idle=$_diff_total
+            _usage=$(((100 * (_diff_total - _diff_idle) + _diff_total / 2) / _diff_total))
             _dest="${_usage}%"
         fi
         CPU_PREV_IDLE=$_idle_all CPU_PREV_TOTAL=$_total
@@ -717,14 +727,25 @@ cpu_power_once() {
     local -n _dest=$1
     _dest=N/A
     if [[ -z "$CPU_POWER_PATH" || ! -r "$CPU_POWER_PATH" ]]; then
-        CPU_POWER_PATH=""
         if (( SECONDS - CPU_POWER_LAST >= 5 )); then
             CPU_POWER_LAST=$SECONDS
             CPU_POWER_PATH=$(find_rapl_domain package || true)
         fi
     fi
     if [[ -n "$CPU_POWER_PATH" ]]; then
-        sample_energy_watts "$1" "$CPU_POWER_PATH" "${CPU_POWER_PATH%/*}/max_energy_range_uj"
+        if [[ -r "$CPU_POWER_PATH" ]]; then
+            CPU_POWER_WARNED=0
+            sample_energy_watts "$1" "$CPU_POWER_PATH" "${CPU_POWER_PATH%/*}/max_energy_range_uj"
+        elif [[ -e "$CPU_POWER_PATH" ]]; then
+            _dest='No access'
+            if (( CPU_POWER_WARNED == 0 )); then
+                printf 'dusky-glance: Cannot read CPU energy counter: %s; enable/start glance_cpu_pkg_watt.service\n' \
+                    "$CPU_POWER_PATH" >&2
+                CPU_POWER_WARNED=1
+            fi
+        fi
+    else
+        CPU_POWER_WARNED=0
     fi
     return 0
 }
@@ -1020,6 +1041,7 @@ gpu_mem_once() {
 }
 gpu_temp_once() {
     local -n _dest=$1
+    local period
     _dest=N/A
     if [[ "$GPU_VENDOR" == nvidia ]]; then
         # Query once via NVML, without touching hwmon on a suspended dGPU.
@@ -1049,6 +1071,7 @@ micro_product() {
     local -n _dest=$1
     local quantity=$2 volts=$3
     # uAh*uV -> uWh, or uA*uV -> uW; split the product to avoid overflow.
+    # shellcheck disable=SC2017
     _dest=$((quantity / 1000000 * volts + (quantity % 1000000) * volts / 1000000))
 }
 format_hours_minutes() {
@@ -1568,7 +1591,7 @@ case "$MODE" in
         HEARTBEAT_FILE="$NET_STATE_DIR/heartbeat"
 
         wake_network_daemon() {
-            [[ -d "$NET_STATE_DIR" ]] || mkdir -m 700 -p -- "$NET_STATE_DIR" 2>/dev/null || true
+            [[ -d "$NET_STATE_DIR" ]] || mkdir -p -- "$NET_STATE_DIR" 2>/dev/null || true
             : > "$HEARTBEAT_FILE" 2>/dev/null || true
             timeout --kill-after=1s 3s systemctl --user --kill-whom=main \
                 --signal=USR1 kill network_meter.service >/dev/null 2>&1 || \
