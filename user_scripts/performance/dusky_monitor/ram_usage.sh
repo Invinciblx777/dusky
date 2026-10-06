@@ -190,8 +190,10 @@ with (out / 'drm.md').open('w') as stream:
             holders=', '.join(f'{clean(comm)}[{pid}]' for pid,comm in sorted(record['holders']))
             stream.write(f"| {holders} | {clean(info['drm-driver'])}/{info.get('drm-pdev','non-PCI')}/{info.get('drm-client-id','unknown')} | {key} | {size/1048576:.1f} |\n")
             count+=1
+    stream.write('\n')
     if not count:
         stream.write('No nonzero standardized memory counters in sampled DRM descriptors; see raw appendix for zero/unsupported counters.\n')
+        stream.write('\n')
     stream.write(f'FD read failures/exits: {drm_errors}. Shared/active/purgeable counters overlap totals/resident; clients can share buffers. Unknown client IDs cannot be deduplicated. Deprecated drm-memory aliases are not summed.\n')
 keys = ['Pss', 'Rss', 'Swap', 'SwapPss']
 (out / 'process_totals').write_text(' '.join(map(str, [len(rows), *[sum(r.get(k,0) for r in rows) for k in keys]]))+'\n')
@@ -415,7 +417,7 @@ else:
         swap_mib=f'{int(swap)/1048576:.1f}' if swap is not None else 'N/A'
         name=str(path.relative_to(root)).replace('|','-').replace('\n',' ')
         print(f"| /{name} | {current/1048576:.1f} | {(current-child_totals[path])/1048576:.1f} | {unevictable_mib} | {swap_mib} | {read(path/'memory.high') or 'N/A'}/{read(path/'memory.max') or 'N/A'} | {events.get('oom_kill','N/A')} | {'; '.join(f'{key}={value}' for key,value in events.items()) or 'N/A'} |")
-    if not groups: print('Unavailable: no readable memory controller groups.')
+    if not groups: print('\nUnavailable: no readable memory controller groups.')
 CGROUPS
 echo ""
 
