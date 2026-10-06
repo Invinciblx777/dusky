@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Description: Optimize systemd-journald limits for minimal RAM footprint and high I/O throughput.
-# Target: Arch Linux / systemd 258+ (systemd 261+ tested)
+# Target: Arch Linux / systemd 262+
 
 set -euo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SELF_PATH="$(realpath -e -- "${BASH_SOURCE[0]}")"
+SELF_PATH="$(realpath -e -- "${BASH_SOURCE[0]}")"
+readonly SELF_PATH
 readonly ORIG_ARGS=("$@")
 
 readonly CONF_DIR="/etc/systemd/journald.conf.d"
@@ -205,4 +206,3 @@ printf '\n%sCurrent Journal Footprint:%s\n' "$C_BOLD" "$C_RESET"
 journalctl --disk-usage 2>/dev/null || true
 
 exit 0
-

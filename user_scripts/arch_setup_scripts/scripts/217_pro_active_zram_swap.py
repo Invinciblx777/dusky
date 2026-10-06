@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #d: Proactive idle memory reclaimer & ZRAM swapper (MGLRU Slice Skimmer & Boot Flush)
-# Target: Arch Linux / Linux Kernel 7.2+ / systemd 261+
+# Target: Arch Linux / Linux Kernel 7.3+ / systemd 262+
 
 from __future__ import annotations
 
@@ -204,22 +204,15 @@ def get_zram_swap_usage() -> tuple[int, int, float] | None:
         pass
     return None
 
-def has_swap_or_zram() -> bool:
+def zram_has_priority() -> bool:
+    """Anonymous reclaim follows the kernel swap allocator's priority order."""
     try:
-        swaps = Path("/proc/swaps").read_text(encoding="utf-8")
-        lines = swaps.strip().splitlines()
-        if len(lines) > 1:
-            return True
-    except OSError:
-        pass
-    try:
-        for zram in Path("/sys/block").glob("zram*"):
-            disksize = (zram / "disksize").read_text(encoding="utf-8").strip() if (zram / "disksize").exists() else "0"
-            if int(disksize) > 0:
-                return True
-    except OSError:
-        pass
-    return Path("/dev/zram0").exists()
+        swaps = [line.split() for line in Path("/proc/swaps").read_text().splitlines()[1:]]
+        zram = [int(row[4]) for row in swaps if row[0].startswith("/dev/zram")]
+        disk = [int(row[4]) for row in swaps if not row[0].startswith("/dev/zram")]
+        return bool(zram) and (not disk or min(zram) > max(disk))
+    except (OSError, ValueError, IndexError):
+        return False
 
 def is_cgroup2_mounted() -> bool:
     try:
@@ -305,10 +298,10 @@ def parse_proactive_reclaimed_bytes(stat_path: Path) -> int:
         return 0
     return 0
 
-def reclaim_cgroup_chunked(cgroup_dir: Path, target_bytes: int, label: str) -> tuple[int, int]:
+def reclaim_cgroup_chunked(cgroup_dir: Path, target_bytes: int, label: str, *, force: bool = False) -> tuple[int, int]:
     """
-    Submits bounded memory reclaim requests in low-latency 32MB chunks with swappiness=max.
-    Delegates cold page identification entirely to the kernel's hardware Multi-Gen LRU (MGLRU).
+    Submit bounded anonymous-memory reclaim requests with swappiness=max.
+    The kernel can reclaim recently used pages too; this is not an idle-page filter.
     """
     reclaim_file = cgroup_dir / "memory.reclaim"
     stat_file = cgroup_dir / "memory.stat"
@@ -319,6 +312,11 @@ def reclaim_cgroup_chunked(cgroup_dir: Path, target_bytes: int, label: str) -> t
     reclaimed_requested = 0
 
     while reclaimed_requested < target_bytes:
+        # Recheck priority between chunks: swap topology can change at runtime.
+        if not zram_has_priority():
+            warn("ZRAM does not exclusively precede disk swap; halting anonymous reclaim.")
+            break
+
         # 1. zRAM saturation guard
         zram_stat = get_zram_swap_usage()
         if zram_stat is None:
@@ -335,11 +333,15 @@ def reclaim_cgroup_chunked(cgroup_dir: Path, target_bytes: int, label: str) -> t
 
         # 2. System memory pressure guard
         psi_sys = get_system_pressure()
-        if psi_sys >= PSI_SOME_THRESHOLD:
+        if not force and psi_sys >= PSI_SOME_THRESHOLD:
             warn(f"System memory pressure active ({psi_sys:.2f}% >= {PSI_SOME_THRESHOLD}%). Halting sweep.")
             break
 
-        chunk = min(CHUNK_SIZE, target_bytes - reclaimed_requested)
+        chunk = min(CHUNK_SIZE, target_bytes - reclaimed_requested,
+                    max(0, int(size_b * ZRAM_MAX_USAGE_RATIO) - used_b))
+        chunk = chunk // PAGE_SIZE * PAGE_SIZE
+        if chunk <= 0:
+            break
         try:
             with reclaim_file.open("w", encoding="utf-8") as fh:
                 fh.write(f"{chunk} swappiness=max\n")
@@ -367,7 +369,7 @@ def perform_reclaim(force: bool = False, boot_flush: bool = False) -> None:
     """
     Executes a bounded slice-level memory reclaim sweep via Linux Kernel MGLRU.
     If boot_flush=True: runs one-time baseline sweep at 60s boot, bypassing the 70% threshold
-    and 30% cap, letting MGLRU reclaim all cold startup residue into zRAM.
+    and 30% cap, requesting anonymous startup memory reclaim.
     """
     load_runtime_config()
 
@@ -405,7 +407,7 @@ def perform_reclaim(force: bool = False, boot_flush: bool = False) -> None:
     if boot_flush:
         info(
             f"Initiating one-time MGLRU baseline boot memory flush at {BOOT_FLUSH_DELAY} (RAM usage={ram_ratio*100:.1f}%, "
-            f"budget={BOOT_FLUSH_MAX_MB}MB, ratio=100% cold, chunk={CHUNK_SIZE // (1024*1024)}MB, zram_limit={int(ZRAM_MAX_USAGE_RATIO*100)}%)..."
+            f"budget={BOOT_FLUSH_MAX_MB}MB, ratio=100% anon cap, chunk={CHUNK_SIZE // (1024*1024)}MB, zram_limit={int(ZRAM_MAX_USAGE_RATIO*100)}%)..."
         )
     else:
         info(
@@ -416,8 +418,9 @@ def perform_reclaim(force: bool = False, boot_flush: bool = False) -> None:
     if not is_cgroup2_mounted():
         die("cgroup v2 not mounted at /sys/fs/cgroup. Arch uses cgroup2 by default.")
 
-    if not has_swap_or_zram():
-        warn("No active swap or ZRAM detected. Kernel will reject anon reclaim.")
+    if not zram_has_priority():
+        warn("Active ZRAM must have higher priority than every disk swap; skipping sweep.")
+        return
 
     # 3. zRAM Swap Guard: Never spill cold pages to disk swap
     zram_stat = get_zram_swap_usage()
@@ -463,13 +466,13 @@ def perform_reclaim(force: bool = False, boot_flush: bool = False) -> None:
         target_reclaim = min(int(anon_bytes * effective_ratio), remaining_budget)
         if target_reclaim <= 0:
             continue
-        req, stl = reclaim_cgroup_chunked(cgroup_target, target_reclaim, label)
+        req, stl = reclaim_cgroup_chunked(cgroup_target, target_reclaim, label, force=force)
         total_requested += req
         total_stolen += stl
         if stl > 0:
             anon_mb = anon_bytes / (1024 * 1024)
             cap_str = "100% (boot)" if boot_flush else f"{int(RECLAIM_RATIO*100)}%"
-            ok(f"Reclaimed {stl / (1024*1024):.1f} MB cold pages from {label} (anon: {anon_mb:.1f} MB, cap: {cap_str})")
+            ok(f"Reclaimed {stl / (1024*1024):.1f} MB from {label} (anon: {anon_mb:.1f} MB, cap: {cap_str})")
 
     # 6. Reclaim remaining budget from system services cold pool (system.slice) via MGLRU
     if total_requested < budget_limit:
@@ -481,13 +484,13 @@ def perform_reclaim(force: bool = False, boot_flush: bool = False) -> None:
                 sys_cap = remaining_budget if boot_flush else min(128 * 1024 * 1024, remaining_budget)
                 target_sys = min(int(sys_anon * effective_ratio), sys_cap)
                 if target_sys > 0:
-                    req, stl = reclaim_cgroup_chunked(system_slice, target_sys, "system.slice")
+                    req, stl = reclaim_cgroup_chunked(system_slice, target_sys, "system.slice", force=force)
                     total_requested += req
                     total_stolen += stl
                     if stl > 0:
                         sys_mb = sys_anon / (1024 * 1024)
                         cap_str = "100% (boot)" if boot_flush else f"{int(RECLAIM_RATIO*100)}%"
-                        ok(f"Reclaimed {stl / (1024*1024):.1f} MB cold pages from system.slice (anon: {sys_mb:.1f} MB, cap: {cap_str})")
+                        ok(f"Reclaimed {stl / (1024*1024):.1f} MB from system.slice (anon: {sys_mb:.1f} MB, cap: {cap_str})")
 
     elapsed_ms = (time.perf_counter() - start_time) * 1000
     zram_info = ""
@@ -500,7 +503,7 @@ def perform_reclaim(force: bool = False, boot_flush: bool = False) -> None:
         pass
 
     sweep_tag = "Boot flush" if boot_flush else "Sweep"
-    ok(f"{sweep_tag} finished in {elapsed_ms:.1f}ms. Stolen: {total_stolen / (1024*1024):.1f} MB to ZRAM{zram_info}")
+    ok(f"{sweep_tag} finished in {elapsed_ms:.1f}ms. Reclaimed: {total_stolen / (1024*1024):.1f} MB (pgsteal_proactive){zram_info}")
     try:
         state_path = Path("/run/dusky/pro_active_zram_swap.state")
         stolen_mb = total_stolen / (1024 * 1024)
@@ -522,7 +525,7 @@ def show_status() -> None:
     print(f"Total System RAM    : {total_b // (1024*1024)} MB ({total_b / (1024*1024*1024):.1f} GB)")
     print(f"Current RAM Used    : {used_b // (1024*1024)} MB ({ram_ratio*100:.1f}%) [Periodic Threshold: {int(RAM_USAGE_THRESHOLD_RATIO*100)}%]")
     print(f"Slice Reclaim Cap   : {int(RECLAIM_RATIO*100)}% anon per periodic sweep [Run Budget: {MAX_PER_RUN_MB} MB max]")
-    print(f"One-Shot Boot Flush : {BOOT_FLUSH_DELAY} after boot [Budget: {BOOT_FLUSH_MAX_MB} MB max, 100% cold pages]")
+    print(f"One-Shot Boot Flush : {BOOT_FLUSH_DELAY} after boot [Budget: {BOOT_FLUSH_MAX_MB} MB max, 100% anon cap]")
     print(f"RAM Tier Policy     : {'<= 29 GB active' if total_b // (1024*1024) <= RAM_TIER_MAX_MB or ENABLE_ON_LARGE_RAM else f'> 29 GB skipped (ENABLE_ON_LARGE_RAM={ENABLE_ON_LARGE_RAM})'}")
     print(f"Memory Pressure PSI : {psi:.2f}% [Abort Threshold: {PSI_SOME_THRESHOLD:.2f}%]")
 
@@ -541,7 +544,7 @@ def show_status() -> None:
         try:
             res = subprocess.run(["systemctl", "is-active", u], capture_output=True, text=True, check=False)
             active = res.stdout.strip() == "active"
-            label = f"Boot Timer ({BOOT_FLUSH_DELAY})   " if "boot" in u else "Periodic Timer (6m) "
+            label = f"Boot Timer ({BOOT_FLUSH_DELAY})   " if "boot" in u else f"Periodic Timer ({TIMER_INTERVAL}) "
             print(f"{label}: {C.GRN if active else C.RED}{res.stdout.strip()}{C.RST}")
         except Exception:
             pass
@@ -562,9 +565,9 @@ def deploy_systemd_units(timer_interval_arg: str = "") -> None:
         except OSError as e:
             die(f"Failed to install to {install_path}: {e}")
 
+    # Preserve explicit runtime tuning across installer reruns.
+    load_runtime_config()
     timer_int = timer_interval_arg.strip() if timer_interval_arg else TIMER_INTERVAL
-
-    # Always reset runtime configuration to canonical defaults (70% threshold, 30% cap)
     conf_content = f"""# Dusky Proactive ZRAM Swap Runtime Configuration
 # Dynamically consumed by /usr/local/bin/dusky_pro_active_zram_swap and gatekeeper
 RAM_USAGE_THRESHOLD_RATIO={RAM_USAGE_THRESHOLD_RATIO:.2f}
@@ -580,11 +583,11 @@ RAM_TIER_MAX_MB={RAM_TIER_MAX_MB}
 TIMER_INTERVAL={timer_int}
 """
     write_file_atomic(CONF_PATH, conf_content, mode=0o644)
-    ok(f"Runtime configuration reset to defaults at {CONF_PATH}")
+    ok(f"Runtime configuration written to {CONF_PATH}")
 
     gate_path = Path("/usr/local/bin/dusky_pro_active_zram_gate")
     gate_content = r"""#!/usr/bin/env bash
-# Dusky Proactive ZRAM Swap - Ultra-Fast Native Pre-flight Gatekeeper (Kernel 7.2+ / systemd 261+)
+# Dusky Proactive ZRAM Swap - Ultra-Fast Native Pre-flight Gatekeeper (Kernel 7.3+ / systemd 262+)
 # Executed by systemd via ExecCondition= before spawning Python runtime for periodic sweeps.
 # Exits 0 if RAM usage >= threshold and tier matches (proceeds to ExecStart= Python)
 # Exits 1 if skipped (bypasses ExecStart= completely with zero Python overhead in <2ms)
@@ -692,7 +695,7 @@ exit 0
     # 1. One-Shot Boot Baseline Memory Flush Units
     boot_service_path = Path("/etc/systemd/system/dusky_boot_zram_flush.service")
     boot_service_content = f"""[Unit]
-Description=One-Shot MGLRU Baseline Cold Memory Flush at {BOOT_FLUSH_DELAY} (Kernel 7.2+ / systemd 261+)
+Description=One-Shot MGLRU Baseline Cold Memory Flush at {BOOT_FLUSH_DELAY} (Kernel 7.3+ / systemd 262+)
 Documentation=https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html
 After=multi-user.target local-fs.target
 ConditionPathExists=/sys/fs/cgroup
@@ -744,7 +747,7 @@ WantedBy=timers.target
     # 2. Periodic Proactive Memory Skimmer Units
     periodic_service_path = Path("/etc/systemd/system/dusky_pro_active_zram_swap.service")
     periodic_service_content = f"""[Unit]
-Description=MGLRU Proactive Slice Memory Skimmer & ZRAM Swapper (Kernel 7.2+ / systemd 261+)
+Description=MGLRU Proactive Slice Memory Skimmer & ZRAM Swapper (Kernel 7.3+ / systemd 262+)
 Documentation=https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html
 After=multi-user.target local-fs.target
 ConditionPathExists=/sys/fs/cgroup

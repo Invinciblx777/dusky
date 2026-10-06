@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Tuner for ZRAM Swappiness, Virtual Memory Paging, and MGLRU Heuristics
-# Target: Arch Linux (Linux Kernel 7.2+, systemd 261+)
+# Target: Arch Linux (Linux Kernel 7.3+, systemd 262+)
 # Scope: Focused strictly on VM memory balance and ZRAM paging efficiency.
 
 set -euo pipefail
@@ -9,7 +9,8 @@ readonly CONFIG_FILE="/etc/sysctl.d/99-vm-zram-parameters.conf"
 readonly MGLRU_CONFIG="/etc/tmpfiles.d/99-mglru-optimize.conf"
 readonly SCRIPT_NAME="${0##*/}"
 ORIG_ARGS=("$@")
-readonly SELF_PATH="$(realpath -e -- "${BASH_SOURCE[0]}")"
+SELF_PATH="$(realpath -e -- "${BASH_SOURCE[0]}")"
+readonly SELF_PATH
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
     C_RESET=$'\033[0m'
@@ -93,13 +94,9 @@ if (( ACTIVE_ZRAM_COUNT == 0 )); then
     die "FATAL: No active ZRAM device detected in /proc/swaps. This high-swappiness profile requires ZRAM swap."
 fi
 
-SWAP_LAYOUT="NONE"
-if (( ACTIVE_ZRAM_COUNT > 0 && ACTIVE_DISK_COUNT > 0 )); then
+SWAP_LAYOUT="ZRAM_ONLY"
+if (( ACTIVE_DISK_COUNT > 0 )); then
     SWAP_LAYOUT="HYBRID"
-elif (( ACTIVE_ZRAM_COUNT > 0 )); then
-    SWAP_LAYOUT="ZRAM_ONLY"
-elif (( ACTIVE_DISK_COUNT > 0 )); then
-    SWAP_LAYOUT="DISK_ONLY"
 fi
 
 if [[ "$SWAP_LAYOUT" == "HYBRID" && -n "$ZRAM_MAX_PRIO" && -n "$DISK_MAX_PRIO" ]]; then
@@ -117,11 +114,9 @@ declare -i EXPECTED_DIRTY_BYTES
 declare -i EXPECTED_DIRTY_BG_BYTES
 declare -i EXPECTED_MGLRU_TTL
 
-# Unified 4-Tier Memory Demarcation
-# S:  < 7 GiB       (< 7,340,032 KiB)
-# M:  7 - < 14 GiB  (7,340,032 - < 14,680,064 KiB)
-# L:  14 - < 28 GiB (14,680,064 - < 29,360,128 KiB)
-# XL: >= 28 GiB     (>= 29,360,128 KiB, captures 32GB+ systems with iGPU/UMA carve-outs)
+# <=16 GiB-class systems (<=17 GiB usable) retain the lean profile.
+# Larger machines keep the existing balanced/performance paging settings.
+# THP interpolation is handled separately by 212; OOM response by 211.
 
 if [[ "$MODE" == "PERFORMANCE" ]] || { [[ "$MODE" == "AUTO" ]] && (( SYSTEM_RAM_KB >= 29360128 )); }; then
     PROFILE_NAME="PERFORMANCE_LEAN (>=32GB class)"
@@ -132,8 +127,8 @@ if [[ "$MODE" == "PERFORMANCE" ]] || { [[ "$MODE" == "AUTO" ]] && (( SYSTEM_RAM_
     EXPECTED_DIRTY_BYTES=536870912       # 512MiB cap prevents massive multi-GB writeback stalls
     EXPECTED_DIRTY_BG_BYTES=134217728    # 128MiB background flush
     EXPECTED_MGLRU_TTL=0                 # 0ms prevents premature OOM under tight memory
-elif (( SYSTEM_RAM_KB >= 14680064 )); then
-    PROFILE_NAME="BALANCED_EFFICIENCY (16-24GB class)"
+elif [[ "$MODE" == "AUTO" ]] && (( SYSTEM_RAM_KB > 17825792 )); then
+    PROFILE_NAME="BALANCED_EFFICIENCY (>16GB to <32GB class)"
     EXPECTED_SWAPPINESS=180
     EXPECTED_VFS_PRESSURE=125
     EXPECTED_SCALE_FACTOR=10             # 10 maximizes MemAvailable across efficiency tiers
@@ -142,10 +137,10 @@ elif (( SYSTEM_RAM_KB >= 14680064 )); then
     EXPECTED_DIRTY_BG_BYTES=67108864     # 64MiB background flush
     EXPECTED_MGLRU_TTL=0
 elif (( SYSTEM_RAM_KB >= 7340032 )); then
-    PROFILE_NAME="DYNAMIC_EFFICIENCY (8-12GB class)"
+    PROFILE_NAME="DYNAMIC_EFFICIENCY (8-16GB class or forced savings)"
     EXPECTED_SWAPPINESS=180
     EXPECTED_VFS_PRESSURE=125
-    EXPECTED_SCALE_FACTOR=10             # 10 (vanilla kernel default) maximizes MemAvailable / lowest idle RAM
+    EXPECTED_SCALE_FACTOR=10             # Kernel default headroom; avoid excessive early reclaim
     EXPECTED_COMPACTION=0                # 0 disables proactive compaction to conserve battery
     EXPECTED_DIRTY_BYTES=134217728       # 128MiB cap
     EXPECTED_DIRTY_BG_BYTES=33554432     # 32MiB background flush
@@ -166,8 +161,8 @@ readonly EXPECTED_BOOST_FACTOR=0        # Disables watermark boosting
 readonly EXPECTED_MAX_MAP_COUNT=2147483642 # SteamOS & modern Proton/Wine standard
 readonly EXPECTED_DIRTY_WRITEBACK_CENTISECS=500  # 5s flusher wakeups (smooth NVMe/SSD dirty writes, prevents freeze spikes)
 readonly EXPECTED_DIRTY_EXPIRE_CENTISECS=3000    # 30s dirty expiration bounds unwritten data age
-readonly EXPECTED_STAT_INTERVAL=1                # 1s per-CPU vmstat fold-in ensures accurate real-time PSI and systemd-oomd metrics
-readonly EXPECTED_VFS_DENOM=100               # Linux 7.2+ explicit VFS cache pressure denominator
+readonly EXPECTED_STAT_INTERVAL=1                # Kernel default vmstat fold interval; PSI has separate accounting
+readonly EXPECTED_VFS_DENOM=100               # Linux 7.3+ explicit VFS cache pressure denominator
 readonly EXPECTED_COMPACT_UNEVIC=1               # 1 allows full compaction across all pages (maximizes contiguous allocation success rate)
 
 log_info "Initializing VM Swappiness & Paging Optimizer..."
@@ -185,7 +180,7 @@ trap 'rm -f "$tmpfile_sysctl" "$tmpfile_mglru"' EXIT
 cat > "$tmpfile_sysctl" <<EOF
 # Managed by ${SCRIPT_NAME}
 # Profile: ${PROFILE_NAME} | Detected RAM: ${SYSTEM_RAM_GB}GB
-# Target: Arch Linux / Kernel 7.2+ / systemd 261+
+# Target: Arch Linux / Kernel 7.3+ / systemd 262+
 
 # --- ZRAM SWAP POLICY ---
 vm.swappiness = ${EXPECTED_SWAPPINESS}
@@ -253,6 +248,7 @@ fi
 log_info "Applying MGLRU parameters via systemd-tmpfiles..."
 systemd-tmpfiles --create "$MGLRU_CONFIG" >/dev/null 2>&1 || log_warn "systemd-tmpfiles finished with warnings (normal if MGLRU not compiled in kernel)."
 
+declare -i VERIFY_ERRORS=0
 verify_param() {
     local key="$1" expected="$2"
     local actual
@@ -261,6 +257,7 @@ verify_param() {
         log_success "  ${key} = ${actual}"
     else
         log_warn "  ${key} = ${actual} (expected: ${expected})"
+        VERIFY_ERRORS+=1
     fi
 }
 
@@ -283,8 +280,14 @@ verify_param "vm.max_map_count" "$EXPECTED_MAX_MAP_COUNT"
 if [[ -f "/sys/kernel/mm/lru_gen/min_ttl_ms" ]]; then
     actual_ttl="$(cat /sys/kernel/mm/lru_gen/min_ttl_ms 2>/dev/null || echo "N/A")"
     log_success "  MGLRU min_ttl_ms = ${actual_ttl}"
+    [[ "$actual_ttl" == "$EXPECTED_MGLRU_TTL" ]] || VERIFY_ERRORS+=1
+fi
+if [[ -r "/sys/kernel/mm/lru_gen/enabled" ]]; then
+    actual_enabled="$(< /sys/kernel/mm/lru_gen/enabled)"
+    log_info "  MGLRU enabled = ${actual_enabled}"
+    (( actual_enabled == 0x7 )) || VERIFY_ERRORS+=1
 fi
 
+(( VERIFY_ERRORS == 0 )) || die "${VERIFY_ERRORS} live kernel settings did not match the generated profile."
 log_success "Profile [${C_BOLD}${PROFILE_NAME}${C_RESET}] successfully deployed."
 exit 0
-

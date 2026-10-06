@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 216_systemd_accounting_optimizer.py
-Target: Arch Linux (Linux Kernel 7.2+, systemd 261+)
+Target: Arch Linux (Linux Kernel 7.3+, systemd 262+)
 Scope: Tune systemd default resource accounting and task limits.
 Balances lowest RAM usage with uncompromised performance and system stability.
 """
@@ -107,8 +107,10 @@ def get_manager_defaults() -> dict[str, str]:
 
 
 
-def write_dropin_atomic(target: Path, content: str) -> None:
+def write_dropin_atomic(target: Path, content: str, *, force: bool = False) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
+    if not force and target.exists() and target.read_text(encoding="utf-8") == content and target.stat().st_mode & 0o777 == 0o644:
+        return
     fd, tmp_path = tempfile.mkstemp(dir=str(target.parent), prefix=f".{target.name}.tmp.")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -126,8 +128,8 @@ def write_dropin_atomic(target: Path, content: str) -> None:
 
 def generate_payload() -> str:
     return """# Managed by 216_systemd_accounting_optimizer.py
-# Target: Arch Linux (Linux Kernel 7.2+, systemd 261+)
-# Scope: Enable default Memory and Tasks accounting for systemd-oomd and MGLRU reclaim,
+# Target: Arch Linux (Linux Kernel 7.3+, systemd 262+)
+# Scope: Enable default Memory and Tasks accounting for systemd-oomd and task limits,
 # while leaving IO and IP accounting disabled to avoid unnecessary kernel overhead.
 
 [Manager]
@@ -170,8 +172,8 @@ def main(argv: list[str]) -> int:
     global QUIET
     ap = argparse.ArgumentParser(
         prog="216_systemd_accounting_optimizer.py",
-        description="Optimize systemd default accounting and task limits for Arch Linux (systemd 261+, Kernel 7.2+). "
-                    "Enables default Memory and Tasks accounting for systemd-oomd and MGLRU reclaim, "
+        description="Optimize systemd default accounting and task limits for Arch Linux (systemd 262+, Kernel 7.3+). "
+                    "Enables default Memory and Tasks accounting for systemd-oomd and task limits, "
                     "while leaving IO and IP accounting disabled to avoid unnecessary kernel overhead.",
     )
     ap.add_argument("-n", "--dry-run", action="store_true", help="Preview configuration without applying")
@@ -239,17 +241,18 @@ def main(argv: list[str]) -> int:
 
     vals = get_manager_defaults()
     already_opt = all(vals.get(k) == DESIRED_STATE[k] for k in VALID_KEYS)
-    if already_opt and not args.force and DROPIN_FILE.exists() and USER_DROPIN_FILE.exists():
-        ok("Systemd manager defaults are already fully optimized.")
-        return 0
-
     try:
-        write_dropin_atomic(DROPIN_FILE, payload)
+        write_dropin_atomic(DROPIN_FILE, payload, force=args.force)
         ok(f"Wrote atomic configuration to {DROPIN_FILE} (0644)")
-        write_dropin_atomic(USER_DROPIN_FILE, payload)
+        write_dropin_atomic(USER_DROPIN_FILE, payload, force=args.force)
         ok(f"Wrote atomic configuration to {USER_DROPIN_FILE} (0644)")
     except Exception as e:
         die(f"Failed writing drop-in file: {e}")
+
+    if already_opt and not args.force:
+        ok("Live system manager defaults already match; no re-exec needed.")
+        info("User defaults apply when each user manager next starts.")
+        return 0
 
     reexec_systemd_manager()
 
@@ -267,4 +270,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print(f"\n{C.YLW}Aborted by user.{C.RST}")
         sys.exit(130)
-

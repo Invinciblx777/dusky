@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # 211_systemd_oomd_zram.py
 #d: Authoritative OOM-protection deployer for a Hyprland desktop.
-#   Target: Arch Linux rolling (kernel 7.2+), systemd 261+, Python 3.14+.
+#   Target: Arch Linux rolling (kernel 7.3+), systemd 262+, Python 3.14+.
 #   Suite order: 205 (ZRAM swap) -> 211 (this) -> 212 (THP/mTHP).
 #
 # HARD INVARIANTS (do not "optimise" these away):
@@ -32,7 +32,7 @@
 #      status 207). The user manager must already sit at -100 so that children
 #      re-writing -100 perform an equal-value write, which the kernel permits.
 #
-#   5. MGLRU needs no sysfs writes: Arch kernel 7.2+ ships CONFIG_LRU_GEN_ENABLED=y
+#   5. MGLRU needs no sysfs writes: Arch kernel 7.3+ ships CONFIG_LRU_GEN_ENABLED=y
 #      => /sys/kernel/mm/lru_gen/enabled == 0x0007 at boot. min_ttl_ms is
 #      deliberately NOT set: per Documentation/admin-guide/mm/multigen_lru.rst it
 #      invokes the *kernel* OOM killer, which bypasses every oomd preference.
@@ -56,42 +56,8 @@ from typing import Final
 SELF_PATH: Final[Path] = Path(__file__).resolve()
 PROG: Final[str] = "211_systemd_oomd_zram"
 
-# Pre-argparse scan: bootstrapping must know whether we are allowed to mutate
-# the system before rich is importable. Kept surgical (exact token match only).
-IS_DRY_RUN: Final[bool] = any(a in ("-n", "--dry-run") for a in sys.argv[1:])
-IS_VERIFY: Final[bool] = "--verify" in sys.argv[1:]
-
-
-def _bootstrap_rich() -> None:
-    try:
-        import rich  # noqa: F401
-        return
-    except ImportError:
-        pass
-    if IS_DRY_RUN or IS_VERIFY:
-        return
-    # One-shot sentinel: without it a pacman success + persistent import failure
-    # would os.execv() this script in an infinite loop.
-    if os.environ.get("DUSKY_RICH_BOOTSTRAP") == "1":
-        print(f"{PROG}: python-rich still unavailable after install; continuing without it.",
-              file=sys.stderr)
-        return
-    if not shutil.which("pacman"):
-        print(f"{PROG}: python-rich missing and pacman unavailable; install python-rich manually.",
-              file=sys.stderr)
-        sys.exit(1)
-    base = ["pacman", "-S", "--needed", "--noconfirm", "python-rich"]
-    cmd = base if os.geteuid() == 0 else ["sudo", *base]
-    if subprocess.run(cmd, check=False).returncode != 0:
-        print(f"{PROG}: failed to install python-rich; install it manually.", file=sys.stderr)
-        sys.exit(1)
-    os.execve(sys.executable,
-              [sys.executable, str(SELF_PATH), *sys.argv[1:]],
-              {**os.environ, "DUSKY_RICH_BOOTSTRAP": "1"})
-
-
-_bootstrap_rich()
-
+# Rich is optional presentation only. Offline installs use the plain fallback
+# rather than trying to install a package before arguments are parsed.
 try:
     from rich import box
     from rich.console import Console
@@ -139,11 +105,9 @@ def panel(title: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# RAM tiering -- cutoffs deliberately identical to 212's KiB constants
+# OOM pressure tiering -- independent of 212's continuous THP policy.
 #   7 GiB  = 7340032 KiB      14 GiB = 14680064 KiB      28 GiB = 29360128 KiB
-# 211 tier P intentionally spans 212's PERFORMANCE_LEAN and EXTREME_PERFORMANCE
-# (they differ only in khugepaged max_ptes_none, which has no reclaim-latency
-# effect), so the --tier S|M|L|P contract is preserved without drift.
+# Keep the --tier S|M|L|P contract for discrete OOM response thresholds.
 # --------------------------------------------------------------------------- #
 
 def read_mem_total_gib() -> float:
@@ -382,6 +346,9 @@ esac
 
 grace_sec="${DUSKY_GRACE_SEC:-0}"
 [[ "$grace_sec" =~ ^[0-9]+$ ]] || grace_sec=0
+if [[ "$slice" == "app.slice" && "$grace_sec" -gt 0 ]]; then
+  preference="avoid"
+fi
 
 if ! command -v -- "$1" >/dev/null 2>&1 && [[ ! -x "$1" ]]; then
   echo "dusky-run: command not found: $1" >&2
@@ -404,6 +371,7 @@ unit="app-${app_name}-$$-${RANDOM}${RANDOM}"
 # Grace period: if explicitly requested via DUSKY_GRACE_SEC for an app.slice
 # application, ensure user.oomd_avoid is removed from the cgroup upon expiry.
 if [[ "$preference" == "avoid" && "$grace_sec" -gt 0 && "$slice" == "app.slice" ]]; then
+  # shellcheck disable=SC2016 # Variables belong to the detached helper shell.
   setsid --fork bash -c '
     sleep "$1"
     unit="$2.scope"
@@ -422,7 +390,7 @@ fi
 # --collect is mandatory: a scope whose only process was SIGKILLed by oomd would
 # otherwise linger in "failed" state and its empty cgroup keeps showing up in
 # the candidate ranking.
-exec systemd-run --user --scope --slice="$slice" --unit="$unit" --collect --quiet \
+exec systemd-run --user --scope --slice="$slice" --unit="$unit" --collect --quiet --expand-environment=no \
   --property=OOMPolicy=continue \
   --property=ManagedOOMPreference="$preference" \
   --property=MemoryAccounting=yes \
@@ -648,6 +616,9 @@ static bool xattr_present(const char *path, const char *name)
  */
 static void shield_apply(const char *path)
 {
+        /* Do not take ownership of an avoid set by systemd or the user. */
+        if (xattr_present(path, XATTR_AVOID) && !xattr_present(path, XATTR_MARKER))
+                return;
         if (setxattr(path, XATTR_AVOID, "1", 1, 0) < 0) {
                 if (errno != ENOENT)
                         logmsg(1, "setxattr(%s, %s): %s", path, XATTR_AVOID, strerror(errno));
@@ -678,8 +649,6 @@ static int sweep_cb(const char *path, const struct stat *sb, int flag, struct FT
         (void)ftw;
         if (flag == FTW_D || flag == FTW_DP) {
                 shield_clear(path);
-                if (strstr(path, "/app.slice/") && strstr(path, ".scope"))
-                        removexattr(path, XATTR_AVOID);
         }
         return 0;
 }
@@ -1476,9 +1445,9 @@ Action=kill-by-pgscan
 """
 
     swap_ceiling_rule = rule_hdr + f"""#
-# Emergency swap exhaustion ceiling: fire immediately when swap is critically
-# depleted (>=95%), even if processes in app.slice are quiescent/idle. This
-# stops code-page refault thrashing before the kernel enters an unrecoverable disk livelock.
+# Emergency swap exhaustion threshold (>95%), without a PSI condition.
+# kill-by-pgscan still requires recent reclaim and an eligible descendant;
+# it cannot guarantee a kill when every descendant is quiescent.
 [Rule]
 SwapUsageMax=95%
 LastingSec=0
@@ -1761,8 +1730,9 @@ def coherence_report(tier: str, gib: float) -> list[tuple[str, str, str]]:
     algo = _read("/sys/block/zram0/comp_algorithm")
     if algo:
         sel = re.search(r"\[([^\]]+)\]", algo)
-        rows.append(("205 zram algo", sel.group(1) if sel else algo,
-                     "OK (expect zstd from 205)" if "zstd" in algo else "WARN: not zstd"))
+        selected = sel.group(1) if sel else algo
+        rows.append(("205 zram algo", selected,
+                     "OK (expect zstd from 205)" if selected == "zstd" else "NOTE: compressor override"))
 
     # --- 212: THP / mTHP ----------------------------------------------------
     for label, path, expect in (
@@ -1793,12 +1763,9 @@ def coherence_report(tier: str, gib: float) -> list[tuple[str, str, str]]:
                      if ok else "WARN: expected 0x0007"))
 
     # --- tier alignment -----------------------------------------------------
-    t212 = ("COMPACT_EFFICIENCY" if gib < 7 else
-            "DYNAMIC_EFFICIENCY" if gib < 14 else
-            "BALANCED_PERFORMANCE" if gib < 28 else
-            "PERFORMANCE_LEAN" if gib < 56 else "EXTREME_PERFORMANCE")
+    t212 = "DYNAMIC_EFFICIENCY" if gib <= 17 else "PROGRESSIVE_PERFORMANCE"
     rows.append(("tier alignment", f"{gib:.1f} GiB -> 211:{tier} / 212:{t212}",
-                 "OK: cutoffs 7/14/28 GiB are shared; 211 P spans 212 LEAN+EXTREME by design"))
+                 "OOM thresholds are discrete; THP stays conservative through 16GB class then scales linearly"))
     return rows
 
 
@@ -1882,7 +1849,7 @@ def verify() -> int:
 def main() -> None:
     ap = argparse.ArgumentParser(
         prog=PROG,
-        description="Deploy Hyprland/desktop OOM protection (Arch, systemd 261+, kernel 7.2+)")
+        description="Deploy Hyprland/desktop OOM protection (Arch, systemd 262+, kernel 7.3+)")
     ap.add_argument("-n", "--dry-run", action="store_true", help="show what would change")
     ap.add_argument("--tier", choices=["S", "M", "L", "P"], default=None,
                     help="override detected RAM tier")
@@ -1920,7 +1887,7 @@ def main() -> None:
     _, _, flag_src = get_makepkg_build_flags()
 
     if args.dry_run:
-        panel(f"DRY RUN: systemd 261+ OOM configuration (tier {tier}, {gib:.1f} GiB, {prof['label']})")
+        panel(f"DRY RUN: systemd 262+ OOM configuration (tier {tier}, {gib:.1f} GiB, {prof['label']})")
         if HAVE_RICH and console:
             t = Table(box=box.SIMPLE_HEAVY)
             t.add_column("Action"); t.add_column("Destination"); t.add_column("Description"); t.add_column("Mode")
@@ -1940,7 +1907,7 @@ def main() -> None:
         print_coherence(tier, gib)
         return
 
-    panel(f"Deploying systemd 261+ OOM configuration (tier {tier}, {gib:.1f} GiB)")
+    panel(f"Deploying systemd 262+ OOM configuration (tier {tier}, {gib:.1f} GiB)")
     print_coherence(tier, gib)
 
     updated = 0

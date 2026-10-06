@@ -2,7 +2,7 @@
 # ==============================================================================
 # 212_thp_sysfs_optimizer.sh
 # Scope: Transparent HugePages (mTHP) & MGLRU sysfs configuration
-# Target: Arch Linux / Kernel 7.2+ / systemd 261+
+# Target: Arch Linux / Kernel 7.3+ / systemd 262+
 # Tuning: Strict RAM savings without performance compromise (<32GB focus)
 # ==============================================================================
 
@@ -79,9 +79,6 @@ else
 fi
 
 declare -i THRESHOLD_64G_KB=58720256 # 56 GiB cutoff for >=64GB class
-declare -i THRESHOLD_32G_KB=29360128 # 28 GiB cutoff for >=32GB class
-declare -i THRESHOLD_16G_KB=14680064 # 14 GiB cutoff for >=16GB class
-declare -i THRESHOLD_8G_KB=7340032   # 7 GiB cutoff for >=8GB class
 declare -i IS_PERF_MODE=0
 
 declare -i EXPECTED_MAX_PTES
@@ -92,53 +89,28 @@ declare -i EXPECTED_PAGES_TO_SCAN
 readonly EXPECTED_ALLOC_SLEEP=60000
 readonly EXPECTED_KHUGEPAGED_DEFRAG=1
 
-# Unified Dynamic THP Demarcation:
-# S:  < 7 GiB       -> max_ptes_none = 128, defrag = 1, scan_sleep = 60s
-# M:  7 - < 14 GiB  -> max_ptes_none = 128, defrag = 1, scan_sleep = 60s
-# L:  14 - < 28 GiB -> max_ptes_none = 300, defrag = 1, scan_sleep = 30s
-# P:  28 - < 56 GiB -> max_ptes_none = 300, defrag = 1, scan_sleep = 10s
-# XL: >= 56 GiB     -> max_ptes_none = 511, defrag = 1, scan_sleep = 10s
-
-if [[ "$MODE" == "AGGRESSIVE" ]] || { [[ "$MODE" == "AUTO" ]] && (( SYSTEM_RAM_KB >= THRESHOLD_64G_KB )); }; then
-    IS_PERF_MODE=1
-    EXPECTED_MODE="EXTREME_PERFORMANCE (>=64GB class)"
-    EXPECTED_MAX_PTES=511               # Kernel maximum (N-1), maximizes hugepage coverage
-    EXPECTED_MAX_PTES_SWAP=0            # Forbid swapping pages back IN from ZRAM
-    EXPECTED_MAX_PTES_SHARED=0          # Forbid shared mapping inflation
-    EXPECTED_SCAN_SLEEP=10000           # 10s rapid scanning
-    EXPECTED_PAGES_TO_SCAN=4096
-elif [[ "$MODE" == "AUTO" ]] && (( SYSTEM_RAM_KB >= THRESHOLD_32G_KB )); then
-    IS_PERF_MODE=1
-    EXPECTED_MODE="PERFORMANCE_LEAN (32GB class)"
-    EXPECTED_MAX_PTES=300               # Progressive padding up to ~60% holes
-    EXPECTED_MAX_PTES_SWAP=0
-    EXPECTED_MAX_PTES_SHARED=0
-    EXPECTED_SCAN_SLEEP=10000           # 10s rapid scanning
-    EXPECTED_PAGES_TO_SCAN=4096
-elif [[ "$MODE" == "AUTO" ]] && (( SYSTEM_RAM_KB >= THRESHOLD_16G_KB )); then
-    IS_PERF_MODE=1
-    EXPECTED_MODE="BALANCED_PERFORMANCE (16-24GB class)"
-    EXPECTED_MAX_PTES=300               # Progressive padding up to ~60% holes
-    EXPECTED_MAX_PTES_SWAP=0
-    EXPECTED_MAX_PTES_SHARED=0
-    EXPECTED_SCAN_SLEEP=30000           # 30s balanced sleep
-    EXPECTED_PAGES_TO_SCAN=2048
-elif [[ "$MODE" == "AUTO" ]] && (( SYSTEM_RAM_KB >= THRESHOLD_8G_KB )); then
-    IS_PERF_MODE=0
-    EXPECTED_MODE="DYNAMIC_EFFICIENCY (8-12GB class)"
-    EXPECTED_MAX_PTES=128               # Gentle padding up to 25% holes
-    EXPECTED_MAX_PTES_SWAP=0
-    EXPECTED_MAX_PTES_SHARED=0
-    EXPECTED_SCAN_SLEEP=60000           # 60s idle sleep prevents CPU churn
-    EXPECTED_PAGES_TO_SCAN=1024
+# Keep the <=16 GiB class conservative (17 GiB usable-memory cutoff).
+# Above it, scale linearly to the existing >=64 GiB-class endpoint at 56 GiB.
+# These are policy bounds, not promises of measured gains on every workload.
+if [[ "$MODE" == "AGGRESSIVE" ]]; then
+    progress_kb=$(( THRESHOLD_64G_KB - 17825792 ))
+elif [[ "$MODE" == "STANDARD" ]] || (( SYSTEM_RAM_KB <= 17825792 )); then
+    progress_kb=0
 else
-    IS_PERF_MODE=0
-    EXPECTED_MODE="COMPACT_EFFICIENCY (<8GB class)"
-    EXPECTED_MAX_PTES=128               # Gentle padding up to 25% holes
-    EXPECTED_MAX_PTES_SWAP=0
-    EXPECTED_MAX_PTES_SHARED=0
-    EXPECTED_SCAN_SLEEP=60000           # 60s idle sleep prevents CPU churn
-    EXPECTED_PAGES_TO_SCAN=1024
+    progress_kb=$(( SYSTEM_RAM_KB - 17825792 ))
+fi
+span_kb=$(( THRESHOLD_64G_KB - 17825792 ))
+(( progress_kb > span_kb )) && progress_kb=$span_kb
+EXPECTED_MAX_PTES=$(( 128 + 383 * progress_kb / span_kb ))
+EXPECTED_MAX_PTES_SWAP=0
+EXPECTED_MAX_PTES_SHARED=0
+EXPECTED_SCAN_SLEEP=$(( 60000 - 50000 * progress_kb / span_kb ))
+EXPECTED_PAGES_TO_SCAN=$(( 1024 + 3072 * progress_kb / span_kb ))
+if (( progress_kb == 0 )); then
+    EXPECTED_MODE="DYNAMIC_EFFICIENCY (<=16GB class)"
+else
+    IS_PERF_MODE=1
+    EXPECTED_MODE="PROGRESSIVE_PERFORMANCE (>16GB class)"
 fi
 
 readonly EXPECTED_ENABLED="madvise"
@@ -162,7 +134,7 @@ trap 'rm -f "${tmpfile:-}"' EXIT
 cat > "$tmpfile" <<CONF_EOF
 # Managed by ${SCRIPT_NAME}
 # Scope: Transparent HugePages (mTHP) systemd-tmpfiles initialization
-# Target: Kernel 7.2+ / systemd 261+ / Arch Linux
+# Target: Kernel 7.3+ / systemd 262+ / Arch Linux
 # Profile: ${EXPECTED_MODE} | Detected RAM: ${SYSTEM_RAM_GB}GB
 # Docs: https://docs.kernel.org/admin-guide/mm/transhuge.html
 
@@ -188,6 +160,10 @@ w- /sys/kernel/mm/transparent_hugepage/khugepaged/alloc_sleep_millisecs - - - - 
 CONF_EOF
 
 detected_sizes=()
+PMD_SIZE_KB=0
+if [[ -r "${THP_BASE_DIR}/hpage_pmd_size" ]]; then
+    PMD_SIZE_KB=$(( $(< "${THP_BASE_DIR}/hpage_pmd_size") / 1024 ))
+fi
 for size_dir in "${THP_BASE_DIR}"/hugepages-*kB; do
     if [[ -d "$size_dir" ]]; then
         basename_dir="${size_dir##*/}"
@@ -198,8 +174,7 @@ for size_dir in "${THP_BASE_DIR}"/hugepages-*kB; do
 done
 
 if (( ${#detected_sizes[@]} == 0 )); then
-    log_info "THP hardware sysfs not populated (offline/chroot). Using standard x86_64 mTHP orders."
-    detected_sizes=(8 16 32 64 128 256 512 1024 2048)
+    log_info "No per-size THP controls exposed. Emitting global controls only."
 fi
 
 for sz in "${detected_sizes[@]}"; do
@@ -207,12 +182,12 @@ for sz in "${detected_sizes[@]}"; do
     target_shmem="never"
 
     if (( IS_PERF_MODE == 1 )); then
-        if (( sz == 64 || sz == 128 || sz == 2048 )); then
+        if (( sz == 64 || sz == 128 || sz == PMD_SIZE_KB )); then
             target_enabled="madvise"
             target_shmem="inherit"
         fi
     else
-        if (( sz == 64 || sz == 2048 )); then
+        if (( sz == 64 || sz == PMD_SIZE_KB )); then
             target_enabled="madvise"
             target_shmem="inherit"
         fi
@@ -298,12 +273,12 @@ for sz in "${detected_sizes[@]}"; do
     target_shmem="never"
 
     if (( IS_PERF_MODE == 1 )); then
-        if (( sz == 64 || sz == 128 || sz == 2048 )); then
+        if (( sz == 64 || sz == 128 || sz == PMD_SIZE_KB )); then
             target_enabled="madvise"
             target_shmem="inherit"
         fi
     else
-        if (( sz == 64 || sz == 2048 )); then
+        if (( sz == 64 || sz == PMD_SIZE_KB )); then
             target_enabled="madvise"
             target_shmem="inherit"
         fi
@@ -337,4 +312,3 @@ log_success "  use_zero_page = 1, shrink_underused = 1, khugepaged/defrag = ${EX
 log_success "  Active Profile: [${C_BOLD:-}${EXPECTED_MODE}${C_RESET:-}]"
 
 exit 0
-

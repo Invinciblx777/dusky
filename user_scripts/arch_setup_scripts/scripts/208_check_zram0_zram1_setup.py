@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Deep ZRAM & Memory Architecture Diagnostics for modern Arch Linux (Kernel 7.2+, systemd 261+).
+Deep ZRAM & Memory Architecture Diagnostics for modern Arch Linux (Kernel 7.3+, systemd 262+).
 Non-destructively audits sysfs state, zswap, swap topology, and mount options.
 Seamlessly supports both native tmpfs and ext4-on-zram1 RAM disks.
 """
@@ -108,24 +108,24 @@ def main() -> int:
 
     # 2. Comprehensive Configuration Discovery (zram-generator)
     info("Resolving zram-generator configuration hierarchy...")
-    conf_search_dirs = [
-        "/etc/systemd/zram-generator.conf.d",
-        "/run/systemd/zram-generator.conf.d",
-        "/usr/lib/systemd/zram-generator.conf.d",
-    ]
+    # zram-generator 1.2.1 locate_fragments(): later directories shadow the
+    # same basename; surviving drop-ins are sorted together, not per directory.
+    conf_roots = [Path(p) for p in ("/usr/lib", "/usr/local/lib", "/etc", "/run")]
     conf_files: list[Path] = []
-    main_conf = Path("/etc/systemd/zram-generator.conf")
-    if main_conf.is_file():
-        conf_files.append(main_conf)
-
-    for cdir in conf_search_dirs:
-        p = Path(cdir)
-        if p.is_dir():
-            conf_files.extend(sorted(p.glob("*.conf")))
+    for root in reversed(conf_roots):
+        main_conf = root / "systemd/zram-generator.conf"
+        if main_conf.is_file():
+            conf_files.append(main_conf)
+            break
+    fragments: dict[str, Path] = {}
+    for root in conf_roots:
+        for cf in (root / "systemd/zram-generator.conf.d").glob("*.conf"):
+            fragments[cf.name] = cf
+    conf_files.extend(fragments[name] for name in sorted(fragments))
 
     zram_configs: dict[str, dict[str, str]] = {}
     for cf in conf_files:
-        cp = configparser.ConfigParser(strict=False)
+        cp = configparser.ConfigParser(strict=False, interpolation=None)
         try:
             cp.read(cf)
             for section in cp.sections():
@@ -331,23 +331,15 @@ def main() -> int:
                 warn(f"tmpfs mount option '{req_opt}' not active (recommended for ephemeral tmpfs).")
 
         # Audit transparent hugepages policy (huge=never is recommended per 206_zram_tmpfs_mounts.py)
-        mount_unit_path = Path("/etc/systemd/system/mnt-zram1.mount")
-        mount_unit_has_huge_never = False
-        if mount_unit_path.exists():
-            try:
-                mount_unit_has_huge_never = "huge=never" in mount_unit_path.read_text(encoding="utf-8")
-            except Exception:
-                pass
-
         huge_opt = [o for o in opts_list if o.startswith("huge=")]
         if huge_opt and huge_opt[0] != "huge=never":
             warn(f"tmpfs transparent hugepages active: '{huge_opt[0]}' (huge=never recommended per 206_zram_tmpfs_mounts.py to prevent 2MB fragmentation/RAM bloat).")
             audit_summary["mnt_zram1"]["huge"] = huge_opt[0]
-        elif mount_unit_has_huge_never or any(o == "huge=never" for o in opts_list):
+        elif any(o == "huge=never" for o in opts_list):
             ok("tmpfs hugepage policy verified: huge=never (lowest idle RAM, zero internal fragmentation).")
             audit_summary["mnt_zram1"]["huge"] = "never"
         else:
-            info("tmpfs mounted with kernel default hugepage policy.")
+            info("No explicit live huge= option reported; the persisted unit alone does not prove live policy.")
             audit_summary["mnt_zram1"]["huge"] = "default"
 
         zram1_dir = Path("/mnt/zram1")
@@ -355,8 +347,10 @@ def main() -> int:
             dst = zram1_dir.stat()
             dmode = stat.S_IMODE(dst.st_mode)
             audit_summary["mnt_zram1"]["mode"] = oct(dmode)
-            if dmode == 0o1777 or (dmode & 0o777) == 0o777:
+            if dmode == 0o1777:
                 ok(f"/mnt/zram1 permissions verified (Mode: {oct(dmode)} - Fully User Writable with Sticky Bit).")
+            elif dmode == 0o777:
+                warn("/mnt/zram1 is world-writable without the sticky bit; expected mode 1777.")
             elif os.access(str(zram1_dir), os.W_OK):
                 ok(f"/mnt/zram1 is directly writable by process UID {os.getuid()} (Mode: {oct(dmode)}).")
             else:
@@ -416,8 +410,10 @@ def main() -> int:
             dst = zram1_dir.stat()
             dmode = stat.S_IMODE(dst.st_mode)
             audit_summary["mnt_zram1"]["mode"] = oct(dmode)
-            if dmode == 0o1777 or (dmode & 0o777) == 0o777:
+            if dmode == 0o1777:
                 ok(f"/mnt/zram1 mount permissions verified (Mode: {oct(dmode)} - Fully User Writable).")
+            elif dmode == 0o777:
+                warn("/mnt/zram1 is world-writable without the sticky bit; expected mode 1777.")
             elif os.access(str(zram1_dir), os.W_OK):
                 ok(f"/mnt/zram1 is directly writable by process UID {os.getuid()} (Mode: {oct(dmode)}).")
             else:
@@ -475,4 +471,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

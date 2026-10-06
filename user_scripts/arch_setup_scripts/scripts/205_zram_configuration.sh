@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # 205_zram_configuration.sh
-# Scope: High-Performance ZRAM Swap Configurator (Kernel 7.2+, systemd 261+)
+# Scope: High-Performance ZRAM Swap Configurator (Kernel 7.3+, systemd 262+)
 # Strategy: Lowest RAM usage without compromising performance via dynamic tiering.
 # ==============================================================================
 
@@ -9,13 +9,8 @@ set -euo pipefail
 
 readonly SCRIPT_NAME="${0##*/}"
 ORIG_ARGS=("$@")
-readonly SELF_PATH="$(realpath -e -- "${BASH_SOURCE[0]}")"
-
-# --- 1. Privilege Escalation (Executed First) ---
-if [[ ${EUID} -ne 0 ]]; then
-    command -v sudo >/dev/null 2>&1 || { echo "Error: root privileges and sudo required." >&2; exit 1; }
-    exec sudo -- /usr/bin/bash "$SELF_PATH" "${ORIG_ARGS[@]}"
-fi
+SELF_PATH="$(realpath -e -- "${BASH_SOURCE[0]}")"
+readonly SELF_PATH
 
 # --- 2. ANSI Formatting ---
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -39,7 +34,7 @@ print_help() {
     cat <<EOF
 ${C_BOLD}Usage:${C_RESET} ${SCRIPT_NAME} [OPTIONS]
 
-Configure high-efficiency ZRAM swap for Arch Linux (Linux 7.2+, systemd 261+).
+Configure high-efficiency ZRAM swap for Arch Linux (Linux 7.3+, systemd 262+).
 
 Options:
   --size, -s <expr>           ZRAM size expression (auto-detected if omitted)
@@ -106,6 +101,12 @@ while [[ $# -gt 0 ]]; do
         *) usage_error "Unknown argument: $1" ;;
     esac
 done
+
+# Parse help and usage errors before requesting root; neither mutates the system.
+if [[ ${EUID} -ne 0 ]]; then
+    command -v sudo >/dev/null 2>&1 || die "Root privileges and sudo required."
+    exec sudo -- /usr/bin/bash "$SELF_PATH" "${ORIG_ARGS[@]}"
+fi
 
 if [[ -z "$ZRAM_SIZE_EXPR" ]]; then
     ZRAM_SIZE_EXPR="$AUTO_SIZE_EXPR"
@@ -231,28 +232,22 @@ unit_is_loaded() {
 
 if unit_is_loaded "$SWAP_SETUP_UNIT" && unit_is_loaded "$SWAP_UNIT"; then
     if swapon --show=NAME --noheadings | grep -qx "$ZRAM_SWAP_DEV"; then
-        log_info "Active swap detected on $ZRAM_SWAP_DEV. Attempting safe swap recycling..."
-        if ! swapoff "$ZRAM_SWAP_DEV" 2>/dev/null; then
-            log_warn "Cannot safely swapoff $ZRAM_SWAP_DEV (swap is actively holding pages)."
-            log_warn "New ZRAM configuration is safely staged and will activate on next reboot."
-            exit 0
-        fi
+        # Do not race PID 1's swap/device lifecycle or fault swapped pages back
+        # into RAM merely to rerun the installer. Device parameters are immutable
+        # after initialization; a boot applies the persisted configuration.
+        log_info "Active swap retained. Persisted device settings apply on next reboot."
+        exit 0
     fi
 
-    if [[ -b "$ZRAM_SWAP_DEV" && -w "/sys/block/zram0/reset" ]]; then
-        echo 1 > "/sys/block/zram0/reset" 2>/dev/null || true
-    fi
-
-    systemctl restart "$SWAP_SETUP_UNIT" 2>/dev/null || true
-    systemctl restart "$SWAP_UNIT" 2>/dev/null || true
+    # Let systemd order device setup before swap activation.
+    systemctl start "$SWAP_UNIT" || die "ZRAM swap activation failed; inspect ${SWAP_SETUP_UNIT}."
     if swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$ZRAM_SWAP_DEV"; then
         log_success "ZRAM swap (${COMPRESSION_ALGORITHM} @ Priority ${SWAP_PRIORITY}) active and verified."
     else
-        log_warn "ZRAM generator units reloaded. Swap device will activate cleanly on next boot."
+        die "ZRAM swap unit started but ${ZRAM_SWAP_DEV} is not active."
     fi
 else
     log_info "ZRAM generator units staged. New configuration will activate automatically on boot."
 fi
 
 exit 0
-
