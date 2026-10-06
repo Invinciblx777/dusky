@@ -405,10 +405,6 @@ def setup_user_chrome(home: Path, source_xpi: Path | None = None) -> bool:
     if installed_profiles > 0:
         print_success(f"Context menu styling injected into {installed_profiles} profile(s).")
     else:
-        has_profile_registry = any((base_dir / "profiles.ini").exists() for base_dir in browser_dirs)
-        if not seen_profiles and not has_profile_registry:
-            print_warn("Firefox has no profiles yet; per-profile preferences, stylesheets, and extension setup are deferred. Run this setup again after creating a Firefox profile.")
-            return True
         print_warn("No profile directories found for context menu styling.")
     if installed_xpis > 0:
         print_success(f"Signed XPI copied into {installed_xpis} browser profile(s).")
@@ -501,11 +497,44 @@ def resolve_source_xpi(script_dir: Path) -> Path | None:
 # ─────────────────────────────────────────────────────────────
 def _browser_data_dirs(home: Path) -> list[Path]:
     """Native Firefox data roots (traditional and current XDG layout)."""
-    return [home / ".mozilla", home / ".config" / "mozilla"]
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config")
+    if not config_home.is_absolute():
+        config_home = home / ".config"
+    return [home / ".mozilla", config_home / "mozilla"]
 
 
 def _profile_base_dirs(home: Path) -> list[Path]:
     return [root / "firefox" for root in _browser_data_dirs(home)]
+
+def ensure_firefox_profiles(home: Path, firefox: str) -> None:
+    """Let Firefox select and register its default before installing profile files."""
+    bases = _profile_base_dirs(home)
+    if any(any(iter_firefox_profiles(base)) for base in bases if base.is_dir()):
+        return
+    if any((base / "profiles.ini").exists() for base in bases):
+        print_error("Firefox has a profile registry but no usable profile directories. Repair the registry before running setup.")
+
+    # Old global copies must not be discovered and disabled before user.js sets
+    # extensions.autoDisableScopes=0 in the new profile.
+    uninstall_global_xpis(home)
+    print_step("Creating Firefox's default profile without opening a browser window...")
+    # --CreateProfile does not assign the installation's dedicated default.
+    # Screenshot mode uses normal profile selection and exits on about:blank.
+    with tempfile.TemporaryDirectory(prefix="dusky-firefox-") as tmp:
+        screenshot = Path(tmp) / "blank.png"
+        try:
+            result = subprocess.run(
+                [firefox, "--headless", "--new-instance", "--screenshot", str(screenshot), "about:blank"],
+                capture_output=True, text=True, timeout=60,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            print_error(f"Could not initialize Firefox's default profile: {error}")
+        if result.returncode or not screenshot.is_file():
+            print_error(f"Firefox profile initialization failed: {result.stderr.strip() or result.stdout.strip()}")
+    if not any(any(iter_firefox_profiles(base)) for base in bases if base.is_dir()):
+        print_error("Firefox did not register a usable default profile.")
+    print_success("Firefox's default profile is ready for provisioning.")
+
 
 def _browser_processes_running() -> list[str]:
     """Return names of detected running Firefox browsers."""
@@ -617,10 +646,8 @@ def uninstall_manifests(home: Path) -> int:
 
 def uninstall_global_xpis(home: Path) -> int:
     """Remove the XPI from global extension paths."""
-    global_ext_dirs = [
-        home / ".mozilla" / "extensions" / "{ec8030f7-c20a-464f-9b0e-13a3a9e97384}",
-        home / ".config" / "mozilla" / "extensions" / "{ec8030f7-c20a-464f-9b0e-13a3a9e97384}",
-    ]
+    global_ext_dirs = [root / "extensions" / "{ec8030f7-c20a-464f-9b0e-13a3a9e97384}"
+                       for root in _browser_data_dirs(home)]
     removed = 0
     for g_dir in global_ext_dirs:
         xpi = g_dir / f"{EXTENSION_ID}.xpi"
@@ -781,6 +808,7 @@ def main() -> None:
     else:
         print_error("Signed XPI package not found. Supply the signed extension package before running setup.")
 
+    ensure_firefox_profiles(home, firefox)
     install_dir.mkdir(parents=True, exist_ok=True)
 
     print_step("Installing host to stable XDG path...")
@@ -863,15 +891,7 @@ def main() -> None:
     if not setup_user_chrome(home, source_xpi):
         print_error("Profile provisioning was incomplete; see the errors above.")
 
-    has_profiles = any(any(iter_firefox_profiles(base_dir))
-                       for base_dir in _profile_base_dirs(home) if base_dir.is_dir())
-    if not has_profiles:
-        # A first launch without user.js auto-disables global sideloads. Do not
-        # expose our XPI until the profile's autoDisableScopes preference is set.
-        # Remove copies left by an earlier unsuccessful fresh installation too.
-        uninstall_global_xpis(home)
-        print_warn("Global extension installation deferred until a Firefox profile has been provisioned.")
-    elif source_xpi and source_xpi.is_file():
+    if source_xpi and source_xpi.is_file():
         print_step("Installing signed WebExtension into global extension paths...")
         global_ext_dirs = [root / "extensions" / "{ec8030f7-c20a-464f-9b0e-13a3a9e97384}"
                            for root in _browser_data_dirs(home)]
