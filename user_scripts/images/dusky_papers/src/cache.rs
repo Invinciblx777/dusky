@@ -6,6 +6,7 @@ use std::fs;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 const THUMB_RECIPE: &str = "dusky-rust-thumb-v5-jpeg85-16x10-oriented";
 const THUMB_WIDTH: u32 = 640;
@@ -46,7 +47,8 @@ pub fn thumb_digest(relative_path: &str, source_path: &Path) -> String {
     }
     if let Ok(metadata) = fs::metadata(source_path) {
         for value in [
-            metadata.dev(),
+            // Btrfs st_dev is allocated at mount time, not a persistent identity.
+            // The canonical path and remaining metadata identify the source.
             metadata.ino(),
             metadata.len(),
             metadata.mtime() as u64,
@@ -228,18 +230,41 @@ pub fn prune_thumbnails(
 }
 
 pub fn batch_generate_thumbs(items: &[crate::scanner::WallpaperItem], force: bool) -> CacheStats {
+    let pending: Vec<_> = items
+        .iter()
+        .filter(|item| force || !is_thumb_valid(&item.path, &item.thumb_path))
+        .collect();
+    let cached = items.len() - pending.len();
+    println!("Thumbnails: {cached} cached, {} to generate", pending.len());
+    if pending.is_empty() {
+        return CacheStats {
+            cached,
+            ..CacheStats::default()
+        };
+    }
+    let completed = AtomicUsize::new(0);
+    let last_report = AtomicU64::new(0);
+    let started = std::time::Instant::now();
+    let report_progress = || {
+        let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+        let seconds = started.elapsed().as_secs();
+        if last_report.fetch_max(seconds, Ordering::Relaxed) < seconds || done == pending.len() {
+            println!("Thumbnail progress: {done}/{}", pending.len());
+        }
+    };
     let available = available_memory_bytes().unwrap_or(2 * 1024 * 1024 * 1024);
     let memory_workers = (available / (1024 * 1024 * 1024)).max(1) as usize;
     let cpu_workers = std::thread::available_parallelism().map_or(1, |count| count.get());
     let workers = memory_workers.min(cpu_workers).min(8);
     let generate = || {
-        items
+        pending
             .par_iter()
             .map(|item| {
                 let status = generate_thumb_with_mode(&item.path, &item.thumb_path, force);
                 if status == ThumbStatus::Failed {
                     eprintln!("Could not generate thumbnail for {}", item.path.display());
                 }
+                report_progress();
                 status
             })
             .fold(CacheStats::default, |mut stats, status| {
@@ -253,20 +278,25 @@ pub fn batch_generate_thumbs(items: &[crate::scanner::WallpaperItem], force: boo
                 left
             })
     };
-    match rayon::ThreadPoolBuilder::new().num_threads(workers).build() {
+    let mut stats = match rayon::ThreadPoolBuilder::new().num_threads(workers).build() {
         Ok(pool) => pool.install(generate),
         Err(error) => {
             eprintln!("Could not create thumbnail workers: {error}");
-            items.iter().fold(CacheStats::default(), |mut stats, item| {
-                stats.add(generate_thumb_with_mode(
-                    &item.path,
-                    &item.thumb_path,
-                    force,
-                ));
-                stats
-            })
+            pending
+                .iter()
+                .fold(CacheStats::default(), |mut stats, item| {
+                    stats.add(generate_thumb_with_mode(
+                        &item.path,
+                        &item.thumb_path,
+                        force,
+                    ));
+                    report_progress();
+                    stats
+                })
         }
-    }
+    };
+    stats.cached += cached;
+    stats
 }
 
 fn available_memory_bytes() -> Option<u64> {
@@ -299,4 +329,60 @@ fn available_memory_bytes() -> Option<u64> {
         }
     }
     Some(available)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incremental_cache_repairs_only_missing_changed_or_corrupt_images() {
+        let root = std::env::temp_dir().join(format!(
+            "dusky-cache-test-{}-{}",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
+        let sources = root.join("sources");
+        let thumbs = root.join("thumbs");
+        fs::create_dir_all(&sources).unwrap();
+        let write_image = |name: &str, rgb| {
+            image::RgbImage::from_pixel(32, 32, image::Rgb(rgb))
+                .save(sources.join(name))
+                .unwrap();
+        };
+        let scan =
+            || crate::scanner::scan_wallpapers(&sources, &thumbs, &HashSet::new(), None).unwrap();
+        write_image("first.png", [255, 0, 0]);
+        let first = scan();
+        assert_eq!(batch_generate_thumbs(&first, false).generated, 1);
+        let original = fs::metadata(&first[0].thumb_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        let stats = batch_generate_thumbs(&scan(), false);
+        assert_eq!((stats.generated, stats.cached, stats.failed), (0, 1, 0));
+        write_image("new.png", [0, 255, 0]);
+        let stats = batch_generate_thumbs(&scan(), false);
+        assert_eq!((stats.generated, stats.cached, stats.failed), (1, 1, 0));
+        assert_eq!(
+            fs::metadata(&first[0].thumb_path)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            original
+        );
+        write_image("first.png", [0, 0, 255]);
+        let changed = scan();
+        assert_ne!(first[0].thumb_path, changed[0].thumb_path);
+        let stats = batch_generate_thumbs(&changed, false);
+        assert_eq!((stats.generated, stats.cached, stats.failed), (1, 1, 0));
+        fs::write(&changed[0].thumb_path, b"broken JPEG").unwrap();
+        assert_eq!(batch_generate_thumbs(&changed, false).generated, 1);
+        let stats = batch_generate_thumbs(&changed, true);
+        assert_eq!((stats.generated, stats.cached, stats.failed), (2, 0, 0));
+        assert_eq!(prune_thumbnails(&changed, &thumbs).unwrap(), 1);
+        fs::remove_file(sources.join("first.png")).unwrap();
+        assert_eq!(prune_thumbnails(&scan(), &thumbs).unwrap(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

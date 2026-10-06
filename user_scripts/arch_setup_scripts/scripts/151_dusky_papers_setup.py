@@ -2,11 +2,13 @@
 """Use a current ISO package or build Dusky Papers for this CPU."""
 
 import argparse
+import codecs
 import hashlib
 import json
 import os
 import platform
 import re
+import selectors
 import shutil
 import signal
 import subprocess
@@ -37,6 +39,7 @@ def env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 3600) -
 BUILD_RECIPE = "native-v3-frozen-sparse"
 FETCH_TIMEOUT_S = env_int("DUSKY_PAPERS_FETCH_TIMEOUT", 120, maximum=1800)
 BUILD_TIMEOUT_S = env_int("DUSKY_PAPERS_BUILD_TIMEOUT", 7200, maximum=7200)
+# Maximum cache inactivity, rather than total time for a growing collection.
 CACHE_TIMEOUT_S = env_int("DUSKY_PAPERS_CACHE_TIMEOUT", 120, maximum=900)
 
 
@@ -286,16 +289,17 @@ def run_bounded(
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
     capture_output: bool = False,
+    inactivity_timeout: bool = False,
 ) -> tuple[int, str, str, bool]:
-    """Run with a hard wall-clock deadline and process-group cleanup."""
+    """Run with a total or output-inactivity deadline and process-group cleanup."""
     try:
         process = subprocess.Popen(
             command,
             cwd=cwd,
             env=env,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE if capture_output else None,
-            stderr=subprocess.PIPE if capture_output else None,
+            stdout=subprocess.PIPE if capture_output or inactivity_timeout else None,
+            stderr=subprocess.PIPE if capture_output or inactivity_timeout else None,
             text=True,
             errors="replace",
             start_new_session=True,
@@ -309,7 +313,32 @@ def run_bounded(
         )
 
     try:
-        if capture_output:
+        if inactivity_timeout:
+            # Cache work scales with the number of missing images. Bound stalls,
+            # not the total duration of a healthy, progressing build.
+            deadline = time.monotonic() + timeout
+            with selectors.DefaultSelector() as selector:
+                for stream, output in ((process.stdout, sys.stdout), (process.stderr, sys.stderr)):
+                    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                    selector.register(stream, selectors.EVENT_READ, (output, decoder))
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    for key, _ in selector.select(remaining):
+                        output, decoder = key.data
+                        data = os.read(key.fd, 65536)
+                        if not data:
+                            selector.unregister(key.fileobj)
+                            output.write(decoder.decode(b"", final=True))
+                            output.flush()
+                        else:
+                            output.write(decoder.decode(data))
+                            output.flush()
+                            deadline = time.monotonic() + timeout
+            process.wait(timeout=max(0, deadline - time.monotonic()))
+            stdout = stderr = ""
+        elif capture_output:
             stdout, stderr = process.communicate(timeout=timeout)
         else:
             process.wait(timeout=timeout)
@@ -332,6 +361,11 @@ def run_bounded(
     except BaseException:
         terminate_process_group(process)
         raise
+    finally:
+        if inactivity_timeout:
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
 
 
 def get_cargo_home(build_dir: Path) -> Path:
@@ -617,9 +651,10 @@ def main(argv: list[str] | None = None) -> int:
         [str(binary), cache_mode],
         timeout=CACHE_TIMEOUT_S,
         capture_output=False,
+        inactivity_timeout=True,
     )
     if timed_out:
-        log("WARN", f"Thumbnail generation exceeded {CACHE_TIMEOUT_S}s and was terminated; continuing update")
+        log("WARN", f"Cache generation made no progress for {CACHE_TIMEOUT_S}s and was terminated; continuing update")
         return 0
     if returncode != 0:
         log("WARN", f"Thumbnail generation failed (exit {returncode}); continuing update")
